@@ -36,8 +36,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use http::{Method, StatusCode};
 use serde_json::{Map, Value, json};
 
-use crate::api::{Api, ApiError, Reply, Req, json as respond, no_content};
+use crate::api::{Api, ApiError, Reply, Req, json as respond, no_content, space_to_develop};
 use crate::brokers;
+use crate::roles::{Access, Need};
 use crate::store::{
     Binding, Instance, Operation, OperationKind, OperationState, Purge, State, guid, now,
 };
@@ -558,17 +559,53 @@ impl Catalog {
     }
 }
 
-/// Whether the plan is seen in the space and organization the request
-/// filters by (`space_guids`, `organization_guids`): one no one sees is
-/// not; there is one space, the organization's.
-fn seen(req: &Req, state: &State, plan: &Value) -> bool {
-    let ours = |key: &str, guid: &str| {
+/// Whether the holder of `access` sees the plan in the spaces and organizations the request
+/// filters by (`space_guids`, `organization_guids`), of those it sees: a public plan
+/// anywhere, an organization's in that organization, a space-scoped broker's in its space.
+/// Unfiltered, an admin sees every plan; filtered, none that is no one's (`admin`).
+fn seen(req: &Req, state: &State, access: &Access, plan: &Value) -> bool {
+    let wanted = |key: &str, guid: &str| {
         values(req, key).is_none_or(|guids| guids.iter().any(|g| g == guid))
     };
     let filtered = req.q("space_guids").is_some() || req.q("organization_guids").is_some();
-    ours("space_guids", &state.space.guid)
-        && ours("organization_guids", &state.org.guid)
-        && (!filtered || plan["visibility_type"] != "admin")
+    if access.admin && !filtered {
+        return true;
+    }
+    let spaces: Vec<&crate::store::Space> = state
+        .spaces
+        .iter()
+        .filter(|space| {
+            wanted("space_guids", &space.guid)
+                && wanted("organization_guids", &space.org)
+                && access.can(state, &space.guid, Need::Read)
+        })
+        .collect();
+    let orgs: Vec<&str> = state
+        .orgs
+        .iter()
+        .map(|org| org.guid.as_str())
+        .filter(|org| {
+            wanted("organization_guids", org)
+                && access.sees_org(state, org)
+                && (req.q("space_guids").is_none() || spaces.iter().any(|space| space.org == *org))
+        })
+        .collect();
+    let guid = plan["guid"].as_str().unwrap_or_default();
+    match state.brokered(guid) {
+        // the wicket's: public
+        None => !filtered || !orgs.is_empty(),
+        Some(brokered) => match brokered.plan.visibility.as_str() {
+            _ if brokered.plan.gone => false,
+            "public" => !filtered || !orgs.is_empty(),
+            "organization" => orgs
+                .iter()
+                .any(|org| brokered.plan.orgs.iter().any(|o| o == org)),
+            "space" => spaces
+                .iter()
+                .any(|space| brokered.broker.space.as_deref() == Some(space.guid.as_str())),
+            _ => false,
+        },
+    }
 }
 
 /// Whether the name of `item` is among those the request filters by `key`.
@@ -698,11 +735,11 @@ fn instance_view(base: &str, state: &State, instance: &Instance) -> Value {
             "name": instance.name, "type": USER_PROVIDED, "tags": instance.tags,
             "syslog_drain_url": null, "route_service_url": null,
             "last_operation": last_operation,
-            "relationships": {"space": {"data": {"guid": state.space.guid}}},
+            "relationships": {"space": {"data": {"guid": instance.space}}},
             "metadata": metadata(),
             "links": {
                 "self": {"href": format!("{base}/v3/service_instances/{guid}")},
-                "space": {"href": format!("{base}/v3/spaces/{}", state.space.guid)},
+                "space": {"href": format!("{base}/v3/spaces/{}", instance.space)},
                 "credentials": {"href": format!("{base}/v3/service_instances/{guid}/credentials")},
                 "service_credential_bindings": {"href": format!("{base}/v3/service_credential_bindings?service_instance_guids={guid}")},
                 "service_route_bindings": {"href": format!("{base}/v3/service_route_bindings?service_instance_guids={guid}")},
@@ -729,13 +766,13 @@ fn instance_view(base: &str, state: &State, instance: &Instance) -> Value {
         "maintenance_info": instance.maintenance_info.clone().unwrap_or_else(|| json!({})),
         "last_operation": last_operation,
         "relationships": {
-            "space": {"data": {"guid": state.space.guid}},
+            "space": {"data": {"guid": instance.space}},
             "service_plan": {"data": {"guid": plan}},
         },
         "metadata": metadata(),
         "links": {
             "self": {"href": format!("{base}/v3/service_instances/{guid}")},
-            "space": {"href": format!("{base}/v3/spaces/{}", state.space.guid)},
+            "space": {"href": format!("{base}/v3/spaces/{}", instance.space)},
             "service_plan": {"href": format!("{base}/v3/service_plans/{plan}")},
             "parameters": {"href": format!("{base}/v3/service_instances/{guid}/parameters")},
             "shared_spaces": {"href": format!("{base}/v3/service_instances/{guid}/relationships/shared_spaces")},
@@ -910,21 +947,52 @@ struct BrokeredUpdate {
 }
 
 impl Api {
+    /// The instance `guid`, if the request's holder may `need` of its space.
+    fn instance_as(&self, req: &Req, guid: &str, need: Need) -> Result<Instance, ApiError> {
+        let access = req.access()?;
+        self.store.read(|state| {
+            let instance = state
+                .instance(guid)
+                .ok_or_else(|| ApiError::not_found("Service instance"))?;
+            access.check(state, &instance.space, need, "Service instance")?;
+            Ok(instance.clone())
+        })
+    }
+
+    /// The binding `guid`, if the request's holder may `need` of its app's space.
+    fn binding_as(&self, req: &Req, guid: &str, need: Need) -> Result<Binding, ApiError> {
+        let access = req.access()?;
+        self.store.read(|state| {
+            let what = "Service credential binding";
+            let binding = state
+                .binding(guid)
+                .ok_or_else(|| ApiError::not_found(what))?;
+            let space = state.app(&binding.app).map_or("", |app| app.space.as_str());
+            access.check(state, space, need, what)?;
+            Ok(binding.clone())
+        })
+    }
+
     /// `/v3/service_*`.
     pub(crate) async fn services(&self, req: &Req, segments: &[&str]) -> Reply {
         let base = req.base.as_str();
+        let access = req.access()?;
         let offer = || async { self.controller.offer().await.unwrap_or_default() };
         match (&req.method, segments) {
             (&Method::GET, ["service_brokers"]) => {
-                let brokers = self.store.read(|state| catalog(base, &Offer::default(), state).brokers);
+                let brokers = self
+                    .store
+                    .read(|state| catalog(base, &Offer::default(), state).brokers);
                 page(req, brokers, &[], |_| Map::new())
             }
             (&Method::GET, ["service_brokers", guid]) if *guid == broker_guid() => {
                 Ok(respond(StatusCode::OK, &broker_view(base)))
             }
-            (_, ["service_brokers", guid, ..]) if *guid == broker_guid() => Err(ApiError::unprocessable(
-                "the broker sluice-wicket is the wicket: its offerings follow the wicket's keyvalue stores and capabilities",
-            )),
+            (_, ["service_brokers", guid, ..]) if *guid == broker_guid() => {
+                Err(ApiError::unprocessable(
+                    "the broker sluice-wicket is the wicket: its offerings follow the wicket's keyvalue stores and capabilities",
+                ))
+            }
             (_, ["service_brokers", ..]) => match self.registered_brokers(req, segments).await {
                 Some(reply) => reply,
                 None if req.method == Method::GET => Err(ApiError::not_found("Service broker")),
@@ -937,26 +1005,33 @@ impl Api {
                     let items: Vec<Value> = catalog
                         .offerings
                         .iter()
-                        .filter(|offering| named(req, "service_broker_names", catalog.broker_of(offering)))
+                        .filter(|offering| {
+                            named(req, "service_broker_names", catalog.broker_of(offering))
+                        })
                         .filter(|offering| {
                             let plans = catalog.plans.iter().filter(|plan| {
                                 related(plan, "service_offering") == offering["guid"].as_str()
                             });
-                            plans.into_iter().any(|plan| seen(req, state, plan))
+                            plans.into_iter().any(|plan| seen(req, state, access, plan))
                         })
                         .cloned()
                         .collect();
-                    page(req, items, &["space_guids", "organization_guids"], |items| {
-                        let mut included = Map::new();
-                        if wants(req, "service_broker") {
-                            let brokers = Catalog::of(
-                                &catalog.brokers,
-                                items.iter().map(|offering| catalog.broker_of(offering)),
-                            );
-                            included.insert("service_brokers".into(), json!(brokers));
-                        }
-                        included
-                    })
+                    page(
+                        req,
+                        items,
+                        &["space_guids", "organization_guids"],
+                        |items| {
+                            let mut included = Map::new();
+                            if wants(req, "service_broker") {
+                                let brokers = Catalog::of(
+                                    &catalog.brokers,
+                                    items.iter().map(|offering| catalog.broker_of(offering)),
+                                );
+                                included.insert("service_brokers".into(), json!(brokers));
+                            }
+                            included
+                        },
+                    )
                 })
             }
             (&Method::GET, ["service_offerings", guid]) => {
@@ -966,7 +1041,8 @@ impl Api {
                     .map(|offering| respond(StatusCode::OK, &offering))
                     .ok_or_else(|| ApiError::not_found("Service offering"))
             }
-            (&Method::DELETE, ["service_offerings", guid]) => match self.delete_offering(req, guid) {
+            (&Method::DELETE, ["service_offerings", guid]) => match self.delete_offering(req, guid)
+            {
                 Some(deleted) => deleted.map(|()| no_content()),
                 None => Err(ApiError::unprocessable(
                     "the offerings of sluice-wicket follow the wicket's keyvalue stores and capabilities",
@@ -977,7 +1053,8 @@ impl Api {
             )),
             (&Method::GET, ["service_plans"]) => {
                 let offer = offer().await;
-                self.store.read(|state| self.plans(req, state, &offer))
+                self.store
+                    .read(|state| self.plans(req, state, access, &offer))
             }
             (&Method::GET, ["service_plans", guid]) => {
                 let offer = offer().await;
@@ -1002,70 +1079,78 @@ impl Api {
             )),
             (&Method::GET, ["service_instances"]) => {
                 let offer = offer().await;
-                self.store.read(|state| self.instances(req, state, &offer))
+                self.store
+                    .read(|state| self.instances(req, state, access, &offer))
             }
             (&Method::POST, ["service_instances"]) => self.create_instance(req).await,
-            (&Method::GET, ["service_instances", guid]) => self
-                .store
-                .read(|state| state.instance(guid).map(|instance| instance_view(base, state, instance)))
-                .map(|view| respond(StatusCode::OK, &view))
-                .ok_or_else(|| ApiError::not_found("Service instance")),
+            (&Method::GET, ["service_instances", guid]) => {
+                let instance = self.instance_as(req, guid, Need::Read)?;
+                Ok(respond(
+                    StatusCode::OK,
+                    &self
+                        .store
+                        .read(|state| instance_view(base, state, &instance)),
+                ))
+            }
             (&Method::PATCH, ["service_instances", guid]) => self.update_instance(req, guid).await,
             (&Method::DELETE, ["service_instances", guid]) => self.delete_instance(req, guid).await,
             (&Method::GET, ["service_instances", guid, "parameters"]) => {
+                self.instance_as(req, guid, Need::Develop)?;
                 self.instance_parameters(guid).await
             }
-            (&Method::GET, ["service_instances", guid, "credentials"]) => self
-                .store
-                .read(|state| {
-                    state
-                        .instance(guid)
-                        .filter(|instance| instance.user_provided())
-                        .map(|instance| Value::Object(instance.credentials.clone()))
-                })
-                .map(|credentials| respond(StatusCode::OK, &credentials))
-                .ok_or_else(|| ApiError::not_found("Service instance")),
+            (&Method::GET, ["service_instances", guid, "credentials"]) => {
+                let instance = self.instance_as(req, guid, Need::Develop)?;
+                match instance.user_provided() {
+                    true => Ok(respond(
+                        StatusCode::OK,
+                        &Value::Object(instance.credentials),
+                    )),
+                    false => Err(ApiError::not_found("Service instance")),
+                }
+            }
             (&Method::GET, ["service_instances", guid, "relationships", "shared_spaces"]) => {
-                self.store
-                    .read(|state| state.instance(guid).map(|_| ()))
-                    .ok_or_else(|| ApiError::not_found("Service instance"))?;
+                self.instance_as(req, guid, Need::Read)?;
                 Ok(respond(
                     StatusCode::OK,
                     &json!({"data": [], "links": {"self": {"href": format!("{base}/v3/service_instances/{guid}/relationships/shared_spaces")}}}),
                 ))
             }
             (_, ["service_instances", _, "relationships", "shared_spaces", ..]) => Err(
-                ApiError::unprocessable("sharing is not supported: the cf-api has one space"),
+                ApiError::unprocessable("sharing is not supported: an instance is its space's"),
             ),
             (&Method::GET, ["service_credential_bindings"]) => {
-                self.store.read(|state| bindings(req, state))
+                self.store.read(|state| bindings(req, state, access))
             }
             (&Method::POST, ["service_credential_bindings"]) => self.create_binding(req).await,
-            (&Method::GET, ["service_credential_bindings", guid]) => self
-                .store
-                .read(|state| state.binding(guid).map(|binding| binding_view(base, binding)))
-                .map(|view| respond(StatusCode::OK, &view))
-                .ok_or_else(|| ApiError::not_found("Service credential binding")),
-            (&Method::GET, ["service_credential_bindings", guid, "details"]) => self
-                .store
+            (&Method::GET, ["service_credential_bindings", guid]) => {
+                let binding = self.binding_as(req, guid, Need::Read)?;
+                Ok(respond(StatusCode::OK, &binding_view(base, &binding)))
+            }
+            (&Method::GET, ["service_credential_bindings", guid, "details"]) => {
+                self.binding_as(req, guid, Need::Develop)?;
+                self.store
                 .read(|state| {
                     let binding = state.binding(guid)?;
                     let instance = state.instance(&binding.instance)?;
                     Some(json!({"credentials": credentials(instance, binding), "syslog_drain_url": null, "volume_mounts": []}))
                 })
                 .map(|view| respond(StatusCode::OK, &view))
-                .ok_or_else(|| ApiError::not_found("Service credential binding")),
+                .ok_or_else(|| ApiError::not_found("Service credential binding"))
+            }
             (&Method::GET, ["service_credential_bindings", guid, "parameters"]) => {
+                self.binding_as(req, guid, Need::Develop)?;
                 self.binding_parameters(guid).await
             }
-            (&Method::DELETE, ["service_credential_bindings", guid]) => self.delete_binding(req, guid).await,
+            (&Method::DELETE, ["service_credential_bindings", guid]) => {
+                self.delete_binding(req, guid).await
+            }
             _ => Err(ApiError::unknown(&req.method, &req.path)),
         }
     }
 
     /// The plans, with their offerings, brokers, spaces and organizations
     /// included as asked; filtered by what is seen where the request says.
-    fn plans(&self, req: &Req, state: &State, offer: &Offer) -> Reply {
+    fn plans(&self, req: &Req, state: &State, access: &Access, offer: &Offer) -> Reply {
         let catalog = catalog(&req.base, offer, state);
         let items: Vec<Value> = catalog
             .plans
@@ -1080,7 +1165,7 @@ impl Api {
                             .and_then(|broker| broker["guid"].as_str())
                             .is_some_and(|guid| guids.iter().any(|wanted| wanted == guid))
                     })
-                    && seen(req, state, plan)
+                    && seen(req, state, access, plan)
             })
             .cloned()
             .collect();
@@ -1101,20 +1186,12 @@ impl Api {
             if wants(req, "service_offering") || wants(req, "service_offering.service_broker") {
                 included.insert("service_offerings".into(), json!(offerings));
             }
-            if wants(req, "space.organization") || wants(req, "space") {
-                // a space-scoped broker's plans are of the one space
-                let scoped = items.iter().any(|plan| related(plan, "space").is_some());
-                let (spaces, orgs) = match scoped {
-                    true => (
-                        vec![views::space(&req.base, state)],
-                        vec![views::org(&req.base, state)],
-                    ),
-                    false => (Vec::new(), Vec::new()),
-                };
-                included.insert("spaces".into(), json!(spaces));
-                if wants(req, "space.organization") {
-                    included.insert("organizations".into(), json!(orgs));
-                }
+            // a space-scoped broker's plans are of its space
+            let scoped = items.iter().filter_map(|plan| related(plan, "space"));
+            if let Some(Value::Object(spaces)) =
+                views::spaces_included(&req.base, state, &req.query, scoped)
+            {
+                included.extend(spaces);
             }
             included
         })
@@ -1122,12 +1199,13 @@ impl Api {
 
     /// The instances, with the plans, offerings, broker, space and
     /// organization they name included as asked.
-    fn instances(&self, req: &Req, state: &State, offer: &Offer) -> Reply {
+    fn instances(&self, req: &Req, state: &State, access: &Access, offer: &Offer) -> Reply {
         let base = req.base.as_str();
         let catalog = catalog(base, offer, state);
         let items = state
             .instances
             .iter()
+            .filter(|instance| access.can(state, &instance.space, Need::Read))
             .filter(|instance| {
                 named(
                     req,
@@ -1162,11 +1240,13 @@ impl Api {
                 );
                 included.insert("service_brokers".into(), json!(brokers));
             }
-            if wants(req, "space") {
-                included.insert("spaces".into(), json!([views::space(base, state)]));
-            }
-            if wants(req, "space.organization") {
-                included.insert("organizations".into(), json!([views::org(base, state)]));
+            let spaces = items
+                .iter()
+                .filter_map(|instance| related(instance, "space"));
+            if let Some(Value::Object(spaces)) =
+                views::spaces_included(base, state, &req.query, spaces)
+            {
+                included.extend(spaces);
             }
             included
         })
@@ -1174,9 +1254,16 @@ impl Api {
 
     async fn create_instance(&self, req: &Req) -> Reply {
         let body: Value = req.json()?;
+        let space = body["relationships"]["space"]["data"]["guid"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let access = req.access()?;
+        self.store
+            .read(|state| space_to_develop(access, state, &space))?;
         match body["type"].as_str() {
             Some("managed") => {}
-            Some(USER_PROVIDED) => return self.create_user_provided(req, &body),
+            Some(USER_PROVIDED) => return self.create_user_provided(req, &body, &space),
             _ => {
                 return Err(ApiError::unprocessable(
                     "type is managed (cf create-service) or user-provided (cf create-user-provided-service)",
@@ -1190,7 +1277,7 @@ impl Api {
             .ok_or_else(|| ApiError::unprocessable("relationships.service_plan names the plan"))?;
         let tags = tags(&body["tags"])?;
         if self.store.read(|state| state.brokered(wanted).is_some()) {
-            return self.create_brokered(req, &body, name, wanted, tags);
+            return self.create_brokered(req, &body, &space, name, wanted, tags);
         }
         no_parameters(&body["parameters"])?;
         let offer = self.controller.offer().await.map_err(|e| {
@@ -1204,13 +1291,15 @@ impl Api {
             .find(|plan| plan_guid(&plan.offering, &plan.name) == wanted)
             .ok_or_else(invalid_plan)?;
         let instance = self.store.update(|state| {
-            if state.instance_named(&name).is_some() {
+            space_to_develop(access, state, &space)?;
+            if state.instance_named(&space, &name).is_some() {
                 return Err(name_taken(&name));
             }
             let at = now();
             let instance = Instance {
                 guid: guid(),
                 name: name.clone(),
+                space: space.clone(),
                 offering: plan.offering.clone(),
                 plan: plan.name.clone(),
                 tags,
@@ -1246,18 +1335,22 @@ impl Api {
         &self,
         req: &Req,
         body: &Value,
+        space: &str,
         name: String,
         plan: &str,
         tags: Vec<String>,
     ) -> Reply {
         let parameters = object_parameters(&body["parameters"]).map_err(ApiError::unprocessable)?;
         let user = self.claims(req)?.user_id;
+        let access = req.access()?;
         let job = self.store.update(|state| {
-            if state.instance_named(&name).is_some() {
+            space_to_develop(access, state, space)?;
+            if state.instance_named(space, &name).is_some() {
                 return Err(name_taken(&name));
             }
             let brokered = state.brokered(plan).ok_or_else(invalid_plan)?;
-            if !brokered.plan.visible() || brokered.offering.gone {
+            let org = state.space(space).map_or("", |space| space.org.as_str());
+            if !brokered.plan.visible(brokered.broker, org, space) || brokered.offering.gone {
                 return Err(invalid_plan());
             }
             let (offering, broker) = (brokered.offering.guid.clone(), brokered.broker.guid.clone());
@@ -1278,6 +1371,7 @@ impl Api {
             state.instances.push(Instance {
                 guid,
                 name: name.clone(),
+                space: space.to_string(),
                 offering,
                 plan: plan.to_string(),
                 tags,
@@ -1298,20 +1392,23 @@ impl Api {
 
     /// A user-provided instance: its credentials, no plan; answered at once,
     /// as CC does (201, no job).
-    fn create_user_provided(&self, req: &Req, body: &Value) -> Reply {
+    fn create_user_provided(&self, req: &Req, body: &Value, space: &str) -> Reply {
         let name = body["name"].as_str().unwrap_or_default().to_string();
         check_name("the name", &name).map_err(ApiError::unprocessable)?;
         user_provided_only(body)?;
         let credentials = user_credentials(&body["credentials"])?.unwrap_or_default();
         let tags = tags(&body["tags"])?;
+        let access = req.access()?;
         let view = self.store.update(|state| {
-            if state.instance_named(&name).is_some() {
+            space_to_develop(access, state, space)?;
+            if state.instance_named(space, &name).is_some() {
                 return Err(name_taken(&name));
             }
             let at = now();
             let instance = Instance {
                 guid: guid(),
                 name: name.clone(),
+                space: space.to_string(),
                 offering: USER_PROVIDED.into(),
                 plan: String::new(),
                 tags,
@@ -1338,6 +1435,7 @@ impl Api {
     /// taken when the broker made it.
     async fn update_instance(&self, req: &Req, guid: &str) -> Reply {
         let body: Value = req.json()?;
+        self.instance_as(req, guid, Need::Develop)?;
         let (user_provided, brokered) = self
             .store
             .read(|state| {
@@ -1391,7 +1489,7 @@ impl Api {
             }
             if let Some(name) = &name
                 && state
-                    .instance_named(name)
+                    .instance_named(&current.space, name)
                     .is_some_and(|other| other.guid != guid)
             {
                 return Err(name_taken(name));
@@ -1467,6 +1565,7 @@ impl Api {
     /// deleted once no app maps it; a broker's instance is its broker's to
     /// delete (202).
     async fn delete_instance(&self, req: &Req, guid: &str) -> Reply {
+        self.instance_as(req, guid, Need::Develop)?;
         let purge = req.q("purge") == Some("true");
         let user = self.claims(req)?.user_id;
         let (instance, dropped, job) = self.store.update(|state| {
@@ -1657,14 +1756,19 @@ impl Api {
             .ok_or_else(|| ApiError::unprocessable("relationships.app names the app"))?;
         let name = body["name"].as_str().map(String::from);
         let user = self.claims(req)?.user_id;
+        let access = req.access()?;
         let (binding, instance_name, user_provided, job) = self.store.update(|state| {
-            if state.app(app).is_none() {
-                return Err(ApiError::unprocessable(format!(
-                    "The app could not be found: {app}"
-                )));
-            }
+            let space = state
+                .app(app)
+                .filter(|app| access.can(state, &app.space, Need::Read))
+                .map(|app| app.space.clone())
+                .ok_or_else(|| {
+                    ApiError::unprocessable(format!("The app could not be found: {app}"))
+                })?;
+            access.check(state, &space, Need::Develop, "App")?;
             let (instance_name, user_provided) = state
                 .instance(instance)
+                .filter(|instance| instance.space == space)
                 .map(|instance| (instance.name.clone(), instance.user_provided()))
                 .ok_or_else(|| {
                     ApiError::unprocessable(format!(
@@ -1735,6 +1839,7 @@ impl Api {
 
     /// At once, but a broker's binding: its broker's to delete (202).
     async fn delete_binding(&self, req: &Req, guid: &str) -> Reply {
+        self.binding_as(req, guid, Need::Develop)?;
         let user = self.claims(req)?.user_id;
         let (binding, instance_name, user_provided, job) = self.store.update(|state| {
             let binding = state
@@ -1803,7 +1908,12 @@ fn brokered_update(
     let plan = plan.filter(|plan| *plan != current.plan);
     if let Some(plan) = plan {
         let wanted = state.brokered(plan).ok_or_else(invalid_plan)?;
-        if wanted.offering.guid != brokered.offering.guid || !wanted.plan.visible() {
+        let org = state
+            .org_of(&current.space)
+            .map_or("", |org| org.guid.as_str());
+        if wanted.offering.guid != brokered.offering.guid
+            || !wanted.plan.visible(wanted.broker, org, &current.space)
+        {
             return Err(invalid_plan());
         }
         if !brokered.plan.feature(brokered.offering, "plan_updateable") {
@@ -1843,12 +1953,18 @@ fn broker_error(detail: String) -> ApiError {
     }
 }
 
-/// The bindings, with the apps and instances they name included as asked.
-fn bindings(req: &Req, state: &State) -> Reply {
+/// The bindings of the apps the holder of `access` sees, with the apps and instances they name
+/// included as asked.
+fn bindings(req: &Req, state: &State, access: &Access) -> Reply {
     let base = req.base.as_str();
     let items = state
         .bindings
         .iter()
+        .filter(|binding| {
+            state
+                .app(&binding.app)
+                .is_some_and(|app| access.can(state, &app.space, Need::Read))
+        })
         .map(|binding| binding_view(base, binding))
         .collect();
     page(req, items, &[], |items| {
@@ -1862,7 +1978,7 @@ fn bindings(req: &Req, state: &State) -> Reply {
                 .apps
                 .iter()
                 .filter(|app| named.contains(app.guid.as_str()))
-                .map(|app| views::app(base, state, app))
+                .map(|app| views::app(base, app))
                 .collect();
             included.insert("apps".into(), json!(apps));
         }

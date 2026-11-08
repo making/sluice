@@ -74,14 +74,14 @@ impl Editors {
     }
 }
 
-/// The destinations of the groups applying to the one space's apps, as the wicket names them,
-/// sorted, once each.
-pub fn egress(state: &State) -> Result<Vec<String>, String> {
+/// The destinations of the groups applying to the apps of the space `space`, as the wicket
+/// names them, sorted, once each.
+pub fn egress(state: &State, space: &str) -> Result<Vec<String>, String> {
     let mut all = BTreeSet::new();
     for group in state
         .security_groups
         .iter()
-        .filter(|group| applies(group, &state.space.guid, true))
+        .filter(|group| applies(group, space, true))
     {
         all.extend(rules_of(&group.rules).map_err(|e| format!("{}: {e}", group.name))?);
     }
@@ -326,11 +326,11 @@ struct SpaceRef {
 }
 
 impl Spaces {
-    /// The guids, which must be the one space's.
+    /// The guids, which must be spaces'.
     fn guids(&self, state: &State) -> Result<Vec<String>, ApiError> {
         let mut guids = Vec::new();
         for space in &self.data {
-            if space.guid != state.space.guid {
+            if state.space(&space.guid).is_none() {
                 return Err(ApiError::unprocessable(format!(
                     "Spaces with guids [\"{}\"] do not exist, or you do not have access to them.",
                     space.guid
@@ -517,7 +517,7 @@ impl Api {
     /// `/v3/spaces/<guid>/{running,staging}_security_groups`.
     pub(crate) fn security_groups_of_space(&self, req: &Req, guid: &str, running: bool) -> Reply {
         let groups = self.store.read(|state| {
-            (state.space.guid == guid).then(|| {
+            state.space(guid).is_some().then(|| {
                 let of = |group: &&SecurityGroup| applies(group, guid, running);
                 state
                     .security_groups
@@ -602,7 +602,7 @@ impl Api {
         editors
             .check(&token, identity.as_ref(), option)
             .map_err(|why| ApiError::not_authorized(&why))?;
-        Ok(token.user_name)
+        Ok(token.name().to_string())
     }
 }
 
@@ -764,7 +764,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
         };
-        let space = state.space.guid.clone();
+        let space = state.spaces[0].guid.clone();
         let mut bound = group("bound", "db");
         bound.running_spaces.push(space.clone());
         let mut global = group("global", "10.0.0.5");
@@ -775,6 +775,6 @@ mod tests {
         let mut again = group("again", "db");
         again.running = true;
         state.security_groups = vec![bound, global, staging, group("unbound", "none"), again];
-        assert_eq!(egress(&state).unwrap(), ["10.0.0.5:80", "db:80"]);
+        assert_eq!(egress(&state, &space).unwrap(), ["10.0.0.5:80", "db:80"]);
     }
 }

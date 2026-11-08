@@ -169,7 +169,13 @@ fn costs(metadata: &Value) -> Value {
 fn visibility_view(state: &State, plan: &BrokerPlan) -> Value {
     let mut view = json!({"type": plan.visibility});
     if plan.visibility == "organization" {
-        view["organizations"] = json!([{"guid": state.org.guid, "name": state.org.name}]);
+        let orgs: Vec<Value> = plan
+            .orgs
+            .iter()
+            .filter_map(|guid| state.org(guid))
+            .map(|org| json!({"guid": org.guid, "name": org.name}))
+            .collect();
+        view["organizations"] = json!(orgs);
     }
     view
 }
@@ -231,6 +237,7 @@ pub fn reconcile(
                     guid: guid(),
                     catalog,
                     visibility: fresh_visibility.into(),
+                    orgs: Vec::new(),
                     gone: false,
                     created_at: at.clone(),
                     updated_at: at.clone(),
@@ -436,7 +443,7 @@ impl Api {
         })?;
         let space = match body["relationships"]["space"]["data"]["guid"].as_str() {
             Some(space) => {
-                if self.store.read(|state| state.space.guid != space) {
+                if self.store.read(|state| state.space(space).is_none()) {
                     return Err(ApiError::unprocessable(
                         "Invalid space. Ensure that the space exists and you have access to it.",
                     ));
@@ -619,8 +626,8 @@ impl Api {
         Some(reply)
     }
 
-    /// `public`, `admin`, or `organization` (the one): an append (POST)
-    /// and a replace (PATCH) are one with one organization.
+    /// `public`, `admin`, or `organization`, of the organizations named: appended to those
+    /// before (POST) or replacing them (PATCH).
     fn set_visibility(&self, req: &Req, plan: &str, space_scoped: bool) -> Reply {
         let editor = self.editor(req, &self.service_broker_editors, EDITORS)?;
         if space_scoped {
@@ -630,28 +637,49 @@ impl Api {
         }
         let body: Value = req.json()?;
         let wanted = body["type"].as_str().unwrap_or_default().to_string();
-        match wanted.as_str() {
-            "public" | "admin" => {}
+        let named: Vec<String> = match wanted.as_str() {
+            "public" | "admin" => Vec::new(),
             "organization" => {
-                let orgs = body["organizations"]
+                let named: Vec<String> = body["organizations"]
                     .as_array()
-                    .cloned()
-                    .unwrap_or_default();
-                let ours = self.store.read(|state| state.org.guid.clone());
-                if orgs.is_empty() || orgs.iter().any(|org| org["guid"] != ours.as_str()) {
+                    .into_iter()
+                    .flatten()
+                    .map(|org| org["guid"].as_str().unwrap_or_default().to_string())
+                    .collect();
+                if named.is_empty() {
                     return Err(ApiError::unprocessable(
-                        "organizations names the one organization of the cf-api",
+                        "Organizations must be given for the type 'organization'",
                     ));
                 }
+                named
             }
             _ => {
                 return Err(ApiError::unprocessable(
                     "Type must be one of 'public', 'admin', 'organization'",
                 ));
             }
-        }
+        };
+        let append = req.method == Method::POST;
         let view = self.store.update(|state| {
+            if let Some(unknown) = named.iter().find(|guid| state.org(guid).is_none()) {
+                return Err(ApiError::unprocessable(format!(
+                    "Could not find Organizations with guids: [\"{unknown}\"]"
+                )));
+            }
             let plan = plan_mut(state, plan).ok_or_else(|| ApiError::not_found("Service plan"))?;
+            match wanted.as_str() {
+                "organization" => {
+                    if !append || plan.visibility != "organization" {
+                        plan.orgs.clear();
+                    }
+                    for org in &named {
+                        if !plan.orgs.contains(org) {
+                            plan.orgs.push(org.clone());
+                        }
+                    }
+                }
+                _ => plan.orgs.clear(),
+            }
             plan.visibility.clone_from(&wanted);
             plan.updated_at = now();
             let plan = plan.clone();
@@ -661,22 +689,26 @@ impl Api {
         Ok(respond(StatusCode::OK, &view))
     }
 
-    /// The organization's access removed: an organization's plan is no
-    /// one's any more.
+    /// The organization's access removed: an organization's plan of none is no one's (`admin`).
     fn unset_visibility(&self, req: &Req, plan: &str, org: &str) -> Reply {
         let editor = self.editor(req, &self.service_broker_editors, EDITORS)?;
         self.store.update(|state| {
-            if state.org.guid != org {
+            if state.org(org).is_none() {
                 return Err(ApiError::not_found("Organization"));
             }
             let plan = plan_mut(state, plan).ok_or_else(|| ApiError::not_found("Service plan"))?;
             if plan.visibility == "organization" {
-                plan.visibility = "admin".into();
+                plan.orgs.retain(|kept| kept != org);
+                if plan.orgs.is_empty() {
+                    plan.visibility = "admin".into();
+                }
                 plan.updated_at = now();
             }
             Ok(())
         })?;
-        println!("SERVICE BROKERS: {editor}: plan {plan} no longer visible to the organization");
+        println!(
+            "SERVICE BROKERS: {editor}: plan {plan} no longer visible to the organization {org}"
+        );
         Ok(no_content())
     }
 

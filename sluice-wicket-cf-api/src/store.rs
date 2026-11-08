@@ -1,5 +1,6 @@
-//! The desired state: one organization and space, the shared domains, the
-//! apps with their web process and environment variables, the routes,
+//! The desired state: the organizations and their spaces, the roles users and clients hold in
+//! them, the shared domains, the apps of the spaces with their web process and environment
+//! variables, the routes,
 //! packages, builds, droplets, deployments and jobs, the service brokers
 //! registered with their catalogs, the service instances and their bindings.
 //! In memory, written by a rename to `state.json` in the
@@ -44,8 +45,22 @@ pub const ROOTFS_STACK: &str = "firecracker";
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct State {
-    pub org: Named,
-    pub space: Named,
+    #[serde(default)]
+    pub orgs: Vec<Named>,
+    #[serde(default)]
+    pub spaces: Vec<Space>,
+    /// The one organization and space of a state written before there were more; taken into
+    /// `orgs` and `spaces` when it is read ([`State::migrate`]).
+    #[serde(default, skip_serializing)]
+    org: Option<Named>,
+    #[serde(default, skip_serializing)]
+    space: Option<Named>,
+    /// The roles given (`crate::roles`); a group's of the provider are not kept.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roles: Vec<Role>,
+    /// The users and clients the roles name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub users: Vec<User>,
     /// The first takes the default and random routes.
     pub domains: Vec<Named>,
     pub apps: Vec<App>,
@@ -98,10 +113,48 @@ pub struct Named {
     pub created_at: String,
 }
 
+/// A space of an organization: its apps, routes and service instances.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Space {
+    pub guid: String,
+    pub name: String,
+    /// The organization's guid.
+    pub org: String,
+    pub created_at: String,
+}
+
+/// A role of a user or a client in an organization or a space, as CC's `/v3/roles` has it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Role {
+    pub guid: String,
+    pub kind: crate::roles::RoleType,
+    /// The user's guid ([`User::guid`]).
+    pub user: String,
+    /// An organization role's organization, a space role's space.
+    pub at: String,
+    pub created_at: String,
+}
+
+/// Who a role names: a user, by the name it logs in with, or a client, by its id.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct User {
+    /// A user's: the `user_id` of its tokens; a client's: its id.
+    pub guid: String,
+    /// None for a client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    pub created_at: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct App {
     pub guid: String,
     pub name: String,
+    /// The space's guid.
+    #[serde(default)]
+    pub space: String,
     pub started: bool,
     pub created_at: String,
     pub updated_at: String,
@@ -226,6 +279,9 @@ pub struct Running {
 pub struct Instance {
     pub guid: String,
     pub name: String,
+    /// The space's guid.
+    #[serde(default)]
+    pub space: String,
     pub offering: String,
     pub plan: String,
     pub tags: Vec<String>,
@@ -415,9 +471,12 @@ pub struct Offering {
 pub struct BrokerPlan {
     pub guid: String,
     pub catalog: serde_json::Map<String, serde_json::Value>,
-    /// `admin` (none but who edits the brokers), `public`, `organization`
-    /// (the one) or `space` (a space-scoped broker's).
+    /// `admin` (none but who edits the brokers and the admins), `public`, `organization`
+    /// (those of `orgs`) or `space` (a space-scoped broker's).
     pub visibility: String,
+    /// The organizations an `organization` plan is visible in.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub orgs: Vec<String>,
     /// Gone from the catalog, kept for its instances.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub gone: bool,
@@ -484,9 +543,16 @@ impl BrokerPlan {
         self.catalog.get("maintenance_info")
     }
 
-    /// Whether the space's apps may have instances of it.
-    pub fn visible(&self) -> bool {
-        self.visibility != "admin" && !self.gone
+    /// Whether the apps of `space`, of the organization `org`, may have instances of it: a
+    /// space-scoped broker's plans are its space's alone.
+    pub fn visible(&self, broker: &Broker, org: &str, space: &str) -> bool {
+        !self.gone
+            && match self.visibility.as_str() {
+                "public" => true,
+                "organization" => self.orgs.iter().any(|guid| guid == org),
+                "space" => broker.space.as_deref() == Some(space),
+                _ => false,
+            }
     }
 }
 
@@ -573,6 +639,9 @@ pub struct Purge {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Route {
     pub guid: String,
+    /// The space's guid.
+    #[serde(default)]
+    pub space: String,
     pub host: String,
     /// The domain's guid.
     pub domain: String,
@@ -728,19 +797,116 @@ pub enum Outcome {
 }
 
 impl State {
-    /// A new state with the organization, space and domains named.
+    /// A new state with the organization, its space and the domains named.
     pub fn new(org: &str, space: &str, domains: &[String]) -> State {
         let named = |name: &str| Named {
             guid: guid(),
             name: name.to_string(),
             created_at: now(),
         };
-        State {
-            org: named(org),
-            space: named(space),
+        let mut state = State {
             domains: domains.iter().map(|domain| named(domain)).collect(),
             ..State::default()
+        };
+        let org = state.create_org(org).guid.clone();
+        state.create_space(space, &org);
+        state
+    }
+
+    /// Takes the one organization and space of a state written before there were more: what
+    /// had no space is theirs, an `organization` plan the organization's.
+    pub fn migrate(&mut self) {
+        if let Some(org) = self.org.take() {
+            if self.org(&org.guid).is_none() {
+                self.orgs.push(org.clone());
+            }
+            for plan in self
+                .brokers
+                .iter_mut()
+                .flat_map(|broker| &mut broker.offerings)
+                .flat_map(|offering| &mut offering.plans)
+                .filter(|plan| plan.visibility == "organization" && plan.orgs.is_empty())
+            {
+                plan.orgs.push(org.guid.clone());
+            }
+            if let Some(space) = self.space.take()
+                && self.space(&space.guid).is_none()
+            {
+                self.spaces.push(Space {
+                    guid: space.guid,
+                    name: space.name,
+                    org: org.guid,
+                    created_at: space.created_at,
+                });
+            }
         }
+        let Some(first) = self.spaces.first().map(|space| space.guid.clone()) else {
+            return;
+        };
+        let unplaced = |space: &mut String| {
+            if space.is_empty() {
+                space.clone_from(&first);
+            }
+        };
+        self.apps
+            .iter_mut()
+            .for_each(|app| unplaced(&mut app.space));
+        self.routes
+            .iter_mut()
+            .for_each(|route| unplaced(&mut route.space));
+        self.instances
+            .iter_mut()
+            .for_each(|instance| unplaced(&mut instance.space));
+    }
+
+    pub fn org(&self, guid: &str) -> Option<&Named> {
+        self.orgs.iter().find(|org| org.guid == guid)
+    }
+
+    pub fn org_named(&self, name: &str) -> Option<&Named> {
+        self.orgs.iter().find(|org| org.name == name)
+    }
+
+    pub fn space(&self, guid: &str) -> Option<&Space> {
+        self.spaces.iter().find(|space| space.guid == guid)
+    }
+
+    pub fn space_named(&self, org: &str, name: &str) -> Option<&Space> {
+        self.spaces
+            .iter()
+            .find(|space| space.org == org && space.name == name)
+    }
+
+    /// The organization of the space `guid`.
+    pub fn org_of(&self, space: &str) -> Option<&Named> {
+        self.space(space).and_then(|space| self.org(&space.org))
+    }
+
+    pub fn create_org(&mut self, name: &str) -> &Named {
+        self.orgs.push(Named {
+            guid: guid(),
+            name: name.to_string(),
+            created_at: now(),
+        });
+        self.orgs.last().expect("just pushed")
+    }
+
+    pub fn create_space(&mut self, name: &str, org: &str) -> &Space {
+        self.spaces.push(Space {
+            guid: guid(),
+            name: name.to_string(),
+            org: org.to_string(),
+            created_at: now(),
+        });
+        self.spaces.last().expect("just pushed")
+    }
+
+    pub fn user(&self, guid: &str) -> Option<&User> {
+        self.users.iter().find(|user| user.guid == guid)
+    }
+
+    pub fn role(&self, guid: &str) -> Option<&Role> {
+        self.roles.iter().find(|role| role.guid == guid)
     }
 
     pub fn app(&self, guid: &str) -> Option<&App> {
@@ -751,8 +917,11 @@ impl State {
         self.apps.iter_mut().find(|app| app.guid == guid)
     }
 
-    pub fn app_named(&self, name: &str) -> Option<&App> {
-        self.apps.iter().find(|app| app.name == name)
+    /// The app `name` of the space `space`.
+    pub fn app_named(&self, space: &str, name: &str) -> Option<&App> {
+        self.apps
+            .iter()
+            .find(|app| app.space == space && app.name == name)
     }
 
     pub fn route(&self, guid: &str) -> Option<&Route> {
@@ -824,8 +993,11 @@ impl State {
         self.instances.iter().find(|instance| instance.guid == guid)
     }
 
-    pub fn instance_named(&self, name: &str) -> Option<&Instance> {
-        self.instances.iter().find(|instance| instance.name == name)
+    /// The service instance `name` of the space `space`.
+    pub fn instance_named(&self, space: &str, name: &str) -> Option<&Instance> {
+        self.instances
+            .iter()
+            .find(|instance| instance.space == space && instance.name == name)
     }
 
     pub fn binding(&self, guid: &str) -> Option<&Binding> {
@@ -891,12 +1063,13 @@ impl State {
         format!("{}.{domain}", route.host)
     }
 
-    /// Adds the app `name`, stopped, with its web process.
-    pub fn create_app(&mut self, name: &str, stack: &str) -> &mut App {
+    /// Adds the app `name` to the space `space`, stopped, with its web process.
+    pub fn create_app(&mut self, name: &str, stack: &str, space: &str) -> &mut App {
         let at = now();
         self.apps.push(App {
             guid: guid(),
             name: name.to_string(),
+            space: space.to_string(),
             started: false,
             created_at: at.clone(),
             updated_at: at.clone(),
@@ -923,11 +1096,12 @@ impl State {
         self.apps.last_mut().expect("just pushed")
     }
 
-    /// Adds the route `host` of the domain, unmapped.
-    pub fn create_route(&mut self, host: &str, domain: &str) -> &mut Route {
+    /// Adds the route `host` of the domain to the space `space`, unmapped.
+    pub fn create_route(&mut self, host: &str, domain: &str, space: &str) -> &mut Route {
         let at = now();
         self.routes.push(Route {
             guid: guid(),
+            space: space.to_string(),
             host: host.to_string(),
             domain: domain.to_string(),
             app: None,
@@ -1237,6 +1411,7 @@ impl Store {
             Ok(json) => {
                 let mut state: State = serde_json::from_slice(&json)
                     .map_err(|e| format!("{}: {e}", file.display()))?;
+                state.migrate();
                 state.follow_domains(domains);
                 state.fail_unfinished_builds();
                 state.settle_unfinished_waits();
@@ -1483,7 +1658,8 @@ mod tests {
     fn the_current_droplet_keeps_the_previous_the_packages_the_newest_and_no_build_outlives_a_restart()
      {
         let mut state = State::new("o", "s", &["localhost".into()]);
-        let app = state.create_app("hello", STACK).guid.clone();
+        let space = state.spaces[0].guid.clone();
+        let app = state.create_app("hello", STACK, &space).guid.clone();
         let droplet = |guid: &str, sha256: &str| Droplet {
             guid: guid.into(),
             app: app.clone(),
@@ -1626,5 +1802,30 @@ mod tests {
     fn rfc3339_formats_the_epoch_seconds() {
         assert_eq!(rfc3339(0), "1970-01-01T00:00:00Z");
         assert_eq!(rfc3339(1_793_323_067), "2026-10-30T01:17:47Z");
+    }
+
+    /// A state of one organization and space, before there were more, takes them as its first.
+    #[test]
+    fn a_state_of_one_space_migrates_to_its_first() {
+        use serde_json::json;
+        let mut written = State::new("o", "s", &["localhost".into()]);
+        let space = written.spaces[0].clone();
+        let org = written.orgs[0].clone();
+        written.create_app("hello", STACK, &space.guid);
+        let mut legacy = serde_json::to_value(&written).unwrap();
+        legacy["org"] = json!(org);
+        legacy["space"] =
+            json!({"guid": space.guid, "name": space.name, "created_at": space.created_at});
+        legacy["orgs"] = json!([]);
+        legacy["spaces"] = json!([]);
+        legacy["apps"][0]["space"] = json!("");
+        let mut state: State = serde_json::from_value(legacy).unwrap();
+        state.migrate();
+        assert_eq!(state.orgs, [org]);
+        assert_eq!(state.spaces, std::slice::from_ref(&space));
+        assert_eq!(state.apps[0].space, space.guid);
+        // written again, none of the one organization or space is kept apart
+        let again = serde_json::to_value(&state).unwrap();
+        assert!(again.get("org").is_none() && again.get("space").is_none());
     }
 }

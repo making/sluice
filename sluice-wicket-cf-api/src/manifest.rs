@@ -127,22 +127,25 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
     serde_saphyr::from_str(text).map_err(|e| format!("the manifest: {e}"))
 }
 
-/// Applies `manifest` to `state`: the guids of the apps it names. `runtime` is what the wicket
-/// runs, None until it answers: a new app's stack then a wasm wicket's.
+/// Applies `manifest` to the space `space` of `state`: the guids of the apps it names.
+/// `runtime` is what the wicket runs, None until it answers: a new app's stack then a wasm
+/// wicket's.
 pub fn apply(
     state: &mut State,
+    space: &str,
     manifest: &Manifest,
     runtime: Option<Runtime>,
 ) -> Result<Vec<String>, String> {
     let mut guids = Vec::new();
     for spec in &manifest.applications {
-        guids.push(apply_app(state, spec, runtime)?);
+        guids.push(apply_app(state, space, spec, runtime)?);
     }
     Ok(guids)
 }
 
 fn apply_app(
     state: &mut State,
+    space: &str,
     spec: &AppManifest,
     runtime: Option<Runtime>,
 ) -> Result<String, String> {
@@ -164,9 +167,9 @@ fn apply_app(
         }
         web = Some(process);
     }
-    let guid = match state.app_named(name) {
+    let guid = match state.app_named(space, name) {
         Some(app) => app.guid.clone(),
-        None => state.create_app(name, stack).guid.clone(),
+        None => state.create_app(name, stack, space).guid.clone(),
     };
     let app = state.app_mut(&guid).expect("just found or created");
     // the CLI reads this back: a docker app's bits it does not gather
@@ -268,8 +271,9 @@ fn apply_services(state: &mut State, guid: &str, spec: &AppManifest) -> Result<(
                 binding_name,
             } => (name, parameters.as_ref(), binding_name.clone()),
         };
+        let space = state.app(guid).map_or("", |app| app.space.as_str());
         let found = state
-            .instance_named(instance)
+            .instance_named(space, instance)
             .ok_or_else(|| format!("{name}: service instance '{instance}' not found"))?
             .guid
             .clone();
@@ -332,12 +336,23 @@ fn apply_routes(state: &mut State, guid: &str, spec: &AppManifest) -> Result<(),
     Ok(())
 }
 
-/// Maps the route (made unless there) to the app: a route serves one app.
+/// Maps the route (made in the app's space unless there) to the app: a route serves one app,
+/// of its own space.
 pub fn map_route(state: &mut State, guid: &str, host: &str, domain: &str) -> Result<(), String> {
+    let space = state
+        .app(guid)
+        .map(|app| app.space.clone())
+        .ok_or("the app is gone")?;
     let route = match state.route_at(host, domain) {
         Some(route) => route.clone(),
-        None => state.create_route(host, domain).clone(),
+        None => state.create_route(host, domain, &space).clone(),
     };
+    if route.space != space {
+        return Err(format!(
+            "route {} is in use by another space",
+            state.url(&route)
+        ));
+    }
     if let Some(other) = route.app.as_deref().filter(|other| *other != guid) {
         let other = state
             .app(other)
@@ -685,11 +700,23 @@ mod tests {
         State::new("o", "s", &["localhost".into(), "example.com".into()])
     }
 
+    /// [`super::apply`] in the state's first space.
+    fn apply(
+        state: &mut State,
+        manifest: &Manifest,
+        runtime: Option<Runtime>,
+    ) -> Result<Vec<String>, String> {
+        let space = state.spaces[0].guid.clone();
+        super::apply(state, &space, manifest, runtime)
+    }
+
     /// Adds the service instance `name`: its guid.
     fn instance(state: &mut State, name: &str, offering: &str, plan: &str) -> String {
+        let space = state.spaces[0].guid.clone();
         state.instances.push(Instance {
             guid: format!("{name}-guid"),
             name: name.into(),
+            space,
             offering: offering.into(),
             plan: plan.into(),
             tags: Vec::new(),
@@ -761,6 +788,14 @@ mod tests {
                 .unwrap_err()
                 .contains("mapped to counter")
         );
+        // an app of another space: the same name is its own, a route of the first is not
+        let org = state.orgs[0].guid.clone();
+        let elsewhere = state.create_space("elsewhere", &org).guid.clone();
+        let there = super::apply(&mut state, &elsewhere, &taken, None);
+        assert!(there.unwrap_err().contains("in use by another space"));
+        let named = parse("applications:\n- name: other\n").unwrap();
+        let there = super::apply(&mut state, &elsewhere, &named, None).unwrap();
+        assert_ne!(there[0], other);
 
         // no-route unmaps; random-route names one
         let none = parse("applications:\n- name: other\n  no-route: true\n").unwrap();
@@ -1174,7 +1209,11 @@ mod tests {
         assert!(refused.unwrap_err().contains("above"));
 
         // a scale holds as the app runs and as annotated, refused naming which
-        let guid = state.app_named("a").unwrap().guid.clone();
+        let guid = state
+            .app_named(&state.spaces[0].guid, "a")
+            .unwrap()
+            .guid
+            .clone();
         let running = |lifetime: &Lifetime| {
             serde_json::from_value(json!({"droplet": "d", "sha256": "s", "file": "f",
                 "memory_mib": 1, "budget_ms": null, "lifetime": lifetime,

@@ -72,6 +72,9 @@ pub struct Claims {
     /// `uaa` (the open mode), `oidc` (a user the provider signed in) or
     /// `client` (client credentials).
     pub origin: String,
+    /// None of a client's, as UAA has it: the CLI then takes it for a client (`cf
+    /// set-space-role --client`), its id its `user_id`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub user_name: String,
     pub email: String,
     pub iat: u64,
@@ -79,6 +82,16 @@ pub struct Claims {
     pub iss: String,
     pub zid: String,
     pub aud: Vec<String>,
+}
+
+impl Claims {
+    /// Who holds it: the user's name, or the client's id.
+    pub fn name(&self) -> &str {
+        match self.user_name.is_empty() {
+            true => &self.client_id,
+            false => &self.user_name,
+        }
+    }
 }
 
 /// Whose tokens: a login, kept by the session for its refreshes.
@@ -199,22 +212,43 @@ impl Uaa {
         matches!(self.mode, Mode::Provider { .. })
     }
 
+    /// Whether `id` is a client that gets tokens: in the open mode, any.
+    pub fn knows_client(&self, id: &str) -> bool {
+        match &self.mode {
+            Mode::Open => true,
+            Mode::Provider { clients, .. } => clients.iter().any(|(known, _)| known == id),
+        }
+    }
+
+    /// The origin of the users who log in: `uaa` in the open mode, `oidc` with the provider.
+    pub fn origin(&self) -> &'static str {
+        match self.mode {
+            Mode::Open => "uaa",
+            Mode::Provider { .. } => "oidc",
+        }
+    }
+
     /// The token response of `grant` for `subject`, issued by `issuer`: a
     /// new session, keyed by the refresh token.
     fn issue(&self, subject: Subject, grant: &str, issuer: &str) -> Value {
         let issued = epoch_secs();
         let client = subject.client.clone();
+        // a client of --client-credentials is no user: its id names it, as a role's user
+        let (user, user_name) = match subject.origin.as_str() {
+            "client" => (client.clone(), String::new()),
+            _ => (user_id(&subject.user_name), subject.user_name.clone()),
+        };
         let claims = Claims {
             jti: guid(),
-            sub: user_id(&subject.user_name),
+            sub: user.clone(),
             scope: SCOPES.iter().map(|scope| scope.to_string()).collect(),
             client_id: client.clone(),
             cid: client.clone(),
             azp: client.clone(),
             grant_type: grant.to_string(),
-            user_id: user_id(&subject.user_name),
+            user_id: user,
             origin: subject.origin.clone(),
-            user_name: subject.user_name.clone(),
+            user_name,
             email: subject.email.clone(),
             iat: issued,
             exp: issued + ACCESS_SECS,
@@ -467,8 +501,8 @@ pub fn login_view(uaa: &str) -> Value {
     })
 }
 
-/// A stable id of a user name (a UUID v5 of it).
-fn user_id(user: &str) -> String {
+/// A stable id of a user name (a UUID v5 of it): its tokens' `user_id`.
+pub fn user_id(user: &str) -> String {
     let digest = Sha256::digest(user.as_bytes());
     uuid::Builder::from_sha1_bytes(digest[..16].try_into().expect("16 bytes"))
         .into_uuid()
@@ -518,7 +552,8 @@ mod tests {
     fn user_of(uaa: &Uaa, tokens: &Value) -> String {
         uaa.verify(tokens["access_token"].as_str().unwrap())
             .unwrap()
-            .user_name
+            .name()
+            .to_string()
     }
 
     #[test]

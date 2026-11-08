@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::controller::Controller;
 use crate::store::{
     App, Build, Deployment, Droplet, Job, Lifecycle, Named, Outcome, Package, ROOTFS_STACK, Route,
-    STACK, SecurityGroup, State, epoch_secs, now,
+    STACK, SecurityGroup, Space, State, epoch_secs, now,
 };
 use crate::wicket::{ListedApp, Runtime, Sandbox};
 
@@ -113,8 +113,7 @@ fn rel(guid: Option<&str>) -> Value {
     }
 }
 
-pub fn org(base: &str, state: &State) -> Value {
-    let org = &state.org;
+pub fn org(base: &str, org: &Named) -> Value {
     json!({
         "guid": org.guid, "created_at": org.created_at, "updated_at": org.created_at,
         "name": org.name, "suspended": false,
@@ -129,20 +128,65 @@ pub fn org(base: &str, state: &State) -> Value {
     })
 }
 
-pub fn space(base: &str, state: &State) -> Value {
-    let space = &state.space;
+pub fn space(base: &str, space: &Space) -> Value {
     json!({
         "guid": space.guid, "created_at": space.created_at, "updated_at": space.created_at,
         "name": space.name,
-        "relationships": {"organization": rel(Some(&state.org.guid)), "quota": rel(None)},
+        "relationships": {"organization": rel(Some(&space.org)), "quota": rel(None)},
         "metadata": metadata(None),
         "links": {
             "self": {"href": format!("{base}/v3/spaces/{}", space.guid)},
-            "organization": {"href": format!("{base}/v3/organizations/{}", state.org.guid)},
+            "organization": {"href": format!("{base}/v3/organizations/{}", space.org)},
             "features": {"href": format!("{base}/v3/spaces/{}/features", space.guid)},
             "apply_manifest": {"href": format!("{base}/v3/spaces/{}/actions/apply_manifest", space.guid), "method": "POST"},
         },
     })
+}
+
+/// The spaces of `spaces` (guids, repeats allowed) and their organizations, as a listing's
+/// `include=space,space.organization` asks them.
+pub fn spaces_included<'a>(
+    base: &str,
+    state: &State,
+    query: &[(String, String)],
+    spaces: impl Iterator<Item = &'a str>,
+) -> Option<Value> {
+    let include = query
+        .iter()
+        .find(|(key, _)| key == "include")
+        .map_or("", |(_, value)| value.as_str());
+    let asks = |resource: &str| include.split(',').any(|named| named == resource);
+    let (with_spaces, with_orgs) = (asks("space"), asks("space.organization"));
+    if !with_spaces && !with_orgs {
+        return None;
+    }
+    let guids: std::collections::BTreeSet<&str> = spaces.collect();
+    let named: Vec<&Space> = state
+        .spaces
+        .iter()
+        .filter(|space| guids.contains(space.guid.as_str()))
+        .collect();
+    let mut included = serde_json::Map::new();
+    if with_spaces || with_orgs {
+        included.insert(
+            "spaces".into(),
+            named.iter().map(|space| self::space(base, space)).collect(),
+        );
+    }
+    if with_orgs {
+        let orgs: std::collections::BTreeSet<&str> =
+            named.iter().map(|space| space.org.as_str()).collect();
+        included.insert(
+            "organizations".into(),
+            state
+                .orgs
+                .iter()
+                .filter(|org| orgs.contains(org.guid.as_str()))
+                .map(|org| self::org(base, org))
+                .collect(),
+        );
+    }
+    Some(Value::Object(included))
 }
 
 pub fn domain(base: &str, domain: &Named) -> Value {
@@ -195,18 +239,18 @@ pub fn stack(base: &str, runtime: Option<Runtime>) -> Value {
     })
 }
 
-pub fn app(base: &str, state: &State, app: &App) -> Value {
+pub fn app(base: &str, app: &App) -> Value {
     let guid = &app.guid;
     json!({
         "guid": guid, "created_at": app.created_at, "updated_at": app.updated_at,
         "name": app.name,
         "state": if app.started { "STARTED" } else { "STOPPED" },
         "lifecycle": lifecycle(app.lifecycle, &app.buildpacks, &app.stack),
-        "relationships": {"space": rel(Some(&state.space.guid))},
+        "relationships": {"space": rel(Some(&app.space))},
         "metadata": metadata(Some(app)),
         "links": {
             "self": {"href": format!("{base}/v3/apps/{guid}")},
-            "space": {"href": format!("{base}/v3/spaces/{}", state.space.guid)},
+            "space": {"href": format!("{base}/v3/spaces/{}", app.space)},
             "processes": {"href": format!("{base}/v3/apps/{guid}/processes")},
             "packages": {"href": format!("{base}/v3/apps/{guid}/packages")},
             "environment_variables": {"href": format!("{base}/v3/apps/{guid}/environment_variables")},
@@ -222,7 +266,7 @@ pub fn app(base: &str, state: &State, app: &App) -> Value {
     })
 }
 
-pub fn process(base: &str, state: &State, app: &App) -> Value {
+pub fn process(base: &str, app: &App) -> Value {
     let process = &app.process;
     let check = &process.health_check;
     let mut data =
@@ -247,7 +291,7 @@ pub fn process(base: &str, state: &State, app: &App) -> Value {
             "self": {"href": format!("{base}/v3/processes/{}", process.guid)},
             "scale": {"href": format!("{base}/v3/processes/{}/actions/scale", process.guid), "method": "POST"},
             "app": {"href": format!("{base}/v3/apps/{}", app.guid)},
-            "space": {"href": format!("{base}/v3/spaces/{}", state.space.guid)},
+            "space": {"href": format!("{base}/v3/spaces/{}", app.space)},
             "stats": {"href": format!("{base}/v3/processes/{}/stats", process.guid)},
         },
     })
@@ -404,10 +448,10 @@ pub fn route(base: &str, state: &State, route: &Route) -> Value {
         "destinations": destinations(route),
         "options": {},
         "metadata": metadata(None),
-        "relationships": {"space": rel(Some(&state.space.guid)), "domain": rel(Some(&route.domain))},
+        "relationships": {"space": rel(Some(&route.space)), "domain": rel(Some(&route.domain))},
         "links": {
             "self": {"href": format!("{base}/v3/routes/{}", route.guid)},
-            "space": {"href": format!("{base}/v3/spaces/{}", state.space.guid)},
+            "space": {"href": format!("{base}/v3/spaces/{}", route.space)},
             "domain": {"href": format!("{base}/v3/domains/{}", route.domain)},
             "destinations": {"href": format!("{base}/v3/routes/{}/destinations", route.guid)},
         },
@@ -667,7 +711,7 @@ pub fn manifest(state: &State, app: &App) -> String {
 
 /// The filters the CLI sends, as JSON pointers into a resource's view;
 /// `app_guids` of a route reads its destinations.
-const FILTERS: [(&str, &str); 24] = [
+const FILTERS: [(&str, &str); 27] = [
     ("names", "/name"),
     ("guids", "/guid"),
     ("space_guids", "/relationships/space/data/guid"),
@@ -676,6 +720,9 @@ const FILTERS: [(&str, &str); 24] = [
         "/relationships/organization/data/guid",
     ),
     ("app_guids", "/relationships/app/data/guid"),
+    ("user_guids", "/relationships/user/data/guid"),
+    ("usernames", "/username"),
+    ("origins", "/origin"),
     ("hosts", "/host"),
     ("paths", "/path"),
     ("ports", "/port"),
@@ -834,7 +881,11 @@ mod tests {
     #[test]
     fn the_stats_list_what_is_alive() {
         let mut state = State::new("o", "s", &["localhost".into()]);
-        let guid = state.create_app("a", crate::store::STACK).guid.clone();
+        let space = state.spaces[0].guid.clone();
+        let guid = state
+            .create_app("a", crate::store::STACK, &space)
+            .guid
+            .clone();
         let domain = state.domains[0].guid.clone();
         let app = state.app_mut(&guid).unwrap();
         app.process.instances = 2;
@@ -891,7 +942,7 @@ mod tests {
 
         // without a route: nothing for the wicket to serve
         assert_eq!(entries(&state, None), vec![]);
-        let route = state.create_route("a", &domain).guid.clone();
+        let route = state.create_route("a", &domain, &space).guid.clone();
         state.map(&route, &guid);
 
         // the wicket's answer awaited, away, refused

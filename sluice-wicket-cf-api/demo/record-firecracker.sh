@@ -101,7 +101,8 @@ curl -fsS -X PUT -H "$auth" http://127.0.0.1:9090/api/apps/cf-api -d @- > /dev/n
       "SLUICE_WICKET_CF_API_OIDC_ISSUER": "http://dex.localhost:5556/dex",
       "SLUICE_WICKET_CF_API_OIDC_CLIENT_ID": "cf",
       "SLUICE_WICKET_CF_API_OIDC_CLIENT_SECRET": "demo-secret",
-      "SLUICE_WICKET_CF_API_OIDC_CLAIM": "email=*@example.com"
+      "SLUICE_WICKET_CF_API_OIDC_CLAIM": "email=*@example.com",
+      "SLUICE_WICKET_CF_API_ADMIN": "email=demo@example.com"
     }
   }
 }

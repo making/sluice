@@ -429,7 +429,8 @@ mod tests {
             state.flume = Some(FlumeCursor { epoch: 1, seq: 9 });
         });
         let scaled = store.update(|state| {
-            let app = state.create_app("scaled", crate::store::STACK);
+            let space = state.spaces[0].guid.clone();
+            let app = state.create_app("scaled", crate::store::STACK, &space);
             app.process.instances = 2;
             app.guid.clone()
         });

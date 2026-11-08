@@ -121,13 +121,14 @@ impl Work {
             .as_ref()
             .and_then(|plan| state.brokered(plan))
             .map(|plan| plan.plan.id().to_string());
+        let (org, space) = (state.org_of(&instance.space), state.space(&instance.space));
         let mut context = json!({
             "platform": "cloudfoundry",
-            "organization_guid": state.org.guid,
-            "organization_name": state.org.name,
+            "organization_guid": org.map(|org| &org.guid),
+            "organization_name": org.map(|org| &org.name),
             "organization_annotations": {},
-            "space_guid": state.space.guid,
-            "space_name": state.space.name,
+            "space_guid": space.map(|space| &space.guid),
+            "space_name": space.map(|space| &space.name),
             "space_annotations": {},
             "instance_name": instance.name,
             "instance_annotations": {},

@@ -657,6 +657,25 @@ fn the_cf_cli_deploys_to_the_wicket() {
     );
     assert!(cf.ok(&["stacks"]).contains("wasip3 "));
 
+    // organizations and spaces: without --admin whoever logs in is an admin; a space holds
+    // its own apps, and its maker manages and develops in it (the CLI gives the roles)
+    cf.ok(&["create-org", "team"]);
+    cf.ok(&["create-space", "dev", "-o", "team"]);
+    cf.ok(&["target", "-o", "team", "-s", "dev"]);
+    assert!(cf.ok(&["apps"]).contains("No apps found"));
+    let users = cf.ok(&["space-users", "team", "dev"]);
+    assert!(
+        users.contains("SPACE MANAGER\n  me") && users.contains("SPACE DEVELOPER\n  me"),
+        "{users}"
+    );
+    cf.ok(&["set-org-role", "me", "team", "OrgManager"]);
+    let users = cf.ok(&["org-users", "team"]);
+    assert!(users.contains("ORG MANAGER\n  me"), "{users}");
+    cf.ok(&["rename-space", "dev", "development"]);
+    cf.ok(&["delete-org", "team", "-f"]);
+    assert!(!cf.ok(&["orgs"]).contains("team"));
+    cf.ok(&["target", "-o", "sluice", "-s", "wicket"]);
+
     // the app's output and requests, from the flume: recent, then streamed
     assert_eq!(get(&listen, "hello.localhost", "/log", None).0, 200);
     let router = "[RTR/0] OUT hello.localhost - [";
@@ -842,8 +861,10 @@ fn the_cf_cli_deploys_to_the_wicket() {
     let refused = cf.ok(&["curl", "-X", "PATCH", &path, "-d", &patch]);
     assert!(refused.contains("no VMs"), "{refused}");
     assert_eq!(cf.ok(&["curl", &path]), before);
+    let space = cf.ok(&["space", "wicket", "--guid"]);
     let create = json!({"name": "refused", "metadata": {"annotations":
-        {"wicket.sluice.ik.am/mode": "pool"}}})
+        {"wicket.sluice.ik.am/mode": "pool"}},
+        "relationships": {"space": {"data": {"guid": space.trim()}}}})
     .to_string();
     let refused = cf.ok(&["curl", "-X", "POST", "/v3/apps", "-d", &create]);
     assert!(refused.contains("no VMs"), "{refused}");
@@ -1210,6 +1231,10 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "robot",
         "--service-broker-editor-client",
         "robot",
+        "--group-role",
+        "devs=space_developer@sluice/wicket,ops=admin",
+        "--admin-client",
+        "robot",
         "--tls-cert",
         cert_file.to_str().unwrap(),
         "--tls-key",
@@ -1248,7 +1273,10 @@ fn the_cf_cli_deploys_to_the_wicket() {
     let output = cf.ok_with_stdin(&["login", "--sso"], &format!("{code}\n"));
     assert!(output.contains("Authenticating...\nOK"), "{output}");
     assert!(cf.ok(&["target"]).contains("user:           alice"));
+    // devs develop in sluice/wicket (--group-role), and are no admins
     assert!(cf.ok(&["app", "hello"]).contains("hi.localhost"));
+    let refused = cf.fails(&["create-org", "team"]);
+    assert!(refused.contains("not authorized"), "{refused}");
     let (_, refresh_token) = cf.tokens();
     // (a failed login drops the CLI's tokens: taken above)
     let output = cf.fails(&["login", "--sso-passcode", &code]);
@@ -1304,6 +1332,27 @@ fn the_cf_cli_deploys_to_the_wicket() {
     }));
     cf.ok(&["create-security-group", "group", &group]);
     api.logged("SECURITY GROUPS: carol: POST /v3/security_groups");
+
+    // carol, of ops, is an admin (--group-role): she makes an organization and gives dave a
+    // space's role in it, who sees that space and the group's
+    cf.ok(&["create-org", "team"]);
+    cf.ok(&["create-space", "dev", "-o", "team"]);
+    cf.ok(&["set-space-role", "dave", "team", "dev", "SpaceDeveloper"]);
+    api.logged("ORGS: carol: gave dave the role space_developer");
+    provider.sign_in(json!({
+        "sub": "4", "email": "dave@example.com", "preferred_username": "dave", "groups": ["devs"]
+    }));
+    let code = passcode(&http, &url);
+    cf.ok_with_stdin(
+        &["login", "--sso", "-o", "team", "-s", "dev"],
+        &format!("{code}\n"),
+    );
+    assert!(cf.ok(&["apps"]).contains("No apps found"));
+    let orgs = cf.ok(&["orgs"]);
+    assert!(orgs.contains("sluice") && orgs.contains("team"), "{orgs}");
+    // a space developer gives no roles
+    let refused = cf.fails(&["set-space-role", "alice", "team", "dev", "SpaceAuditor"]);
+    assert!(refused.contains("not authorized"), "{refused}");
     cf.ok(&["auth", "other", "0ther", "--client-credentials"]);
     let refused = cf.fails(&["delete-security-group", "group", "-f"]);
     assert!(
@@ -2804,6 +2853,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
             "SLUICE_WICKET_CF_API_OIDC_CLIENT_SECRET": "s3",
             "SLUICE_WICKET_CF_API_OIDC_SCOPES": "openid,email,profile,groups",
             "SLUICE_WICKET_CF_API_OIDC_CLAIM": "email=*@example.com",
+            "SLUICE_WICKET_CF_API_ADMIN": "email=alice@example.com",
         }),
     );
     assert_eq!(status, 200, "{put}");

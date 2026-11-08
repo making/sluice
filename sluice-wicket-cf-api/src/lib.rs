@@ -27,7 +27,9 @@ pub mod operations;
 pub mod osb;
 /// The OpenID Provider client, shared with the wicket's console.
 pub use sluice_wicket_oidc as oidc;
+pub mod orgs;
 pub mod registry;
+pub mod roles;
 pub mod security_groups;
 pub mod services;
 pub mod staging;
@@ -109,6 +111,8 @@ pub struct Settings {
     pub oidc: Option<oidc::OidcSettings>,
     /// The clients of `cf auth --client-credentials`, with the provider.
     pub clients: Vec<(String, String)>,
+    /// Who is an admin, and the roles the provider's groups give.
+    pub policy: roles::Policy,
     /// Who may edit the security groups.
     pub security_group_editors: security_groups::Editors,
     /// Who may edit the service brokers.
@@ -234,6 +238,7 @@ pub async fn serve(
     let api = Arc::new(api::Api {
         store: store.clone(),
         uaa,
+        policy: settings.policy.clone(),
         security_group_editors: settings.security_group_editors.clone(),
         service_broker_editors: settings.service_broker_editors.clone(),
         osb,
@@ -279,6 +284,7 @@ mod tests {
             flume: None,
             oidc: None,
             clients: Vec::new(),
+            policy: roles::Policy::default(),
             security_group_editors: security_groups::Editors::default(),
             service_broker_editors: security_groups::Editors::default(),
             tls,

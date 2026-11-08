@@ -151,6 +151,7 @@ services:
       SLUICE_WICKET_CF_API_OIDC_CLIENT_ID: sluice
       SLUICE_WICKET_CF_API_OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
       SLUICE_WICKET_CF_API_OIDC_CLAIM: email=admin@example.com    # who may log in
+      SLUICE_WICKET_CF_API_ADMIN: email=admin@example.com    # who is an admin
     ports:
       - "127.0.0.1:9091:9091"       # the API, from this host only
     volumes:
@@ -240,9 +241,11 @@ curl http://counter.localhost:28000/       # hits 1, 2, ... in Redis: cf/<instan
 (Redis keeps it in its append-only file) and the logins (`sessions.json` in the cf-api's). For
 other users, add them to `staticPasswords` and to `SLUICE_WICKET_CF_API_OIDC_CLAIM` and
 wicket.yaml's `oidc-claim` (`email=admin@example.com,email=dev@example.com`), or give them a
-group and allow the group (`groups=devs`, with the scopes `openid,email,profile,groups`); a Dex
-[connector](https://dexidp.io/docs/connectors/) replaces the static users with GitHub, LDAP,
-another OpenID Provider and the like.
+group and allow the group (`groups=devs`, with the scopes `openid,email,profile,groups`), and give
+them [roles](#organizations-spaces-and-roles) (`cf set-space-role dev sluice wicket
+SpaceDeveloper`, or a group's: `SLUICE_WICKET_CF_API_GROUP_ROLE:
+devs=space_developer@sluice/wicket`); a Dex [connector](https://dexidp.io/docs/connectors/)
+replaces the static users with GitHub, LDAP, another OpenID Provider and the like.
 
 ### Mapping to components
 
@@ -495,7 +498,7 @@ curl http://web.localhost:8080/
   that it listens on its VM's loopback protects nothing here: the wicket relays its route to whoever
   reaches `--listen`, or the sluice server with `--server`, saying `Host: cf.localhost`. Keep them on
   the host's loopback as above until it has a provider: `..._OIDC_ISSUER`, `..._OIDC_CLIENT_ID`,
-  `..._OIDC_CLIENT_SECRET`, `..._OIDC_CLAIM` in `env` in place of `..._ANY_CREDENTIALS` (see
+  `..._OIDC_CLIENT_SECRET`, `..._OIDC_CLAIM`, `..._ADMIN` in `env` in place of `..._ANY_CREDENTIALS` (see
   [Login](#login)), the provider's `host:port` in `egress`. Then `-p 8080:8080`, `cf login --sso`.
   With neither it does not start: the PUT is refused (422), `docker logs wicket` saying why
 - **jail mode**, for tenants on the wicket: in `docker run`, `-u 0 --cap-add SYS_ADMIN --security-opt
@@ -600,6 +603,7 @@ services:
       SLUICE_WICKET_CF_API_OIDC_CLIENT_ID: sluice
       SLUICE_WICKET_CF_API_OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
       SLUICE_WICKET_CF_API_OIDC_CLAIM: email=admin@example.com    # who may log in
+      SLUICE_WICKET_CF_API_ADMIN: email=admin@example.com    # who is an admin
     ports:
       - "127.0.0.1:9091:9091"       # the API, from this host only
     volumes:
@@ -668,8 +672,9 @@ cf scale hello -i 2                        # one more VM, cloned from the app's 
 `docker compose down` keeps the volumes: the next `up` serves the apps again, once their VMs have
 booted, with the logins (`sessions.json` in the cf-api's). For other users, add them to
 `staticPasswords` and to both `..._OIDC_CLAIM`s (`email=admin@example.com,email=dev@example.com`), or
-give them a group and allow the group (`groups=devs`, with the scopes `openid,email,profile,groups`);
-a Dex [connector](https://dexidp.io/docs/connectors/) replaces the static users with GitHub, LDAP,
+give them a group and allow the group (`groups=devs`, with the scopes `openid,email,profile,groups`),
+and give them [roles](#organizations-spaces-and-roles), as on a wasi wicket; a Dex
+[connector](https://dexidp.io/docs/connectors/) replaces the static users with GitHub, LDAP,
 another OpenID Provider and the like.
 
 ### On a Mac
@@ -774,7 +779,7 @@ cf restart blog
 | `ports`: `443`, `80,443`, `8000-8100` | a rule per port |
 | `protocol`: `tcp` | what a rule is |
 | `protocol`: `udp`, `icmp`, `all` | refused (422): the wicket relays TCP alone |
-| `bind-security-group`, `bind-running-security-group` | the apps of the one space, at their next start: the `running` snapshot |
+| `bind-security-group`, `bind-running-security-group` | the apps of the spaces bound (of every space for a global group), at their next start: the `running` snapshot |
 | `--lifecycle staging`, `bind-staging-security-group` | shown, no effect: no VM stages |
 | `log`, `description` | shown, no effect: the wicket records every connection |
 
@@ -807,7 +812,7 @@ cf restart blog
 | `--wicket-token <token>` / `--wicket-token-file <path>` | its `--console-token` |
 | `--domain <name>` | a shared domain; repeatable (or comma-separated): the first takes the default and random routes (default `localhost`). Through a sluice server, a suffix whose wildcard DNS reaches it |
 | `--data-dir <path>` | the state and the blobs (default `cf-api`): `state.json` (written by a rename on every change), `jwt.key` and `sessions.json` (the logins), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app) |
-| `--org <name>` / `--space <name>` | the one organization and space (default `sluice` / `wicket`) |
+| `--org <name>` / `--space <name>` | the organization and its space the first start makes (default `sluice` / `wicket`) |
 | `--flume <url>` | the sluice-flume the wicket feeds (`grpc://host:port` / `grpcs://host:port`): the apps' output and requests reach `cf logs` from it |
 | `--flume-token <token>` / `--flume-token-file <path>` | its bearer token |
 | `--flume-ca-cert <path>` / `--flume-insecure` | a `grpcs://` flume verified against this PEM CA (default the webPKI roots), or not at all |
@@ -819,6 +824,10 @@ cf restart blog
 | `--oidc-scopes <list>` | the scopes asked for, comma-separated (default `openid,email,profile`; Dex sends the `groups` claim for the scope `groups`) |
 | `--oidc-ca-cert <path>` | a PEM CA the provider's certificate is verified against (default the webPKI roots) |
 | `--client-credentials <id>:<secret>` / `--client-credentials-file <path>` | a client of `cf auth <id> <secret> --client-credentials` (CI); repeatable, the file one per line. With `--oidc-issuer` only |
+| `--admin <claim>=<pattern>` | who is an [admin](#organizations-spaces-and-roles): as `--security-group-editor`. With `--oidc-issuer` this, `--admin-client` or a group's `--group-role` is required; with `--any-credentials` and none of them, whoever logs in is one |
+| `--admin-client <id>` | a client of `--client-credentials` who is an admin; repeatable |
+| `--group-role <group>=<role>` | the role a group of the provider gives its members: `admin`, `organization_<role>@<org>` or `space_<role>@<org>/<space>` ([details](#organizations-spaces-and-roles)); repeatable (or comma-separated). With `--oidc-issuer` only |
+| `--oidc-groups-claim <claim>` | the ID token's claim listing a user's groups, which `--group-role` reads (default `groups`) |
 | `--security-group-editor <claim>=<pattern>` | who may edit the [security groups](#security-groups), nobody without it: as `--oidc-claim`; without `--oidc-issuer` the claims are `user_name` and `email`, both the name anyone logs in with |
 | `--security-group-editor-client <id>` | a client of `--client-credentials` who may too; repeatable |
 | `--service-broker-editor <claim>=<pattern>` | who may register, update and delete the [service brokers](#service-brokers) and set who sees their plans, nobody without it: as `--security-group-editor` |
@@ -846,7 +855,7 @@ What holds on both wickets; a component's and a VM's are in
 | shared domain | `--domain` |
 | instance state | once the wicket took the app, an entry per [instance alive](#instances), `RUNNING`, its `since` its own start, for a VM it keeps and has not up yet `STARTING`, and for a VM it keeps gone down or not starting (no room in the wicket's budget, a snapshot gone), or none alive at `warm: 0` with a request's restore failing for anything but room, `CRASHED` with why as `details`, `since` the failure began, until it is up; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable or has not taken the app. These two list `instances` entries |
 | rolling deployment | the app put with the new droplet: the wicket swaps it in place; finalized at once |
-| org / space | one of each |
+| org / space | the cf-api's own ([Organizations, spaces and roles](#organizations-spaces-and-roles)): the wicket knows none, its hosts are every space's |
 | health check, log rate, stack, buildpacks | accepted and shown, no effect |
 
 ### Instances
@@ -1010,9 +1019,8 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
   (`cf logs: watching the flume <url> for <hosts>`): a request whose `Host` is none of them is in
   no app's log. See [Live access log](../.kb/live-access-log.md#wickets-and-the-cf-api)
 - auth: see [Login](#login). Every request but the root document, `/v3`, `/v3/info` and the
-  UAA endpoints needs a valid token (log-cache's included), and whoever holds one may do
-  everything but edit the [security groups](#security-groups) and the
-  [service brokers](#service-brokers)
+  UAA endpoints needs a valid token (log-cache's included), and its holder may what its
+  [roles](#organizations-spaces-and-roles) say
 - errors are in CC's shape (`{"errors": [{"code", "title", "detail"}]}`); `/v3/info` names
   this API
 - connections: 64 at once. TCP keepalive ends one whose client is gone, and a client that leaves
@@ -1062,13 +1070,50 @@ for Dex's groups); the discovery document must be reachable from the cf-api, whi
 the first sign-in and keeps it. Dex, Keycloak, Entra ID, Google and the like serve; the
 [Docker Compose](#docker-compose) sample runs Dex with its users in a file.
 
+## Organizations, spaces and roles
+
+`cf create-org`, `create-space`, `target`, `rename-org`, `rename-space`, `delete-org`,
+`delete-space`, `set-org-role`, `set-space-role`, `unset-org-role`, `unset-space-role`,
+`org-users` and `space-users` work as on CF. The first start makes `--org` and its `--space`; a
+state written before there were more takes its apps, routes and service instances into them.
+
+- **Admins.** An admin sees everything, makes the organizations and may do anything in them, but
+  edit the [security groups](#security-groups) and the [service brokers](#service-brokers), which
+  take their own editors. `--admin` names who (a claim rule, as `--oidc-claim`), `--admin-client`
+  which clients, `--group-role <group>=admin` which groups; with `--oidc-issuer` one of them is
+  required. With `--any-credentials` and neither `--admin` nor `--admin-client`, whoever logs in is
+  an admin; with them, the claims are `user_name` and `email`, both the name given at `cf login`
+- **Roles.** As CC's: a space's developer pushes, deletes and binds, and reads the environment
+  and the credentials; its supporter starts, stops, scales, stages and maps routes; its auditor
+  and manager read the rest. A space's manager renames it and gives its roles; an organization's
+  manager does the same for all its spaces, makes and deletes them, and gives the organization's
+  roles. A space role needs a role in the organization (the CLI gives `organization_user` first).
+  An organization or a space none of one's roles names is not seen (`404`), one seen but not
+  allowed is refused (`403`). A role names a user by the name logged in with (through a provider,
+  the ID token's `preferred_username`, else `email`, else `sub`), a client by its id; giving one is
+  logged (`ORGS: carol: gave dave the role space_developer at <guid>`)
+- **A group's roles.** `--group-role <group>=<role>` gives the members of a group of the provider,
+  as the ID token's `--oidc-groups-claim` (default `groups`) lists them, a role at each request:
+  `admin`, `organization_<manager|billing_manager|auditor|user>@<org>` or
+  `space_<developer|supporter|manager|auditor>@<org>/<space>`, by name (a group's name may hold `=`,
+  not `,`). They follow the claims of the login (a refresh reads them again), and are not listed
+  in `cf org-users` / `space-users`
+- **Deleting.** `cf delete-space` deletes its apps (gone from the wicket), routes, service
+  instances (a keyvalue one's data, as `cf delete-service`), space-scoped brokers and roles;
+  refused while it holds a broker's instance (`cf delete-service` it first). `cf delete-org`
+  deletes its spaces so, and takes it off the plans visible to it
+- **What is shared.** The shared domains, the stack and the wicket's offerings are every
+  space's. A host is one route's, of one space: a route taken in another is refused. A broker's
+  plan is visible as `cf enable-service-access` says: to everyone, to the organizations named
+  (`-o`), or, a space-scoped broker's, to its space
+
 ## Limits
 
 Refused with why (422): route paths, ports and wildcards, private and internal domains, tasks,
 ssh, sidecars, process types but `web`, route services, syslog drains, environment variable
-groups, service keys. One owner (`cf`) per wicket: two cf-apis must not share one.
-No roles: whoever may log in may do everything, but for the
-[security groups](#security-groups) and the [service brokers](#service-brokers).
+groups, service keys, sharing a service instance with another space, an organization made by
+other than an admin. One quota, of no limit. One owner (`cf`) per wicket: two cf-apis must not
+share one.
 
 ## Tests
 

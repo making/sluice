@@ -97,6 +97,7 @@ pub fn vcap_application(base: &str, state: &State, app: &App) -> Value {
         .routes_of(&app.guid)
         .map(|route| state.url(route))
         .collect();
+    let (org, space) = (state.org_of(&app.space), state.space(&app.space));
     json!({
         "application_id": app.guid,
         "application_name": app.name,
@@ -105,10 +106,10 @@ pub fn vcap_application(base: &str, state: &State, app: &App) -> Value {
         "cf_api": base,
         "limits": {"fds": 16384, "mem": app.process.memory_mb, "disk": app.process.disk_mb},
         "name": app.name,
-        "organization_id": state.org.guid,
-        "organization_name": state.org.name,
-        "space_id": state.space.guid,
-        "space_name": state.space.name,
+        "organization_id": org.map(|org| &org.guid),
+        "organization_name": org.map(|org| &org.name),
+        "space_id": space.map(|space| &space.guid),
+        "space_name": space.map(|space| &space.name),
         "uris": uris,
         "users": null,
         "version": app.process.guid,
@@ -208,9 +209,13 @@ mod tests {
         }
 
         let mut state = State::new("o", "s", &["localhost".into()]);
-        let guid = state.create_app("hello", crate::store::STACK).guid.clone();
+        let space = state.spaces[0].guid.clone();
+        let guid = state
+            .create_app("hello", crate::store::STACK, &space)
+            .guid
+            .clone();
         let domain = state.domains[0].guid.clone();
-        let route = state.create_route("hello", &domain).guid.clone();
+        let route = state.create_route("hello", &domain, &space).guid.clone();
         state.map(&route, &guid);
         state.app_mut(&guid).unwrap().env = env;
         let app = state.app(&guid).unwrap().clone();

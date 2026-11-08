@@ -20,8 +20,8 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
   --domain <name>             a shared domain; repeatable (or comma-separated): the first
                               takes the default and random routes (default localhost)
   --data-dir <path>           the state, the packages and the droplets (default cf-api)
-  --org <name>                the one organization (default sluice)
-  --space <name>              the one space (default wicket)
+  --org <name>                the organization made at the first start (default sluice)
+  --space <name>              and its space (default wicket)
   --flume <url>               the sluice-flume the wicket feeds: the apps' output and
                               requests reach cf logs from it; grpc://host:port or
                               grpcs://host:port
@@ -48,6 +48,16 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
   --oidc-scopes <list>        the scopes asked for, comma-separated (default
                               openid,email,profile; Dex needs groups for the groups claim)
   --oidc-ca-cert <path>       PEM CA verifying the provider (default the webPKI roots)
+  --oidc-groups-claim <claim> the ID token's claim listing a user's groups, which
+                              --group-role maps (default groups)
+  --admin <claim>=<pattern>   who is an admin: as --oidc-claim; without --oidc-issuer the
+                              claims are user_name and email, both the name anyone logs in
+                              with, and without --admin or --admin-client everyone is
+  --admin-client <id>         a client of --client-credentials who is an admin; repeatable
+  --group-role <group>=<role> the role a group of the provider gives: admin,
+                              organization_<role>@<org> or space_<role>@<org>/<space>;
+                              repeatable (or comma-separated). With --oidc-issuer, which
+                              needs an admin: --admin, --admin-client or a group's
   --client-credentials <id>:<secret>
                               a client of cf auth --client-credentials (CI); repeatable
   --client-credentials-file <path>
@@ -108,6 +118,10 @@ const VALUED: &[&str] = &[
     "oidc-claim",
     "oidc-scopes",
     "oidc-ca-cert",
+    "oidc-groups-claim",
+    "admin",
+    "admin-client",
+    "group-role",
     "client-credentials",
     "client-credentials-file",
     "security-group-editor",
@@ -369,6 +383,23 @@ pub fn parse(
         }
         _ => {}
     }
+    let admins = editors("admin")?;
+    let group_roles =
+        crate::roles::parse_group_roles(values("group-role").iter().map(String::as_str))?;
+    if !group_roles.is_empty() && oidc.is_none() {
+        return Err("--group-role needs --oidc-issuer: the groups are the provider's".into());
+    }
+    let policy = crate::roles::Policy {
+        everyone_admin: oidc.is_none() && admins.rules.is_empty() && admins.clients.is_empty(),
+        admins,
+        groups_claim: value("oidc-groups-claim").unwrap_or_else(|| "groups".into()),
+        group_roles,
+    };
+    if !policy.has_admins() {
+        return Err(
+            "who is an admin is not said: --admin <claim>=<pattern>, --admin-client <id> or --group-role <group>=admin; an admin makes the organizations and gives the roles".into(),
+        );
+    }
     Ok(Command::Serve(Box::new(Config {
         listen: value("listen").unwrap_or_else(|| "127.0.0.1:9091".to_string()),
         exit_on_stdin_close: exit_on_stdin_close
@@ -383,6 +414,7 @@ pub fn parse(
             flume,
             oidc,
             clients,
+            policy,
             security_group_editors,
             service_broker_editors,
             tls,
@@ -422,13 +454,16 @@ mod tests {
             "SLUICE_WICKET_CF_API_SECURITY_GROUP_EDITOR" => Some("groups=ops".to_string()),
             "SLUICE_WICKET_CF_API_SECURITY_GROUP_EDITOR_CLIENT" => Some("robot".to_string()),
             "SLUICE_WICKET_CF_API_SERVICE_BROKER_EDITOR" => Some("email=*@example.com".to_string()),
+            "SLUICE_WICKET_CF_API_GROUP_ROLE" => Some("ops=admin".to_string()),
+            "SLUICE_WICKET_CF_API_ADMIN_CLIENT" => Some("robot".to_string()),
             _ => None,
         };
         let config = serve(parse(
             args(
                 "--listen 0.0.0.0:9191 --domain=c.example --flume grpcs://flume:8002 \
                  --oidc-issuer https://idp.example.com/dex --oidc-client-id cf \
-                 --oidc-scopes openid,email,groups",
+                 --oidc-scopes openid,email,groups --oidc-groups-claim teams \
+                 --group-role devs=space_developer@sluice/wicket",
             ),
             env,
         ));
@@ -492,6 +527,14 @@ mod tests {
                 clients: Vec::new(),
             }
         );
+        let policy = &config.settings.policy;
+        assert!(!policy.everyone_admin && policy.admins.rules.is_empty());
+        assert_eq!(policy.admins.clients, ["robot"]);
+        assert_eq!(policy.groups_claim, "teams");
+        assert_eq!(
+            policy.group_roles,
+            crate::roles::parse_group_roles(["devs=space_developer@sluice/wicket"]).unwrap()
+        );
         assert!(config.settings.tls.is_none());
         let config = serve(parse(
             args("--wicket http://w:1 --any-credentials --domain x.io --domain y.io,Z.io."),
@@ -509,6 +552,7 @@ mod tests {
         assert!(config.settings.oidc.is_none());
         assert!(config.settings.clients.is_empty());
         assert_eq!(config.settings.security_group_editors, Editors::default());
+        assert_eq!(config.settings.policy, crate::roles::Policy::default());
         // a variable of the options' prefix naming none is refused, not left unread
         assert_eq!(
             check_env(
@@ -552,6 +596,14 @@ mod tests {
         );
         let oidc = "--wicket http://w:1 --oidc-issuer https://idp --oidc-client-id cf";
         assert!(error(oidc).contains("--oidc-claim is required"));
+        // a provider's users are no admins unless said
+        assert!(
+            error(&format!("{oidc} --oidc-claim email=*")).contains("who is an admin is not said")
+        );
+        assert!(
+            error("--wicket http://w:1 --any-credentials --group-role ops=admin")
+                .contains("--group-role needs --oidc-issuer")
+        );
         assert!(
             error("--wicket http://w:1 --oidc-issuer https://idp --oidc-claim email=*")
                 .contains("--oidc-client-id is required")

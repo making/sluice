@@ -67,7 +67,7 @@ start cf-api "$run/cf-api" "$cf_api" \
 	--data-dir "$run/cf-api" \
 	--flume grpc://127.0.0.1:8002 --flume-token flume-secret \
 	--oidc-issuer http://127.0.0.1:5556/dex --oidc-client-id cf --oidc-client-secret demo-secret \
-	--oidc-claim 'email=*@example.com'
+	--oidc-claim 'email=*@example.com' --admin email=demo@example.com
 wait_port 9091
 echo "cf API http://127.0.0.1:9091 (cf login --sso: demo@example.com / demo at Dex, or passcode.sh)," \
 	"apps http://<app>.localhost:8080, wicket console http://127.0.0.1:9090 (password wicket-secret)"

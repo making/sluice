@@ -32,6 +32,7 @@ use crate::logs::{self, Logs};
 use crate::manifest;
 use crate::oidc::Provider;
 use crate::registry::{Reference, Registry};
+use crate::roles::{Access, Need};
 use crate::security_groups;
 use crate::services;
 use crate::staging::{self, Hashed};
@@ -60,6 +61,8 @@ pub(crate) type Reply = Result<Response, ApiError>;
 pub struct Api {
     pub store: Arc<Store>,
     pub uaa: Uaa,
+    /// Who is an admin, and the roles the provider's groups give.
+    pub policy: crate::roles::Policy,
     /// Who may edit the security groups.
     pub security_group_editors: crate::security_groups::Editors,
     /// Who may edit the service brokers.
@@ -80,7 +83,7 @@ pub struct Api {
 }
 
 /// An error in CC's shape.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ApiError {
     pub status: StatusCode,
     pub code: u32,
@@ -210,6 +213,8 @@ pub(crate) struct Req {
     spool: Option<Spool>,
     /// Where the CLI reaches this API: the links name it.
     pub(crate) base: String,
+    /// What the holder of its token may; why not without a valid one.
+    access: Result<Access, ApiError>,
 }
 
 impl Req {
@@ -223,6 +228,11 @@ impl Req {
     pub(crate) fn json<T: DeserializeOwned>(&self) -> Result<T, ApiError> {
         serde_json::from_slice(&self.body)
             .map_err(|e| ApiError::bad_request(format!("Request invalid due to parse error: {e}")))
+    }
+
+    /// What the holder of its token may.
+    pub(crate) fn access(&self) -> Result<&Access, ApiError> {
+        self.access.as_ref().map_err(ApiError::clone)
     }
 
     fn header(&self, name: header::HeaderName) -> Option<&str> {
@@ -277,7 +287,12 @@ impl Api {
     async fn handle(&self, request: hyper::Request<Body>) -> Response {
         let (parts, body) = request.into_parts();
         let path = parts.uri.path().to_string();
-        let authenticated = self.authenticated(&parts.headers).is_ok();
+        let access = self.token(&parts.headers).map(|token| {
+            let identity = self.uaa.identity(&token);
+            self.store
+                .read(|state| Access::of(state, &token, identity.as_ref(), &self.policy))
+        });
+        let authenticated = access.is_ok();
         if authenticated {
             body.admit();
         }
@@ -331,6 +346,7 @@ impl Api {
             spool,
             base: format!("{scheme}://{host}"),
             path,
+            access,
         };
         let response = match self.dispatch(&req).await {
             Ok(response) => response,
@@ -476,6 +492,16 @@ impl Api {
             _ => {
                 self.authenticate(req)?;
                 match segments.as_slice() {
+                    // the CLI's check of a client given a role (`cf set-org-role --client`)
+                    ["uaa", "oauth", "clients", id] if req.method == Method::GET => {
+                        match self.uaa.knows_client(id) {
+                            true => Ok(json(StatusCode::OK, &json!({"client_id": id}))),
+                            false => Ok(json(
+                                StatusCode::NOT_FOUND,
+                                &json!({"error": "not_found", "error_description": "no such client"}),
+                            )),
+                        }
+                    }
                     ["api", "v1", rest @ ..] => self.log_cache(req, rest),
                     ["v3", rest @ ..] => self.v3(req, rest).await,
                     _ => Err(ApiError::unknown(&req.method, &req.path)),
@@ -485,11 +511,7 @@ impl Api {
     }
 
     fn authenticate(&self, req: &Req) -> Result<(), ApiError> {
-        self.authenticated(&req.headers)
-    }
-
-    fn authenticated(&self, headers: &HeaderMap) -> Result<(), ApiError> {
-        self.token(headers).map(|_| ())
+        req.access().map(|_| ())
     }
 
     /// The claims of the request's token.
@@ -539,6 +561,16 @@ impl Api {
                 &json!({"version": "3.0.0", "vm_uptime": epoch_secs().to_string()}),
             )),
             (&Method::GET, ["read", app]) => {
+                // an app it does not see has no lines for it: neither does one deleted
+                let access = req.access()?;
+                let seen = self.store.read(|state| {
+                    state
+                        .app(app)
+                        .is_some_and(|found| access.can(state, &found.space, Need::Read))
+                });
+                if !seen {
+                    return Ok(json(StatusCode::OK, &logs::envelopes(app, &[])));
+                }
                 let number = |key: &str| req.q(key).and_then(|value| value.parse::<u128>().ok());
                 let lines = self.logs.read(
                     app,
@@ -558,6 +590,7 @@ impl Api {
     async fn v3(&self, req: &Req, segments: &[&str]) -> Reply {
         let base = req.base.as_str();
         let store = &self.store;
+        let access = req.access()?;
         let listing = |items: Vec<Value>, included: Option<Value>| {
             Ok(json(
                 StatusCode::OK,
@@ -571,49 +604,50 @@ impl Api {
             ))
         };
         let empty = || listing(Vec::new(), None);
+        // whether the holder reads what the space `space` holds
+        let reads = |state: &State, space: &str| access.can(state, space, Need::Read);
+        // the apps of `app`'s guid a resource names, read
+        let app_read = |state: &State, app: &str| {
+            state
+                .app(app)
+                .is_some_and(|found| reads(state, &found.space))
+        };
         match (&req.method, segments) {
-            // --- the organization, the space, the domains, the stack
-            (&Method::GET, ["organizations"]) => {
-                listing(store.read(|state| vec![views::org(base, state)]), None)
-            }
-            (&Method::GET, ["organizations", guid]) => store
-                .read(|state| (state.org.guid == *guid).then(|| views::org(base, state)))
-                .map_or_else(
-                    || Err(ApiError::not_found("Organization")),
-                    |org| Ok(json(StatusCode::OK, &org)),
-                ),
+            // --- a space's manifest and security groups; the organizations, the spaces, the
+            // roles, the users (`crate::orgs`)
             (
                 &Method::GET,
                 [
-                    "organizations",
-                    _,
-                    "relationships",
-                    "default_isolation_segment",
+                    "spaces",
+                    guid,
+                    kind @ ("running_security_groups" | "staging_security_groups"),
                 ],
-            ) => Ok(json(StatusCode::OK, &json!({"data": null, "links": {}}))),
-            (&Method::GET, ["organizations", _, "domains"]) | (&Method::GET, ["domains"]) => {
-                listing(
-                    store.read(|state| {
-                        state
-                            .domains
-                            .iter()
-                            .map(|domain| views::domain(base, domain))
-                            .collect()
-                    }),
-                    None,
-                )
+            ) => {
+                store.read(|state| access.check(state, guid, Need::Read, "Space"))?;
+                self.security_groups_of_space(req, guid, *kind == "running_security_groups")
             }
-            (&Method::GET, ["organizations", _, "domains", "default"]) => store
-                .read(|state| {
+            (&Method::POST, ["spaces", guid, "actions", "apply_manifest"]) => {
+                self.apply_manifest(req, guid).await
+            }
+            (&Method::POST, ["spaces", guid, "manifest_diff"]) => self.manifest_diff(req, guid),
+            (
+                _,
+                [
+                    "organizations" | "organization_quotas" | "spaces" | "roles" | "users",
+                    ..,
+                ],
+            ) => self.orgs(req, segments).await,
+            // --- the domains, the stack
+            (&Method::GET, ["domains"]) => listing(
+                store.read(|state| {
                     state
                         .domains
-                        .first()
+                        .iter()
                         .map(|domain| views::domain(base, domain))
-                })
-                .map_or_else(
-                    || Err(ApiError::not_found("Domain")),
-                    |domain| Ok(json(StatusCode::OK, &domain)),
-                ),
+                        .collect()
+                }),
+                None,
+            ),
             (&Method::GET, ["domains", guid]) => store
                 .read(|state| state.domain(guid).map(|domain| views::domain(base, domain)))
                 .map_or_else(
@@ -626,46 +660,6 @@ impl Api {
             (&Method::DELETE, ["domains", _]) => Err(ApiError::unprocessable(
                 "the shared domains are the cf-api's --domain",
             )),
-            (&Method::GET, ["spaces"]) => {
-                let included = req
-                    .q("include")
-                    .is_some_and(|include| include.contains("organization"));
-                store.read(|state| {
-                    listing(
-                        vec![views::space(base, state)],
-                        included.then(|| json!({"organizations": [views::org(base, state)]})),
-                    )
-                })
-            }
-            (&Method::GET, ["spaces", guid]) => store
-                .read(|state| (state.space.guid == *guid).then(|| views::space(base, state)))
-                .map_or_else(
-                    || Err(ApiError::not_found("Space")),
-                    |space| Ok(json(StatusCode::OK, &space)),
-                ),
-            (&Method::GET, ["spaces", _, "features", name]) => Ok(json(
-                StatusCode::OK,
-                &json!({"name": name, "description": "", "enabled": false}),
-            )),
-            (&Method::GET, ["spaces", _, "features"]) => Ok(json(
-                StatusCode::OK,
-                &json!({"resources": [{"name": "ssh", "description": "", "enabled": false}], "pagination": {"total_results": 1, "total_pages": 1}}),
-            )),
-            (&Method::GET, ["spaces", _, "relationships", "isolation_segment"]) => {
-                Ok(json(StatusCode::OK, &json!({"data": null, "links": {}})))
-            }
-            (
-                &Method::GET,
-                [
-                    "spaces",
-                    guid,
-                    kind @ ("running_security_groups" | "staging_security_groups"),
-                ],
-            ) => self.security_groups_of_space(req, guid, *kind == "running_security_groups"),
-            (&Method::POST, ["spaces", _, "actions", "apply_manifest"]) => {
-                self.apply_manifest(req).await
-            }
-            (&Method::POST, ["spaces", _, "manifest_diff"]) => self.manifest_diff(req),
             (&Method::GET, ["stacks"]) => {
                 let runtime = self.controller.runtime().await.ok();
                 listing(vec![views::stack(base, runtime)], None)
@@ -685,55 +679,49 @@ impl Api {
                 Ok(json(StatusCode::OK, &feature_flag(name)))
             }
             // --- apps
-            (&Method::GET, ["apps"]) => {
-                let include = req.q("include").unwrap_or_default();
-                store.read(|state| {
-                    let mut included = serde_json::Map::new();
-                    if include.contains("space") {
-                        included.insert("spaces".into(), json!([views::space(base, state)]));
-                    }
-                    if include.contains("space.organization") {
-                        included.insert("organizations".into(), json!([views::org(base, state)]));
-                    }
-                    listing(
-                        state
-                            .apps
-                            .iter()
-                            .map(|app| views::app(base, state, app))
-                            .collect(),
-                        (!included.is_empty()).then_some(Value::Object(included)),
-                    )
-                })
-            }
+            (&Method::GET, ["apps"]) => store.read(|state| {
+                let apps: Vec<&crate::store::App> = state
+                    .apps
+                    .iter()
+                    .filter(|app| reads(state, &app.space))
+                    .collect();
+                listing(
+                    apps.iter().map(|app| views::app(base, app)).collect(),
+                    views::spaces_included(
+                        base,
+                        state,
+                        &req.query,
+                        apps.iter().map(|app| app.space.as_str()),
+                    ),
+                )
+            }),
             (&Method::POST, ["apps"]) => self.create_app(req).await,
             (&Method::GET, ["apps", guid]) => self.app_view(req, guid),
             (&Method::PATCH, ["apps", guid]) => self.patch_app(req, guid).await,
             (&Method::DELETE, ["apps", guid]) => self.delete_app(req, guid).await,
             (&Method::GET, ["apps", guid, "processes"]) => {
-                let app = self.app(guid)?;
-                listing(
-                    store.read(|state| vec![views::process(base, state, &app)]),
-                    None,
-                )
+                let app = self.app_as(req, guid, Need::Read)?;
+                listing(vec![views::process(base, &app)], None)
             }
             (&Method::GET, ["apps", guid, "processes", "web"]) => {
-                let app = self.app(guid)?;
-                Ok(json(
-                    StatusCode::OK,
-                    &store.read(|state| views::process(base, state, &app)),
-                ))
+                let app = self.app_as(req, guid, Need::Read)?;
+                Ok(json(StatusCode::OK, &views::process(base, &app)))
             }
-            (&Method::GET, ["apps", guid, "processes", "web", "stats"]) => self.stats(guid).await,
+            (&Method::GET, ["apps", guid, "processes", "web", "stats"]) => {
+                self.app_as(req, guid, Need::Read)?;
+                self.stats(guid).await
+            }
             (&Method::POST, ["apps", guid, "processes", "web", "actions", "scale"]) => {
                 self.scale(req, guid).await
             }
-            (&Method::GET, ["apps", _, "processes", kind])
-            | (&Method::GET, ["apps", _, "processes", kind, "stats"])
-            | (&Method::POST, ["apps", _, "processes", kind, "actions", "scale"]) => {
+            (&Method::GET, ["apps", guid, "processes", kind])
+            | (&Method::GET, ["apps", guid, "processes", kind, "stats"])
+            | (&Method::POST, ["apps", guid, "processes", kind, "actions", "scale"]) => {
+                self.app_as(req, guid, Need::Read)?;
                 Err(ApiError::not_found(&format!("Process ({kind})")))
             }
             (&Method::GET, ["apps", guid, "routes"]) => {
-                self.app(guid)?;
+                self.app_as(req, guid, Need::Read)?;
                 listing(
                     store.read(|state| {
                         state
@@ -745,7 +733,7 @@ impl Api {
                 )
             }
             (&Method::GET, ["apps", guid, "packages"]) => {
-                self.app(guid)?;
+                self.app_as(req, guid, Need::Read)?;
                 listing(
                     store.read(|state| {
                         state
@@ -759,7 +747,7 @@ impl Api {
                 )
             }
             (&Method::GET, ["apps", guid, "droplets"]) => {
-                self.app(guid)?;
+                self.app_as(req, guid, Need::Read)?;
                 listing(
                     store.read(|state| {
                         state
@@ -773,7 +761,7 @@ impl Api {
                 )
             }
             (&Method::GET, ["apps", guid, "droplets", "current"]) => {
-                let app = self.app(guid)?;
+                let app = self.app_as(req, guid, Need::Read)?;
                 let current = app
                     .current_droplet
                     .as_deref()
@@ -790,7 +778,7 @@ impl Api {
                     )
             }
             (&Method::GET, ["apps", guid, "relationships", "current_droplet"]) => {
-                let app = self.app(guid)?;
+                let app = self.app_as(req, guid, Need::Read)?;
                 Ok(json(
                     StatusCode::OK,
                     &json!({"data": app.current_droplet.as_ref().map(|guid| json!({"guid": guid})), "links": {}}),
@@ -809,14 +797,14 @@ impl Api {
                 ],
             ) => self.lifecycle(req, guid, action).await,
             (&Method::GET, ["apps", guid, "env"]) => {
-                let app = self.app(guid)?;
+                let app = self.app_as(req, guid, Need::Develop)?;
                 Ok(json(
                     StatusCode::OK,
                     &store.read(|state| views::env(base, state, &app)),
                 ))
             }
             (&Method::GET, ["apps", guid, "environment_variables"]) => {
-                let app = self.app(guid)?;
+                let app = self.app_as(req, guid, Need::Develop)?;
                 Ok(json(
                     StatusCode::OK,
                     &views::environment_variables(base, &app),
@@ -826,7 +814,7 @@ impl Api {
                 self.set_env(req, guid).await
             }
             (&Method::GET, ["apps", guid, "manifest"]) => {
-                let app = self.app(guid)?;
+                let app = self.app_as(req, guid, Need::Develop)?;
                 Ok(text(
                     StatusCode::OK,
                     "application/x-yaml",
@@ -834,21 +822,21 @@ impl Api {
                 ))
             }
             (&Method::GET, ["apps", guid, "features"]) => {
-                self.app(guid)?;
+                self.app_as(req, guid, Need::Read)?;
                 Ok(json(
                     StatusCode::OK,
                     &json!({"resources": [{"name": "ssh", "description": "", "enabled": false}, {"name": "revisions", "description": "", "enabled": false}], "pagination": {"total_results": 2, "total_pages": 1}}),
                 ))
             }
             (&Method::GET, ["apps", guid, "features", name]) => {
-                self.app(guid)?;
+                self.app_as(req, guid, Need::Read)?;
                 Ok(json(
                     StatusCode::OK,
                     &json!({"name": name, "description": "", "enabled": false}),
                 ))
             }
             (&Method::GET, ["apps", guid, "ssh_enabled"]) => {
-                self.app(guid)?;
+                self.app_as(req, guid, Need::Read)?;
                 Ok(json(
                     StatusCode::OK,
                     &json!({"enabled": false, "reason": "ssh is not supported: a wasm component has no shell"}),
@@ -858,17 +846,17 @@ impl Api {
             | (&Method::GET, ["apps", guid, "revisions"])
             | (&Method::GET, ["apps", guid, "revisions", "deployed"])
             | (&Method::GET, ["apps", guid, "tasks"]) => {
-                self.app(guid)?;
+                self.app_as(req, guid, Need::Read)?;
                 empty()
             }
             (&Method::POST, ["apps", guid, "tasks"]) => {
-                self.app(guid)?;
+                self.app_as(req, guid, Need::Read)?;
                 Err(ApiError::unprocessable(
                     "tasks are not supported: a wasm component serves requests only",
                 ))
             }
             (&Method::POST, ["apps", guid, "sidecars"]) => {
-                self.app(guid)?;
+                self.app_as(req, guid, Need::Read)?;
                 Err(ApiError::unprocessable("sidecars are not supported"))
             }
             // --- processes
@@ -877,29 +865,27 @@ impl Api {
                     state
                         .apps
                         .iter()
-                        .map(|app| views::process(base, state, app))
+                        .filter(|app| reads(state, &app.space))
+                        .map(|app| views::process(base, app))
                         .collect()
                 }),
                 None,
             ),
             (&Method::GET, ["processes", guid]) => {
-                let app = self.app_of_process(guid)?;
-                Ok(json(
-                    StatusCode::OK,
-                    &store.read(|state| views::process(base, state, &app)),
-                ))
+                let app = self.app_of_process(req, guid, Need::Read)?;
+                Ok(json(StatusCode::OK, &views::process(base, &app)))
             }
             (&Method::PATCH, ["processes", guid]) => self.patch_process(req, guid).await,
             (&Method::GET, ["processes", guid, "stats"]) => {
-                let app = self.app_of_process(guid)?;
+                let app = self.app_of_process(req, guid, Need::Read)?;
                 self.stats(&app.guid).await
             }
             (&Method::GET, ["processes", guid, "sidecars"]) => {
-                self.app_of_process(guid)?;
+                self.app_of_process(req, guid, Need::Read)?;
                 empty()
             }
             (&Method::POST, ["processes", guid, "actions", "scale"]) => {
-                let app = self.app_of_process(guid)?;
+                let app = self.app_of_process(req, guid, Need::Read)?;
                 self.scale(req, &app.guid).await
             }
             // --- packages, builds, droplets
@@ -908,27 +894,20 @@ impl Api {
                     state
                         .packages
                         .iter()
+                        .filter(|package| app_read(state, &package.app))
                         .map(|package| views::package(base, package))
                         .collect()
                 }),
                 None,
             ),
             (&Method::POST, ["packages"]) => self.create_package(req),
-            (&Method::GET, ["packages", guid]) => store
-                .read(|state| {
-                    state
-                        .package(guid)
-                        .map(|package| views::package(base, package))
-                })
-                .map_or_else(
-                    || Err(ApiError::not_found("Package")),
-                    |package| Ok(json(StatusCode::OK, &package)),
-                ),
+            (&Method::GET, ["packages", guid]) => {
+                let package = self.package_as(req, guid, Need::Read)?;
+                Ok(json(StatusCode::OK, &views::package(base, &package)))
+            }
             (&Method::POST, ["packages", guid, "upload"]) => self.upload(req, guid).await,
             (&Method::GET, ["packages", guid, "droplets"]) => {
-                store
-                    .read(|state| state.package(guid).map(|_| ()))
-                    .ok_or_else(|| ApiError::not_found("Package"))?;
+                self.package_as(req, guid, Need::Read)?;
                 listing(
                     store.read(|state| {
                         state
@@ -942,6 +921,7 @@ impl Api {
                 )
             }
             (&Method::DELETE, ["packages", guid]) => {
+                self.package_as(req, guid, Need::Operate)?;
                 let found = store.update(|state| {
                     let found = state.package(guid).is_some();
                     state.packages.retain(|package| package.guid != *guid);
@@ -961,6 +941,7 @@ impl Api {
                     state
                         .builds
                         .iter()
+                        .filter(|build| app_read(state, &build.app))
                         .map(|build| views::build(base, state, build))
                         .collect()
                 }),
@@ -971,6 +952,7 @@ impl Api {
                 .read(|state| {
                     state
                         .build(guid)
+                        .filter(|build| app_read(state, &build.app))
                         .map(|build| views::build(base, state, build))
                 })
                 .map_or_else(
@@ -982,6 +964,7 @@ impl Api {
                     state
                         .droplets
                         .iter()
+                        .filter(|droplet| app_read(state, &droplet.app))
                         .map(|droplet| views::droplet(base, droplet))
                         .collect()
                 }),
@@ -991,6 +974,7 @@ impl Api {
                 .read(|state| {
                     state
                         .droplet(guid)
+                        .filter(|droplet| app_read(state, &droplet.app))
                         .map(|droplet| views::droplet(base, droplet))
                 })
                 .map_or_else(
@@ -1004,25 +988,21 @@ impl Api {
                     let included = include.contains("domain").then(|| {
                         json!({"domains": state.domains.iter().map(|domain| views::domain(base, domain)).collect::<Vec<_>>()})
                     });
-                    listing(state.routes.iter().map(|route| views::route(base, state, route)).collect(), included)
+                    let routes = state.routes.iter().filter(|route| reads(state, &route.space));
+                    listing(routes.map(|route| views::route(base, state, route)).collect(), included)
                 })
             }
             (&Method::POST, ["routes"]) => self.create_route(req),
-            (&Method::GET, ["routes", guid]) | (&Method::PATCH, ["routes", guid]) => store
-                .read(|state| {
-                    state
-                        .route(guid)
-                        .map(|route| views::route(base, state, route))
-                })
-                .map_or_else(
-                    || Err(ApiError::not_found("Route")),
-                    |route| Ok(json(StatusCode::OK, &route)),
-                ),
+            (&Method::GET, ["routes", guid]) | (&Method::PATCH, ["routes", guid]) => {
+                let route = self.route_as(req, guid, Need::Read)?;
+                Ok(json(
+                    StatusCode::OK,
+                    &store.read(|state| views::route(base, state, &route)),
+                ))
+            }
             (&Method::DELETE, ["routes", guid]) => self.delete_route(req, guid).await,
             (&Method::GET, ["routes", guid, "destinations"]) => {
-                let route = store
-                    .read(|state| state.route(guid).cloned())
-                    .ok_or_else(|| ApiError::not_found("Route"))?;
+                let route = self.route_as(req, guid, Need::Read)?;
                 Ok(json(
                     StatusCode::OK,
                     &json!({"destinations": views::destinations(&route), "links": {"self": {"href": format!("{base}/v3/routes/{guid}/destinations")}, "route": {"href": format!("{base}/v3/routes/{guid}")}}}),
@@ -1043,6 +1023,7 @@ impl Api {
                     state
                         .deployments
                         .iter()
+                        .filter(|deployment| app_read(state, &deployment.app))
                         .map(|deployment| views::deployment(base, deployment))
                         .collect()
                 }),
@@ -1053,6 +1034,7 @@ impl Api {
                 .read(|state| {
                     state
                         .deployment(guid)
+                        .filter(|deployment| app_read(state, &deployment.app))
                         .map(|deployment| views::deployment(base, deployment))
                 })
                 .map_or_else(
@@ -1062,6 +1044,7 @@ impl Api {
             (&Method::POST, ["deployments", _, "actions", _]) => Err(ApiError::unprocessable(
                 "a deployment is finalized at once: the wicket swaps the app in place",
             )),
+            // a job's guid is its asker's alone to know: no space hides it
             (&Method::GET, ["jobs", guid]) => store
                 .read(|state| state.job(guid).map(|job| views::job(base, job)))
                 .map_or_else(
@@ -1089,10 +1072,7 @@ impl Api {
             | (&Method::GET, ["service_route_bindings"])
             | (&Method::GET, ["audit_events"])
             | (&Method::GET, ["isolation_segments"])
-            | (&Method::GET, ["users"])
-            | (&Method::GET, ["roles"])
             | (&Method::GET, ["space_quotas"])
-            | (&Method::GET, ["organization_quotas"])
             | (&Method::GET, ["tasks"])
             | (&Method::GET, ["sidecars"])
             | (&Method::GET, ["revisions"]) => empty(),
@@ -1108,30 +1088,75 @@ impl Api {
 
     // --- lookups
 
+    /// The app `guid`, as the state has it now.
     fn app(&self, guid: &str) -> Result<crate::store::App, ApiError> {
         self.store
             .read(|state| state.app(guid).cloned())
             .ok_or_else(|| ApiError::not_found("App"))
     }
 
-    fn app_of_process(&self, process: &str) -> Result<crate::store::App, ApiError> {
-        self.store
-            .read(|state| {
-                state
-                    .apps
-                    .iter()
-                    .find(|app| app.process.guid == process)
-                    .cloned()
-            })
-            .ok_or_else(|| ApiError::not_found("Process"))
+    /// The app `guid`, if the request's holder may `need` of its space.
+    pub(crate) fn app_as(
+        &self,
+        req: &Req,
+        guid: &str,
+        need: Need,
+    ) -> Result<crate::store::App, ApiError> {
+        let access = req.access()?;
+        self.store.read(|state| {
+            let app = state.app(guid).ok_or_else(|| ApiError::not_found("App"))?;
+            access.check(state, &app.space, need, "App")?;
+            Ok(app.clone())
+        })
+    }
+
+    /// The app of the process `process`, as [`Api::app_as`].
+    fn app_of_process(
+        &self,
+        req: &Req,
+        process: &str,
+        need: Need,
+    ) -> Result<crate::store::App, ApiError> {
+        let access = req.access()?;
+        self.store.read(|state| {
+            let app = state
+                .apps
+                .iter()
+                .find(|app| app.process.guid == process)
+                .ok_or_else(|| ApiError::not_found("Process"))?;
+            access.check(state, &app.space, need, "Process")?;
+            Ok(app.clone())
+        })
+    }
+
+    /// The package `guid`, if the request's holder may `need` of its app's space.
+    fn package_as(&self, req: &Req, guid: &str, need: Need) -> Result<Package, ApiError> {
+        let access = req.access()?;
+        self.store.read(|state| {
+            let package = state
+                .package(guid)
+                .ok_or_else(|| ApiError::not_found("Package"))?;
+            let space = state.app(&package.app).map_or("", |app| app.space.as_str());
+            access.check(state, space, need, "Package")?;
+            Ok(package.clone())
+        })
+    }
+
+    /// The route `guid`, if the request's holder may `need` of its space.
+    fn route_as(&self, req: &Req, guid: &str, need: Need) -> Result<crate::store::Route, ApiError> {
+        let access = req.access()?;
+        self.store.read(|state| {
+            let route = state
+                .route(guid)
+                .ok_or_else(|| ApiError::not_found("Route"))?;
+            access.check(state, &route.space, need, "Route")?;
+            Ok(route.clone())
+        })
     }
 
     fn app_view(&self, req: &Req, guid: &str) -> Reply {
-        let app = self.app(guid)?;
-        Ok(json(
-            StatusCode::OK,
-            &self.store.read(|state| views::app(&req.base, state, &app)),
-        ))
+        let app = self.app_as(req, guid, Need::Read)?;
+        Ok(json(StatusCode::OK, &views::app(&req.base, &app)))
     }
 
     /// The process stats, of the instances alive as the wicket lists them at this request: its
@@ -1243,7 +1268,10 @@ impl Api {
 
     // --- the manifest
 
-    async fn apply_manifest(&self, req: &Req) -> Reply {
+    async fn apply_manifest(&self, req: &Req, space: &str) -> Reply {
+        let access = req.access()?;
+        self.store
+            .read(|state| access.check(state, space, Need::Develop, "Space"))?;
         let manifest = match manifest::parse(
             std::str::from_utf8(&req.body)
                 .map_err(|_| ApiError::bad_request("the manifest is not UTF-8"))?,
@@ -1262,14 +1290,14 @@ impl Api {
         let named: Vec<String> = self.store.read(|state| {
             let named = manifest.applications.iter();
             named
-                .filter_map(|spec| state.app_named(spec.name.trim()))
+                .filter_map(|spec| state.app_named(space, spec.name.trim()))
                 .map(|app| app.guid.clone())
                 .collect()
         });
         let _apps = self.controller.hold_all(&named).await;
         let (trial, guids) = {
             let mut trial = self.store.read(State::clone);
-            match manifest::apply(&mut trial, &manifest, runtime) {
+            match manifest::apply(&mut trial, space, &manifest, runtime) {
                 Ok(guids) => (trial, guids),
                 Err(e) => {
                     return self.job(
@@ -1311,8 +1339,11 @@ impl Api {
         // made on the state as it is by now: all of it or, the other edits since refusing it,
         // none. An app new since the trial was not put: it is no started one
         let committed = self.store.update(|state| {
+            if state.space(space).is_none() {
+                return Err("the space is gone".to_string());
+            }
             let mut next = state.clone();
-            let guids = manifest::apply(&mut next, &manifest, runtime)?;
+            let guids = manifest::apply(&mut next, space, &manifest, runtime)?;
             // the bindings `services:` made: a broker's is its broker's to make
             let bound: Vec<(String, String, Option<String>)> = next
                 .bindings
@@ -1325,9 +1356,9 @@ impl Api {
                 })
                 .collect();
             *state = next;
-            Ok::<_, String>((guids, bound, state.space.guid.clone()))
+            Ok::<_, String>((guids, bound))
         });
-        let (guids, bound, space) = match committed {
+        let (guids, bound) = match committed {
             Ok(committed) => committed,
             Err(e) => {
                 for guid in applied {
@@ -1392,7 +1423,10 @@ impl Api {
         Ok(warned(self.located(req, &job), &warnings))
     }
 
-    fn manifest_diff(&self, req: &Req) -> Reply {
+    fn manifest_diff(&self, req: &Req, space: &str) -> Reply {
+        let access = req.access()?;
+        self.store
+            .read(|state| access.check(state, space, Need::Develop, "Space"))?;
         let manifest = manifest::parse(
             std::str::from_utf8(&req.body)
                 .map_err(|_| ApiError::bad_request("the manifest is not UTF-8"))?,
@@ -1402,7 +1436,7 @@ impl Api {
                 .applications
                 .iter()
                 .enumerate()
-                .filter(|(_, spec)| state.app_named(spec.name.trim()).is_none())
+                .filter(|(_, spec)| state.app_named(space, spec.name.trim()).is_none())
                 .map(|(i, spec)| json!({"op": "add", "path": format!("/applications/{i}"), "value": {"name": spec.name}}))
                 .collect()
         });
@@ -1428,11 +1462,16 @@ impl Api {
             }
         };
         let lifecycle = lifecycle(&body)?;
+        let space = body["relationships"]["space"]["data"]["guid"]
+            .as_str()
+            .unwrap_or_default();
+        let access = req.access()?;
         // of what the wicket runs, a wasm wicket's until it answers
         let runtime = self.controller.runtime().await.ok();
         let stack = runtime.map_or(crate::store::STACK, Runtime::stack);
         let view = self.store.update(|state| {
-            if state.app_named(name).is_some() {
+            space_to_develop(access, state, space)?;
+            if state.app_named(space, name).is_some() {
                 return Err(ApiError {
                     status: StatusCode::UNPROCESSABLE_ENTITY,
                     code: 10016,
@@ -1440,7 +1479,7 @@ impl Api {
                     detail: format!("App with the name '{name}' already exists."),
                 });
             }
-            let guid = state.create_app(name, stack).guid.clone();
+            let guid = state.create_app(name, stack, space).guid.clone();
             let app = state.app_mut(&guid).expect("just created");
             app.env = env;
             app.lifecycle = lifecycle.unwrap_or_default();
@@ -1459,8 +1498,7 @@ impl Api {
             if let Some(stack) = body["lifecycle"]["data"]["stack"].as_str() {
                 app.stack = stack.to_string();
             }
-            let app = app.clone();
-            Ok(views::app(&req.base, state, &app))
+            Ok(views::app(&req.base, app))
         })?;
         Ok(json(StatusCode::CREATED, &view))
     }
@@ -1470,12 +1508,12 @@ impl Api {
     async fn patch_app(&self, req: &Req, guid: &str) -> Reply {
         let body: Value = req.json()?;
         let lifecycle = lifecycle(&body)?;
-        self.app(guid)?;
+        let space = self.app_as(req, guid, Need::Develop)?.space;
         let runtime = self.controller.runtime().await.ok();
         let change = |state: &mut State| {
             if let Some(name) = body["name"].as_str()
                 && state
-                    .app_named(name)
+                    .app_named(&space, name)
                     .is_some_and(|other| other.guid != guid)
             {
                 return Err(ApiError::unprocessable(format!(
@@ -1512,8 +1550,7 @@ impl Api {
         if body["metadata"]["annotations"].is_object() {
             self.annotations_waiting(&app);
         }
-        let view = self.store.read(|state| views::app(&req.base, state, &app));
-        Ok(json(StatusCode::OK, &view))
+        Ok(json(StatusCode::OK, &views::app(&req.base, &app)))
     }
 
     /// Logs why the running `app` takes none of its annotations until its next start.
@@ -1535,7 +1572,7 @@ impl Api {
         let var = body["var"]
             .as_object()
             .ok_or_else(|| ApiError::unprocessable("Var must be an object"))?;
-        self.app(guid)?;
+        self.app_as(req, guid, Need::Develop)?;
         let app = self.store.update(|state| {
             let app = state
                 .app_mut(guid)
@@ -1561,7 +1598,7 @@ impl Api {
     /// them: the job settles once they are unbound and the app deleted, and fails, the app
     /// left, if one is not.
     async fn delete_app(&self, req: &Req, guid: &str) -> Reply {
-        let app = self.app(guid)?;
+        let app = self.app_as(req, guid, Need::Develop)?;
         let user = self.claims(req)?.user_id;
         let job = self.store.update(|state| {
             let brokered: Vec<String> = state
@@ -1637,7 +1674,7 @@ impl Api {
 
     async fn patch_process(&self, req: &Req, process: &str) -> Reply {
         let body: Value = req.json()?;
-        let app = self.app_of_process(process)?;
+        let app = self.app_of_process(req, process, Need::Operate)?;
         let view = self.store.update(|state| {
             let app = state
                 .app_mut(&app.guid)
@@ -1661,8 +1698,7 @@ impl Api {
                     .map(String::from);
             }
             app.process.updated_at = now();
-            let app = app.clone();
-            Ok::<_, ApiError>(views::process(&req.base, state, &app))
+            Ok::<_, ApiError>(views::process(&req.base, app))
         })?;
         Ok(json(StatusCode::OK, &view))
     }
@@ -1672,7 +1708,7 @@ impl Api {
     /// restarts the app for `-m`).
     async fn scale(&self, req: &Req, guid: &str) -> Reply {
         let body: Value = req.json()?;
-        self.app(guid)?;
+        self.app_as(req, guid, Need::Operate)?;
         let instances = body
             .get("instances")
             .map(|value| {
@@ -1733,12 +1769,7 @@ impl Api {
             .add(&guid, "API", format!("Scaled the web process: {body}"));
         let app = self.app(&guid)?;
         let warning = instances.and_then(|_| manifest::scale_warning(&app));
-        let scaled = json(
-            StatusCode::ACCEPTED,
-            &self
-                .store
-                .read(|state| views::process(&req.base, state, &app)),
-        );
+        let scaled = json(StatusCode::ACCEPTED, &views::process(&req.base, &app));
         Ok(warned(scaled, warning.as_slice()))
     }
 
@@ -1748,7 +1779,7 @@ impl Api {
             .as_str()
             .ok_or_else(|| ApiError::unprocessable("data.guid names the droplet"))?
             .to_string();
-        self.app(guid)?;
+        self.app_as(req, guid, Need::Operate)?;
         let _app = self.controller.hold(guid).await;
         let blobs = self.store.update(|state| {
             match state.droplet(&droplet) {
@@ -1778,7 +1809,7 @@ impl Api {
     /// and the environment; a stop removes the app from the wicket. The
     /// outcome is in the stats and the log.
     async fn lifecycle(&self, req: &Req, guid: &str, action: &str) -> Reply {
-        self.app(guid)?;
+        self.app_as(req, guid, Need::Operate)?;
         let _app = self.controller.hold(guid).await;
         let app = self.store.update(|state| {
             let running = if action == "stop" {
@@ -1808,10 +1839,7 @@ impl Api {
             ),
         );
         let _ = self.controller.sync(guid).await;
-        Ok(json(
-            StatusCode::OK,
-            &self.store.read(|state| views::app(&req.base, state, &app)),
-        ))
+        Ok(json(StatusCode::OK, &views::app(&req.base, &app)))
     }
 
     // --- packages, builds
@@ -1833,7 +1861,7 @@ impl Api {
         let app = body["relationships"]["app"]["data"]["guid"]
             .as_str()
             .ok_or_else(|| ApiError::unprocessable("relationships.app names the app"))?;
-        self.app(app)?;
+        self.app_as(req, app, Need::Operate)?;
         let image = docker.as_ref().map(|docker| docker.image.clone());
         let (view, blobs) = self.store.update(|state| {
             let at = now();
@@ -1868,10 +1896,7 @@ impl Api {
     /// has one worker, which its API and its watch run on. The app's older packages go, and an
     /// upload to one that went is refused.
     async fn upload(&self, req: &Req, guid: &str) -> Reply {
-        let package = self
-            .store
-            .read(|state| state.package(guid).cloned())
-            .ok_or_else(|| ApiError::not_found("Package"))?;
+        let package = self.package_as(req, guid, Need::Operate)?;
         if package.docker.is_some() {
             return Err(ApiError::unprocessable(
                 "a docker package takes no upload: its image is pulled at staging",
@@ -1946,7 +1971,7 @@ impl Api {
             .store
             .read(|state| state.package(package_guid).cloned())
             .ok_or_else(|| ApiError::unprocessable("Unable to use package. Ensure that the package exists and you have access to it."))?;
-        let app = self.app(&package.app)?;
+        let app = self.app_as(req, &package.app, Need::Operate)?;
         if package.state != "READY" {
             return Err(ApiError::unprocessable(
                 "Only packages with state READY can be staged.",
@@ -2030,7 +2055,17 @@ impl Api {
             .ok_or_else(|| ApiError::unprocessable("relationships.domain names the domain"))?
             .to_string();
         let host = manifest::check_host(body["host"].as_str().unwrap_or_default())?;
+        let space = body["relationships"]["space"]["data"]["guid"]
+            .as_str()
+            .unwrap_or_default();
+        let access = req.access()?;
         let view = self.store.update(|state| {
+            if state.space(space).is_none() || !access.can(state, space, Need::Read) {
+                return Err(ApiError::unprocessable(
+                    "Invalid space. Ensure that the space exists and you have access to it.",
+                ));
+            }
+            access.check(state, space, Need::Operate, "Space")?;
             if state.domain(&domain).is_none() {
                 return Err(ApiError::unprocessable(
                     "Invalid domain. Ensure that the domain exists and you have access to it.",
@@ -2039,13 +2074,14 @@ impl Api {
             if state.route_at(&host, &domain).is_some() {
                 return Err(ApiError::unprocessable("Route already exists."));
             }
-            let route = state.create_route(&host, &domain).clone();
+            let route = state.create_route(&host, &domain, space).clone();
             Ok(views::route(&req.base, state, &route))
         })?;
         Ok(json(StatusCode::CREATED, &view))
     }
 
     async fn delete_route(&self, req: &Req, guid: &str) -> Reply {
+        self.route_as(req, guid, Need::Operate)?;
         let _route = self.controller.hold(guid).await;
         let route = self
             .store
@@ -2069,6 +2105,7 @@ impl Api {
     /// `replace` (a PATCH) unmaps the app mapped before.
     async fn map_route(&self, req: &Req, guid: &str, replace: bool) -> Reply {
         let body: Value = req.json()?;
+        self.route_as(req, guid, Need::Operate)?;
         let _route = self.controller.hold(guid).await;
         let route = self
             .store
@@ -2095,8 +2132,14 @@ impl Api {
             let app = destination["app"]["guid"]
                 .as_str()
                 .ok_or_else(|| ApiError::unprocessable("a destination names an app"))?;
-            self.app(app)
+            let found = self
+                .app_as(req, app, Need::Read)
                 .map_err(|_| ApiError::unprocessable(format!("App with guid '{app}' not found")))?;
+            if found.space != route.space {
+                return Err(ApiError::unprocessable(
+                    "Routes destinations must be in either the app's space or the route's shared spaces",
+                ));
+            }
             if wanted.as_deref().is_some_and(|wanted| wanted != app) {
                 return Err(ApiError::unprocessable(
                     "a route serves one app on this platform",
@@ -2151,7 +2194,8 @@ impl Api {
         ))
     }
 
-    async fn unmap_route(&self, _req: &Req, guid: &str, destination: &str) -> Reply {
+    async fn unmap_route(&self, req: &Req, guid: &str, destination: &str) -> Reply {
+        self.route_as(req, guid, Need::Operate)?;
         let _route = self.controller.hold(guid).await;
         let route = self
             .store
@@ -2197,7 +2241,7 @@ impl Api {
             .as_str()
             .ok_or_else(|| ApiError::unprocessable("relationships.app names the app"))?
             .to_string();
-        self.app(&app)?;
+        self.app_as(req, &app, Need::Operate)?;
         let strategy = body["strategy"].as_str().unwrap_or("rolling").to_string();
         if strategy != "rolling" {
             return Err(ApiError::unprocessable(format!(
@@ -2300,7 +2344,7 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
             env::check_guest(&env).map_err(ApiError::unprocessable)?;
             env
         },
-        egress: security_groups::egress(state)?,
+        egress: security_groups::egress(state, &app.space)?,
         tag: Some(env::tag()),
         since: epoch_secs(),
     })
@@ -2345,6 +2389,21 @@ fn docker_image(data: &Value) -> Result<DockerImage, ApiError> {
 }
 
 /// The feature flags the CLI asks for: docker images, no sharing.
+/// Checks the space `space` a body names to make something in: CC's 422 when it is none the
+/// holder sees, 403 when the holder may not develop in it.
+pub(crate) fn space_to_develop(
+    access: &Access,
+    state: &State,
+    space: &str,
+) -> Result<(), ApiError> {
+    if state.space(space).is_none() || !access.can(state, space, Need::Read) {
+        return Err(ApiError::unprocessable(
+            "Invalid space. Ensure that the space exists and you have access to it.",
+        ));
+    }
+    access.check(state, space, Need::Develop, "Space")
+}
+
 fn feature_flag(name: &str) -> Value {
     json!({"name": name, "enabled": name == "diego_docker", "updated_at": null, "custom_error_message": null, "links": {}})
 }
