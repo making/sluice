@@ -146,7 +146,12 @@ impl OtlpSettings {
             .into_iter()
             .flatten()
         {
-            for pair in pairs.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+            // a file may hold one a line as well
+            for pair in pairs
+                .split([',', '\n'])
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+            {
                 let Some((name, value)) = pair.split_once('=') else {
                     return Err(format!("--otlp-headers: no '=' in {pair}"));
                 };
@@ -214,7 +219,7 @@ impl OtlpSettings {
     }
 }
 
-/// `k=v,k=v`, the values as given.
+/// `k=v,k=v`, the values percent-decoded.
 fn pairs(raw: Option<&str>, option: &str) -> Result<Vec<(String, String)>, String> {
     let mut pairs = Vec::new();
     for pair in raw.unwrap_or_default().split(',').map(str::trim) {
@@ -224,7 +229,9 @@ fn pairs(raw: Option<&str>, option: &str) -> Result<Vec<(String, String)>, Strin
         let Some((key, value)) = pair.split_once('=') else {
             return Err(format!("{option}: no '=' in {pair}"));
         };
-        pairs.push((key.trim().to_string(), value.to_string()));
+        let key = key.trim();
+        let value = percent_decode(value.trim()).map_err(|e| format!("{option}: {key}: {e}"))?;
+        pairs.push((key.to_string(), value));
     }
     Ok(pairs)
 }
@@ -238,7 +245,8 @@ fn list(raw: Option<String>) -> Vec<String> {
         .collect()
 }
 
-/// `%XX` sequences decoded, as `OTEL_EXPORTER_OTLP_HEADERS` takes its values.
+/// `%XX` sequences decoded, as the `OTEL_*` lists take their values. The error
+/// does not repeat the value: it may be a secret.
 fn percent_decode(value: &str) -> Result<String, String> {
     let bytes = value.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
@@ -248,9 +256,9 @@ fn percent_decode(value: &str) -> Result<String, String> {
             let hex = bytes
                 .get(index + 1..index + 3)
                 .and_then(|hex| std::str::from_utf8(hex).ok())
-                .ok_or_else(|| format!("invalid percent-encoding: {value}"))?;
-            let byte = u8::from_str_radix(hex, 16)
-                .map_err(|_| format!("invalid percent-encoding: {value}"))?;
+                .ok_or_else(|| "invalid percent-encoding".to_string())?;
+            let byte =
+                u8::from_str_radix(hex, 16).map_err(|_| "invalid percent-encoding".to_string())?;
             decoded.push(byte);
             index += 3;
         } else {
@@ -258,7 +266,7 @@ fn percent_decode(value: &str) -> Result<String, String> {
             index += 1;
         }
     }
-    String::from_utf8(decoded).map_err(|_| format!("invalid percent-encoding: {value}"))
+    String::from_utf8(decoded).map_err(|_| "invalid percent-encoding".to_string())
 }
 
 /// The TLS a `POST` uses: the roots of `--otlp-ca` or the webPKI ones, with the
@@ -327,6 +335,15 @@ impl Exporter {
     }
 }
 
+impl Drop for Exporter {
+    /// A flume dropped without its shutdown stops exporting too.
+    fn drop(&mut self) {
+        if let Some(task) = self.task.take() {
+            task.abort();
+        }
+    }
+}
+
 /// Starts exporting every line the hub receives; the exporter is a standing
 /// watcher, so the nodes feed it whether or not a console watches too.
 pub fn start(hub: Arc<Hub>, settings: OtlpSettings) -> Exporter {
@@ -348,34 +365,38 @@ async fn run(
     stop: watch::Receiver<bool>,
 ) -> Result<(), String> {
     eprintln!("otlp: exporting to {}", settings.url);
-    let filter = settings.filter.clone();
-    let watch = hub.watch(filter, None)?;
+    let watch = hub.watch(settings.filter.clone(), None)?;
+    let seen = watch.seq;
     let (sender, mut receiver) = mpsc::channel(WATCH_BUFFER);
     // dropped when the exporter stops: the nodes nobody else watches stop feeding
-    tokio::spawn(crate::service::relay(hub, watch, sender));
-    Export::new(settings, stop).run(&mut receiver).await
+    tokio::spawn(crate::service::relay(hub.clone(), watch, sender));
+    Export::new(hub, settings, stop)
+        .run(&mut receiver, seen)
+        .await
 }
 
 /// The exporter's state across batches.
 struct Export {
+    hub: Arc<Hub>,
     settings: OtlpSettings,
     stop: watch::Receiver<bool>,
     /// When a shutdown is to have sent the pending batch by.
     stop_deadline: Option<Instant>,
-    /// A failure was reported and no success since.
-    failing: bool,
+    /// The attempts failed since the last delivery: the first is reported.
+    failures: u64,
     dropped: u64,
     rejected: u64,
     last_report: Instant,
 }
 
 impl Export {
-    fn new(settings: OtlpSettings, stop: watch::Receiver<bool>) -> Self {
+    fn new(hub: Arc<Hub>, settings: OtlpSettings, stop: watch::Receiver<bool>) -> Self {
         Self {
+            hub,
             settings,
             stop,
             stop_deadline: None,
-            failing: false,
+            failures: 0,
             dropped: 0,
             rejected: 0,
             // the first count reports at once
@@ -385,7 +406,13 @@ impl Export {
         }
     }
 
-    async fn run(&mut self, receiver: &mut mpsc::Receiver<WatchEvent>) -> Result<(), String> {
+    /// Exports what the relay passes, `seen` the hub's sequence its watch
+    /// began after.
+    async fn run(
+        &mut self,
+        receiver: &mut mpsc::Receiver<WatchEvent>,
+        mut seen: u64,
+    ) -> Result<(), String> {
         let mut batch = Batch::default();
         let mut deadline: Option<Instant> = None;
         loop {
@@ -407,8 +434,9 @@ impl Export {
                 () = stopped => break,
                 maybe = receiver.recv() => {
                     let Some(event) = maybe else {
-                        return Ok(());
+                        break;
                     };
+                    seen = seen.max(sequence(&event));
                     if batch.add(&event) == 0 {
                         continue;
                     }
@@ -428,15 +456,24 @@ impl Export {
                 }
             }
         }
-        // the stop: what is pending goes out within the grace
-        self.stop_deadline = Some(Instant::now() + SHUTDOWN_GRACE);
+        // the stop: what the hub took past the last line seen goes out within
+        // the grace, from the ring: the relay may not have passed it yet
+        self.stopping();
+        let (events, _, _) = self.hub.catch_up(&self.settings.filter, seen);
+        for event in &events {
+            batch.add(event);
+            if batch.full(&self.settings) {
+                self.deliver(&batch).await;
+                batch = Batch::default();
+            }
+        }
         if !batch.is_empty() {
             self.deliver(&batch).await;
         }
         Ok(())
     }
 
-    /// When a shutdown began: no attempt starts past it.
+    /// When a shutdown is to be done by: no attempt starts past it.
     fn stopping(&mut self) -> Option<Instant> {
         if self.stop_deadline.is_none() && *self.stop.borrow() {
             self.stop_deadline = Some(Instant::now() + SHUTDOWN_GRACE);
@@ -460,7 +497,6 @@ impl Export {
             }
         };
         let mut backoff = RETRY_BASE;
-        let mut attempts: u64 = 0;
         loop {
             if self
                 .remaining()
@@ -468,7 +504,6 @@ impl Export {
             {
                 return;
             }
-            attempts += 1;
             let timeout = self
                 .remaining()
                 .map_or(REQUEST_TIMEOUT, |remaining| remaining.min(REQUEST_TIMEOUT));
@@ -481,35 +516,44 @@ impl Export {
             };
             match outcome {
                 Outcome::Delivered { rejected, message } => {
-                    if self.failing {
-                        eprintln!("otlp: recovered after {attempts} attempts");
-                        self.failing = false;
+                    if self.failures > 0 {
+                        eprintln!("otlp: recovered after {} failed attempts", self.failures);
+                        self.failures = 0;
                     }
                     if rejected > 0 {
                         self.rejected += rejected;
                         if let Some(message) = message {
                             eprintln!("otlp: {message}");
                         }
-                        self.report();
                     }
+                    self.report();
                     return;
                 }
                 Outcome::Retry { reason, after } => {
-                    if !self.failing {
+                    if self.failures == 0 {
                         eprintln!("otlp: {reason}, retrying");
-                        self.failing = true;
                     }
+                    self.failures += 1;
                     let delay = jitter(after.unwrap_or(backoff));
                     backoff = (backoff * 2).min(RETRY_MAX);
-                    let delay = self.remaining().map_or(delay, |left| delay.min(left));
-                    if !delay.is_zero() {
-                        tokio::time::sleep(delay).await;
+                    match self.remaining() {
+                        Some(left) => tokio::time::sleep(delay.min(left)).await,
+                        // a stop cuts the wait short: the grace begins
+                        None => {
+                            let mut stop = self.stop.clone();
+                            tokio::select! {
+                                () = tokio::time::sleep(delay) => {}
+                                _ = stop.changed() => {}
+                            }
+                        }
                     }
                 }
                 Outcome::Dropped { reason } => {
-                    if !self.failing {
+                    // a refusal that lasts is summed, not repeated per batch
+                    if self.failures == 0 {
                         eprintln!("otlp: {reason}, dropping the batch");
                     }
+                    self.failures += 1;
                     self.dropped += batch.count as u64;
                     self.report();
                     return;
@@ -604,6 +648,15 @@ enum Outcome {
     Dropped {
         reason: String,
     },
+}
+
+/// The hub's sequence of a line or a node's gap; 0 for the rest.
+fn sequence(event: &WatchEvent) -> u64 {
+    match event.body.as_ref() {
+        Some(watch_event::Body::Record(record)) => record.seq,
+        Some(watch_event::Body::Gap(gap)) => gap.seq,
+        _ => 0,
+    }
 }
 
 /// A status worth the same batch again.

@@ -173,7 +173,7 @@ the log of the app holding its host, which `cf logs` shows as Cloud Foundry does
 to an OTLP/HTTP logs endpoint (`application/x-protobuf` only: no OTLP/gRPC, no OTLP/JSON).
 A URL without a path, or with `/`, gets `/v1/logs` appended; another path is used as is.
 `--otlp-headers` (values percent-decoded, as `OTEL_EXPORTER_OTLP_HEADERS`) or
-`--otlp-headers-file` carries the authentication, `--otlp-ca` pins the endpoint's TLS (else
+`--otlp-headers-file` (one a line or a comma list) carries the authentication, `--otlp-ca` pins the endpoint's TLS (else
 the webPKI roots; `--otlp-client-cert` / `--otlp-client-key` for mTLS), `--otlp-compression`
 gzip (default) or none, `--otlp-batch-size` (512), `--otlp-batch-delay` (1000 ms), and
 `--otlp-kinds` / `--otlp-route-keys` / `--otlp-node-ids` bound what goes out. Every option
@@ -191,7 +191,8 @@ One `ExportLogsServiceRequest` per batch:
 
 - a `ResourceLogs` per node: `service.name` (`--otlp-service-name`, default `sluice`) and
   `service.instance.id` its id (`wicket:<client-id>` for a wicket), then
-  `--otlp-resource-attributes` (`k=v,...`, a key given there wins);
+  `--otlp-resource-attributes` (`k=v,...`, values percent-decoded as
+  `OTEL_RESOURCE_ATTRIBUTES`; a key given there wins);
 - one `ScopeLogs`, name `sluice.access` at the flume's version;
 - a `LogRecord` per line: `time_unix_nano` the node's time, `observed_time_unix_nano` when
   the flume took it, severity INFO, `event_name` `sluice.access.<kind>`, attributes
@@ -210,7 +211,8 @@ flight and a node's records keep its order. A connection error, a timeout, 429, 
 limit: the ring is the exporter's buffer, and what it loses meanwhile comes out as one
 `behind` gap once the endpoint is back. Any other non-2xx drops the batch; a
 `partial_success` rejection is counted. Delivery is at least once. On SIGTERM, SIGINT or
-stdin EOF the pending batch goes out within 5 s, then the flume exits. stderr shows the
+stdin EOF what the flume took and the exporter has not sent (the pending batch and the
+ring's lines past it) goes out within 5 s, then the flume exits. stderr shows the
 endpoint at the start, the first failure with its status, the recovery, and at most one
 line a minute summing dropped lines and rejected records.
 

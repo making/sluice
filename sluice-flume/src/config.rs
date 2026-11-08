@@ -25,12 +25,12 @@ usage: sluice-flume --token <token> [options]
   --otlp-compression <gzip|none>  body encoding of a request (default gzip)
   --otlp-headers <k=v,...>      request headers, values percent-decoded, as
                           OTEL_EXPORTER_OTLP_HEADERS
-  --otlp-headers-file <path>    read --otlp-headers from a file instead
+  --otlp-headers-file <path>    more of them from a file (k=v a line or a comma list)
   --otlp-ca <path>        PEM CA verifying the endpoint (default the webPKI roots)
   --otlp-client-cert <path>     PEM client certificate for mTLS (with --otlp-client-key)
   --otlp-client-key <path>      PEM private key of --otlp-client-cert
   --otlp-batch-size <records>   records a request takes at most (default 512)
-  --otlp-batch-delay <ms>       how long a batch waits for its first line (default 1000)
+  --otlp-batch-delay <ms>       how long a batch waits after its first line (default 1000)
   --otlp-kinds <kinds>    export only these kinds (default all)
   --otlp-route-keys <keys>      export only these route keys (default all)
   --otlp-node-ids <ids>   export only these nodes (default all)

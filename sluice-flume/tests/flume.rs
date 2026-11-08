@@ -649,14 +649,16 @@ async fn the_exporter_batches_the_lines_and_resends_a_refused_batch() {
     let body = record.body.as_ref().expect("a body");
     assert_eq!(text(body.value.as_ref()), "method=GET agent=\"curl 8\"");
 
+    let mut console = watch(&mut client, filter(&[], &[], &[]), None).await;
     node.send
         .send(FeedMessage {
             body: Some(feed_message::Body::Gap(FeedGap { dropped: 5 })),
         })
         .await
         .unwrap();
-    // let the gap reach the exporter before the shutdown takes its batch
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // the hub holds the gap: the shutdown takes it from the ring, whether or
+    // not the exporter's relay has passed it on
+    while !matches!(next(&mut console).await, watch_event::Body::Gap(_)) {}
     stop.send(()).unwrap();
     tokio::time::timeout(HANG, serving)
         .await
@@ -672,6 +674,11 @@ async fn the_exporter_batches_the_lines_and_resends_a_refused_batch() {
             "service.instance.id"
         )),
         "node-1"
+    );
+    assert_eq!(
+        gap.scope_logs[0].log_records.len(),
+        1,
+        "the gap once: from the relay or the ring"
     );
     let record = &gap.scope_logs[0].log_records[0];
     assert_eq!(record.event_name, "sluice.gap");
