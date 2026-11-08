@@ -14,13 +14,15 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import am.ik.sluice.server.config.SluiceServerProperties;
+import am.ik.sluice.server.proxyprotocol.TrustedProxy;
 import am.ik.sluice.server.route.Router;
 
 /**
  * Data plane IP access control (the HAProxy {@code tcp-request connection} counterpart):
  * the server-wide deny list is a blacklist applied to every connection, the allow side
  * uses the route's {@code allowed-cidrs} when it has one and the server-wide allow list
- * otherwise; an empty effective allow list means every address passes. An unreadable peer
+ * otherwise; no configured allow list means every address passes, while a configured list
+ * whose entries were all malformed denies every address (fail closed). An unreadable peer
  * address is allowed through (fail open). When the peer is a configured trusted proxy,
  * the rightmost {@code X-Forwarded-For} entry it appended is judged instead of the peer
  * address -- entries further left are client-supplied and part of the chain of trust
@@ -29,7 +31,7 @@ import am.ik.sluice.server.route.Router;
  * {@code X-Forwarded-For}.
  */
 @Component
-public class AccessControl {
+public class AccessControl implements TrustedProxy {
 
 	private static final Logger log = LoggerFactory.getLogger(AccessControl.class);
 
@@ -105,6 +107,13 @@ public class AccessControl {
 	}
 
 	/**
+	 * Whether a PROXY protocol header from the peer may be believed: always when no
+	 * trusted proxy is configured (enabling the header is itself the opt-in), else only
+	 * from a configured trusted proxy.
+	 */
+	@Override
+	public boolean trustsProxySource(@Nullable InetAddress peer) {
+		return this.trustedProxies.isEmpty() || trusts(peer);
 	}
 
 	/**

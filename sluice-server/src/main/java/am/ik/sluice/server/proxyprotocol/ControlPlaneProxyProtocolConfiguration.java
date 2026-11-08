@@ -1,13 +1,16 @@
 package am.ik.sluice.server.proxyprotocol;
 
+import java.net.InetAddress;
 import java.time.Duration;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 
 import io.grpc.netty.NettyServerBuilder;
 import io.netty.channel.EventLoopGroup;
 import io.netty.channel.MultiThreadIoEventLoopGroup;
 import io.netty.channel.nio.NioIoHandler;
 import io.netty.util.concurrent.DefaultThreadFactory;
+import org.jspecify.annotations.Nullable;
 
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.context.annotation.Bean;
@@ -37,12 +40,13 @@ class ControlPlaneProxyProtocolConfiguration {
 	 * gRPC's own channels and event loops) untouched.
 	 */
 	@Bean
-	ServerBuilderCustomizer<NettyServerBuilder> controlPlaneProxyProtocol(SluiceServerProperties properties) {
+	ServerBuilderCustomizer<NettyServerBuilder> controlPlaneProxyProtocol(SluiceServerProperties properties,
+			TrustedProxy trustedProxy) {
 		if (!properties.controlProxyProtocol()) {
 			return builder -> {
 			};
 		}
-		return new ProxiedControlPlane(properties.limits().headTimeout());
+		return new ProxiedControlPlane(properties.limits().headTimeout(), trustedProxy::trustsProxySource);
 	}
 
 	/**
@@ -53,19 +57,22 @@ class ControlPlaneProxyProtocolConfiguration {
 
 		private final Duration headTimeout;
 
+		private final Predicate<@Nullable InetAddress> trustedProxy;
+
 		private final EventLoopGroup boss = new MultiThreadIoEventLoopGroup(1,
 				new DefaultThreadFactory("sluice-grpc-boss", true), NioIoHandler.newFactory());
 
 		private final EventLoopGroup worker = new MultiThreadIoEventLoopGroup(0,
 				new DefaultThreadFactory("sluice-grpc-worker", true), NioIoHandler.newFactory());
 
-		ProxiedControlPlane(Duration headTimeout) {
+		ProxiedControlPlane(Duration headTimeout, Predicate<@Nullable InetAddress> trustedProxy) {
 			this.headTimeout = headTimeout;
+			this.trustedProxy = trustedProxy;
 		}
 
 		@Override
 		public void customize(NettyServerBuilder builder) {
-			builder.channelFactory(() -> new ProxiedServerSocketChannel(this.headTimeout))
+			builder.channelFactory(() -> new ProxiedServerSocketChannel(this.headTimeout, this.trustedProxy))
 				.bossEventLoopGroup(this.boss)
 				.workerEventLoopGroup(this.worker);
 		}

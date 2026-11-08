@@ -137,6 +137,23 @@ class AccessControlTest {
 
 	@Test
 	void anAllMalformedAllowListFailsClosed() {
+		AccessControl accessControl = rules(List.of("10.0.0.0/33", "not-an-address"), List.of());
+		// configured, but nothing usable remains: deny instead of allowing every address
+		assertThat(accessControl.allowed(null, peer("10.1.2.3"))).isFalse();
+		assertThat(accessControl.allowed(route("192.168.0.0/33"), peer("192.168.1.2"))).isFalse();
+	}
+
+	@Test
+	void aProxySourceIsTrustedOnlyFromAConfiguredTrustedProxy() {
+		assertThat(rules(List.of(), List.of()).trustsProxySource(peer("203.0.113.7")))
+			.as("no trusted proxy configured: the header is the opt-in")
+			.isTrue();
+		AccessControl accessControl = rules(List.of(), List.of(), List.of("10.0.0.0/8"));
+		assertThat(accessControl.trustsProxySource(peer("10.1.2.3"))).isTrue();
+		assertThat(accessControl.trustsProxySource(peer("203.0.113.7"))).isFalse();
+		assertThat(accessControl.trustsProxySource(null)).isFalse();
+	}
+
 	@Test
 	void anUnreadablePeerAddressIsAllowedThrough() {
 		AccessControl accessControl = rules(List.of("10.0.0.0/8"), List.of("203.0.113.0/24"));

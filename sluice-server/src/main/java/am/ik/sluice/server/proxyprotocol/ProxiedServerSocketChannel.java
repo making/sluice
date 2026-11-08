@@ -1,13 +1,16 @@
 package am.ik.sluice.server.proxyprotocol;
 
+import java.net.InetAddress;
 import java.nio.channels.SocketChannel;
 import java.time.Duration;
 import java.util.List;
+import java.util.function.Predicate;
 
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.util.internal.SocketUtils;
 import io.netty.util.internal.logging.InternalLogger;
 import io.netty.util.internal.logging.InternalLoggerFactory;
+import org.jspecify.annotations.Nullable;
 
 /**
  * A server socket channel whose accepted connections are {@link ProxiedSocketChannel}s:
@@ -20,8 +23,11 @@ final class ProxiedServerSocketChannel extends NioServerSocketChannel {
 
 	private final Duration headTimeout;
 
-	ProxiedServerSocketChannel(Duration headTimeout) {
+	private final Predicate<@Nullable InetAddress> trustedProxy;
+
+	ProxiedServerSocketChannel(Duration headTimeout, Predicate<@Nullable InetAddress> trustedProxy) {
 		this.headTimeout = headTimeout;
+		this.trustedProxy = trustedProxy;
 	}
 
 	@Override
@@ -47,6 +53,10 @@ final class ProxiedServerSocketChannel extends NioServerSocketChannel {
 
 	Duration headTimeout() {
 		return this.headTimeout;
+	}
+
+	Predicate<@Nullable InetAddress> trustedProxy() {
+		return this.trustedProxy;
 	}
 
 }

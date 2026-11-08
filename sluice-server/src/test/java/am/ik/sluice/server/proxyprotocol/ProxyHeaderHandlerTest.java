@@ -1,6 +1,7 @@
 package am.ik.sluice.server.proxyprotocol;
 
 import java.io.ByteArrayOutputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
@@ -8,6 +9,7 @@ import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 import java.util.stream.Stream;
 
 import io.netty.buffer.AbstractByteBufAllocator;
@@ -80,6 +82,21 @@ class ProxyHeaderHandlerTest {
 		assertThat(fixture.channel.isOpen()).isTrue();
 		assertThat(fed).allSatisfy(chunk -> assertThat(chunk.refCnt()).isZero());
 		assertThat(fixture.allocator.allocated).allSatisfy(buffer -> assertThat(buffer.refCnt()).isZero());
+	}
+
+	/**
+	 * A peer that is not a configured trusted proxy cannot spoof the source: the header
+	 * is still consumed, but the channel keeps the socket peer.
+	 */
+	@ParameterizedTest(name = "{0}")
+	@MethodSource("heads")
+	void aHeaderFromAnUntrustedPeerIsIgnored(String name, byte[] input, @Nullable String source, byte[] passed)
+			throws Exception {
+		Fixture fixture = new Fixture(peer -> false);
+		fixture.channel.writeInbound(Unpooled.wrappedBuffer(input));
+		assertThat(fixture.channel.pipeline().get(ProxyHeaderHandler.class)).isNull();
+		assertThat(fixture.channel.attr(ProxyHeaderHandler.SOURCE).get()).isNull();
+		assertThat(fixture.downstream.bytes.toByteArray()).isEqualTo(passed);
 	}
 
 	static Stream<Arguments> failures() {
@@ -158,12 +175,16 @@ class ProxyHeaderHandlerTest {
 		final EmbeddedChannel channel = new EmbeddedChannel(false, false);
 
 		Fixture() throws Exception {
+			this(peer -> true);
+		}
+
+		Fixture(Predicate<@Nullable InetAddress> trustedProxy) throws Exception {
 			this.channel.config().setAllocator(this.allocator);
 			this.channel.pipeline().addLast(this.downstream);
 			this.channel.register();
 			// the deadline is scheduled as the handler is added, on the frozen clock
 			this.channel.freezeTime();
-			this.channel.pipeline().addFirst(new ProxyHeaderHandler(DEADLINE));
+			this.channel.pipeline().addFirst(new ProxyHeaderHandler(DEADLINE, trustedProxy));
 		}
 
 	}

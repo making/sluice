@@ -2,11 +2,14 @@ package am.ik.sluice.server.proxyprotocol;
 
 import java.io.IOException;
 import java.io.InputStream;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
+import java.net.SocketAddress;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.TimeUnit;
+import java.util.function.Predicate;
 
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
@@ -25,11 +28,13 @@ import am.ik.sluice.server.tunnel.LogThrottle;
  * Consumes the PROXY protocol header a front end may prepend to a connection, before any
  * handler behind it sees a byte. The header is parsed by {@link ProxyProtocolParser}, so
  * v1 / v2, headerless connections and malformed headers are treated as on the data plane;
- * the header's source lands in the channel attribute {@link #SOURCE}. Until the head is
- * decided, the inbound bytes and the user events are held back: gRPC starts its protocol
- * negotiation on a user event and reads the channel's remote address then, so it sees the
- * header's source. A malformed header, or a head undecided by the deadline, closes the
- * connection. Once decided, the handler releases what it held and leaves the pipeline.
+ * the header's source lands in the channel attribute {@link #SOURCE} when the socket peer
+ * is a trusted proxy ({@code trusted-proxy-cidrs}; none configured = every peer). Until
+ * the head is decided, the inbound bytes and the user events are held back: gRPC starts
+ * its protocol negotiation on a user event and reads the channel's remote address then,
+ * so it sees the header's source. A malformed header, or a head undecided by the
+ * deadline, closes the connection. Once decided, the handler releases what it held and
+ * leaves the pipeline.
  * <p>
  * <b>Native image.</b> netty reflects on the public methods of every channel handler;
  * this one is registered in {@code reflect-config.json}.
@@ -45,14 +50,21 @@ final class ProxyHeaderHandler extends ChannelInboundHandlerAdapter {
 
 	private final Duration deadline;
 
+	/**
+	 * Whether the header's source may be believed: the TCP peer is a configured trusted
+	 * proxy, or none is configured (enabling the header is the opt-in).
+	 */
+	private final Predicate<@Nullable InetAddress> trustedProxy;
+
 	private final List<Object> heldEvents = new ArrayList<>();
 
 	private @Nullable ByteBuf head;
 
 	private @Nullable ScheduledFuture<?> timeout;
 
-	ProxyHeaderHandler(Duration deadline) {
+	ProxyHeaderHandler(Duration deadline, Predicate<@Nullable InetAddress> trustedProxy) {
 		this.deadline = deadline;
+		this.trustedProxy = trustedProxy;
 	}
 
 	@Override
@@ -108,7 +120,7 @@ final class ProxyHeaderHandler extends ChannelInboundHandlerAdapter {
 			this.fail(ctx, e.getMessage());
 			return;
 		}
-		if (header != null && header.source() != null) {
+		if (header != null && header.source() != null && this.trustsSource(ctx)) {
 			ctx.channel().attr(SOURCE).set(new InetSocketAddress(header.source(), header.sourcePort()));
 		}
 		// a headerless stream is pushed back whole; a header is read exactly to its end
@@ -125,6 +137,16 @@ final class ProxyHeaderHandler extends ChannelInboundHandlerAdapter {
 			held.release();
 		}
 		ctx.pipeline().remove(this);
+	}
+
+	/**
+	 * Whether the header of this connection may be believed: the socket peer, which the
+	 * header cannot change, is a trusted proxy (or none is configured).
+	 */
+	private boolean trustsSource(ChannelHandlerContext ctx) {
+		SocketAddress remote = ctx.channel().remoteAddress();
+		InetAddress peer = remote instanceof InetSocketAddress inet ? inet.getAddress() : null;
+		return this.trustedProxy.test(peer);
 	}
 
 	private void fail(ChannelHandlerContext ctx, @Nullable String reason) {

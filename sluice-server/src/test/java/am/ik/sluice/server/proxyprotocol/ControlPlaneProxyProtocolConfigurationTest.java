@@ -7,6 +7,7 @@ import org.junit.jupiter.api.Test;
 import org.springframework.boot.test.context.runner.ApplicationContextRunner;
 
 import am.ik.sluice.server.config.SluiceServerProperties;
+import am.ik.sluice.server.proxy.AccessControl;
 import am.ik.sluice.server.proxyprotocol.ControlPlaneProxyProtocolConfiguration.ProxiedControlPlane;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -14,7 +15,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class ControlPlaneProxyProtocolConfigurationTest {
 
 	private final ApplicationContextRunner runner = new ApplicationContextRunner()
-		.withUserConfiguration(ControlPlaneProxyProtocolConfiguration.class);
+		.withUserConfiguration(ControlPlaneProxyProtocolConfiguration.class, AccessControl.class);
 
 	/**
 	 * The switch is read when the bean is created, not by a condition (evaluated at build

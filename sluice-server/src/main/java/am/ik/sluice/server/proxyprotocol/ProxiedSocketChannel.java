@@ -14,7 +14,7 @@ final class ProxiedSocketChannel extends NioSocketChannel {
 
 	ProxiedSocketChannel(ProxiedServerSocketChannel parent, SocketChannel socket) {
 		super(parent, socket);
-		pipeline().addFirst(new ProxyHeaderHandler(parent.headTimeout()));
+		pipeline().addFirst(new ProxyHeaderHandler(parent.headTimeout(), parent.trustedProxy()));
 	}
 
 	@Override
