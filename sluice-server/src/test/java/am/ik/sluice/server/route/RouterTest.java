@@ -6,6 +6,7 @@ import java.util.Map;
 
 import am.ik.sluice.v1.proto.Upstream;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.ValueSource;
 
@@ -512,6 +513,31 @@ class RouterTest {
 	 */
 	@Test
 	void theLiteralHostIsCarriedAlongsideThePatternKey() {
+		Router router = new Router();
+		router.register("c1",
+				List.of(Upstream.newBuilder()
+					.setHost("api.local")
+					.setHostPattern("api\\.local")
+					.setTargetUrl("http://127.0.0.1:3000")
+					.build()));
+		Router.Route route = router.lookup("api.local").orElseThrow();
+		assertThat(route.routeKey()).isEqualTo("api\\.local");
+		assertThat(route.literalHost()).isEqualTo("api.local");
+	}
+
+	/**
+	 * A pattern with catastrophic backtracking is abandoned once its character budget is
+	 * spent, so the lookup falls through instead of holding the event loop (the timeout
+	 * is a hang guard, not a speed assertion).
+	 */
+	@Test
+	@Timeout(10)
+	void aBacktrackingHostPatternGivesUpInsteadOfBlockingTheLookup() {
+		Router router = new Router();
+		router.register("c1", List.of(patternUpstream("(a+)+$", "http://127.0.0.1:3000")));
+		assertThat(router.lookup("a".repeat(64) + "!")).isEmpty();
+	}
+
 	@Test
 	void invalidHostPatternFallsBackToTheLiteralHost() {
 		Router router = new Router();

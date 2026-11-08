@@ -38,6 +38,13 @@ public class Router {
 	private static final Logger log = LoggerFactory.getLogger(Router.class);
 
 	/**
+	 * The characters one host pattern match may inspect before it is abandoned as a
+	 * non-match: a client-supplied pattern with catastrophic backtracking must not hold
+	 * the event loop for the time its worst case takes.
+	 */
+	private static final int HOST_MATCH_BUDGET = 1_000_000;
+
+	/**
 	 * Resolved route: the client owning the upstream, the domain the route is registered
 	 * under, its dial address, whether the request Host header is rewritten to the target
 	 * ({@code rewrite-host}), whether TLS connections are relayed untouched
@@ -569,7 +576,7 @@ public class Router {
 			for (Map.Entry<String, List<Target>> entry : this.byPattern.entrySet()) {
 				List<Target> targets = this.opened(entry.getKey(), entry.getValue());
 				Pattern pattern = entry.getValue().get(0).hostPattern();
-				if (targets != null && pattern != null && pattern.matcher(bareHost).matches()) {
+				if (targets != null && pattern != null && matches(pattern, bareHost)) {
 					return Optional.of(new Match(entry.getKey(), targets));
 				}
 			}
@@ -579,6 +586,77 @@ public class Router {
 			return Optional.empty();
 		}
 		return Optional.of(new Match("", catchAll));
+	}
+
+	/**
+	 * Whether the host matches the pattern within the character budget; a pattern that
+	 * exhausts it is a non-match, so the lookup falls through to the next candidate.
+	 */
+	private static boolean matches(Pattern pattern, String host) {
+		try {
+			return pattern.matcher(new BudgetedText(host, HOST_MATCH_BUDGET)).matches();
+		}
+		catch (BudgetedText.Exhausted e) {
+			log.debug("host pattern [{}] gave up after {} character comparisons", pattern.pattern(), HOST_MATCH_BUDGET);
+			return false;
+		}
+	}
+
+	/**
+	 * A {@link CharSequence} whose {@code charAt} stops the match once the budget is
+	 * spent: the regex engine's backtracking is bounded by the characters it reads, not
+	 * by the shapes it can take.
+	 */
+	private static final class BudgetedText implements CharSequence {
+
+		private final CharSequence text;
+
+		private final int[] remaining;
+
+		BudgetedText(CharSequence text, int budget) {
+			this(text, new int[] { budget });
+		}
+
+		private BudgetedText(CharSequence text, int[] remaining) {
+			this.text = text;
+			this.remaining = remaining;
+		}
+
+		@Override
+		public int length() {
+			return this.text.length();
+		}
+
+		@Override
+		public char charAt(int index) {
+			if (--this.remaining[0] < 0) {
+				throw Exhausted.INSTANCE;
+			}
+			return this.text.charAt(index);
+		}
+
+		@Override
+		public CharSequence subSequence(int start, int end) {
+			// the budget is shared: a capture group's subsequence cannot spend its own
+			return new BudgetedText(this.text.subSequence(start, end), this.remaining);
+		}
+
+		@Override
+		public String toString() {
+			return this.text.toString();
+		}
+
+		/** A control-flow signal, thrown once per exhausted match. */
+		private static final class Exhausted extends RuntimeException {
+
+			static final Exhausted INSTANCE = new Exhausted();
+
+			private Exhausted() {
+				super("the host pattern match budget is spent", null, false, false);
+			}
+
+		}
+
 	}
 
 	/**
