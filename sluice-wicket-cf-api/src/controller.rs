@@ -546,14 +546,19 @@ const WICKET_DEFAULT_BOOT_MS: u64 = 10_000;
 /// What a Firecracker wicket does not list of a route's `keep-ms`: its default.
 const WICKET_DEFAULT_KEEP_MS: u64 = 60_000;
 
-/// What an instance takes at once, unannotated; a Firecracker wicket's default of a route's
-/// `concurrency`, which it does not list.
-const DEFAULT_CONCURRENCY: u64 = 16;
+/// What an instance takes at once, unannotated: a component's requests, a pool VM's connections.
+/// Cloud Run's 80 is where it adds an instance; at `-i 1` this is where a request is turned
+/// away, so it is what a CF app's one instance takes, as many as a JVM's request threads.
+const DEFAULT_CONCURRENCY: u64 = 200;
+
+/// What a Firecracker wicket does not list of a pool route's `concurrency`: its default.
+const WICKET_DEFAULT_CONCURRENCY: u64 = 16;
 
 /// A rootfs's sandbox on a Firecracker wicket: `instances` VMs at most (from 1: 0 is no app),
 /// living as `lifetime` says. None annotated, a pool of that size cloned from a snapshot, at any
 /// size: a scale adds to the VMs running, and takes from them, in a restore's time (`boot`, annotated,
-/// a boot's). What is not annotated is the wicket's default. Its process has `timeout` seconds to
+/// a boot's). What is not annotated is the wicket's default, but a pool's `concurrency`
+/// ([`DEFAULT_CONCURRENCY`]). Its process has `timeout` seconds to
 /// listen, and connects to the destinations of `egress`.
 fn vm_sandbox(
     memory_mib: u64,
@@ -572,7 +577,11 @@ fn vm_sandbox(
         keep_ms: lifetime.keep_ms,
         uses: lifetime.uses,
         lifetime_ms: lifetime.lifetime_ms,
-        concurrency: lifetime.concurrency,
+        // what only a pool takes
+        concurrency: match mode {
+            "pool" => Some(lifetime.concurrency.unwrap_or(DEFAULT_CONCURRENCY)),
+            _ => lifetime.concurrency,
+        },
         boot_ms: Some(timeout.clamp(1, MAXIMUM_HEALTH_CHECK_TIMEOUT) * 1000),
         egress: egress.to_vec(),
         env: env.clone(),
@@ -634,7 +643,8 @@ fn same_vm(listed: &VmSandbox, desired: &VmSandbox) -> bool {
         _ => sandbox.instances,
     };
     let keep_ms = |sandbox: &VmSandbox| sandbox.keep_ms.unwrap_or(WICKET_DEFAULT_KEEP_MS);
-    let concurrency = |sandbox: &VmSandbox| sandbox.concurrency.unwrap_or(DEFAULT_CONCURRENCY);
+    let concurrency =
+        |sandbox: &VmSandbox| sandbox.concurrency.unwrap_or(WICKET_DEFAULT_CONCURRENCY);
     sorted(&listed.egress) == sorted(&desired.egress)
         && listed.mode == desired.mode
         && listed.memory_mib == desired.memory_mib
@@ -755,7 +765,7 @@ mod tests {
         let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
         (running.file, running.lifetime.mode) = ("hello.wasm".into(), None);
         // `cf scale` a component's limit too: the instances kept unless annotated, each taking
-        // `concurrency` at once (16 unless annotated), past what the wicket runs or not; as a
+        // `concurrency` at once (200 unless annotated), past what the wicket runs or not; as a
         // VM's, no lower than what the start keeps warm, which the wicket refuses. `keep-ms` as
         // annotated
         for (instances, warm, concurrency, keep_ms, kept, cap) in [
@@ -787,7 +797,7 @@ mod tests {
                 (
                     Some(kept),
                     Some(cap),
-                    Some(concurrency.unwrap_or(16)),
+                    Some(concurrency.unwrap_or(200)),
                     keep_ms
                 ),
                 "{instances} {warm:?} {concurrency:?} {keep_ms:?}"
@@ -814,8 +824,8 @@ mod tests {
         let body = serde_json::to_value(&desired).unwrap();
         assert_eq!(
             body["sandbox"],
-            serde_json::json!({"mode": "pool", "memory-mib": 64, "instances": 2, "boot-ms": 60_000,
-                "egress": ["db.internal:5432", "10.0.0.0/24:443"], "env": {"GREETING": "hello"}})
+            serde_json::json!({"mode": "pool", "memory-mib": 64, "instances": 2, "concurrency": 200,
+                "boot-ms": 60_000, "egress": ["db.internal:5432", "10.0.0.0/24:443"], "env": {"GREETING": "hello"}})
         );
         // as the wicket lists it: its vCPUs too, the env by its names
         let mut listed = body;
@@ -941,7 +951,8 @@ mod tests {
                     annotated.keep_ms,
                     annotated.uses,
                     annotated.lifetime_ms,
-                    annotated.concurrency
+                    // a pool's 200 unless annotated, the others' none
+                    (mode == "pool").then_some(annotated.concurrency.unwrap_or(200))
                 )
             );
         }

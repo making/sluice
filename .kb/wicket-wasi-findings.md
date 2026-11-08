@@ -66,6 +66,11 @@ it near 40k/s for the hello guest. `/hold/5` (the guest waits 5ms on a host time
 So the default stays 1 and CPU-bound routes spread over stores; the cf-api maps a CF instance
 to one store (memory, indices and the trap's reach as CF has them), `cf scale -i` adding cores.
 
+The cf-api's default of 200 (2026-11-08, same machine, `warm=1&instances=1`, `oha -c 200` for
+5s): `/hold/50` served 3.8k/s at 53ms on average (86ms the slowest) at `concurrency=200`, against
+340/s at 596ms (3.1s) at 16, the others waiting for room; `/` 26k/s against 34k/s. The wicket's
+RSS stayed 57-59MB, and the pool's fiber stacks (8 an instance of `--max-instances`) sufficed.
+
 What wasmtime 50 lets the host do with several requests in one store:
 
 - no guest task can be cancelled (wasmtime#11833; `wasmtime_wasi_http::handler` lets an expired

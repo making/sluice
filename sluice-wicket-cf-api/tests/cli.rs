@@ -831,8 +831,9 @@ fn the_cf_cli_deploys_to_the_wicket() {
     instances_come_to(&cf, "hello", "2/2");
     assert_eq!(listing(&console)["apps"][0]["sandbox"]["warm"], 2);
 
-    // `cf scale` the limit: an instance takes 16 requests at once, the next waits for one of
-    // them to end; what serves beside them is named as `cf app` lists it
+    // `cf scale` the limit: an instance takes `concurrency` requests at once (200 unless
+    // annotated), the next waits for one of them to end; what serves beside them is named as
+    // `cf app` lists it
     let limited = "limited.localhost";
     let manifest = dir.join("limited.yml");
     let budget = "applications:\n- name: limited\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/budget-ms: 30000\n";
@@ -855,7 +856,6 @@ fn the_cf_cli_deploys_to_the_wicket() {
         drop(streams);
         assert_eq!(waiting.recv_timeout(HANG).ok(), Some(200));
     };
-    beyond(16);
     let stream = held(&listen, limited, "/stall");
     assert_eq!(get(&listen, limited, "/log", None).0, 200);
     drop(stream);
@@ -892,7 +892,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
             count("keep-ms"),
         )
     };
-    assert_eq!(limits(), (Some(1), Some(1), Some(16), None));
+    assert_eq!(limits(), (Some(1), Some(1), Some(200), None));
     annotate(
         &cf,
         "limited",

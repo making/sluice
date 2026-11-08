@@ -811,7 +811,7 @@ Cloud Run's do:
 | setting | what it is | Cloud Run | default |
 |---|---|---|---|
 | `instances` (`cf scale -i N`) | the most instances alive at once | maximum instances | 1 |
-| annotation `wicket.sluice.ik.am/concurrency` | what an instance takes at once: a component's requests, a `pool` VM's connections | concurrency | 16 |
+| annotation `wicket.sluice.ik.am/concurrency` | what an instance takes at once: a component's requests, a `pool` VM's connections | concurrency | 200 |
 | annotation `wicket.sluice.ik.am/warm` | the instances kept up with no request, from 0 to N | minimum instances | N, as on CF; a VM per connection: 0 |
 
 - **A component's instance** is one wasm instance (a store) taking `concurrency` requests at
@@ -824,8 +824,8 @@ Cloud Run's do:
 
   | request | served by |
   |---|---|
-  | the 1st to the 16th | the warm instance, at once |
-  | the 17th | the first of them to end, waited for within its `budget-ms`, then a 503 |
+  | the 1st to the 200th | the warm instance, at once |
+  | the 201st | the first of them to end, waited for within its `budget-ms`, then a 503 |
 
   A request no warm instance has room for, within `instances`, starts one, which takes the next
   ones as the warm do and ends once it serves none; annotated `keep-ms`, it is kept until it
@@ -880,9 +880,11 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
 | `pool` VM | N VMs (`instances`), each taking `concurrency` connections before the pool grows | as `concurrency` has it |
 | `per-connection`, `reuse` VM | N VMs (`instances`): the memory is N x `memory-mib`, as CF's quota counts it | N connections |
 
-- **`concurrency`** (`wicket.sluice.ik.am/concurrency`) is from 1, 16 by default, the route's
-  `concurrency`. `-i 1` with no annotation behaves as a CF app: a component takes 16 requests at once, a
-  pool of one VM any number of connections. A component wanting one request at a time per instance
+- **`concurrency`** (`wicket.sluice.ik.am/concurrency`) is from 1, 200 by default, the route's
+  `concurrency`. Cloud Run's 80 is where it adds an instance; at `-i 1` there is none to add, so
+  the default is where a request is turned away: a CF instance has no such limit, a JVM's request
+  threads are 200. `-i 1` with no annotation behaves as a CF app: a component takes 200 requests at
+  once, a pool of one VM any number of connections. A component wanting one request at a time per instance
   annotates 1. `boot`, growing none past N, has none to decide and a VM per connection is 1 by
   definition: those modes refuse it
 - **It means what each can tell.** A component's counts requests, and is hard: one past the limit
