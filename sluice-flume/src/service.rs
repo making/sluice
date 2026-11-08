@@ -74,7 +74,8 @@ impl Flume for FlumeService {
         let request = request.into_inner();
         let watch = self
             .hub
-            .watch(request.filter.unwrap_or_default(), request.after);
+            .watch(request.filter.unwrap_or_default(), request.after)
+            .map_err(Status::invalid_argument)?;
         let (sender, receiver) = mpsc::channel(WATCH_BUFFER);
         tokio::spawn(relay(self.hub.clone(), watch, sender));
         Ok(Response::new(ReceiverStream::new(receiver)))

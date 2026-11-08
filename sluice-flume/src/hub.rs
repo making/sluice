@@ -85,12 +85,14 @@ struct State {
     watchers: HashMap<u64, AccessFilter>,
     /// What each node is to feed, from the watchers naming it, kept as the
     /// watchers register and unregister.
+    steer: HashMap<String, Steer>,
     next_id: u64,
 }
 
 /// A node's watchers, counted so a registration adds one filter's entries
 /// instead of reuniting every watcher's.
 #[derive(Default)]
+struct Steer {
     /// The watchers naming the node, or every node.
     watchers: usize,
     /// Those of them asking every route (or kind): nothing is then excluded.
@@ -100,6 +102,7 @@ struct State {
     kinds: HashMap<String, usize>,
 }
 
+impl Steer {
     fn add(&mut self, filter: &AccessFilter) {
         self.watchers += 1;
         if filter.route_keys.is_empty() {
@@ -243,6 +246,8 @@ impl Hub {
                 connected: true,
             }));
         }
+        // a node coming back is told what the watchers already ask of it
+        Self::rebuild(&mut state, node_id);
         Self::steer(&mut state, node_id);
         (id, receiver)
     }
@@ -303,7 +308,12 @@ impl Hub {
     /// Opens a watch: the events to send first (hello, node states, backfill),
     /// the live receiver continuing right after them, the sequence the
     /// snapshot reached, and the guard keeping the watcher registered.
-    pub fn watch(self: &Arc<Self>, filter: AccessFilter, after: Option<Cursor>) -> Watch {
+    pub fn watch(
+        self: &Arc<Self>,
+        filter: AccessFilter,
+        after: Option<Cursor>,
+    ) -> Result<Watch, String> {
+        Self::check(&filter)?;
         let mut state = self.state();
         let live = self.live.subscribe();
         let resume = after.filter(|cursor| cursor.epoch == self.epoch);
@@ -330,12 +340,17 @@ impl Hub {
         }
         state.next_id += 1;
         let id = state.next_id;
-        state.watchers.insert(id, filter.clone());
-        let nodes: Vec<String> = state.nodes.keys().cloned().collect();
-        for node_id in nodes {
-            Self::steer(&mut state, &node_id);
+        let affected = Self::affected(&state, &filter);
+        for node_id in &affected {
+            state.steer.entry(node_id.clone()).or_default().add(&filter);
         }
-        Watch {
+        state.watchers.insert(id, filter.clone());
+        for node_id in &affected {
+            if state.nodes.contains_key(node_id) {
+                Self::steer(&mut state, node_id);
+            }
+        }
+        Ok(Watch {
             first,
             live,
             seq: state.seq,
@@ -344,6 +359,34 @@ impl Hub {
                 hub: self.clone(),
                 id,
             },
+        })
+    }
+
+    /// Refuses a filter of more entries than [`MAX_FILTER_ENTRIES`] in a list.
+    fn check(filter: &AccessFilter) -> Result<(), String> {
+        for (what, entries) in [
+            ("route keys", filter.route_keys.len()),
+            ("kinds", filter.kinds.len()),
+            ("node ids", filter.node_ids.len()),
+        ] {
+            if entries > MAX_FILTER_ENTRIES {
+                return Err(format!(
+                    "the watch filter names {entries} {what}: at most {MAX_FILTER_ENTRIES} are kept"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The nodes a watcher's registration or removal steers: those it names,
+    /// or, naming none, every node there is at the time (one connecting later
+    /// is steered from the watchers then).
+    fn affected(state: &State, filter: &AccessFilter) -> Vec<String> {
+        if filter.node_ids.is_empty() {
+            state.nodes.keys().cloned().collect()
+        } else {
+            let nodes: BTreeSet<String> = filter.node_ids.iter().cloned().collect();
+            nodes.into_iter().collect()
         }
     }
 
@@ -401,25 +444,25 @@ impl Hub {
         events
     }
 
-    /// Tells the node's feed what to send for the watchers now registered:
-    /// the union of their filters naming it, or nothing at all.
+    /// The node's watchers, read from every watcher: the node's state when it
+    /// connects.
+    fn rebuild(state: &mut State, node_id: &str) {
+        let mut steer = Steer::default();
+        for filter in state.watchers.values() {
+            if filter.node_ids.is_empty() || filter.node_ids.iter().any(|id| id == node_id) {
+                steer.add(filter);
+            }
+        }
+        state.steer.insert(node_id.to_string(), steer);
+    }
+
+    /// Tells the node's feed what its watchers ask of it, or nothing at all.
     fn steer(state: &mut State, node_id: &str) {
-        let filters: Vec<&AccessFilter> = state
-            .watchers
-            .values()
-            .filter(|filter| {
-                filter.node_ids.is_empty() || filter.node_ids.iter().any(|id| id == node_id)
-            })
-            .collect();
-        let desired = if filters.is_empty() {
-            Desired::Stop
-        } else {
-            Desired::Start(AccessFilter {
-                route_keys: union(filters.iter().map(|filter| &filter.route_keys)),
-                kinds: union(filters.iter().map(|filter| &filter.kinds)),
-                node_ids: Vec::new(),
-            })
-        };
+        let desired = state
+            .steer
+            .get(node_id)
+            .map(Steer::desired)
+            .unwrap_or(Desired::Stop);
         let Some(node) = state.nodes.get(node_id) else {
             return;
         };
@@ -454,10 +497,30 @@ impl Hub {
 
     fn unregister(&self, id: u64) {
         let mut state = self.state();
-        state.watchers.remove(&id);
-        let nodes: Vec<String> = state.nodes.keys().cloned().collect();
-        for node_id in nodes {
-            Self::steer(&mut state, &node_id);
+        let Some(filter) = state.watchers.remove(&id) else {
+            return;
+        };
+        let affected = Self::affected(&state, &filter);
+        for node_id in &affected {
+            if let Some(steer) = state.steer.get_mut(node_id) {
+                steer.remove(&filter);
+            }
+        }
+        // a node gone from the table leaves nothing to steer; keep its entry
+        // only while a watcher names it
+        for node_id in &affected {
+            let empty = state
+                .steer
+                .get(node_id)
+                .is_some_and(|steer| steer.watchers == 0);
+            if empty && !state.nodes.contains_key(node_id) {
+                state.steer.remove(node_id);
+            }
+        }
+        for node_id in &affected {
+            if state.nodes.contains_key(node_id) {
+                Self::steer(&mut state, node_id);
+            }
         }
     }
 }
@@ -482,18 +545,6 @@ impl Drop for WatcherGuard {
     fn drop(&mut self) {
         self.hub.unregister(self.id);
     }
-}
-
-/// Empty (everything) when any of the lists is, else every entry once, sorted.
-fn union<'a>(lists: impl Iterator<Item = &'a Vec<String>>) -> Vec<String> {
-    let mut all = BTreeSet::new();
-    for list in lists {
-        if list.is_empty() {
-            return Vec::new();
-        }
-        all.extend(list.iter().cloned());
-    }
-    all.into_iter().collect()
 }
 
 /// Whether the line passes the filter; a node's dropped lines pass unless the
@@ -582,3 +633,41 @@ mod tests {
 
     #[test]
     fn one_line_larger_than_the_budget_is_kept_alone() {
+        let hub = Hub::new(100, 16, 10);
+        hub.publish("n", event(&"v".repeat(1024)));
+        let state = hub.state();
+        assert_eq!(state.ring.len(), 1);
+        assert!(state.retained > 16);
+    }
+
+    #[test]
+    fn a_watch_filter_is_capped() {
+        let hub = Arc::new(Hub::new(10, 1 << 20, 10));
+        let keys = |count: usize| -> Vec<String> { (0..count).map(|i| format!("r{i}")).collect() };
+        let at = |count: usize| AccessFilter {
+            route_keys: keys(count),
+            ..Default::default()
+        };
+        assert!(hub.watch(at(MAX_FILTER_ENTRIES), None).is_ok());
+        assert!(hub.watch(at(MAX_FILTER_ENTRIES + 1), None).is_err());
+    }
+
+    #[test]
+    fn watchers_steer_a_node_as_they_come_and_go() {
+        let hub = Arc::new(Hub::new(10, 1 << 20, 10));
+        let (_node, mut control) = hub.connect("n1", "boot");
+        let watch = hub
+            .watch(filter(&["r1"], &[]), None)
+            .expect("a small filter is accepted");
+        assert_eq!(started(&mut control).route_keys, vec!["r1".to_string()]);
+        drop(watch);
+        let stop = control.borrow_and_update().clone();
+        assert!(
+            matches!(
+                stop.as_ref().and_then(|control| control.body.as_ref()),
+                Some(feed_control::Body::Stop(_))
+            ),
+            "a node whose watchers are gone is stopped"
+        );
+    }
+}
