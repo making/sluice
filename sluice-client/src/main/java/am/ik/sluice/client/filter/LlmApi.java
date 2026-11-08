@@ -41,7 +41,10 @@ enum LlmApi {
 		return this != ANTHROPIC;
 	}
 
-	/** The API of a request, by its exact path; null for another request. */
+	/**
+	 * The API of a request, by its exact path, the {@code /v1} prefix aside; null for
+	 * another request.
+	 */
 	static @Nullable LlmApi of(String method, String path) {
 		if (!method.equals("POST")) {
 			return null;
@@ -69,12 +72,18 @@ enum LlmApi {
 		return ofPath("/" + String.join("/", segments).toLowerCase(Locale.ROOT));
 	}
 
+	/**
+	 * The API of a path, the {@code /v1} prefix aside: some upstreams serve the same
+	 * endpoints without it ({@code /chat/completions}), and a request there is as much
+	 * one of the API's.
+	 */
 	private static @Nullable LlmApi ofPath(String path) {
-		return switch (path) {
-			case "/v1/chat/completions" -> CHAT;
-			case "/v1/completions" -> COMPLETIONS;
-			case "/v1/responses" -> RESPONSES;
-			case "/v1/messages" -> ANTHROPIC;
+		String bare = path.startsWith("/v1/") ? path.substring("/v1".length()) : path;
+		return switch (bare) {
+			case "/chat/completions" -> CHAT;
+			case "/completions" -> COMPLETIONS;
+			case "/responses" -> RESPONSES;
+			case "/messages" -> ANTHROPIC;
 			default -> null;
 		};
 	}

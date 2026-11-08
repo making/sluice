@@ -115,6 +115,13 @@ class LlmUsageFilterTest {
 				new Usage("/v1/messages", sse(ANTHROPIC_START,
 						"event: error\ndata: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n"),
 						tokens("anthropic", "claude", 2679, 3, 11, 7, "true", "error")),
+				// an upstream serving them without the /v1 prefix is counting too
+				new Usage("/chat/completions",
+						json("{\"model\":\"gpt\",\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":9}}"),
+						tokens("openai", "gpt", 8, 9, 0, 0, "false", "complete")),
+				new Usage("/messages",
+						json("{\"model\":\"claude\",\"usage\":{\"input_tokens\":4,\"output_tokens\":5}}"),
+						tokens("anthropic", "claude", 4, 5, 0, 0, "false", "complete")),
 				new Usage("/v1/messages/count_tokens", json("{\"input_tokens\":3}"), Map.of()),
 				new Usage("/v1/messages",
 						"HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
@@ -220,6 +227,8 @@ class LlmUsageFilterTest {
 				"{\"stream\":true,\"stream_options\":{\"include_usage\":false}}")) {
 			assertThat(upstreamOf(include, "/v1/chat/completions", body, 1024)).isEqualTo(sized(body));
 		}
+		// the /v1 prefix aside, it is the same API
+		assertThat(upstreamOf(include, "/chat/completions", stream, 1024)).isEqualTo(sized(added));
 		assertThat(upstreamOf(include, "/v1/messages", stream, 1024)).isEqualTo(sized(stream));
 		// not set: the body is not even held
 		assertThat(upstreamOf(usage().build(), "/v1/chat/completions", stream, 1024)).isEqualTo(sized(stream));

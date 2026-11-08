@@ -140,7 +140,9 @@ class LlmGuardFilterTest {
 		Map<String, String> bodies = Map.of("/v1/messages",
 				"{ \"model\" : \"claude-sonnet-4-5\", \"max_tokens\": 1024, \"messages\":[{\"model\":\"x\",\"max_tokens\":9}], \"stream\":true }",
 				"/v1/chat/completions", "{\"model\":\"gpt-4\\u006f\",\"max_tokens\":1,\"max_completion_tokens\":1.0E3}",
-				"/v1/responses", "{\"model\":\"gpt-4o\",\"max_output_tokens\":7,\"input\":\"\\u00e9 あ\"}");
+				"/v1/responses", "{\"model\":\"gpt-4o\",\"max_output_tokens\":7,\"input\":\"\\u00e9 あ\"}",
+				// the /v1 prefix aside, guarded as the same API
+				"/chat/completions", "{\"model\":\"gpt-4o\",\"max_tokens\":1024}");
 		for (Map.Entry<String, String> body : bodies.entrySet()) {
 			for (boolean chunked : new boolean[] { false, true }) {
 				String request = FilterTests
@@ -161,7 +163,7 @@ class LlmGuardFilterTest {
 					.upstream())
 			.isEqualTo(others);
 		assertThat(FilterTests.counters(registry))
-			.isEqualTo(Map.of("llm.guard.requests anthropic allowed", 2L, "llm.guard.requests openai allowed", 4L));
+			.isEqualTo(Map.of("llm.guard.requests anthropic allowed", 2L, "llm.guard.requests openai allowed", 6L));
 	}
 
 	private record Lowered(String path, String body, String lowered) {

@@ -21,8 +21,9 @@ import org.springframework.util.unit.DataSize;
 /**
  * The token usage of the OpenAI compatible APIs and of the Anthropic API, read from their
  * responses as they pass: one scanner of JSON and server-sent events, a dialect per API
- * chosen by exact request path, the same counters out. It holds nothing of a response, so
- * a filtered connection costs no more for it.
+ * chosen by exact request path (the {@code /v1} prefix aside, as some upstreams serve the
+ * endpoints without it), the same counters out. It holds nothing of a response, so a
+ * filtered connection costs no more for it.
  * <p>
  * {@code include-usage} ({@code args}) adds {@code stream_options.include_usage} to a
  * request of a stream that does not set it: an OpenAI compatible stream reports no usage
