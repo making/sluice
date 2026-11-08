@@ -691,6 +691,7 @@ mod tests {
             offering: offering.into(),
             plan: plan.into(),
             tags: Vec::new(),
+            credentials: Default::default(),
             created_at: now(),
             updated_at: now(),
         });
@@ -768,17 +769,22 @@ mod tests {
         );
 
         // services: an instance by name, or with the binding's parameters
-        // and name; again, the bindings stay as they are
+        // and name; again, the bindings stay as they are. A user-provided
+        // instance grants nothing: its credentials are in VCAP_SERVICES
         let kv = instance(&mut state, "kv", "keyvalue", "local");
         let sessions = instance(&mut state, "sessions", "keyvalue", "shared");
         instance(&mut state, "net", "wasi", "inherit-network");
+        let creds = instance(&mut state, "creds", services::USER_PROVIDED, "");
+        state.instances.last_mut().unwrap().credentials =
+            json!({"password": "s3cr3t"}).as_object().unwrap().clone();
+        state.instances.last_mut().unwrap().tags = vec!["db".into()];
         let bound = parse(
-            "applications:\n- name: counter\n  services:\n  - kv\n  - name: sessions\n    binding_name: s\n    parameters:\n      identifier: sessions\n  - net\n",
+            "applications:\n- name: counter\n  services:\n  - kv\n  - name: sessions\n    binding_name: s\n    parameters:\n      identifier: sessions\n  - net\n  - creds\n",
         )
         .unwrap();
         apply(&mut state, &bound, None).unwrap();
         apply(&mut state, &bound, None).unwrap();
-        assert_eq!(state.bindings.len(), 3);
+        assert_eq!(state.bindings.len(), 4);
         let (wasi, keyvalue) = services::grants(&state, &guids[0]);
         assert_eq!(wasi, ["cli", "inherit-network", "keyvalue"]);
         assert_eq!(
@@ -805,6 +811,23 @@ mod tests {
         assert_eq!(
             vcap["wasi"][0]["credentials"],
             json!({"capabilities": ["inherit-network", "cli"]})
+        );
+        let provided = vcap["user-provided"][0].as_object().unwrap();
+        assert_eq!(
+            (
+                &provided["label"],
+                &provided["instance_guid"],
+                &provided["credentials"],
+                &provided["tags"],
+                provided.contains_key("plan"),
+            ),
+            (
+                &json!("user-provided"),
+                &json!(creds),
+                &json!({"password": "s3cr3t"}),
+                &json!(["db"]),
+                false
+            )
         );
         let written = parse(&crate::views::manifest(&state, &app)).unwrap();
         let mut again = state.clone();
@@ -877,6 +900,7 @@ mod tests {
             ("kv", "keyvalue", "local"),
             ("other", "keyvalue", "local"),
             ("net", "wasi", "tcp"),
+            ("creds", services::USER_PROVIDED, ""),
         ] {
             instance(&mut state, name, offering, plan);
         }
@@ -897,6 +921,10 @@ mod tests {
             (
                 "- name: kv\n    parameters: {store: x}",
                 "takes the parameter 'identifier' only",
+            ),
+            (
+                "- name: creds\n    parameters: {x: 1}",
+                "Binding parameters are not supported for user-provided service instances",
             ),
             // the last: kv is bound then
             (

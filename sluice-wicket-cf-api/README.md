@@ -14,7 +14,7 @@ What `cf push` deploys depends on the wicket, whose listing names its runtime:
 | the wicket | [sluice-wicket-runtime-wasi](../sluice-wicket-runtime-wasi/README.md#apps) | [sluice-wicket-runtime-firecracker](../sluice-wicket-runtime-firecracker/README.md#apps) |
 | an app | a wasm component: its bits, or an image in an OCI registry; or a [static site](#static-sites): html, css, js | a container image, a CNB image say, or a rootfs in a zip: microVMs |
 | the cf-api | a process or a container next to the wicket | an app of the wicket, in a VM with a disk, or next to it |
-| services | the wicket's keyvalue stores and capabilities | none |
+| services | the wicket's keyvalue stores and capabilities; [user-provided](#user-provided-services) | [user-provided](#user-provided-services) |
 | `cf logs` | the app's output and requests | the process's output |
 
 The rest holds for both: [Options](#options), [Mapping](#mapping), [Behavior](#behavior),
@@ -266,6 +266,7 @@ another OpenID Provider and the like.
 | keyvalue service instance | the namespace `cf/<instance guid>` of its plan's store |
 | binding to a keyvalue instance | the sandbox's `keyvalue` map: its identifier (parameter `identifier`, default `""`) -> `<store>/cf/<instance guid>`, and the capability `keyvalue` |
 | binding to a wasi instance | the plan's capability; a network one `cli` too |
+| user-provided service instance | its credentials in `VCAP_SERVICES`, nothing granted ([User-provided services](#user-provided-services)) |
 
 ### Static sites
 
@@ -323,7 +324,22 @@ config.
   one included (`DELETE /api/keyvalue/<store>/<namespace>`, tried at the deletion and after each
   listing of the wicket). `cf purge-service-instance` drops the bindings with the instance
 - `cf rename-service` and `cf update-service -t` apply at once; a plan change, instance
-  parameters, service keys, user-provided instances and sharing are refused (422)
+  parameters, service keys and sharing are refused (422)
+
+### User-provided services
+
+On either wicket, `cf create-user-provided-service <name> -p '<json>' [-t <tags>]` keeps the
+credentials, and `cf bind-service` gives them to the app in `VCAP_SERVICES` (`user-provided`,
+as on CF), granting nothing else:
+
+- as a binding, new credentials (`cf update-user-provided-service -p`, which replaces them)
+  apply at the app's next start, restart, restage or deployment; `cf env` shows the current
+  ones. Binding parameters (`-c`), a syslog drain (`-l`) and a route service (`-r`) are refused
+  (422)
+- the credentials are a secret, as an environment variable's value: in `state.json` (0600) and
+  the guest's env, in no log and no listing of the wicket. 64 KiB of JSON at most; a start
+  whose env would be more than the 128 KiB the wicket takes is refused, naming the size
+- creating, updating, binding, unbinding and deleting answer at once (no job), as on CF
 
 ## On a Firecracker wicket
 
@@ -643,7 +659,7 @@ The wicket's listing says `runtime: firecracker`.
 | web process `health_check` `timeout` (`cf push -t`) | `boot-ms`, 60s by default and 180s at most as on CF: how long the process may take to listen, in the request that starts it. A process exiting first is refused at once |
 | environment variables, `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: the process's environment, over the image's (its `PORT` is `/init`'s) |
 | disk | no effect: the rootfs is read-only and `/tmp` a tmpfs of the VM's memory; a persistent disk is the wicket API's, with no CF counterpart |
-| services | none: the listing offers neither capabilities nor keyvalue stores |
+| services | [user-provided](#user-provided-services) ones: the listing offers neither capabilities nor keyvalue stores |
 | outbound connections | the [security groups](#security-groups): the route's `egress`. An app reaches no other host |
 | `cf logs` | the process's output, naming the VM (`APP/PROC/WEB/<index>`): the lowest index free among the VMs alive, so `0` to `instances - 1` in every mode, modulo `instances` for a VM past a scale down finishing its connections: what `cf app` lists. No `RTR` line: this wicket feeds no requests to the flume |
 | annotations | [how long a VM lives](#how-long-a-vm-lives); `budget-ms`, a component's, is refused |
@@ -1000,8 +1016,8 @@ the first sign-in and keeps it. Dex, Keycloak, Entra ID, Google and the like ser
 ## Limits
 
 Refused with why (422): route paths, ports and wildcards, private and internal domains, tasks,
-ssh, sidecars, process types but `web`, route services, environment variable groups,
-user-provided services, service keys. One owner (`cf`) per wicket: two cf-apis must not share one.
+ssh, sidecars, process types but `web`, route services, syslog drains, environment variable
+groups, service keys. One owner (`cf`) per wicket: two cf-apis must not share one.
 No roles: whoever may log in may do everything, but for the
 [security groups](#security-groups).
 

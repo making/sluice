@@ -2206,7 +2206,11 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
         lifetime,
         wasi,
         keyvalue,
-        env: env::guest(base, state, app),
+        env: {
+            let env = env::guest(base, state, app);
+            env::check_guest(&env).map_err(ApiError::unprocessable)?;
+            env
+        },
         egress: security_groups::egress(state)?,
         tag: Some(env::tag()),
         since: epoch_secs(),

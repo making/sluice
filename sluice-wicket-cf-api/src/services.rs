@@ -13,6 +13,12 @@
 //! once. An instance bound is not deleted; a keyvalue one deleted has its
 //! data deleted once no app maps it (see [`Controller::purge_pending`]).
 //!
+//! A user-provided instance is the user's credentials (`cf
+//! create-user-provided-service -p`), given the apps bound in
+//! `VCAP_SERVICES` and nothing more: it grants no capability, on either
+//! wicket. As on CF, its operations answer at once (no job), and new
+//! credentials apply at the next start, as a binding.
+//!
 //! [`Controller::purge_pending`]: crate::controller::Controller::purge_pending
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -29,12 +35,18 @@ use crate::wicket::ListedStore;
 pub const BROKER: &str = "sluice-wicket";
 pub const KEYVALUE: &str = "keyvalue";
 pub const WASI: &str = "wasi";
+/// The offering of the user's instances: no broker's, no plan.
+pub const USER_PROVIDED: &str = "user-provided";
 const OFFERINGS: [&str; 2] = [KEYVALUE, WASI];
 /// The capabilities of wasi:sockets: linked only with `cli`, they grant it
 /// too.
 const NETWORK: [&str; 4] = ["inherit-network", "allow-ip-name-lookup", "tcp", "udp"];
 /// Longest instance name, binding name and keyvalue identifier.
 const MAX_NAME: usize = 255;
+/// The most a user-provided instance's credentials hold, as JSON: as the
+/// user's variables, half of an env the wicket takes; a start checks the
+/// whole env ([`crate::env::check_guest`]).
+const MAX_CREDENTIALS: usize = crate::env::MAX_BYTES;
 /// When the broker, the offerings and the plans were made: they have no
 /// history.
 const EPOCH: &str = "2026-01-01T00:00:00Z";
@@ -134,14 +146,16 @@ pub fn grants(state: &State, app: &str) -> (Vec<String>, BTreeMap<String, String
         let Some(instance) = state.instance(&binding.instance) else {
             continue;
         };
-        if instance.offering == KEYVALUE {
-            wasi.insert(KEYVALUE.to_string());
-            keyvalue.insert(
-                binding.identifier.clone(),
-                format!("{}/{}", instance.plan, namespace(&instance.guid)),
-            );
-        } else {
-            wasi.extend(granted(&instance.plan));
+        match instance.offering.as_str() {
+            KEYVALUE => {
+                wasi.insert(KEYVALUE.to_string());
+                keyvalue.insert(
+                    binding.identifier.clone(),
+                    format!("{}/{}", instance.plan, namespace(&instance.guid)),
+                );
+            }
+            WASI => wasi.extend(granted(&instance.plan)),
+            _ => {}
         }
     }
     (wasi.into_iter().collect(), keyvalue)
@@ -238,6 +252,11 @@ fn identifier(instance: &Instance, parameters: &Value) -> Result<String, String>
         Value::Object(given) => given,
         _ => return Err("the parameters are a JSON object".into()),
     };
+    if instance.user_provided() && !given.is_empty() {
+        return Err(
+            "Binding parameters are not supported for user-provided service instances".into(),
+        );
+    }
     if instance.offering != KEYVALUE {
         return match given.keys().next() {
             None => Ok(String::new()),
@@ -270,13 +289,15 @@ fn check_name(what: &str, name: &str) -> Result<(), String> {
     }
 }
 
-/// What a binding gives the app: where its namespace lives, or the
-/// capabilities granted.
+/// What a binding gives the app: where its namespace lives, the
+/// capabilities granted, or the user's credentials.
 fn credentials(instance: &Instance, binding: &Binding) -> Value {
-    if instance.offering == KEYVALUE {
-        json!({"store": instance.plan, "namespace": namespace(&instance.guid), "identifier": binding.identifier})
-    } else {
-        json!({"capabilities": granted(&instance.plan)})
+    match instance.offering.as_str() {
+        KEYVALUE => {
+            json!({"store": instance.plan, "namespace": namespace(&instance.guid), "identifier": binding.identifier})
+        }
+        USER_PROVIDED => Value::Object(instance.credentials.clone()),
+        _ => json!({"capabilities": granted(&instance.plan)}),
     }
 }
 
@@ -287,25 +308,32 @@ pub fn vcap_services(state: &State, app: &str) -> Value {
         let Some(instance) = state.instance(&binding.instance) else {
             continue;
         };
-        let mut tags = vec![instance.offering.clone()];
+        // a user-provided instance's tags are its own, and it has no plan
+        let mut tags = Vec::new();
+        if !instance.user_provided() {
+            tags.push(instance.offering.clone());
+        }
         tags.extend(instance.tags.iter().cloned());
+        let mut entry = json!({
+            "binding_guid": binding.guid,
+            "binding_name": binding.name,
+            "credentials": credentials(instance, binding),
+            "instance_guid": instance.guid,
+            "instance_name": instance.name,
+            "label": instance.offering,
+            "name": binding.name.as_ref().unwrap_or(&instance.name),
+            "syslog_drain_url": null,
+            "tags": tags,
+            "volume_mounts": [],
+        });
+        if !instance.user_provided() {
+            entry["plan"] = json!(instance.plan);
+            entry["provider"] = Value::Null;
+        }
         services
             .entry(instance.offering.as_str())
             .or_default()
-            .push(json!({
-                "binding_guid": binding.guid,
-                "binding_name": binding.name,
-                "credentials": credentials(instance, binding),
-                "instance_guid": instance.guid,
-                "instance_name": instance.name,
-                "label": instance.offering,
-                "name": binding.name.as_ref().unwrap_or(&instance.name),
-                "plan": instance.plan,
-                "provider": null,
-                "syslog_drain_url": null,
-                "tags": tags,
-                "volume_mounts": [],
-            }));
+            .push(entry);
     }
     json!(services)
 }
@@ -318,7 +346,11 @@ fn catalog(offer: &Offer, state: &State) -> Vec<(Plan, bool)> {
         .iter()
         .map(|plan| (plan.clone(), true))
         .collect();
-    for instance in &state.instances {
+    for instance in state
+        .instances
+        .iter()
+        .filter(|instance| !instance.user_provided())
+    {
         if !plans
             .iter()
             .any(|(plan, _)| plan.offering == instance.offering && plan.name == instance.plan)
@@ -431,15 +463,33 @@ fn instance_view(base: &str, state: &State, instance: &Instance) -> Value {
     } else {
         "update"
     };
+    let last_operation = json!({
+        "type": operation, "state": "succeeded", "description": "",
+        "created_at": instance.updated_at, "updated_at": instance.updated_at,
+    });
+    if instance.user_provided() {
+        return json!({
+            "guid": guid, "created_at": instance.created_at, "updated_at": instance.updated_at,
+            "name": instance.name, "type": USER_PROVIDED, "tags": instance.tags,
+            "syslog_drain_url": null, "route_service_url": null,
+            "last_operation": last_operation,
+            "relationships": {"space": {"data": {"guid": state.space.guid}}},
+            "metadata": metadata(),
+            "links": {
+                "self": {"href": format!("{base}/v3/service_instances/{guid}")},
+                "space": {"href": format!("{base}/v3/spaces/{}", state.space.guid)},
+                "credentials": {"href": format!("{base}/v3/service_instances/{guid}/credentials")},
+                "service_credential_bindings": {"href": format!("{base}/v3/service_credential_bindings?service_instance_guids={guid}")},
+                "service_route_bindings": {"href": format!("{base}/v3/service_route_bindings?service_instance_guids={guid}")},
+            },
+        });
+    }
     json!({
         "guid": guid, "created_at": instance.created_at, "updated_at": instance.updated_at,
         "name": instance.name, "type": "managed",
         "tags": instance.tags, "dashboard_url": null, "upgrade_available": false,
         "maintenance_info": {},
-        "last_operation": {
-            "type": operation, "state": "succeeded", "description": "",
-            "created_at": instance.updated_at, "updated_at": instance.updated_at,
-        },
+        "last_operation": last_operation,
         "relationships": {
             "space": {"data": {"guid": state.space.guid}},
             "service_plan": {"data": {"guid": plan}},
@@ -565,6 +615,52 @@ fn name_taken(name: &str) -> ApiError {
     }
 }
 
+/// Refuses what a user-provided instance cannot have here: a syslog drain
+/// (no drain gets the apps' logs) and a route service (none is), its
+/// parameters (it has credentials), a plan.
+fn user_provided_only(body: &Value) -> Result<(), ApiError> {
+    let set = |key: &str| body[key].as_str().is_some_and(|url| !url.is_empty());
+    if set("syslog_drain_url") {
+        return Err(ApiError::unprocessable(
+            "a syslog drain is not supported: cf logs reads the apps' logs",
+        ));
+    }
+    if set("route_service_url") {
+        return Err(ApiError::unprocessable("route services are not supported"));
+    }
+    if !body["parameters"].is_null() {
+        return Err(ApiError::unprocessable(
+            "a user-provided service instance takes credentials, not parameters (-p)",
+        ));
+    }
+    if !body["relationships"]["service_plan"].is_null() {
+        return Err(ApiError::unprocessable(
+            "a user-provided service instance has no plan",
+        ));
+    }
+    Ok(())
+}
+
+/// A user-provided instance's credentials as given: a JSON object of
+/// [`MAX_CREDENTIALS`] at most, or none (null, absent). An error holds no
+/// value.
+fn user_credentials(value: &Value) -> Result<Option<Map<String, Value>>, ApiError> {
+    match value {
+        Value::Null => Ok(None),
+        Value::Object(credentials) => {
+            let bytes = value.to_string().len();
+            if bytes > MAX_CREDENTIALS {
+                return Err(ApiError::unprocessable(format!(
+                    "the credentials hold {bytes} bytes of JSON, more than {} KiB",
+                    MAX_CREDENTIALS >> 10
+                )));
+            }
+            Ok(Some(credentials.clone()))
+        }
+        _ => Err(ApiError::unprocessable("the credentials are a JSON object")),
+    }
+}
+
 impl Api {
     /// `/v3/service_*`.
     pub(crate) async fn services(&self, req: &Req, segments: &[&str]) -> Reply {
@@ -674,11 +770,27 @@ impl Api {
             (&Method::PATCH, ["service_instances", guid]) => self.update_instance(req, guid).await,
             (&Method::DELETE, ["service_instances", guid]) => self.delete_instance(req, guid).await,
             (&Method::GET, ["service_instances", guid, "parameters"]) => {
-                self.store
-                    .read(|state| state.instance(guid).map(|_| ()))
+                let user_provided = self
+                    .store
+                    .read(|state| state.instance(guid).map(Instance::user_provided))
                     .ok_or_else(|| ApiError::not_found("Service instance"))?;
+                if user_provided {
+                    return Err(ApiError::unprocessable(
+                        "a user-provided service instance has no parameters: it has credentials",
+                    ));
+                }
                 Ok(respond(StatusCode::OK, &json!({})))
             }
+            (&Method::GET, ["service_instances", guid, "credentials"]) => self
+                .store
+                .read(|state| {
+                    state
+                        .instance(guid)
+                        .filter(|instance| instance.user_provided())
+                        .map(|instance| Value::Object(instance.credentials.clone()))
+                })
+                .map(|credentials| respond(StatusCode::OK, &credentials))
+                .ok_or_else(|| ApiError::not_found("Service instance")),
             (&Method::GET, ["service_instances", guid, "relationships", "shared_spaces"]) => {
                 self.store
                     .read(|state| state.instance(guid).map(|_| ()))
@@ -783,11 +895,14 @@ impl Api {
 
     async fn create_instance(&self, req: &Req) -> Reply {
         let body: Value = req.json()?;
-        if body["type"].as_str() != Some("managed") {
-            return Err(ApiError::unprocessable(
-                "user-provided service instances are not supported: the services are the wicket's \
-                 keyvalue stores and capabilities (cf marketplace)",
-            ));
+        match body["type"].as_str() {
+            Some("managed") => {}
+            Some(USER_PROVIDED) => return self.create_user_provided(req, &body),
+            _ => {
+                return Err(ApiError::unprocessable(
+                    "type is managed (cf create-service) or user-provided (cf create-user-provided-service)",
+                ));
+            }
         }
         let name = body["name"].as_str().unwrap_or_default().to_string();
         check_name("the name", &name).map_err(ApiError::unprocessable)?;
@@ -821,6 +936,7 @@ impl Api {
                 offering: plan.offering.clone(),
                 plan: plan.name.clone(),
                 tags,
+                credentials: Map::new(),
                 created_at: at.clone(),
                 updated_at: at,
             };
@@ -842,9 +958,55 @@ impl Api {
         )
     }
 
-    /// A rename or new tags apply at once; the plan stays.
+    /// A user-provided instance: its credentials, no plan; answered at once,
+    /// as CC does (201, no job).
+    fn create_user_provided(&self, req: &Req, body: &Value) -> Reply {
+        let name = body["name"].as_str().unwrap_or_default().to_string();
+        check_name("the name", &name).map_err(ApiError::unprocessable)?;
+        user_provided_only(body)?;
+        let credentials = user_credentials(&body["credentials"])?.unwrap_or_default();
+        let tags = tags(&body["tags"])?;
+        let view = self.store.update(|state| {
+            if state.instance_named(&name).is_some() {
+                return Err(name_taken(&name));
+            }
+            let at = now();
+            let instance = Instance {
+                guid: guid(),
+                name: name.clone(),
+                offering: USER_PROVIDED.into(),
+                plan: String::new(),
+                tags,
+                credentials,
+                created_at: at.clone(),
+                updated_at: at,
+            };
+            state.instances.push(instance.clone());
+            Ok(instance_view(&req.base, state, &instance))
+        })?;
+        println!("SERVICES: created user-provided service instance {name}");
+        Ok(respond(StatusCode::CREATED, &view))
+    }
+
+    /// A rename or new tags apply at once, and so do a user-provided
+    /// instance's new credentials (replacing the old, as on CC), which its
+    /// apps get at their next start; the plan stays.
     async fn update_instance(&self, req: &Req, guid: &str) -> Reply {
         let body: Value = req.json()?;
+        let user_provided = self
+            .store
+            .read(|state| state.instance(guid).map(Instance::user_provided))
+            .ok_or_else(|| ApiError::not_found("Service instance"))?;
+        let credentials = if user_provided {
+            user_provided_only(&body)?;
+            user_credentials(&body["credentials"])?
+        } else if !body["credentials"].is_null() {
+            return Err(ApiError::unprocessable(
+                "credentials are a user-provided service instance's",
+            ));
+        } else {
+            None
+        };
         no_parameters(&body["parameters"])?;
         if !body["maintenance_info"].is_null() {
             return Err(ApiError::unprocessable("no upgrade is available"));
@@ -857,7 +1019,7 @@ impl Api {
             .then(|| tags(&body["tags"]))
             .transpose()?;
         let plan = body["relationships"]["service_plan"]["data"]["guid"].as_str();
-        let view = self.store.update(|state| {
+        let (view, name, bound) = self.store.update(|state| {
             let current = state
                 .instance(guid)
                 .cloned()
@@ -886,10 +1048,34 @@ impl Api {
             if let Some(tags) = &tags {
                 instance.tags = tags.clone();
             }
+            let changed = credentials
+                .as_ref()
+                .is_some_and(|credentials| *credentials != instance.credentials);
+            if let Some(credentials) = credentials {
+                instance.credentials = credentials;
+            }
             instance.updated_at = now();
             let instance = instance.clone();
-            Ok(instance_view(&req.base, state, &instance))
+            let bound: Vec<String> = match changed {
+                true => state
+                    .bindings
+                    .iter()
+                    .filter(|binding| binding.instance == guid)
+                    .map(|binding| binding.app.clone())
+                    .collect(),
+                false => Vec::new(),
+            };
+            Ok((instance_view(&req.base, state, &instance), instance.name, bound))
         })?;
+        for app in &bound {
+            self.logs.add(
+                app,
+                "API",
+                format!(
+                    "Updated the credentials of service instance {name}: applies at the next start, restart or restage"
+                ),
+            );
+        }
         Ok(respond(StatusCode::OK, &view))
     }
 
@@ -948,7 +1134,7 @@ impl Api {
         }
         println!("SERVICES: deleted service instance {}", instance.name);
         self.controller.purge_pending().await;
-        if purge {
+        if purge || instance.user_provided() {
             return Ok(no_content());
         }
         self.job(req, "service_instance.delete", Vec::new(), None)
@@ -978,22 +1164,22 @@ impl Api {
             .as_str()
             .ok_or_else(|| ApiError::unprocessable("relationships.app names the app"))?;
         let name = body["name"].as_str().map(String::from);
-        let (binding, instance_name) = self.store.update(|state| {
+        let (binding, instance_name, user_provided) = self.store.update(|state| {
             if state.app(app).is_none() {
                 return Err(ApiError::unprocessable(format!(
                     "The app could not be found: {app}"
                 )));
             }
-            let instance_name = state
+            let (instance_name, user_provided) = state
                 .instance(instance)
-                .map(|instance| instance.name.clone())
+                .map(|instance| (instance.name.clone(), instance.user_provided()))
                 .ok_or_else(|| {
                     ApiError::unprocessable(format!(
                         "The service instance could not be found: {instance}"
                     ))
                 })?;
             match bind(state, app, instance, name.clone(), &body["parameters"]) {
-                Ok(binding) => Ok((binding, instance_name)),
+                Ok(binding) => Ok((binding, instance_name, user_provided)),
                 Err(Unbound::Already) => Err(ApiError {
                     status: StatusCode::UNPROCESSABLE_ENTITY,
                     code: 90003,
@@ -1010,6 +1196,13 @@ impl Api {
                 "Bound service instance {instance_name}: applies at the next start, restart or restage"
             ),
         );
+        if user_provided {
+            // as CC: a user-provided instance's binding has no broker to wait for
+            return Ok(respond(
+                StatusCode::CREATED,
+                &binding_view(&req.base, &binding),
+            ));
+        }
         self.job(
             req,
             "service_bindings.create",
@@ -1022,16 +1215,18 @@ impl Api {
     }
 
     async fn delete_binding(&self, req: &Req, guid: &str) -> Reply {
-        let (binding, instance_name) = self.store.update(|state| {
+        let (binding, instance_name, user_provided) = self.store.update(|state| {
             let binding = state
                 .binding(guid)
                 .cloned()
                 .ok_or_else(|| ApiError::not_found("Service credential binding"))?;
-            let name = state
+            let (name, user_provided) = state
                 .instance(&binding.instance)
-                .map_or_else(String::new, |instance| instance.name.clone());
+                .map_or_else(Default::default, |instance| {
+                    (instance.name.clone(), instance.user_provided())
+                });
             state.bindings.retain(|kept| kept.guid != guid);
-            Ok::<_, ApiError>((binding, name))
+            Ok::<_, ApiError>((binding, name, user_provided))
         })?;
         self.logs.add(
             &binding.app,
@@ -1040,6 +1235,9 @@ impl Api {
                 "Unbound service instance {instance_name}: applies at the next start, restart or restage"
             ),
         );
+        if user_provided {
+            return Ok(no_content());
+        }
         self.job(req, "service_bindings.delete", Vec::new(), None)
     }
 }

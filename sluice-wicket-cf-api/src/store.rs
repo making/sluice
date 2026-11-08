@@ -214,7 +214,8 @@ pub struct Running {
 }
 
 /// A service instance: a namespace of a keyvalue store (offering
-/// `keyvalue`, the store its plan) or a capability (offering `wasi`).
+/// `keyvalue`, the store its plan), a capability (offering `wasi`), or the
+/// user's credentials (offering `user-provided`, no plan).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Instance {
     pub guid: String,
@@ -222,8 +223,18 @@ pub struct Instance {
     pub offering: String,
     pub plan: String,
     pub tags: Vec<String>,
+    /// A user-provided instance's credentials, what its bindings give the
+    /// apps: a secret, as an environment variable's value.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub credentials: serde_json::Map<String, serde_json::Value>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl Instance {
+    pub fn user_provided(&self) -> bool {
+        self.offering == crate::services::USER_PROVIDED
+    }
 }
 
 /// A security group (`crate::security_groups`): its rules, as given, and where they apply.

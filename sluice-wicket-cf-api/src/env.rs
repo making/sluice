@@ -11,8 +11,11 @@ use serde_json::{Map, Value, json};
 use crate::store::{App, State};
 
 /// The most the user's variables hold, names and values together: half of
-/// what the wicket takes (128 KiB), the rest left to `VCAP_*`.
+/// what the wicket takes ([`WICKET_BYTES`]), the rest left to `VCAP_*`.
 pub const MAX_BYTES: usize = 64 << 10;
+
+/// The most an env the wicket takes holds, names and values together.
+pub const WICKET_BYTES: usize = 128 << 10;
 
 /// Whether the user may set `name`: as on CF, not empty, no `VCAP_` or
 /// `VMC` prefix and not `PORT` (in any case); as the wicket takes it, no
@@ -127,6 +130,25 @@ pub fn guest(base: &str, state: &State, app: &App) -> BTreeMap<String, String> {
     env
 }
 
+/// Checks the guest's environment ([`guest`]) against what the wicket takes:
+/// the user-provided instances' credentials make `VCAP_SERVICES` as large as
+/// they are.
+pub fn check_guest(env: &BTreeMap<String, String>) -> Result<(), String> {
+    let bytes: usize = env
+        .iter()
+        .map(|(name, value)| name.len() + value.len())
+        .sum();
+    if bytes > WICKET_BYTES {
+        return Err(format!(
+            "the app's environment holds {bytes} bytes with VCAP_APPLICATION and VCAP_SERVICES, \
+             more than the {} KiB the wicket takes: unbind a user-provided service instance or \
+             shrink its credentials",
+            WICKET_BYTES >> 10
+        ));
+    }
+    Ok(())
+}
+
 /// A tag of a snapshot for the wicket, drawn at random: the wicket lists an
 /// env by its names only, so the tag tells the app it serves from another
 /// snapshot, and holds nothing of the values.
@@ -143,7 +165,8 @@ mod tests {
     /// A PATCH merges and removes, takes a number or a boolean as text,
     /// and is refused -- naming the variable, never its value -- for a name
     /// CF or the wicket takes not, a structured value, a NUL or a size past
-    /// the limit; the guest's environment adds VCAP_* to the user's.
+    /// the limit; the guest's environment adds VCAP_* to the user's, within
+    /// what the wicket takes.
     #[test]
     fn the_users_variables_are_merged_checked_and_given_with_vcap() {
         let var = |value: Value| value.as_object().unwrap().clone();
@@ -200,6 +223,14 @@ mod tests {
         );
         assert_eq!(vcap["cf_api"], "http://api");
         assert_eq!(guest["VCAP_SERVICES"], "{}");
+        assert!(check_guest(&guest).is_ok());
+        let mut large = guest.clone();
+        large.insert("VCAP_SERVICES".into(), "s3cr3t".repeat(WICKET_BYTES / 6));
+        let e = check_guest(&large).unwrap_err();
+        assert!(
+            e.contains("more than the 128 KiB") && !e.contains("s3cr3t"),
+            "{e}"
+        );
         assert_ne!(tag(), tag());
     }
 }

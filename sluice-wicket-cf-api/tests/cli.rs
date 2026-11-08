@@ -936,11 +936,45 @@ fn the_cf_cli_deploys_to_the_wicket() {
     );
     cf.ok(&["delete", "limited", "-f"]);
 
-    // the user's variables, VCAP_APPLICATION and VCAP_SERVICES: the guest
-    // gets them from the next start on; no log and no listing of the
-    // wicket holds a value
+    // the user's variables, VCAP_APPLICATION and VCAP_SERVICES with a
+    // user-provided instance's credentials: the guest gets them from the
+    // next start on; no log and no listing of the wicket holds a value
     let variable = |name: &str| get(&listen, "hello.localhost", &format!("/env/{name}"), None);
+    let password = || {
+        let (status, vcap) = variable("VCAP_SERVICES");
+        assert_eq!(status, 200, "{vcap}");
+        let vcap: Value = serde_json::from_str(&vcap).unwrap();
+        vcap["user-provided"][0]["credentials"]["password"].clone()
+    };
     cf.ok(&["set-env", "hello", "GREETING", "s3cr3t-greeting"]);
+    let credentials = |password: &str| format!(r#"{{"password":"{password}"}}"#);
+    cf.ok(&[
+        "create-user-provided-service",
+        "creds",
+        "-p",
+        &credentials("s3cr3t-1"),
+        "-t",
+        "db",
+    ]);
+    for (args, refusal) in [
+        (
+            &["bind-service", "hello", "creds", "-c", r#"{"x":1}"#][..],
+            "Binding parameters are not supported",
+        ),
+        (
+            &[
+                "create-user-provided-service",
+                "drain",
+                "-l",
+                "syslog://logs:514",
+            ][..],
+            "a syslog drain is not supported",
+        ),
+    ] {
+        let output = cf.fails(args);
+        assert!(output.contains(refusal), "{output}");
+    }
+    cf.ok(&["bind-service", "hello", "creds"]);
     assert_eq!(variable("GREETING").0, 404, "until the next start");
     cf.ok(&["restart", "hello"]);
     assert_eq!(variable("GREETING"), (200, "s3cr3t-greeting".into()));
@@ -948,9 +982,25 @@ fn the_cf_cli_deploys_to_the_wicket() {
     assert_eq!(status, 200, "{vcap}");
     let vcap: Value = serde_json::from_str(&vcap).unwrap();
     assert_eq!(vcap["application_name"], "hello");
-    assert_eq!(variable("VCAP_SERVICES"), (200, "{}".into()));
+    assert_eq!(password(), "s3cr3t-1");
+    cf.ok(&[
+        "update-user-provided-service",
+        "creds",
+        "-p",
+        &credentials("s3cr3t-2"),
+    ]);
+    assert_eq!(password(), "s3cr3t-1", "until the next start");
     let env = cf.ok(&["env", "hello"]);
-    assert!(env.contains("GREETING: s3cr3t-greeting"), "{env}");
+    assert!(
+        env.contains("GREETING: s3cr3t-greeting") && env.contains("\"password\": \"s3cr3t-2\""),
+        "{env}"
+    );
+    for shown in [cf.ok(&["services"]), cf.ok(&["service", "creds"])] {
+        assert!(
+            shown.contains("user-provided") && shown.contains("hello"),
+            "{shown}"
+        );
+    }
     let (_, apps) = get(&console, &console, "/api/apps", Some(TOKEN));
     assert!(
         apps.contains("\"GREETING\"") && !apps.contains("s3cr3t"),
@@ -977,6 +1027,13 @@ fn the_cf_cli_deploys_to_the_wicket() {
         env.contains("No user-provided env variables have been set"),
         "{env}"
     );
+    cf.ok(&["restart", "hello"]);
+    assert_eq!(password(), "s3cr3t-2");
+    cf.ok(&["unbind-service", "hello", "creds"]);
+    cf.ok(&["delete-service", "creds", "-f"]);
+    assert!(!cf.ok(&["services"]).contains("creds"));
+    cf.ok(&["restart", "hello"]);
+    assert_eq!(variable("VCAP_SERVICES"), (200, "{}".into()));
 
     // a component in an OCI registry (the test's, as ghcr.io: a token for
     // every pull, the user's for a private image), pushed by tag: its
@@ -1624,11 +1681,20 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     let (ok, output) = cf.output(push, "");
     assert!(ok, "{output}");
     cf.ok(&["set-env", "fc", "GREETING", "hello world"]);
+    // services: a user-provided one, its credentials in VCAP_SERVICES
+    cf.ok(&[
+        "create-user-provided-service",
+        "creds",
+        "-p",
+        r#"{"password":"s3cr3t"}"#,
+    ]);
+    cf.ok(&["bind-service", "fc", "creds"]);
     cf.ok(&["start", "fc"]);
     let shown = cf.ok(&["app", "fc"]);
     assert!(shown.contains(&format!("{image}@{manifest}")), "{shown}");
 
-    // from inside the VM: the image's user, its files' owners and modes, the env
+    // from inside the VM: the image's user, its files' owners and modes, the env, its
+    // services
     let (status, body) = get(&listen, "fc.localhost", "/", None);
     assert_eq!(status, 200, "{body}");
     for expected in [
@@ -1643,6 +1709,8 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         "IMAGE_VAR=from-image\n",
         "PORT=8080\n",
         "VCAP_APPLICATION={",
+        "VCAP_SERVICES={\"user-provided\":[",
+        "\"credentials\":{\"password\":\"s3cr3t\"}",
     ] {
         assert!(body.contains(expected), "{expected}: {body}");
     }
