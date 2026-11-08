@@ -9,3 +9,4 @@ target/
 .vscode/
 .DS_Store
 .todo/.icebox
+*_VULNHUNT_RESULTS_*
