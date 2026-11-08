@@ -40,6 +40,9 @@ public class AccessControl {
 
 	private final List<Cidr> allow;
 
+	/** Whether a server-wide allow list was configured, usable or not. */
+	private final boolean allowConfigured;
+
 	private final List<Cidr> trustedProxies;
 
 	/** Compiled per-route allow lists, keyed by the configured literals. */
@@ -49,6 +52,7 @@ public class AccessControl {
 		SluiceServerProperties.AccessControl accessControl = properties.accessControl();
 		this.deny = compile("deny-cidrs", accessControl.denyCidrs());
 		this.allow = compile("allow-cidrs", accessControl.allowCidrs());
+		this.allowConfigured = !accessControl.allowCidrs().isEmpty();
 		this.trustedProxies = compile("trusted-proxy-cidrs", accessControl.trustedProxyCidrs());
 	}
 
@@ -81,14 +85,26 @@ public class AccessControl {
 			}
 		}
 		List<String> configured = route == null ? List.of() : route.allowedCidrs();
-		List<Cidr> allow = configured.isEmpty() ? this.allow
-				: this.routeCidrs.computeIfAbsent(configured, cidrs -> compile("allowed-cidrs", cidrs));
+		List<Cidr> allow;
+		boolean allowConfigured;
+		if (configured.isEmpty()) {
+			allow = this.allow;
+			allowConfigured = this.allowConfigured;
+		}
+		else {
+			allow = this.routeCidrs.computeIfAbsent(configured, cidrs -> compile("allowed-cidrs", cidrs));
+			allowConfigured = true;
+		}
 		for (Cidr cidr : allow) {
 			if (cidr.matches(claimed)) {
 				return true;
 			}
 		}
-		return allow.isEmpty();
+		// a configured list that compiled to nothing was meant as a restriction: deny
+		return !allowConfigured;
+	}
+
+	/**
 	}
 
 	/**

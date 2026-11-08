@@ -136,6 +136,8 @@ class AccessControlTest {
 	}
 
 	@Test
+	void anAllMalformedAllowListFailsClosed() {
+	@Test
 	void anUnreadablePeerAddressIsAllowedThrough() {
 		AccessControl accessControl = rules(List.of("10.0.0.0/8"), List.of("203.0.113.0/24"));
 		assertThat(accessControl.allowed(null, (InetAddress) null)).isTrue();
