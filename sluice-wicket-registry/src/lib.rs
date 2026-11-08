@@ -23,6 +23,10 @@ pub const INDEX_TYPES: [&str; 2] = [
 ];
 /// The distribution spec's largest manifest.
 const MAX_MANIFEST_BYTES: u64 = 4 << 20;
+/// The most of a registry's refusal body read: its distribution error's detail.
+const MAX_ERROR_BYTES: u64 = 64 << 10;
+/// The most of a registry's token response read.
+const MAX_TOKEN_BYTES: u64 = 1 << 20;
 
 /// An image reference, `[registry/]repository[:tag][@sha256:<digest>]`, read
 /// as docker reads one: a first segment holding a `.` or a `:`, or
@@ -314,9 +318,9 @@ impl Session<'_> {
                 if !response.status().is_success() {
                     return Err(self.refused(response).await);
                 }
-                let body: Value = response
-                    .json()
-                    .await
+                let bytes =
+                    read(response, MAX_TOKEN_BYTES, "the registry's token response").await?;
+                let body: Value = serde_json::from_slice(&bytes)
                     .map_err(|e| format!("the registry's token: {e}"))?;
                 let token = body["token"]
                     .as_str()
@@ -347,26 +351,28 @@ impl Session<'_> {
     async fn refused(&self, response: reqwest::Response) -> String {
         let status = response.status();
         let path = response.url().path().to_string();
-        let body = response.bytes().await.unwrap_or_default();
-        let detail = serde_json::from_slice::<Value>(&body)
-            .ok()
-            .and_then(|body| {
-                let error = &body["errors"][0];
-                Some(format!(
-                    ": {}: {}",
-                    error["code"].as_str()?,
-                    error["message"].as_str().unwrap_or_default()
-                ))
-            })
-            .unwrap_or_else(|| {
-                let text = String::from_utf8_lossy(&body[..body.len().min(200)]);
-                let text = text.trim();
-                if text.is_empty() {
-                    String::new()
-                } else {
-                    format!(": {text}")
-                }
-            });
+        let detail = match read(response, MAX_ERROR_BYTES, "the registry's error body").await {
+            Ok(body) => serde_json::from_slice::<Value>(&body)
+                .ok()
+                .and_then(|body| {
+                    let error = &body["errors"][0];
+                    Some(format!(
+                        ": {}: {}",
+                        error["code"].as_str()?,
+                        error["message"].as_str().unwrap_or_default()
+                    ))
+                })
+                .unwrap_or_else(|| {
+                    let text = String::from_utf8_lossy(&body[..body.len().min(200)]);
+                    let text = text.trim();
+                    if text.is_empty() {
+                        String::new()
+                    } else {
+                        format!(": {text}")
+                    }
+                }),
+            Err(why) => format!(": {why}"),
+        };
         let hint = match (status.as_u16(), self.credentials.is_some()) {
             (401 | 403, false) => {
                 ": the image does not exist, or it is private: it needs credentials"
@@ -541,5 +547,45 @@ mod tests {
         assert_eq!(escaped["realm"], r#"a "b", c"#);
         assert_eq!(escaped["error"], "insufficient_scope");
         assert!(parameters("").is_empty());
+    }
+
+    /// Serves one response, then closes.
+    fn serve_once(response: Vec<u8>) -> String {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buffer = [0u8; 4096];
+            let _ = stream.read(&mut buffer);
+            let _ = stream.write_all(&response);
+        });
+        address
+    }
+
+    fn response(status: &str, body: &[u8]) -> Vec<u8> {
+        let mut bytes = format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        bytes.extend_from_slice(body);
+        bytes
+    }
+
+    /// A refusal body past the cap is cut off, not read whole.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_body_is_read_with_a_cap() {
+        let address = serve_once(response("403 Forbidden", &vec![b'x'; 4 << 20]));
+        let registry = Registry::new("test").unwrap();
+        let reference = Reference::parse(&format!("{address}/me/app:1")).unwrap();
+        let error = registry
+            .session(&reference, None)
+            .manifest("1")
+            .await
+            .expect_err("403 is a refusal");
+        assert!(error.contains("403"), "{error}");
+        assert!(error.contains("more than 65536 bytes"), "{error}");
     }
 }
