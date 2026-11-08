@@ -15,3 +15,6 @@ sluice-wicket-oidc = { path = "../sluice-wicket-oidc" }
 serde_json = "1"
 sha2 = "0.10"
 base64 = "0.22"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

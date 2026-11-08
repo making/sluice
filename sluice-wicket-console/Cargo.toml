@@ -31,3 +31,4 @@ sluice-wicket-oidc = { path = "../sluice-wicket-oidc" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+http = "1"

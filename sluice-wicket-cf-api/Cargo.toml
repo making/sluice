@@ -58,6 +58,8 @@ sluice-wicket-oidc = { path = "../sluice-wicket-oidc", features = ["mock"] }
 tokio = { version = "1", features = ["test-util"] }
 # the layers of the image the test pushes for a Firecracker wicket
 flate2 = "1"
+# the crypto provider a client built here needs installed first
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14"
