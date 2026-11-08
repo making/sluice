@@ -1012,6 +1012,9 @@ public final class TunnelSession implements AutoCloseable {
 			if (!this.closed.compareAndSet(false, true)) {
 				return;
 			}
+			// release the registration and the pending place now: the route removal below
+			// runs on the advertiser, which a pending stream may never have reached
+			this.registry.remove(this);
 		}
 		Thread deadline = this.advertiseDeadline;
 		if (deadline != null && deadline != Thread.currentThread()) {
