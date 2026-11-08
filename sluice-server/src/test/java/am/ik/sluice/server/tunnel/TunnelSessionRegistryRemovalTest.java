@@ -1,6 +1,7 @@
 package am.ik.sluice.server.tunnel;
 
 import java.util.Set;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 import am.ik.sluice.server.config.SluiceServerProperties;
 import am.ik.sluice.server.route.Router;
@@ -32,6 +33,22 @@ class TunnelSessionRegistryRemovalTest {
 		assertThat(this.registry.count()).isEqualTo(1);
 		session.close();
 		assertThat(this.registry.count()).isZero();
+	}
+
+	/**
+	 * The registry removal and what the caller owns are one step: a session no longer
+	 * registered does not run the removal, so a newer session's routes stay.
+	 */
+	@Test
+	void onlyTheRegisteredSessionRunsTheOwnedRemoval() {
+		TunnelSession first = session("client-a");
+		TunnelSession second = session("client-a");
+		AtomicBoolean removed = new AtomicBoolean();
+
+		assertThat(this.registry.remove(first, () -> removed.set(true))).isFalse();
+		assertThat(removed).isFalse();
+		assertThat(this.registry.remove(second, () -> removed.set(true))).isTrue();
+		assertThat(removed).isTrue();
 	}
 
 	@Test

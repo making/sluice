@@ -1012,7 +1012,6 @@ public final class TunnelSession implements AutoCloseable {
 			if (!this.closed.compareAndSet(false, true)) {
 				return;
 			}
-			this.registry.remove(this);
 		}
 		Thread deadline = this.advertiseDeadline;
 		if (deadline != null && deadline != Thread.currentThread()) {
@@ -1068,12 +1067,14 @@ public final class TunnelSession implements AutoCloseable {
 	 * advertise replaces them, its close removes them).
 	 */
 	private void removeRoutes() {
-		if (this.registry.find(this.clientId).isPresent()) {
-			return;
-		}
-		// the routes first: a port released below is handed to another client serving it
-		this.router.remove(this.clientId);
-		this.tcpRoutes.reconcile(this.clientId, Set.of());
+		// compare-and-remove under the registry's lock: a session registering between the
+		// two steps cannot be mistaken for this one, and its routes stay
+		this.registry.remove(this, () -> {
+			// the routes first: a port released below is handed to another client serving
+			// it
+			this.router.remove(this.clientId);
+			this.tcpRoutes.reconcile(this.clientId, Set.of());
+		});
 	}
 
 }

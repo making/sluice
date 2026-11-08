@@ -233,12 +233,35 @@ public class SessionRegistry {
 		return Optional.empty();
 	}
 
-	public void remove(TunnelSession session) {
+	/**
+	 * Removes the session if it is still its client id's registered one.
+	 * @return whether it was, so the caller owns what belonged to the client id
+	 */
+	public boolean remove(TunnelSession session) {
+		return remove(session, () -> {
+		});
+	}
+
+	/**
+	 * Removes the session if it is still its client id's registered one, or if none is
+	 * registered, then runs {@code onRemoved} under the lock: a session registering in
+	 * between waits, so the compare and what the caller does with its ownership are one
+	 * step. A newer session of the same client id keeps what belongs to it.
+	 * @return whether {@code onRemoved} ran
+	 */
+	boolean remove(TunnelSession session, Runnable onRemoved) {
 		synchronized (this.lock) {
 			release(session);
-			if (this.sessions.remove(session.clientId(), session)) {
+			TunnelSession existing = this.sessions.get(session.clientId());
+			if (existing != null && existing != session) {
+				return false;
+			}
+			if (existing != null) {
+				this.sessions.remove(session.clientId(), session);
 				decrement(this.sessionsPerAddress, session.sourceAddress());
 			}
+			onRemoved.run();
+			return true;
 		}
 	}
 
