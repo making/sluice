@@ -65,7 +65,7 @@ impl Flume for FlumeService {
         Ok(Response::new(Box::pin(controls)))
     }
 
-    type WatchStream = ReceiverStream<Result<WatchEvent, Status>>;
+    type WatchStream = Pin<Box<dyn Stream<Item = Result<WatchEvent, Status>> + Send>>;
 
     async fn watch(
         &self,
@@ -78,14 +78,15 @@ impl Flume for FlumeService {
             .map_err(Status::invalid_argument)?;
         let (sender, receiver) = mpsc::channel(WATCH_BUFFER);
         tokio::spawn(relay(self.hub.clone(), watch, sender));
-        Ok(Response::new(ReceiverStream::new(receiver)))
+        let stream = ReceiverStream::new(receiver).map(Ok);
+        Ok(Response::new(Box::pin(stream)))
     }
 }
 
 /// Sends the watch's first events, then the live ones passing its filter,
 /// until the watcher goes away; a watcher that fell behind catches up from the
-/// ring.
-async fn relay(hub: Arc<Hub>, watch: hub::Watch, sender: mpsc::Sender<Result<WatchEvent, Status>>) {
+/// ring. A console's watch and the OTLP export both read one.
+pub(crate) async fn relay(hub: Arc<Hub>, watch: hub::Watch, sender: mpsc::Sender<WatchEvent>) {
     let hub::Watch {
         first,
         mut live,
@@ -96,7 +97,7 @@ async fn relay(hub: Arc<Hub>, watch: hub::Watch, sender: mpsc::Sender<Result<Wat
     let mut pending = first;
     loop {
         for event in pending.drain(..) {
-            if sender.send(Ok(event)).await.is_err() {
+            if sender.send(event).await.is_err() {
                 drop(guard);
                 return;
             }

@@ -9,6 +9,7 @@ COPY sluice-build-info/Cargo.toml sluice-build-info/
 COPY sluice-build-info/src sluice-build-info/src
 COPY sluice-flume/Cargo.toml sluice-flume/Cargo.lock sluice-flume/build.rs sluice-flume/
 COPY sluice-flume/src sluice-flume/src
+COPY sluice-flume/proto sluice-flume/proto
 # the context has no .git: the commit --version and the console show comes from here
 ARG GIT_COMMIT=""
 RUN SLUICE_GIT_COMMIT=${GIT_COMMIT} \

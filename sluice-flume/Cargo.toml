@@ -14,6 +14,19 @@ tonic-health = "0.14"
 prost = "0.14"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-std", "io-util", "signal"] }
 tokio-stream = { version = "0.1", features = ["net", "sync"] }
+# the OTLP export: as sluice-wicket-oidc, no TLS of reqwest's own, the ring
+# provider of rustls does it
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+webpki-roots = "1"
+flate2 = "1"
+
+[dev-dependencies]
+# the fake OTLP/HTTP receiver of tests/flume.rs
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+http-body-util = "0.1"
+bytes = "1"
 
 [build-dependencies]
 tonic-prost-build = "0.14"

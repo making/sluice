@@ -755,7 +755,8 @@ logged, filtered by route, kind and node, with pause and follow. Behind a load b
 request is logged by one node only; the nodes feed their lines to `sluice-flume`, a small
 gRPC server collecting them in memory while someone watches, and the console of any node
 shows them all, with the flume's build (version and commit). Without a viewer the nodes send
-nothing; without `sluice.live-log.url` the feature is off.
+nothing, unless the flume exports them over OTLP/HTTP (`--otlp-endpoint`, the same `.kb`
+file); without `sluice.live-log.url` the feature is off.
 
 ```text
 cargo build --release --manifest-path sluice-flume/Cargo.toml   # needs protoc
@@ -772,7 +773,8 @@ browser reconnecting, to any node, resumes after the last line it showed. The se
 and serves with the flume down. A wicket feeds the flume too (`--flume`): the requests it
 answered (`response`) and its guests' output (`stdout`, `stderr`), each naming its
 instance, which the cf-api turns into the apps' `cf logs`; a Firecracker wicket its VMs'
-output, each line naming its VM. Topology, drops, ordering, wickets and proxy settings:
+output, each line naming its VM. Topology, drops, ordering, wickets, OTLP export
+(`--otlp-endpoint`: every line to a collector as OTLP/HTTP logs) and proxy settings:
 [.kb/live-access-log.md](.kb/live-access-log.md).
 
 #### Client certificate issuance

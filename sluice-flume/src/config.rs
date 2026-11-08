@@ -17,6 +17,23 @@ usage: sluice-flume --token <token> [options]
   --ring-size <lines>     newest lines kept for backfill and resume (default 10000)
   --ring-bytes <bytes>    most bytes those lines may hold (default 67108864)
   --backfill <lines>      newest lines a new watch begins with (default 200)
+  --otlp-endpoint <url>   export every line here, OTLP/HTTP (opt-in; a path of
+                          / or none gets /v1/logs appended)
+  --otlp-service-name <name>    service.name of the exported resources (default sluice)
+  --otlp-resource-attributes <k=v,...>  resource attributes to add (a key
+                          also set here wins), as OTEL_RESOURCE_ATTRIBUTES
+  --otlp-compression <gzip|none>  body encoding of a request (default gzip)
+  --otlp-headers <k=v,...>      request headers, values percent-decoded, as
+                          OTEL_EXPORTER_OTLP_HEADERS
+  --otlp-headers-file <path>    read --otlp-headers from a file instead
+  --otlp-ca <path>        PEM CA verifying the endpoint (default the webPKI roots)
+  --otlp-client-cert <path>     PEM client certificate for mTLS (with --otlp-client-key)
+  --otlp-client-key <path>      PEM private key of --otlp-client-cert
+  --otlp-batch-size <records>   records a request takes at most (default 512)
+  --otlp-batch-delay <ms>       how long a batch waits for its first line (default 1000)
+  --otlp-kinds <kinds>    export only these kinds (default all)
+  --otlp-route-keys <keys>      export only these route keys (default all)
+  --otlp-node-ids <ids>   export only these nodes (default all)
   --exit-on-stdin-close   exit when stdin reaches its end (a parent's child process)
   --version               print the build (version, commit, build time) and exit
 
@@ -28,7 +45,7 @@ another variable of that prefix is refused.";
 pub enum Command {
     Help,
     Version,
-    Serve(Config),
+    Serve(Box<Config>),
 }
 
 #[derive(Debug)]
@@ -49,6 +66,20 @@ const VALUED: &[&str] = &[
     "ring-size",
     "ring-bytes",
     "backfill",
+    "otlp-endpoint",
+    "otlp-service-name",
+    "otlp-resource-attributes",
+    "otlp-compression",
+    "otlp-headers",
+    "otlp-headers-file",
+    "otlp-ca",
+    "otlp-client-cert",
+    "otlp-client-key",
+    "otlp-batch-size",
+    "otlp-batch-delay",
+    "otlp-kinds",
+    "otlp-route-keys",
+    "otlp-node-ids",
 ];
 
 /// The switches read from the environment too.
@@ -150,7 +181,42 @@ pub fn parse(
         raw.parse::<u16>()
             .map_err(|_| format!("--port: not a port: {raw}"))
     })?;
-    Ok(Command::Serve(Config {
+    let file = |name: &str| -> Result<Option<Vec<u8>>, String> {
+        value(name)
+            .map(|path| std::fs::read(&path).map_err(|e| format!("--{name} {path}: {e}")))
+            .transpose()
+    };
+    let otlp = match value("otlp-endpoint") {
+        Some(endpoint) => Some(crate::export::OtlpSettings::new(crate::export::RawOtlp {
+            endpoint,
+            service_name: value("otlp-service-name"),
+            resource_attributes: value("otlp-resource-attributes"),
+            compression: value("otlp-compression"),
+            headers: value("otlp-headers"),
+            headers_file: file("otlp-headers-file")?
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned()),
+            ca_pem: file("otlp-ca")?,
+            client_cert_pem: file("otlp-client-cert")?,
+            client_key_pem: file("otlp-client-key")?,
+            batch_size: value("otlp-batch-size"),
+            batch_delay: value("otlp-batch-delay"),
+            kinds: value("otlp-kinds"),
+            route_keys: value("otlp-route-keys"),
+            node_ids: value("otlp-node-ids"),
+        })?),
+        // the others configure nothing without an endpoint: refused, not unread
+        None => {
+            let configured = VALUED
+                .iter()
+                .filter(|name| name.starts_with("otlp-") && **name != "otlp-endpoint")
+                .find(|name| value(name).is_some());
+            if let Some(name) = configured {
+                return Err(format!("--{name} needs --otlp-endpoint"));
+            }
+            None
+        }
+    };
+    Ok(Command::Serve(Box::new(Config {
         host: value("host").unwrap_or_else(|| "0.0.0.0".to_string()),
         port,
         exit_on_stdin_close: exit_on_stdin_close
@@ -161,8 +227,9 @@ pub fn parse(
             ring_bytes: number("ring-bytes", 64 << 20)?.max(1),
             backfill: number("backfill", 200)?,
             tls,
+            otlp,
         },
-    }))
+    })))
 }
 
 #[cfg(test)]
@@ -175,7 +242,7 @@ mod tests {
 
     fn serve(command: Result<Command, String>) -> Config {
         match command {
-            Ok(Command::Serve(config)) => config,
+            Ok(Command::Serve(config)) => *config,
             other => panic!("not a serve command: {other:?}"),
         }
     }
@@ -187,9 +254,14 @@ mod tests {
             "SLUICE_FLUME_PORT" => Some("9100".to_string()),
             "SLUICE_FLUME_RING_SIZE" => Some("50".to_string()),
             "SLUICE_FLUME_RING_BYTES" => Some("1024".to_string()),
+            "SLUICE_FLUME_OTLP_ENDPOINT" => Some("https://collector.example/v1/logs".to_string()),
+            "SLUICE_FLUME_OTLP_BATCH_SIZE" => Some("64".to_string()),
             _ => None,
         };
-        let config = serve(parse(args("--port 9200 --backfill=7"), env));
+        let config = serve(parse(
+            args("--port 9200 --backfill=7 --otlp-endpoint http://127.0.0.1:4318"),
+            env,
+        ));
         assert_eq!(config.port, 9200);
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.settings.token, "from-env");
@@ -197,6 +269,19 @@ mod tests {
         assert_eq!(config.settings.ring_bytes, 1024);
         assert_eq!(config.settings.backfill, 7);
         assert!(config.settings.tls.is_none());
+        // the flag overrides the endpoint, which added the signal's path; the
+        // batch size stays the environment's
+        let otlp = config.settings.otlp.as_ref().expect("the endpoint given");
+        assert_eq!(otlp.endpoint(), "http://127.0.0.1:4318/v1/logs");
+        assert_eq!(otlp.batch_size, 64);
+        assert_eq!(
+            serve(parse(args("--token t"), env))
+                .settings
+                .otlp
+                .as_ref()
+                .map(|otlp| otlp.endpoint().to_string()),
+            Some("https://collector.example/v1/logs".to_string())
+        );
         assert!(!config.exit_on_stdin_close);
         assert!(
             serve(parse(args("--token t --exit-on-stdin-close"), |_| None)).exit_on_stdin_close
@@ -207,6 +292,7 @@ mod tests {
                 [
                     "PATH",
                     "SLUICE_FLUME_TOKEN",
+                    "SLUICE_FLUME_OTLP_ENDPOINT",
                     "SLUICE_FLUME_EXIT_ON_STDIN_CLOSE"
                 ]
                 .map(String::from)
@@ -247,5 +333,24 @@ mod tests {
             parse(args("--token t --help"), none),
             Ok(Command::Help)
         ));
+        let rejected = |line: &str| parse(args(line), none).unwrap_err();
+        assert!(
+            rejected("--token t --otlp-endpoint ftp://host/logs").contains("not http or https")
+        );
+        assert!(
+            rejected("--token t --otlp-endpoint http://h --otlp-compression lz4").contains("gzip")
+        );
+        assert!(
+            rejected("--token t --otlp-endpoint http://h --otlp-headers AuthorizationBearer")
+                .contains("no '='")
+        );
+        assert!(
+            rejected("--token t --otlp-endpoint http://h --otlp-client-cert Cargo.toml")
+                .contains("together")
+        );
+        assert!(
+            rejected("--token t --otlp-service-name svc")
+                .contains("--otlp-service-name needs --otlp-endpoint")
+        );
     }
 }

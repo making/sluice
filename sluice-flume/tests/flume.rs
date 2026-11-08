@@ -32,6 +32,7 @@ async fn flume(ring_size: usize, backfill: usize) -> String {
         ring_bytes: 64 << 20,
         backfill,
         tls: None,
+        otlp: None,
     };
     tokio::spawn(sluice_flume::serve(
         listener,
@@ -392,5 +393,299 @@ async fn calls_without_the_token_are_refused_but_the_health_check() {
     assert_eq!(
         health.status,
         tonic_health::pb::health_check_response::ServingStatus::Serving as i32
+    );
+}
+
+/// What the fake OTLP/HTTP receiver got: one `POST`.
+#[derive(Clone, Debug)]
+struct Exported {
+    path: String,
+    content_type: String,
+    content_encoding: Option<String>,
+    request: sluice_flume::export::otlp::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest,
+}
+
+/// A fake OTLP/HTTP receiver: it refuses the first request with `503` and
+/// `Retry-After: 0`, takes the rest, and keeps what it decoded.
+struct OtlpReceiver {
+    url: String,
+    received: std::sync::Arc<std::sync::Mutex<Vec<Exported>>>,
+}
+
+impl OtlpReceiver {
+    async fn start() -> OtlpReceiver {
+        use bytes::Bytes;
+        use http_body_util::{BodyExt, Full};
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let kept = received.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (kept, count) = (kept.clone(), count.clone());
+                tokio::spawn(async move {
+                    let service = service_fn(
+                        move |request: hyper::Request<hyper::body::Incoming>| {
+                            let (kept, count) = (kept.clone(), count.clone());
+                            async move {
+                                let path = request.uri().path().to_string();
+                                let header = |name: &str| {
+                                    request
+                                        .headers()
+                                        .get(name)
+                                        .and_then(|value| value.to_str().ok())
+                                        .map(String::from)
+                                };
+                                let content_type = header("content-type").unwrap_or_default();
+                                let content_encoding = header("content-encoding");
+                                let body = request.into_body().collect().await.unwrap().to_bytes();
+                                let body = match content_encoding.as_deref() {
+                                    Some("gzip") => gunzip(&body),
+                                    _ => body.to_vec(),
+                                };
+                                let request = <sluice_flume::export::otlp::opentelemetry::proto::collector::logs::v1::ExportLogsServiceRequest as prost::Message>::decode(&body[..])
+                                .expect("an ExportLogsServiceRequest");
+                                kept.lock().unwrap().push(Exported {
+                                    path,
+                                    content_type,
+                                    content_encoding,
+                                    request,
+                                });
+                                let first =
+                                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+                                let mut response = hyper::Response::builder()
+                                    .status(if first {
+                                        hyper::StatusCode::SERVICE_UNAVAILABLE
+                                    } else {
+                                        hyper::StatusCode::OK
+                                    })
+                                    .header("content-type", "application/x-protobuf");
+                                if first {
+                                    response = response.header("retry-after", "0");
+                                }
+                                Ok::<_, std::convert::Infallible>(
+                                    response.body(Full::new(Bytes::new())).unwrap(),
+                                )
+                            }
+                        },
+                    );
+                    let _ = hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), service)
+                        .await;
+                });
+            }
+        });
+        OtlpReceiver { url, received }
+    }
+
+    /// The requests received so far, once there are `count` of them.
+    async fn wait_for(&self, count: usize) -> Vec<Exported> {
+        let deadline = tokio::time::Instant::now() + HANG;
+        loop {
+            {
+                let received = self.received.lock().unwrap();
+                if received.len() >= count {
+                    return received.clone();
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "fewer than {count} requests reached the endpoint"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+}
+
+fn gunzip(body: &[u8]) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut decoded = Vec::new();
+    flate2::read::GzDecoder::new(body)
+        .read_to_end(&mut decoded)
+        .expect("a gzip body");
+    decoded
+}
+
+/// One attribute of a resource or a record.
+fn attribute<'a>(
+    attributes: &'a [sluice_flume::export::otlp::opentelemetry::proto::common::v1::KeyValue],
+    key: &str,
+) -> Option<&'a sluice_flume::export::otlp::opentelemetry::proto::common::v1::any_value::Value> {
+    attributes
+        .iter()
+        .find(|attribute| attribute.key == key)
+        .and_then(|attribute| attribute.value.as_ref())
+        .and_then(|value| value.value.as_ref())
+}
+
+fn text(
+    value: Option<&sluice_flume::export::otlp::opentelemetry::proto::common::v1::any_value::Value>,
+) -> String {
+    use sluice_flume::export::otlp::opentelemetry::proto::common::v1::any_value::Value;
+    match value {
+        Some(Value::StringValue(text)) => text.clone(),
+        Some(Value::IntValue(number)) => number.to_string(),
+        other => panic!("not a string or int: {other:?}"),
+    }
+}
+
+/// The export is a standing watcher: the nodes feed it with no console
+/// watching. It batches the lines, retries a refused batch once and sends the
+/// same one again, and a shutdown sends what it still holds.
+#[tokio::test]
+async fn the_exporter_batches_the_lines_and_resends_a_refused_batch() {
+    use sluice_flume::export::{OtlpSettings, RawOtlp};
+
+    let receiver = OtlpReceiver::start().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let settings = Settings {
+        token: TOKEN.to_string(),
+        ring_size: 100,
+        ring_bytes: 1 << 20,
+        backfill: 0,
+        tls: None,
+        otlp: Some(
+            OtlpSettings::new(RawOtlp {
+                endpoint: receiver.url.clone(),
+                batch_size: Some("3".to_string()),
+                // only a shutdown closes a batch that is not full
+                batch_delay: Some("600000".to_string()),
+                ..Default::default()
+            })
+            .expect("the settings parse"),
+        ),
+    };
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(sluice_flume::serve(listener, settings, async move {
+        let _ = stopped.await;
+    }));
+    let mut client = client(&url, TOKEN).await;
+    let mut node = Node::connect(&mut client, "node-1", "boot-a").await;
+    // the exporter's watch asks every node to feed
+    assert_eq!(
+        node.control().await,
+        start(0, &[], &[]),
+        "no console watches"
+    );
+
+    for node_seq in 1..=3 {
+        node.send
+            .send(FeedMessage {
+                body: Some(feed_message::Body::Event(AccessEvent {
+                    node_seq,
+                    time_unix_millis: 1_700_000_000_000,
+                    kind: "request".to_string(),
+                    route_key: "a.local".to_string(),
+                    fields: vec![
+                        sluice_flume::proto::access_event::Field {
+                            name: "method".to_string(),
+                            value: "GET".to_string(),
+                        },
+                        sluice_flume::proto::access_event::Field {
+                            name: "agent".to_string(),
+                            value: "curl 8".to_string(),
+                        },
+                    ],
+                })),
+            })
+            .await
+            .unwrap();
+    }
+    let requests = receiver.wait_for(2).await;
+    let first = &requests[0];
+    assert_eq!(first.path, "/v1/logs");
+    assert_eq!(first.content_type, "application/x-protobuf");
+    assert_eq!(first.content_encoding.as_deref(), Some("gzip"));
+    assert_eq!(
+        first.request, requests[1].request,
+        "the refused batch again, unchanged"
+    );
+    let resource_logs = &first.request.resource_logs;
+    assert_eq!(resource_logs.len(), 1, "one resource: the node's");
+    let resource = resource_logs[0].resource.as_ref().expect("a resource");
+    assert_eq!(
+        text(attribute(&resource.attributes, "service.name")),
+        "sluice"
+    );
+    assert_eq!(
+        text(attribute(&resource.attributes, "service.instance.id")),
+        "node-1"
+    );
+    let scope = &resource_logs[0].scope_logs[0];
+    let scope_info = scope.scope.as_ref().expect("a scope");
+    assert_eq!(scope_info.name, "sluice.access");
+    assert_eq!(scope_info.version, env!("CARGO_PKG_VERSION"));
+    assert_eq!(scope.log_records.len(), 3);
+    let record = &scope.log_records[0];
+    assert_eq!(record.time_unix_nano, 1_700_000_000_000_000_000);
+    assert_ne!(record.observed_time_unix_nano, 0);
+    assert_eq!(
+        record.severity_number,
+        sluice_flume::export::otlp::opentelemetry::proto::logs::v1::SeverityNumber::Info as i32
+    );
+    assert_eq!(record.severity_text, "INFO");
+    assert_eq!(record.event_name, "sluice.access.request");
+    assert_eq!(
+        text(attribute(&record.attributes, "sluice.kind")),
+        "request"
+    );
+    assert_eq!(
+        text(attribute(&record.attributes, "sluice.route_key")),
+        "a.local"
+    );
+    assert_eq!(text(attribute(&record.attributes, "sluice.node_seq")), "1");
+    assert_eq!(
+        text(attribute(&record.attributes, "sluice.agent")),
+        "curl 8"
+    );
+    let body = record.body.as_ref().expect("a body");
+    assert_eq!(text(body.value.as_ref()), "method=GET agent=\"curl 8\"");
+
+    node.send
+        .send(FeedMessage {
+            body: Some(feed_message::Body::Gap(FeedGap { dropped: 5 })),
+        })
+        .await
+        .unwrap();
+    // let the gap reach the exporter before the shutdown takes its batch
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    stop.send(()).unwrap();
+    tokio::time::timeout(HANG, serving)
+        .await
+        .expect("the flume stops in time")
+        .unwrap()
+        .expect("serving ends without an error");
+    let requests = receiver.wait_for(3).await;
+    assert_eq!(requests.len(), 3, "nothing sent twice");
+    let gap = &requests[2].request.resource_logs[0];
+    assert_eq!(
+        text(attribute(
+            &gap.resource.as_ref().unwrap().attributes,
+            "service.instance.id"
+        )),
+        "node-1"
+    );
+    let record = &gap.scope_logs[0].log_records[0];
+    assert_eq!(record.event_name, "sluice.gap");
+    assert_eq!(record.severity_text, "WARN");
+    assert_eq!(
+        text(attribute(&record.attributes, "sluice.gap.cause")),
+        "node_dropped"
+    );
+    assert_eq!(
+        text(attribute(&record.attributes, "sluice.gap.dropped")),
+        "5"
+    );
+    assert_eq!(
+        text(record.body.as_ref().unwrap().value.as_ref()),
+        "node-1 dropped 5 lines"
     );
 }

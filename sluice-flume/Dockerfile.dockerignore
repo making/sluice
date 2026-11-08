@@ -7,3 +7,4 @@
 !sluice-flume/Cargo.lock
 !sluice-flume/build.rs
 !sluice-flume/src
+!sluice-flume/proto

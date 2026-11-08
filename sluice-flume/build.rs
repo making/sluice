@@ -20,10 +20,27 @@ fn main() {
             &[protos],
         )
         .expect("failed to compile flume.proto");
+    // The vendored OTLP logs protos, messages only: the exporter sends them, it
+    // serves no gRPC.
+    let otlp = manifest_dir.join("proto/opentelemetry/proto");
+    tonic_prost_build::configure()
+        .build_server(false)
+        .build_client(false)
+        .compile_protos(
+            &[
+                otlp.join("common/v1/common.proto"),
+                otlp.join("resource/v1/resource.proto"),
+                otlp.join("logs/v1/logs.proto"),
+                otlp.join("collector/logs/v1/logs_service.proto"),
+            ],
+            &[manifest_dir.join("proto")],
+        )
+        .expect("failed to compile the OTLP protos");
     sluice_build_info::embed(&[
         "build.rs",
         "Cargo.toml",
         "src",
+        "proto",
         "../sluice-proto/src/main/proto",
     ]);
 }

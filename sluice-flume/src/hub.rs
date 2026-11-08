@@ -363,7 +363,7 @@ impl Hub {
     }
 
     /// Refuses a filter of more entries than [`MAX_FILTER_ENTRIES`] in a list.
-    fn check(filter: &AccessFilter) -> Result<(), String> {
+    pub fn check(filter: &AccessFilter) -> Result<(), String> {
         for (what, entries) in [
             ("route keys", filter.route_keys.len()),
             ("kinds", filter.kinds.len()),

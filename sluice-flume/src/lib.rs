@@ -6,6 +6,7 @@
 //! ```
 
 pub mod config;
+pub mod export;
 pub mod hub;
 mod service;
 
@@ -71,6 +72,8 @@ pub struct Settings {
     pub backfill: usize,
     /// The PEM certificate chain and private key, for TLS.
     pub tls: Option<(Vec<u8>, Vec<u8>)>,
+    /// Where to export every line it receives, OTLP/HTTP.
+    pub otlp: Option<export::OtlpSettings>,
 }
 
 /// Serves Feed, Watch and the gRPC health service on `listener` until
@@ -85,6 +88,7 @@ pub async fn serve(
         settings.ring_bytes,
         settings.backfill,
     ));
+    let export_hub = hub.clone();
     let expected: MetadataValue<_> = format!("Bearer {}", settings.token)
         .parse()
         .expect("the token is a valid header value");
@@ -107,11 +111,18 @@ pub async fn serve(
         server =
             server.tls_config(ServerTlsConfig::new().identity(Identity::from_pem(cert, key)))?;
     }
+    // a standing watcher of the hub: the nodes feed it too, watched or not
+    let exporter = settings.otlp.map(|otlp| export::start(export_hub, otlp));
     let incoming = TcpListenerStream::new(listener);
-    tokio::select! {
+    let served = tokio::select! {
         served = server.add_service(health).add_service(flume).serve_with_incoming(incoming) => served,
         () = shutdown => Ok(()),
+    };
+    // what the exporter still holds goes out before the flume exits
+    if let Some(exporter) = exporter {
+        exporter.shutdown().await;
     }
+    served
 }
 
 /// Compares without an early exit, so the time taken tells nothing of the token.

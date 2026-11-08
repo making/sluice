@@ -18,7 +18,7 @@ async fn main() -> ExitCode {
             println!("{}", sluice_flume::describe_build());
             return ExitCode::SUCCESS;
         }
-        Ok(Command::Serve(config)) => config,
+        Ok(Command::Serve(config)) => *config,
         Err(message) => {
             eprintln!("{message}\n\n{}", config::USAGE);
             return ExitCode::from(2);
@@ -41,8 +41,15 @@ async fn main() -> ExitCode {
         "grpc"
     };
     // a parent process waits for this line before it dials
+    let otlp = config
+        .settings
+        .otlp
+        .as_ref()
+        .map_or("otlp none".to_string(), |otlp| {
+            format!("otlp {}", otlp.endpoint())
+        });
     println!(
-        "{} listening on {scheme}://{address} (ring {} lines)",
+        "{} listening on {scheme}://{address} (ring {} lines, {otlp})",
         sluice_flume::describe_build(),
         config.settings.ring_size
     );

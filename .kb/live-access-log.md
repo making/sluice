@@ -167,6 +167,57 @@ the log of the app holding its host, which `cf logs` shows as Cloud Foundry does
 - After a flume restart the wicket sends again the lines of its ring the new flume lacks,
   so an app's log may repeat some.
 
+## OTLP export
+
+`--otlp-endpoint https://collector.example:4318` has the flume export every line it receives
+to an OTLP/HTTP logs endpoint (`application/x-protobuf` only: no OTLP/gRPC, no OTLP/JSON).
+A URL without a path, or with `/`, gets `/v1/logs` appended; another path is used as is.
+`--otlp-headers` (values percent-decoded, as `OTEL_EXPORTER_OTLP_HEADERS`) or
+`--otlp-headers-file` carries the authentication, `--otlp-ca` pins the endpoint's TLS (else
+the webPKI roots; `--otlp-client-cert` / `--otlp-client-key` for mTLS), `--otlp-compression`
+gzip (default) or none, `--otlp-batch-size` (512), `--otlp-batch-delay` (1000 ms), and
+`--otlp-kinds` / `--otlp-route-keys` / `--otlp-node-ids` bound what goes out. Every option
+is `SLUICE_FLUME_<NAME>` too, like the others; the `OTEL_*` variables are not read.
+
+The exporter is a standing watcher of the flume, as a console's view is, and never goes
+away. With it on, every node (and wicket) the filter covers feeds whether or not a console
+watches -- nothing is sent without a viewer no longer holds -- and a console's narrower
+filter no longer narrows what a node sends. Exported are the lines the nodes'
+`sluice.access` logger emits, past the access log settings and the rate limit (the
+`ratelimit` summaries included; the default rate limit is 10 lines / 10 s per kind per
+node).
+
+One `ExportLogsServiceRequest` per batch:
+
+- a `ResourceLogs` per node: `service.name` (`--otlp-service-name`, default `sluice`) and
+  `service.instance.id` its id (`wicket:<client-id>` for a wicket), then
+  `--otlp-resource-attributes` (`k=v,...`, a key given there wins);
+- one `ScopeLogs`, name `sluice.access` at the flume's version;
+- a `LogRecord` per line: `time_unix_nano` the node's time, `observed_time_unix_nano` when
+  the flume took it, severity INFO, `event_name` `sluice.access.<kind>`, attributes
+  `sluice.kind`, `sluice.route_key`, `sluice.node_seq` and each field as `sluice.<name>`
+  (a string: the wire carries no type), `stdout` / `stderr` also `log.iostream`, the body
+  its `line` or, for the other kinds, the logfmt line rebuilt from the fields (a value that
+  is empty or holds a space, `"`, `\`, `=` or a control character quoted as the node
+  quotes it; the wire does not carry which it quoted, so the body may differ in quoting);
+- a gap as a record: WARN, `event_name` `sluice.gap`, `sluice.gap.cause` (`node_dropped` /
+  `behind`), `sluice.gap.dropped`, body `<node> dropped N lines` / `up to N lines missed`,
+  a `behind` gap under `service.instance.id` `sluice-flume`.
+
+A batch closes at 512 records, 1 MiB encoded or 1 s after its first line; one request is in
+flight and a node's records keep its order. A connection error, a timeout, 429, 502, 503 or
+504 sends the same batch again after 1 s doubling to 30 s (or `Retry-After`), without
+limit: the ring is the exporter's buffer, and what it loses meanwhile comes out as one
+`behind` gap once the endpoint is back. Any other non-2xx drops the batch; a
+`partial_success` rejection is counted. Delivery is at least once. On SIGTERM, SIGINT or
+stdin EOF the pending batch goes out within 5 s, then the flume exits. stderr shows the
+endpoint at the start, the first failure with its status, the recovery, and at most one
+line a minute summing dropped lines and rejected records.
+
+OTLP/gRPC, OTLP/JSON, metrics and traces, persistence beyond the ring and semconv HTTP
+attributes (`http.request.method`, ...) are out: the field names are the nodes' and evolve
+with them.
+
 ## Deployment notes
 
 - The console session is per node: a browser's SSE reconnect must reach the node it signed
