@@ -270,6 +270,30 @@ class RouteAuthenticatorTest {
 		assertThat(authenticator.schemes(ROUTE)).containsExactly("bearer");
 	}
 
+	/**
+	 * A host pattern route is protected by the policy of the literal host it announced,
+	 * not only by one keyed by the pattern source.
+	 */
+	@Test
+	void aPatternRouteIsProtectedByItsLiteralHostsPolicy() throws Exception {
+		RouteAuthenticator authenticator = authenticator(
+				SluiceServerProperties.Route.Auth.builder().bearer(List.of(secret("noop", "token"))).build());
+		Router.Route patterned = Router.Route.builder()
+			.clientId("c")
+			.domain("api\\.local")
+			.literalHost("api.local")
+			.address("127.0.0.1:1")
+			.build();
+
+		assertThat(authenticator.protects(patterned)).isTrue();
+		assertThat(authenticator.verifyAsync(patterned, headers("GET"), Origin.UNKNOWN).get())
+			.isInstanceOf(Verdict.Unauthorized.class);
+		assertThat(authenticator.verifyAsync(patterned, headers("GET", "authorization", "Bearer token"), Origin.UNKNOWN)
+			.get()).isEqualTo(new Verdict.Pass(AUTHORIZATION));
+		// a pattern with no literal host stays keyed by the pattern source
+		assertThat(authenticator.protects(route("api\\.local"))).isFalse();
+	}
+
 	@Test
 	void aPreflightPassesWithoutCredentialsOnlyWhenAllowed() {
 		SluiceServerProperties.Route.Auth.Builder auth = SluiceServerProperties.Route.Auth.builder()

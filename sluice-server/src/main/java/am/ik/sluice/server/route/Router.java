@@ -44,18 +44,22 @@ public class Router {
 	 * ({@code tls-passthrough}) instead of terminated on the data plane, whether the data
 	 * plane's TLS termination prefers http/1.1 in ALPN and answers an h2 stream 421
 	 * ({@code force-http1}: the upstream speaks HTTP/1.1 only), the IP networks allowed
-	 * to connect (empty = the server-wide allow list applies), and how long a connection
+	 * to connect (empty = the server-wide allow list applies), how long a connection
 	 * relayed verbatim may relay no byte either way before it is closed
 	 * ({@code verbatim-idle-timeout}; zero = the route sets none, the server's default
-	 * applies).
+	 * applies), and the literal host the client announced separately from the pattern key
+	 * ({@code null} when it announced none), so a credential policy configured for that
+	 * host applies to its host pattern too.
 	 */
 	public record Route(String clientId, String domain, String address, int listenPort, boolean rewriteHost,
-			boolean tlsPassthrough, boolean forceHttp1, List<String> allowedCidrs, Duration verbatimIdleTimeout) {
+			boolean tlsPassthrough, boolean forceHttp1, List<String> allowedCidrs, Duration verbatimIdleTimeout,
+			@Nullable String literalHost) {
 
 		public Route {
 			allowedCidrs = allowedCidrs == null ? List.of() : List.copyOf(allowedCidrs);
 			verbatimIdleTimeout = verbatimIdleTimeout == null || verbatimIdleTimeout.isNegative() ? Duration.ZERO
 					: verbatimIdleTimeout;
+			literalHost = literalHost == null || literalHost.isBlank() ? null : literalHost;
 		}
 
 		/**
@@ -105,6 +109,8 @@ public class Router {
 
 			private Duration verbatimIdleTimeout = Duration.ZERO;
 
+			private @Nullable String literalHost;
+
 			private Builder() {
 			}
 
@@ -153,11 +159,21 @@ public class Router {
 				return this;
 			}
 
+			/**
+			 * The literal host the client announced alongside the pattern key; blank or
+			 * absent when it announced none.
+			 */
+			public Builder literalHost(@Nullable String literalHost) {
+				this.literalHost = literalHost;
+				return this;
+			}
+
 			public Route build() {
 				return new Route(Objects.requireNonNull(this.clientId, "clientId is required"),
 						Objects.requireNonNull(this.domain, "domain is required"),
 						Objects.requireNonNull(this.address, "address is required"), this.listenPort, this.rewriteHost,
-						this.tlsPassthrough, this.forceHttp1, this.allowedCidrs, this.verbatimIdleTimeout);
+						this.tlsPassthrough, this.forceHttp1, this.allowedCidrs, this.verbatimIdleTimeout,
+						this.literalHost);
 			}
 
 		}
@@ -219,7 +235,7 @@ public class Router {
 
 	record Target(String clientId, String domain, String address, boolean rewriteHost, boolean tlsPassthrough,
 			boolean forceHttp1, int listenPort, List<String> allowedCidrs, Duration verbatimIdleTimeout,
-			@Nullable Pattern hostPattern) {
+			@Nullable Pattern hostPattern, @Nullable String literalHost) {
 
 		Target {
 			allowedCidrs = allowedCidrs == null ? List.of() : List.copyOf(allowedCidrs);
@@ -250,6 +266,8 @@ public class Router {
 			private Duration verbatimIdleTimeout = Duration.ZERO;
 
 			private @Nullable Pattern hostPattern;
+
+			private @Nullable String literalHost;
 
 			private Builder() {
 			}
@@ -304,12 +322,17 @@ public class Router {
 				return this;
 			}
 
+			Builder literalHost(@Nullable String literalHost) {
+				this.literalHost = literalHost;
+				return this;
+			}
+
 			Target build() {
 				return new Target(Objects.requireNonNull(this.clientId, "clientId is required"),
 						Objects.requireNonNull(this.domain, "domain is required"),
 						Objects.requireNonNull(this.address, "address is required"), this.rewriteHost,
 						this.tlsPassthrough, this.forceHttp1, this.listenPort, this.allowedCidrs,
-						this.verbatimIdleTimeout, this.hostPattern);
+						this.verbatimIdleTimeout, this.hostPattern, this.literalHost);
 			}
 
 		}
@@ -390,6 +413,7 @@ public class Router {
 				.allowedCidrs(upstream.getAllowedCidrsList())
 				.verbatimIdleTimeout(verbatimIdleTimeoutOf(upstream))
 				.hostPattern(hostPattern)
+				.literalHost(upstream.getHost())
 				.build());
 		}
 		if (clientId == null || clientId.isBlank()) {
@@ -646,6 +670,7 @@ public class Router {
 			.forceHttp1(target.forceHttp1())
 			.allowedCidrs(target.allowedCidrs())
 			.verbatimIdleTimeout(target.verbatimIdleTimeout())
+			.literalHost(target.literalHost())
 			.build();
 	}
 

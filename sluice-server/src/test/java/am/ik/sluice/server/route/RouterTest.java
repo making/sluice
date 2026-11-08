@@ -506,6 +506,12 @@ class RouterTest {
 		assertThat(router.lookup("svc-a.local").orElseThrow().clientId()).isEqualTo("c2");
 	}
 
+	/**
+	 * The literal host a client announces alongside its host pattern is carried
+	 * separately, so the operator's policy for that host can still be found.
+	 */
+	@Test
+	void theLiteralHostIsCarriedAlongsideThePatternKey() {
 	@Test
 	void invalidHostPatternFallsBackToTheLiteralHost() {
 		Router router = new Router();

@@ -271,7 +271,7 @@ public class RouteAuthenticator implements AutoCloseable {
 	 * @param origin the origin the client addressed, which the browser sign-in returns to
 	 */
 	public CompletableFuture<Verdict> verifyAsync(Router.Route route, RequestHeaders headers, Origin origin) {
-		Policy policy = this.policies.get(route.routeKey());
+		Policy policy = this.policy(route);
 		if (policy == null) {
 			return CompletableFuture.completedFuture(Verdict.OPEN);
 		}
@@ -335,7 +335,24 @@ public class RouteAuthenticator implements AutoCloseable {
 	 * read a request of (TLS passthrough, a non-HTTP protocol) is refused.
 	 */
 	public boolean protects(Router.Route route) {
-		return this.policies.containsKey(route.routeKey());
+		return this.policy(route) != null;
+	}
+
+	/**
+	 * The policy of the route: the one configured for the literal host it announced, then
+	 * the one configured for its key (the host pattern the domain is spelled as, or the
+	 * literal domain); null when neither requires credentials.
+	 */
+	private @Nullable Policy policy(Router.Route route) {
+		// a tcp route's host takes no part in routing; its key alone decides
+		String literalHost = route.listenPort() > 0 ? null : route.literalHost();
+		if (literalHost != null) {
+			Policy byHost = this.policies.get(normalize(literalHost));
+			if (byHost != null) {
+				return byHost;
+			}
+		}
+		return this.policies.get(route.routeKey());
 	}
 
 	/**
