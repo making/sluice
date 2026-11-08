@@ -10,8 +10,12 @@ use tokio::sync::{broadcast, watch};
 
 use crate::proto::{
     AccessEvent, AccessFilter, Cursor, FeedControl, FeedStart, FeedStop, NodeState, WatchEvent,
-    WatchGap, WatchHello, WatchRecord, feed_control, watch_event, watch_gap,
+    WatchGap, WatchHello, WatchRecord, access_event, feed_control, watch_event, watch_gap,
 };
+
+/// The most entries one list of a watch's filter may name: a client's choice,
+/// so bounded before it is stored.
+pub const MAX_FILTER_ENTRIES: usize = 1024;
 
 /// One line of the ring: an access log line or the lines a node dropped.
 #[derive(Debug)]
@@ -25,6 +29,29 @@ pub struct Line {
 pub enum LineBody {
     Event(AccessEvent),
     Dropped(u64),
+}
+
+/// The heap a line holds, near enough to bound the ring by: its structs and
+/// the strings they own.
+pub fn line_bytes(line: &Line) -> usize {
+    let base = std::mem::size_of::<Line>() + line.node_id.len();
+    match &line.body {
+        LineBody::Event(event) => {
+            base + std::mem::size_of::<AccessEvent>()
+                + event.kind.len()
+                + event.route_key.len()
+                + event
+                    .fields
+                    .iter()
+                    .map(|field: &access_event::Field| {
+                        std::mem::size_of::<access_event::Field>()
+                            + field.name.len()
+                            + field.value.len()
+                    })
+                    .sum::<usize>()
+        }
+        LineBody::Dropped(_) => base,
+    }
 }
 
 /// What the watchers hear live, in the order of the global sequence.
@@ -41,6 +68,9 @@ pub struct Hub {
     epoch: u64,
     backfill: usize,
     ring_size: usize,
+    /// The most bytes the ring keeps: its lines are dropped from the front
+    /// until they fit.
+    ring_bytes: usize,
     live: broadcast::Sender<Item>,
     state: Mutex<State>,
 }
@@ -49,9 +79,95 @@ pub struct Hub {
 struct State {
     seq: u64,
     ring: VecDeque<Arc<Line>>,
+    /// The bytes of `ring`'s lines, by [`line_bytes`].
+    retained: usize,
     nodes: BTreeMap<String, Node>,
     watchers: HashMap<u64, AccessFilter>,
+    /// What each node is to feed, from the watchers naming it, kept as the
+    /// watchers register and unregister.
     next_id: u64,
+}
+
+/// A node's watchers, counted so a registration adds one filter's entries
+/// instead of reuniting every watcher's.
+#[derive(Default)]
+    /// The watchers naming the node, or every node.
+    watchers: usize,
+    /// Those of them asking every route (or kind): nothing is then excluded.
+    all_routes: usize,
+    all_kinds: usize,
+    routes: HashMap<String, usize>,
+    kinds: HashMap<String, usize>,
+}
+
+    fn add(&mut self, filter: &AccessFilter) {
+        self.watchers += 1;
+        if filter.route_keys.is_empty() {
+            self.all_routes += 1;
+        } else {
+            for key in &filter.route_keys {
+                *self.routes.entry(key.clone()).or_default() += 1;
+            }
+        }
+        if filter.kinds.is_empty() {
+            self.all_kinds += 1;
+        } else {
+            for kind in &filter.kinds {
+                *self.kinds.entry(kind.clone()).or_default() += 1;
+            }
+        }
+    }
+
+    fn remove(&mut self, filter: &AccessFilter) {
+        self.watchers = self.watchers.saturating_sub(1);
+        if filter.route_keys.is_empty() {
+            self.all_routes = self.all_routes.saturating_sub(1);
+        } else {
+            for key in &filter.route_keys {
+                if let Some(count) = self.routes.get_mut(key) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.routes.remove(key);
+                    }
+                }
+            }
+        }
+        if filter.kinds.is_empty() {
+            self.all_kinds = self.all_kinds.saturating_sub(1);
+        } else {
+            for kind in &filter.kinds {
+                if let Some(count) = self.kinds.get_mut(kind) {
+                    *count -= 1;
+                    if *count == 0 {
+                        self.kinds.remove(kind);
+                    }
+                }
+            }
+        }
+    }
+
+    fn desired(&self) -> Desired {
+        if self.watchers == 0 {
+            return Desired::Stop;
+        }
+        let mut routes: Vec<String> = if self.all_routes > 0 {
+            Vec::new()
+        } else {
+            self.routes.keys().cloned().collect()
+        };
+        routes.sort();
+        let mut kinds: Vec<String> = if self.all_kinds > 0 {
+            Vec::new()
+        } else {
+            self.kinds.keys().cloned().collect()
+        };
+        kinds.sort();
+        Desired::Start(AccessFilter {
+            route_keys: routes,
+            kinds,
+            node_ids: Vec::new(),
+        })
+    }
 }
 
 struct Node {
@@ -74,9 +190,9 @@ enum Desired {
 }
 
 impl Hub {
-    /// A hub keeping the newest `ring_size` lines, a watch without a cursor
-    /// beginning with the newest `backfill` of them.
-    pub fn new(ring_size: usize, backfill: usize) -> Self {
+    /// A hub keeping the newest `ring_size` lines within `ring_bytes` bytes, a
+    /// watch without a cursor beginning with the newest `backfill` of them.
+    pub fn new(ring_size: usize, ring_bytes: usize, backfill: usize) -> Self {
         let ring_size = ring_size.max(1);
         let epoch = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -87,6 +203,7 @@ impl Hub {
             epoch,
             backfill,
             ring_size,
+            ring_bytes: ring_bytes.max(1),
             live,
             state: Mutex::new(State::default()),
         }
@@ -167,9 +284,16 @@ impl Hub {
             node_id: node_id.to_string(),
             body,
         });
+        state.retained += line_bytes(&line);
         state.ring.push_back(line.clone());
-        while state.ring.len() > self.ring_size {
-            state.ring.pop_front();
+        // one line may be larger than the whole budget: it is kept alone, so
+        // the ring stays bounded by the budget plus one event's size
+        while state.ring.len() > self.ring_size
+            || (state.retained > self.ring_bytes && state.ring.len() > 1)
+        {
+            if let Some(front) = state.ring.pop_front() {
+                state.retained -= line_bytes(&front);
+            }
         }
         // under the lock, so a watch subscribing meanwhile sees each line once:
         // in its snapshot or live
@@ -406,3 +530,55 @@ pub fn record(line: &Line) -> WatchEvent {
 fn event(body: watch_event::Body) -> WatchEvent {
     WatchEvent { body: Some(body) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(value: &str) -> AccessEvent {
+        AccessEvent {
+            node_seq: 0,
+            time_unix_millis: 0,
+            kind: "request".into(),
+            route_key: "r".into(),
+            fields: vec![access_event::Field {
+                name: "v".into(),
+                value: value.into(),
+            }],
+        }
+    }
+
+    fn filter(routes: &[&str], kinds: &[&str]) -> AccessFilter {
+        AccessFilter {
+            route_keys: routes.iter().map(|key| key.to_string()).collect(),
+            kinds: kinds.iter().map(|kind| kind.to_string()).collect(),
+            node_ids: Vec::new(),
+        }
+    }
+
+    fn started(control: &mut ControlReceiver) -> AccessFilter {
+        match control
+            .borrow_and_update()
+            .as_ref()
+            .and_then(|control| control.body.as_ref())
+        {
+            Some(feed_control::Body::Start(start)) => start.filter.clone().unwrap_or_default(),
+            other => panic!("not started: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_ring_drops_its_oldest_lines_to_fit_its_byte_budget() {
+        let hub = Hub::new(100, 4096, 10);
+        for _ in 0..20 {
+            hub.publish("n", event(&"v".repeat(256)));
+        }
+        let state = hub.state();
+        assert!(!state.ring.is_empty());
+        let retained: usize = state.ring.iter().map(|line| line_bytes(line)).sum();
+        assert!(retained <= 4096, "{retained} bytes retained");
+        assert_eq!(state.retained, retained);
+    }
+
+    #[test]
+    fn one_line_larger_than_the_budget_is_kept_alone() {

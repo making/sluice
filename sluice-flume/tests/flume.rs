@@ -29,6 +29,7 @@ async fn flume(ring_size: usize, backfill: usize) -> String {
     let settings = Settings {
         token: TOKEN.to_string(),
         ring_size,
+        ring_bytes: 64 << 20,
         backfill,
         tls: None,
     };

@@ -14,8 +14,8 @@ browser ──SSE──> console of any node ──Watch (server-streaming gRPC)
 Behind a load balancer each request is logged by one node only, so a node-local view
 would show about 1/N of the traffic. `sluice-flume` (Rust, `sluice-flume/`) collects the
 lines of every node in memory while someone watches; the console of any node relays them.
-Nothing is stored at rest: the flume keeps the newest `--ring-size` lines (10000) for
-backfill and resume, and loses them on restart.
+Nothing is stored at rest: the flume keeps the newest `--ring-size` lines (10000) within
+`--ring-bytes` (64 MiB) for backfill and resume, and loses them on restart.
 
 ```text
 cargo build --release --manifest-path sluice-flume/Cargo.toml
@@ -29,8 +29,9 @@ sluice-flume/target/release/sluice-flume --token FLUME_SECRET            # grpc:
 Every flume option is also an environment variable `SLUICE_FLUME_<NAME>` (`--help`; another
 variable of that prefix, a misspelled one, is refused at the start):
 `--host`, `--port` (8002), `--token` / `--token-file` (required), `--tls-cert` /
-`--tls-key` (PEM, serves `grpcs://`), `--ring-size`, `--backfill` (200: the newest lines a
-new view begins with), `--exit-on-stdin-close`. `--version` prints its build (version, git
+`--tls-key` (PEM, serves `grpcs://`), `--ring-size`, `--ring-bytes` (64 MiB: the most those
+lines may hold), `--backfill` (200: the newest lines a new view begins with),
+`--exit-on-stdin-close`. `--version` prints its build (version, git
 commit, build time); the `listening on ...` line it prints once bound starts with the same,
 and every view's `WatchHello` carries it, shown next to the page's state (a flume predating
 that shows `Unknown (older build)`). It serves the gRPC health service (`sluice.v1.Flume`)

@@ -15,6 +15,7 @@ usage: sluice-flume --token <token> [options]
   --tls-cert <path>       PEM certificate chain: serve TLS (with --tls-key)
   --tls-key <path>        PEM private key of --tls-cert
   --ring-size <lines>     newest lines kept for backfill and resume (default 10000)
+  --ring-bytes <bytes>    most bytes those lines may hold (default 67108864)
   --backfill <lines>      newest lines a new watch begins with (default 200)
   --exit-on-stdin-close   exit when stdin reaches its end (a parent's child process)
   --version               print the build (version, commit, build time) and exit
@@ -46,6 +47,7 @@ const VALUED: &[&str] = &[
     "tls-cert",
     "tls-key",
     "ring-size",
+    "ring-bytes",
     "backfill",
 ];
 
@@ -156,6 +158,7 @@ pub fn parse(
         settings: Settings {
             token,
             ring_size: number("ring-size", 10_000)?.max(1),
+            ring_bytes: number("ring-bytes", 64 << 20)?.max(1),
             backfill: number("backfill", 200)?,
             tls,
         },
@@ -183,6 +186,7 @@ mod tests {
             "SLUICE_FLUME_TOKEN" => Some("from-env".to_string()),
             "SLUICE_FLUME_PORT" => Some("9100".to_string()),
             "SLUICE_FLUME_RING_SIZE" => Some("50".to_string()),
+            "SLUICE_FLUME_RING_BYTES" => Some("1024".to_string()),
             _ => None,
         };
         let config = serve(parse(args("--port 9200 --backfill=7"), env));
@@ -190,6 +194,7 @@ mod tests {
         assert_eq!(config.host, "0.0.0.0");
         assert_eq!(config.settings.token, "from-env");
         assert_eq!(config.settings.ring_size, 50);
+        assert_eq!(config.settings.ring_bytes, 1024);
         assert_eq!(config.settings.backfill, 7);
         assert!(config.settings.tls.is_none());
         assert!(!config.exit_on_stdin_close);

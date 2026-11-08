@@ -65,6 +65,8 @@ pub struct Settings {
     pub token: String,
     /// The newest lines kept for backfill and resume.
     pub ring_size: usize,
+    /// The most bytes those lines may hold: more are dropped from the front.
+    pub ring_bytes: usize,
     /// The newest lines a watch without a cursor begins with.
     pub backfill: usize,
     /// The PEM certificate chain and private key, for TLS.
@@ -78,7 +80,11 @@ pub async fn serve(
     settings: Settings,
     shutdown: impl Future<Output = ()>,
 ) -> Result<(), tonic::transport::Error> {
-    let hub = Arc::new(hub::Hub::new(settings.ring_size, settings.backfill));
+    let hub = Arc::new(hub::Hub::new(
+        settings.ring_size,
+        settings.ring_bytes,
+        settings.backfill,
+    ));
     let expected: MetadataValue<_> = format!("Bearer {}", settings.token)
         .parse()
         .expect("the token is a valid header value");
