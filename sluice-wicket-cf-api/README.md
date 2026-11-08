@@ -14,7 +14,7 @@ What `cf push` deploys depends on the wicket, whose listing names its runtime:
 | the wicket | [sluice-wicket-runtime-wasi](../sluice-wicket-runtime-wasi/README.md#apps) | [sluice-wicket-runtime-firecracker](../sluice-wicket-runtime-firecracker/README.md#apps) |
 | an app | a wasm component: its bits, or an image in an OCI registry; or a [static site](#static-sites): html, css, js | a container image, a CNB image say, or a rootfs in a zip: microVMs |
 | the cf-api | a process or a container next to the wicket | an app of the wicket, in a VM with a disk, or next to it |
-| services | the wicket's keyvalue stores and capabilities; [user-provided](#user-provided-services) | [user-provided](#user-provided-services) |
+| services | the wicket's keyvalue stores and capabilities; [user-provided](#user-provided-services); a [service broker](#service-brokers)'s | [user-provided](#user-provided-services); a [service broker](#service-brokers)'s |
 | `cf logs` | the app's output and requests | the process's output |
 
 The rest holds for both: [Options](#options), [Mapping](#mapping), [Behavior](#behavior),
@@ -341,6 +341,50 @@ as on CF), granting nothing else:
   whose env would be more than the 128 KiB the wicket takes is refused, naming the size
 - creating, updating, binding, unbinding and deleting answer at once (no job), as on CF
 
+### Service brokers
+
+On either wicket, any [Open Service Broker API](https://github.com/cloudfoundry/servicebroker/blob/v2.17/spec.md)
+broker (2.17) the cf-api reaches offers its plans beside the wicket's:
+
+```text
+cf create-service-broker db-broker <user> <password> https://broker.example.com [--space-scoped]
+cf enable-service-access db [-p <plan>] [-o sluice]
+cf create-service db small db1 -c '{"size": 1}' [--wait]
+cf bind-service hello db1 [-c '<json>'] [--wait]
+cf restart hello                          # VCAP_SERVICES holds the broker's credentials
+```
+
+- **Who registers them.** A broker's URL is any the cf-api reaches, and its catalog decides what
+  everyone sees: registering, updating, renaming and deleting brokers, `cf enable-service-access`
+  / `disable-service-access` and `cf purge-service-offering` take `--service-broker-editor` (or
+  `--service-broker-editor-client`), as the [security groups](#security-groups) do theirs; anyone
+  logged in reads them. A global broker's plans are seen by no one until `cf
+  enable-service-access` (`cf marketplace` lists none, `cf create-service` is refused); a
+  `--space-scoped` one's are the space's at once
+- **The catalog.** Fetched and checked as CC does at `cf create-service-broker` and `cf
+  update-service-broker` (a problem refuses it, each named in the job's error). An offering or a
+  plan dropped from it stays, deactivated and offering no new instance, while it has instances
+  (a warning says so)
+- **Operations.** Provision, update (`-p`, `-c`, `cf upgrade-service` for a plan's
+  `maintenance_info`), deprovision, bind and unbind are sent with `accepts_incomplete=true`, the
+  login's `Originating-Identity`, and the parameters as given. A broker answering `202` is polled
+  (`last_operation`, as its `Retry-After` asks, else every 5s) until it succeeds, fails or outlives
+  the plan's `maximum_polling_duration` (7 days without one): the job is `POLLING` meanwhile, so
+  the CLI says `in progress` and returns unless `--wait`; `cf service` shows the last operation.
+  One operation at a time per instance or binding (`409`). An operation under way outlives a
+  restart of the cf-api, which sends it again or polls on. A provision or bind whose outcome is
+  unknown (no answer in 60s, a `5xx`) is undone with a deprovision or unbind, as the
+  specification asks
+- **Bindings.** The credentials (an async one's fetched once it succeeds) are in `VCAP_SERVICES`
+  under the offering's name, with the plan's and the offering's tags, from the app's next start,
+  as any binding. A manifest's `services:` waits for its bindings, `cf delete` of an app for its
+  unbinds. `cf service --params` and the binding's parameters are the broker's, when its offering
+  says they are retrievable
+- `cf delete-service` is refused while the instance is bound, `cf delete-service-broker` while
+  the broker has instances; `cf purge-service-instance` drops an instance and its bindings
+  without asking the broker. The broker's password is in no answer, the credentials in `cf env`
+  alone; both are in `state.json` (0600) and in no log. Service keys and sharing are refused (422)
+
 ## On a Firecracker wicket
 
 For a host with KVM that should run the wicket and little else: the cf-api is an app of the
@@ -659,7 +703,7 @@ The wicket's listing says `runtime: firecracker`.
 | web process `health_check` `timeout` (`cf push -t`) | `boot-ms`, 60s by default and 180s at most as on CF: how long the process may take to listen, in the request that starts it. A process exiting first is refused at once |
 | environment variables, `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: the process's environment, over the image's (its `PORT` is `/init`'s) |
 | disk | no effect: the rootfs is read-only and `/tmp` a tmpfs of the VM's memory; a persistent disk is the wicket API's, with no CF counterpart |
-| services | [user-provided](#user-provided-services) ones: the listing offers neither capabilities nor keyvalue stores |
+| services | [user-provided](#user-provided-services) ones and a [service broker](#service-brokers)'s: the listing offers neither capabilities nor keyvalue stores |
 | outbound connections | the [security groups](#security-groups): the route's `egress`. An app reaches no other host |
 | `cf logs` | the process's output, naming the VM (`APP/PROC/WEB/<index>`): the lowest index free among the VMs alive, so `0` to `instances - 1` in every mode, modulo `instances` for a VM past a scale down finishing its connections: what `cf app` lists. No `RTR` line: this wicket feeds no requests to the flume |
 | annotations | [how long a VM lives](#how-long-a-vm-lives); `budget-ms`, a component's, is refused |
@@ -777,6 +821,8 @@ cf restart blog
 | `--client-credentials <id>:<secret>` / `--client-credentials-file <path>` | a client of `cf auth <id> <secret> --client-credentials` (CI); repeatable, the file one per line. With `--oidc-issuer` only |
 | `--security-group-editor <claim>=<pattern>` | who may edit the [security groups](#security-groups), nobody without it: as `--oidc-claim`; without `--oidc-issuer` the claims are `user_name` and `email`, both the name anyone logs in with |
 | `--security-group-editor-client <id>` | a client of `--client-credentials` who may too; repeatable |
+| `--service-broker-editor <claim>=<pattern>` | who may register, update and delete the [service brokers](#service-brokers) and set who sees their plans, nobody without it: as `--security-group-editor` |
+| `--service-broker-editor-client <id>` | a client of `--client-credentials` who may too; repeatable |
 | `--tls-cert <path>` / `--tls-key <path>` | serve TLS: the certificate chain and its private key, PEM. Without them, behind a TLS proxy, `X-Forwarded-Proto: https` makes the links `https` |
 | `--exit-on-stdin-close` | exit when stdin reaches its end (a parent's child process) |
 
@@ -965,7 +1011,8 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
   no app's log. See [Live access log](../.kb/live-access-log.md#wickets-and-the-cf-api)
 - auth: see [Login](#login). Every request but the root document, `/v3`, `/v3/info` and the
   UAA endpoints needs a valid token (log-cache's included), and whoever holds one may do
-  everything but edit the [security groups](#security-groups)
+  everything but edit the [security groups](#security-groups) and the
+  [service brokers](#service-brokers)
 - errors are in CC's shape (`{"errors": [{"code", "title", "detail"}]}`); `/v3/info` names
   this API
 - connections: 64 at once. TCP keepalive ends one whose client is gone, and a client that leaves
@@ -1021,7 +1068,7 @@ Refused with why (422): route paths, ports and wildcards, private and internal d
 ssh, sidecars, process types but `web`, route services, syslog drains, environment variable
 groups, service keys. One owner (`cf`) per wicket: two cf-apis must not share one.
 No roles: whoever may log in may do everything, but for the
-[security groups](#security-groups).
+[security groups](#security-groups) and the [service brokers](#service-brokers).
 
 ## Tests
 

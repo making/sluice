@@ -11,7 +11,10 @@
 //! own -- `cf login --sso` through the passcode page, a refresh, the
 //! clients configured, who is refused, who may edit the security groups --, a component
 //! the wicket refuses
-//! until a service binding grants what it needs, the services' lifecycle,
+//! until a service binding grants what it needs, the services' lifecycle, a service broker
+//! (a stub) -- who registers it, who sees its plans, its operations at once and polled
+//! across a restart of the cf-api, failed, its bindings' credentials, a manifest's and an
+//! app's delete waiting for it, its catalog fetched again --,
 //! delete. And against a Firecracker wicket, where `/dev/kvm` is usable: a
 //! private image made into a rootfs by the wicket, its process's user, files and
 //! environment seen from the VM, its connections through the security groups, a scale keeping
@@ -23,6 +26,7 @@
 //! through its egress: refused with no word on who logs in, its apps and logins kept
 //! across a restart of the VM, a wicket killed right after a push and an upgrade.
 
+mod broker;
 mod registry;
 
 use std::io::{BufRead, BufReader, Read as _, Write as _};
@@ -33,6 +37,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
+use broker::Broker;
 use registry::Registry;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -438,6 +443,15 @@ fn start_api(
     (api, url)
 }
 
+/// Waits for `done`, polled.
+fn eventually(what: &str, done: impl Fn() -> bool) {
+    let deadline = Instant::now() + HANG;
+    while !done() {
+        assert!(Instant::now() < deadline, "never {what}");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
 /// `rules` as a file `cf create-security-group` takes.
 fn security_group_file(dir: &Path, name: &str, rules: &Value) -> String {
     let file = dir.join(format!("{name}.json"));
@@ -618,6 +632,18 @@ fn the_cf_cli_deploys_to_the_wicket() {
     assert!(
         cf.ok(&["security-groups"])
             .contains("No security groups found")
+    );
+    // nor the service brokers: a broker's URL is any the cf-api reaches
+    let refused = cf.fails(&[
+        "create-service-broker",
+        "db-broker",
+        "broker",
+        "br0ker",
+        "http://127.0.0.1:1",
+    ]);
+    assert!(
+        refused.contains("--service-broker-editor names no one"),
+        "{refused}"
     );
 
     // push from a directory: served on the wicket's listener
@@ -1182,6 +1208,8 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "groups=ops",
         "--security-group-editor-client",
         "robot",
+        "--service-broker-editor-client",
+        "robot",
         "--tls-cert",
         cert_file.to_str().unwrap(),
         "--tls-key",
@@ -1410,6 +1438,203 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "{body}"
     );
 
+    // a service broker, registered by an editor of them: its plans seen by none until
+    // enabled; its operations at once or polled as it answers them, across a restart of the
+    // cf-api; a binding's credentials in VCAP_SERVICES from the app's next start
+    let broker = Broker::start("broker", "br0ker");
+    let output = cf.fails(&[
+        "create-service-broker",
+        "db-broker",
+        "broker",
+        "wrong",
+        &broker.url,
+    ]);
+    assert!(
+        output.contains("Service broker error (status 401)"),
+        "{output}"
+    );
+    cf.ok(&[
+        "create-service-broker",
+        "db-broker",
+        "broker",
+        "br0ker",
+        &broker.url,
+    ]);
+    assert!(!cf.ok(&["marketplace"]).contains("db-broker"));
+    let output = cf.fails(&["create-service", "db", "small", "db1"]);
+    assert!(output.contains("Invalid service plan"), "{output}");
+    cf.ok(&["enable-service-access", "db"]);
+    let marketplace = cf.ok(&["marketplace", "-e", "db"]);
+    assert!(
+        marketplace.contains("broker: db-broker") && marketplace.contains("USD 9.50/MONTHLY"),
+        "{marketplace}"
+    );
+    cf.ok(&[
+        "create-service",
+        "db",
+        "small",
+        "db1",
+        "-c",
+        r#"{"size":1}"#,
+        "-t",
+        "t1",
+    ]);
+    let provisioned = broker.provisioned();
+    assert_eq!(provisioned["parameters"], json!({"size": 1}));
+    assert_eq!(provisioned["context"]["instance_name"], "db1");
+    assert!(
+        broker.requests().iter().any(|(request, identity)| {
+            request.starts_with("PUT /v2/service_instances/")
+                && identity
+                    .as_deref()
+                    .is_some_and(|identity| identity.starts_with("cloudfoundry "))
+        }),
+        "{:?}",
+        broker.requests()
+    );
+    assert_eq!(
+        cf.ok(&["service", "db1", "--params"]).trim(),
+        "{\n  \"size\": 1\n}"
+    );
+    cf.ok(&["bind-service", "hello", "db1"]);
+    broker.hold(true);
+    let output = cf.ok(&[
+        "create-service",
+        "db",
+        "small",
+        "db2",
+        "-c",
+        r#"{"async":true}"#,
+    ]);
+    assert!(output.contains("Create in progress"), "{output}");
+    let shown = cf.ok(&["service", "db2"]);
+    assert!(
+        shown.contains("create in progress") && shown.contains("working on it"),
+        "{shown}"
+    );
+    let output = cf.fails(&["bind-service", "hello", "db2"]);
+    assert!(
+        output.contains("An operation for service instance db2 is in progress"),
+        "{output}"
+    );
+    drop(api);
+    let (api, _) = with_rules(&["email=*@example.com", "groups=devs"]);
+    broker.hold(false);
+    eventually("the instance made after the restart", || {
+        cf.ok(&["service", "db2"]).contains("create succeeded")
+    });
+    let output = cf.ok(&[
+        "bind-service",
+        "hello",
+        "db2",
+        "-c",
+        r#"{"async":true}"#,
+        "--wait",
+    ]);
+    assert!(
+        output.contains("Waiting for the operation to complete"),
+        "{output}"
+    );
+    let vcap = || {
+        let (status, vcap) = get(&listen, "hello.localhost", "/env/VCAP_SERVICES", None);
+        assert_eq!(status, 200, "{vcap}");
+        serde_json::from_str::<Value>(&vcap).unwrap()
+    };
+    assert!(vcap()["db"].is_null(), "until the next start");
+    // (pushed again: a package left awaiting its upload above is its newest)
+    cf.ok(&["push", "hello", "-p", dir.join("app").to_str().unwrap()]);
+    let bound = vcap()["db"].as_array().cloned().unwrap();
+    assert_eq!(bound.len(), 2, "{bound:?}");
+    for (entry, name) in bound.iter().zip(["db1", "db2"]) {
+        assert_eq!(entry["instance_name"], name);
+        assert_eq!(entry["plan"], "small");
+        assert_eq!(entry["credentials"]["password"], "s3cr3t-db");
+        let binding = entry["binding_guid"].as_str().unwrap();
+        assert_eq!(
+            entry["credentials"]["uri"],
+            format!("db://db.example.com/{binding}")
+        );
+    }
+    assert_eq!(bound[0]["tags"], json!(["sql", "t1"]));
+    // a new plan, taken once the broker made it; failures, at once and polled
+    cf.ok(&[
+        "update-service",
+        "db1",
+        "-p",
+        "large",
+        "-c",
+        r#"{"async":true}"#,
+        "--wait",
+    ]);
+    let shown = cf.ok(&["service", "db1"]);
+    assert!(
+        shown.contains("large") && shown.contains("update succeeded"),
+        "{shown}"
+    );
+    let output = cf.fails(&[
+        "create-service",
+        "db",
+        "small",
+        "bad",
+        "-c",
+        r#"{"fail":"no capacity"}"#,
+    ]);
+    assert!(
+        output.contains(
+            "creating service instance bad failed: Service broker error (status 400): BadRequest: no capacity"
+        ),
+        "{output}"
+    );
+    let output = cf.fails(&[
+        "create-service",
+        "db",
+        "small",
+        "bad2",
+        "-c",
+        r#"{"async":true,"fail_async":"disk full"}"#,
+        "--wait",
+    ]);
+    assert!(
+        output.contains("creating service instance bad2 failed: disk full"),
+        "{output}"
+    );
+    assert!(cf.ok(&["service", "bad"]).contains("create failed"));
+    cf.ok(&["delete-service", "bad", "-f"]);
+    cf.ok(&["purge-service-instance", "bad2", "-f"]);
+    // unbound, and deleted, as the broker does it
+    cf.ok(&["unbind-service", "hello", "db2", "--wait"]);
+    cf.ok(&["delete-service", "db2", "-f", "--wait"]);
+    assert!(!cf.ok(&["services"]).contains("db2"));
+    assert_eq!(broker.instances().len(), 1);
+    // a manifest's binding to it waits for its broker
+    std::fs::write(
+        &manifest,
+        "applications:\n- name: relay\n  routes:\n  - route: relay.localhost\n  services:\n  - sockets\n  - name: db1\n    parameters:\n      async: true\n",
+    )
+    .unwrap();
+    cf.ok(&pushed);
+    let shown = cf.ok(&["service", "db1"]);
+    assert!(
+        shown.contains("relay") && !shown.contains("in progress"),
+        "{shown}"
+    );
+    // a plan gone from its catalog stays while it has an instance, deactivated
+    broker.offer(&["small"]);
+    let output = cf.ok(&[
+        "update-service-broker",
+        "db-broker",
+        "broker",
+        "br0ker",
+        &broker.url,
+    ]);
+    assert!(output.contains("the plans large are gone"), "{output}");
+    assert!(cf.ok(&["marketplace", "-e", "db"]).contains("small"));
+    let output = cf.fails(&["delete-service-broker", "db-broker", "-f"]);
+    assert!(
+        output.contains("associated service instances: db1"),
+        "{output}"
+    );
+
     // a static site: a directory of no component with an index.html, served by the site
     // guest from its files, read-only; its dot files never reach the wicket
     let site = dir.join("site");
@@ -1455,6 +1680,12 @@ fn the_cf_cli_deploys_to_the_wicket() {
         services.contains("sessions") && !services.contains("counter"),
         "{services}"
     );
+    // the broker unbound them first (relay's polled); then the instance goes, and the broker
+    assert!(broker.bindings().is_empty(), "{:?}", broker.bindings());
+    cf.ok(&["delete-service", "db1", "-f", "--wait"]);
+    cf.ok(&["delete-service-broker", "db-broker", "-f"]);
+    assert!(broker.instances().is_empty());
+    assert!(!cf.ok(&["service-brokers"]).contains("db-broker"));
 
     // alice no longer allowed (the rules changed): her next refresh is
     // refused, and her session with it

@@ -550,9 +550,9 @@ pub fn job(base: &str, job: &Job) -> Value {
     json!({
         "guid": job.guid, "created_at": job.created_at, "updated_at": job.updated_at,
         "operation": job.operation,
-        "state": if job.errors.is_empty() { "COMPLETE" } else { "FAILED" },
+        "state": job.state(),
         "errors": job.errors,
-        "warnings": [],
+        "warnings": job.warnings.iter().map(|detail| json!({"detail": detail})).collect::<Vec<_>>(),
         "links": links,
     })
 }

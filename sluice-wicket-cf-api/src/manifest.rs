@@ -276,7 +276,9 @@ fn apply_services(state: &mut State, guid: &str, spec: &AppManifest) -> Result<(
         let parameters = parameters.cloned().unwrap_or_default();
         match services::bind(state, guid, &found, binding_name, &parameters) {
             Ok(_) | Err(Unbound::Already) => {}
-            Err(Unbound::Refused(e)) => return Err(format!("{name}: service {instance}: {e}")),
+            Err(Unbound::Refused(e) | Unbound::Busy(e)) => {
+                return Err(format!("{name}: service {instance}: {e}"));
+            }
         }
     }
     Ok(())
@@ -692,6 +694,10 @@ mod tests {
             plan: plan.into(),
             tags: Vec::new(),
             credentials: Default::default(),
+            broker: None,
+            dashboard_url: None,
+            maintenance_info: None,
+            operation: None,
             created_at: now(),
             updated_at: now(),
         });

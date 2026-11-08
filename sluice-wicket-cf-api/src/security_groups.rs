@@ -38,8 +38,9 @@ const MAX_EGRESS: usize = 1024;
 /// A group's name at most, as on CC.
 const MAX_NAME: usize = 250;
 
-/// Who may edit the security groups (`--security-group-editor`,
-/// `--security-group-editor-client`); no one by default.
+/// Who may edit what reaches the network of the cf-api's or the wicket's host: the security
+/// groups (`--security-group-editor`, `--security-group-editor-client`), the service brokers
+/// (`--service-broker-editor`, `--service-broker-editor-client`); no one by default.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Editors {
     pub rules: Vec<ClaimRule>,
@@ -48,19 +49,25 @@ pub struct Editors {
 }
 
 impl Editors {
-    /// Whether the holder of `token`, whose [`crate::uaa::Uaa::identity`] is `identity`, may.
-    fn check(&self, token: &Claims, identity: Option<&Value>) -> Result<(), String> {
+    /// Whether the holder of `token`, whose [`crate::uaa::Uaa::identity`] is `identity`, may, as
+    /// the options `--<option>` and `--<option>-client` say.
+    pub(crate) fn check(
+        &self,
+        token: &Claims,
+        identity: Option<&Value>,
+        option: &str,
+    ) -> Result<(), String> {
         if token.origin == "client" {
             return match self.clients.contains(&token.client_id) {
                 true => Ok(()),
                 false => Err(format!(
-                    "the client {} is not of --security-group-editor-client",
+                    "the client {} is not of --{option}-client",
                     token.client_id
                 )),
             };
         }
         if self.rules.is_empty() {
-            return Err("--security-group-editor names no one".into());
+            return Err(format!("--{option} names no one"));
         }
         let identity = identity.ok_or("this token was replaced by a refresh: log in again")?;
         allowed(&self.rules, identity)
@@ -580,10 +587,20 @@ impl Api {
 
     /// The name of who edits, if they may.
     fn security_group_editor(&self, req: &Req) -> Result<String, ApiError> {
+        self.editor(req, &self.security_group_editors, "security-group-editor")
+    }
+
+    /// The name of who edits, if `editors` (of `--<option>`) let them.
+    pub(crate) fn editor(
+        &self,
+        req: &Req,
+        editors: &Editors,
+        option: &str,
+    ) -> Result<String, ApiError> {
         let token = self.claims(req)?;
         let identity = self.uaa.identity(&token);
-        self.security_group_editors
-            .check(&token, identity.as_ref())
+        editors
+            .check(&token, identity.as_ref(), option)
             .map_err(|why| ApiError::not_authorized(&why))?;
         Ok(token.user_name)
     }

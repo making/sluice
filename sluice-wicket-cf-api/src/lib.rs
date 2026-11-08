@@ -15,6 +15,7 @@
 //! ```
 
 pub mod api;
+pub mod brokers;
 pub mod config;
 pub mod controller;
 mod env;
@@ -22,6 +23,8 @@ pub mod flume;
 pub mod logs;
 pub mod manifest;
 mod multipart;
+pub mod operations;
+pub mod osb;
 /// The OpenID Provider client, shared with the wicket's console.
 pub use sluice_wicket_oidc as oidc;
 pub mod registry;
@@ -108,6 +111,8 @@ pub struct Settings {
     pub clients: Vec<(String, String)>,
     /// Who may edit the security groups.
     pub security_group_editors: security_groups::Editors,
+    /// Who may edit the service brokers.
+    pub service_broker_editors: security_groups::Editors,
     /// The listener's own TLS; None: plain HTTP.
     pub tls: Option<TlsSettings>,
 }
@@ -218,10 +223,21 @@ pub async fn serve(
         .flume
         .clone()
         .map(|flume| tokio::spawn(flume::watch(flume, store.clone(), logs.clone())));
+    let osb = osb::Client::new()?;
+    let operations = Arc::new(operations::Operations::new(
+        store.clone(),
+        osb.clone(),
+        logs.clone(),
+    ));
+    // what a stop left under way
+    operations.kick();
     let api = Arc::new(api::Api {
         store: store.clone(),
         uaa,
         security_group_editors: settings.security_group_editors.clone(),
+        service_broker_editors: settings.service_broker_editors.clone(),
+        osb,
+        operations,
         provider,
         tls: acceptor.is_some(),
         logs,
@@ -264,6 +280,7 @@ mod tests {
             oidc: None,
             clients: Vec::new(),
             security_group_editors: security_groups::Editors::default(),
+            service_broker_editors: security_groups::Editors::default(),
             tls,
         }
     }

@@ -58,6 +58,13 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
                               and email, both the name anyone logs in with
   --security-group-editor-client <id>
                               a client of --client-credentials who may too; repeatable
+  --service-broker-editor <claim>=<pattern>
+                              who may register, update and delete service brokers, and set
+                              who sees their plans (cf enable-service-access), nobody without
+                              it: a broker's URL is any the cf-api reaches; as
+                              --security-group-editor
+  --service-broker-editor-client <id>
+                              a client of --client-credentials who may too; repeatable
   --tls-cert <path>           serve TLS: the certificate chain, PEM
   --tls-key <path>            and its private key, PEM
   --exit-on-stdin-close       exit when stdin reaches its end (a parent's child process)
@@ -105,6 +112,8 @@ const VALUED: &[&str] = &[
     "client-credentials-file",
     "security-group-editor",
     "security-group-editor-client",
+    "service-broker-editor",
+    "service-broker-editor-client",
     "tls-cert",
     "tls-key",
 ];
@@ -316,22 +325,27 @@ pub fn parse(
             "--client-credentials needs --oidc-issuer: without it any client passes".into(),
         );
     }
-    let security_group_editors = Editors {
-        rules: parse_rules(
-            values("security-group-editor").iter().map(String::as_str),
-            "--security-group-editor",
-        )?,
-        clients: values("security-group-editor-client"),
+    let editors = |option: &str| {
+        let editors = Editors {
+            rules: parse_rules(
+                values(option).iter().map(String::as_str),
+                &format!("--{option}"),
+            )?,
+            clients: values(&format!("{option}-client")),
+        };
+        match editors
+            .clients
+            .iter()
+            .find(|client| !clients.iter().any(|(id, _)| id == *client))
+        {
+            Some(unknown) => Err(format!(
+                "--{option}-client {unknown}: not a client of --client-credentials"
+            )),
+            None => Ok(editors),
+        }
     };
-    if let Some(unknown) = security_group_editors
-        .clients
-        .iter()
-        .find(|client| !clients.iter().any(|(id, _)| id == *client))
-    {
-        return Err(format!(
-            "--security-group-editor-client {unknown}: not a client of --client-credentials"
-        ));
-    }
+    let security_group_editors = editors("security-group-editor")?;
+    let service_broker_editors = editors("service-broker-editor")?;
     let tls = match (value("tls-cert").is_some(), value("tls-key").is_some()) {
         (true, true) => Some(TlsSettings {
             cert_pem: pem("tls-cert")?.expect("given"),
@@ -370,6 +384,7 @@ pub fn parse(
             oidc,
             clients,
             security_group_editors,
+            service_broker_editors,
             tls,
         },
     })))
@@ -406,6 +421,7 @@ mod tests {
             "SLUICE_WICKET_CF_API_CLIENT_CREDENTIALS" => Some("robot:r0bot".to_string()),
             "SLUICE_WICKET_CF_API_SECURITY_GROUP_EDITOR" => Some("groups=ops".to_string()),
             "SLUICE_WICKET_CF_API_SECURITY_GROUP_EDITOR_CLIENT" => Some("robot".to_string()),
+            "SLUICE_WICKET_CF_API_SERVICE_BROKER_EDITOR" => Some("email=*@example.com".to_string()),
             _ => None,
         };
         let config = serve(parse(
@@ -464,6 +480,16 @@ mod tests {
                     patterns: vec!["ops".into()],
                 }],
                 clients: vec!["robot".into()],
+            }
+        );
+        assert_eq!(
+            config.settings.service_broker_editors,
+            Editors {
+                rules: vec![ClaimRule {
+                    claim: "email".into(),
+                    patterns: vec!["*@example.com".into()],
+                }],
+                clients: Vec::new(),
             }
         );
         assert!(config.settings.tls.is_none());
@@ -545,10 +571,16 @@ mod tests {
             .contains("<id>:<secret>")
         );
         assert!(error("--wicket http://w:1 --security-group-editor email").contains("<claim>="));
-        assert!(
-            error("--wicket http://w:1 --security-group-editor-client robot")
-                .contains("not a client of --client-credentials")
-        );
+        for client in [
+            "--security-group-editor-client",
+            "--service-broker-editor-client",
+        ] {
+            assert!(
+                error(&format!("--wicket http://w:1 {client} robot")).contains(&format!(
+                    "{client} robot: not a client of --client-credentials"
+                ))
+            );
+        }
         assert!(error("--wicket http://w:1 --tls-key k.pem").contains("go together"));
         // who logs in is said, wherever it runs: nothing tells what relays to its loopback
         for named in ["--oidc-issuer", "--any-credentials"] {

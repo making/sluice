@@ -55,6 +55,18 @@ with no count of its own: 64 rules of `0.0.0.0/0:10000` (1023 bytes), 53 of `127
   process there now
 - the CLI (8.19.0) validates no `destination`: a name, its case kept, reaches the cf-api
 
+## Service brokers
+
+What the CLI (8.19.0) does with them, against the stub broker of `tests/broker`:
+
+- `cf create-service`, `bind-service`, `update-service`, `delete-service` poll the job and stop at
+  `POLLING` (`... in progress`) unless `--wait`; a broker's operation done within the CLI's first
+  poll reads as done at once, so the test holds the broker (`Broker::hold`) to see one under way
+- of a `FAILED` job the CLI prints the first error's `detail` alone, so the broker's description
+  goes there (`... failed: Service broker error (status 400): ...`)
+- `cf marketplace` asks with `space_guids`, `cf create-service` takes the plan by name without:
+  the visibility is checked at the create too
+
 ## The demo's GIF
 
 2.5MB ([demo/README.md](../sluice-wicket-cf-api/demo/README.md)).

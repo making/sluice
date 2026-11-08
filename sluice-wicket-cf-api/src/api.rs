@@ -62,6 +62,11 @@ pub struct Api {
     pub uaa: Uaa,
     /// Who may edit the security groups.
     pub security_group_editors: crate::security_groups::Editors,
+    /// Who may edit the service brokers.
+    pub service_broker_editors: crate::security_groups::Editors,
+    /// The brokers' client, and their operations under way.
+    pub osb: crate::osb::Client,
+    pub operations: Arc<crate::operations::Operations>,
     /// The OpenID Provider users log in through; None: any credentials.
     pub provider: Option<Provider>,
     /// Whether the listener serves TLS: the scheme of the links.
@@ -1165,6 +1170,11 @@ impl Api {
         let guid = self
             .store
             .update(|state| state.add_job(operation, errors, resource));
+        Ok(self.located(req, &guid))
+    }
+
+    /// 202, the job `guid` located.
+    pub(crate) fn located(&self, req: &Req, guid: &str) -> Response {
         let mut response = json(StatusCode::ACCEPTED, &Value::Null);
         *response.body_mut() = Full::new(Bytes::new());
         response.headers_mut().insert(
@@ -1172,7 +1182,7 @@ impl Api {
             HeaderValue::from_str(&format!("{}/v3/jobs/{guid}", req.base))
                 .expect("a plain location"),
         );
-        Ok(response)
+        response
     }
 
     /// Changes the state as `change` says, once the wicket took the apps
@@ -1303,14 +1313,15 @@ impl Api {
         let committed = self.store.update(|state| {
             let mut next = state.clone();
             let guids = manifest::apply(&mut next, &manifest, runtime)?;
-            // the bindings `services:` made
-            let bound: Vec<(String, String)> = next
+            // the bindings `services:` made: a broker's is its broker's to make
+            let bound: Vec<(String, String, Option<String>)> = next
                 .bindings
                 .iter()
                 .filter(|binding| state.binding(&binding.guid).is_none())
                 .filter_map(|binding| {
                     let instance = next.instance(&binding.instance)?;
-                    Some((binding.app.clone(), instance.name.clone()))
+                    let brokered = binding.operation.is_some().then(|| binding.guid.clone());
+                    Some((binding.app.clone(), instance.name.clone(), brokered))
                 })
                 .collect();
             *state = next;
@@ -1347,20 +1358,38 @@ impl Api {
                 );
             }
         }
-        for (app, instance) in bound {
-            self.logs.add(
-                &app,
-                "API",
-                format!("Bound service instance {instance}: applies at the next start, restart or restage"),
-            );
+        let mut brokered = Vec::new();
+        for (app, instance, by_broker) in bound {
+            match by_broker {
+                // logged when the broker made it
+                Some(binding) => brokered.push(binding),
+                None => self.logs.add(
+                    &app,
+                    "API",
+                    format!("Bound service instance {instance}: applies at the next start, restart or restage"),
+                ),
+            }
         }
-        let job = self.job(
-            req,
-            "space.apply_manifest",
-            Vec::new(),
-            Some(("space".into(), format!("/v3/spaces/{space}"))),
-        )?;
-        Ok(warned(job, &warnings))
+        let user = self.claims(req)?.user_id;
+        let job = self.store.update(|state| {
+            let job = state.add_waiting_job(
+                "space.apply_manifest",
+                brokered.clone(),
+                Some(("space".into(), format!("/v3/spaces/{space}"))),
+            );
+            for binding in &brokered {
+                if let Some(operation) = state
+                    .binding_mut(binding)
+                    .and_then(|binding| binding.operation.as_mut())
+                {
+                    operation.job = Some(job.clone());
+                    operation.user = Some(user.clone());
+                }
+            }
+            job
+        });
+        self.operations.kick();
+        Ok(warned(self.located(req, &job), &warnings))
     }
 
     fn manifest_diff(&self, req: &Req) -> Reply {
@@ -1528,22 +1557,82 @@ impl Api {
         ))
     }
 
+    /// Deletes the app; its bindings to brokers' instances first, as their brokers unbind
+    /// them: the job settles once they are unbound and the app deleted, and fails, the app
+    /// left, if one is not.
     async fn delete_app(&self, req: &Req, guid: &str) -> Reply {
         let app = self.app(guid)?;
-        let _app = self.controller.hold(guid).await;
-        // gone from the wicket first; if it does not take that, the watch removes it when it does
-        let removed = self.controller.apply(guid, None).await;
-        let blobs = self.store.update(|state| {
-            if removed.as_ref().is_err_and(Failure::retried) {
-                state.removals.push(guid.to_string());
+        let user = self.claims(req)?.user_id;
+        let job = self.store.update(|state| {
+            let brokered: Vec<String> = state
+                .bindings_of(guid)
+                .filter(|binding| {
+                    state
+                        .instance(&binding.instance)
+                        .is_some_and(crate::store::Instance::brokered)
+                })
+                .map(|binding| binding.guid.clone())
+                .collect();
+            if brokered.is_empty() {
+                return Ok(None);
             }
-            state.remove_app(guid)
+            if let Some(busy) = state
+                .bindings_of(guid)
+                .find(|binding| brokered.contains(&binding.guid) && binding.busy())
+            {
+                let instance = state
+                    .instance(&busy.instance)
+                    .map_or("", |instance| instance.name.as_str());
+                return Err(ApiError {
+                    status: StatusCode::CONFLICT,
+                    code: 60016,
+                    title: "CF-AsyncServiceInstanceOperationInProgress",
+                    detail: format!(
+                        "An operation for the service binding between app {} and service instance {instance} is in progress.",
+                        app.name
+                    ),
+                });
+            }
+            let mut waits = brokered.clone();
+            waits.push(guid.to_string());
+            let job = state.add_waiting_job("app.delete", waits, None);
+            for binding in &brokered {
+                let binding = state.binding_mut(binding).expect("listed above");
+                binding.operation = Some(crate::store::Operation::new(
+                    crate::store::OperationKind::Delete,
+                    Some(job.clone()),
+                    Some(user.clone()),
+                ));
+            }
+            Ok(Some((job, brokered)))
+        })?;
+        let Some((job, unbound)) = job else {
+            self.controller.remove(guid, &app.name).await;
+            return self.job(req, "app.delete", Vec::new(), None);
+        };
+        self.operations.kick();
+        let (operations, controller, store) = (
+            self.operations.clone(),
+            self.controller.clone(),
+            self.store.clone(),
+        );
+        let (guid, located) = (guid.to_string(), job.clone());
+        tokio::spawn(async move {
+            operations
+                .until(|state| {
+                    state
+                        .job(&job)
+                        .is_none_or(|job| !job.waits.iter().any(|wait| unbound.contains(wait)))
+                })
+                .await;
+            let unbound =
+                store.read(|state| state.job(&job).is_some_and(|job| job.errors.is_empty()));
+            if unbound {
+                controller.remove(&guid, &app.name).await;
+            }
+            store.update(|state| state.settle(&job, &guid, None));
         });
-        self.store.delete(&blobs);
-        self.logs.forget(guid);
-        self.controller.forget(guid);
-        println!("[{guid}] API: deleted app {}", app.name);
-        self.job(req, "app.delete", Vec::new(), None)
+        Ok(self.located(req, &located))
     }
 
     async fn patch_process(&self, req: &Req, process: &str) -> Reply {

@@ -1,7 +1,8 @@
 //! The desired state: one organization and space, the shared domains, the
 //! apps with their web process and environment variables, the routes,
-//! packages, builds, droplets, deployments and jobs, the service instances
-//! and their bindings. In memory, written by a rename to `state.json` in the
+//! packages, builds, droplets, deployments and jobs, the service brokers
+//! registered with their catalogs, the service instances and their bindings.
+//! In memory, written by a rename to `state.json` in the
 //! data directory on every change; the blobs next to it
 //! (`packages/<guid>.zip`, `droplets/<sha256>.wasm`, a static site's files
 //! `droplets/<sha256>.tar`). Every file is its
@@ -54,6 +55,9 @@ pub struct State {
     pub droplets: Vec<Droplet>,
     pub deployments: Vec<Deployment>,
     pub jobs: Vec<Job>,
+    /// The brokers registered (`crate::brokers`), their catalogs with them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub brokers: Vec<Broker>,
     #[serde(default)]
     pub instances: Vec<Instance>,
     #[serde(default)]
@@ -214,8 +218,10 @@ pub struct Running {
 }
 
 /// A service instance: a namespace of a keyvalue store (offering
-/// `keyvalue`, the store its plan), a capability (offering `wasi`), or the
-/// user's credentials (offering `user-provided`, no plan).
+/// `keyvalue`, the store its plan), a capability (offering `wasi`), the
+/// user's credentials (offering `user-provided`, no plan), or a broker's
+/// (`broker`; `offering` and `plan` the guids of its offering and plan in the
+/// broker's catalog).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Instance {
     pub guid: String,
@@ -227,6 +233,19 @@ pub struct Instance {
     /// apps: a secret, as an environment variable's value.
     #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
     pub credentials: serde_json::Map<String, serde_json::Value>,
+    /// The guid of the broker of a broker's instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker: Option<String>,
+    /// What the broker answered of a broker's instance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dashboard_url: Option<String>,
+    /// The maintenance info of its plan a broker's instance was made or
+    /// updated to.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_info: Option<serde_json::Value>,
+    /// The last operation of a broker's instance; None: created at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Operation>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -235,6 +254,248 @@ impl Instance {
     pub fn user_provided(&self) -> bool {
         self.offering == crate::services::USER_PROVIDED
     }
+
+    pub fn brokered(&self) -> bool {
+        self.broker.is_some()
+    }
+
+    /// Whether an operation of the broker on it is under way.
+    pub fn busy(&self) -> bool {
+        self.operation.as_ref().is_some_and(Operation::under_way)
+    }
+}
+
+/// An operation of a broker on an instance or a binding, as CC keeps the
+/// last one: under way until the broker says how it went (`crate::operations`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Operation {
+    pub kind: OperationKind,
+    pub state: OperationState,
+    pub description: String,
+    /// Whether the broker took the request: until then (a restart of the
+    /// cf-api included), it is sent again.
+    pub sent: bool,
+    /// The parameters to send, dropped once the broker took them: they may
+    /// hold secrets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parameters: Option<serde_json::Value>,
+    /// An update's plan (its guid) and maintenance info, taken when it
+    /// succeeds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plan: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub maintenance_info: Option<serde_json::Value>,
+    /// The broker's `operation`, polled with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub broker_operation: Option<String>,
+    /// The job it settles.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<String>,
+    /// The user_id of who asked: the broker's originating identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// When the polling gives up, seconds since the epoch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<u64>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OperationKind {
+    Create,
+    Update,
+    Delete,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperationState {
+    #[serde(rename = "in progress")]
+    InProgress,
+    #[serde(rename = "succeeded")]
+    Succeeded,
+    #[serde(rename = "failed")]
+    Failed,
+}
+
+impl OperationKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OperationKind::Create => "create",
+            OperationKind::Update => "update",
+            OperationKind::Delete => "delete",
+        }
+    }
+}
+
+impl OperationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OperationState::InProgress => "in progress",
+            OperationState::Succeeded => "succeeded",
+            OperationState::Failed => "failed",
+        }
+    }
+}
+
+impl Operation {
+    /// A new operation under way, not sent yet.
+    pub fn new(kind: OperationKind, job: Option<String>, user: Option<String>) -> Operation {
+        let at = now();
+        Operation {
+            kind,
+            state: OperationState::InProgress,
+            description: String::new(),
+            sent: false,
+            parameters: None,
+            plan: None,
+            maintenance_info: None,
+            broker_operation: None,
+            job,
+            user,
+            deadline: None,
+            created_at: at.clone(),
+            updated_at: at,
+        }
+    }
+
+    pub fn under_way(&self) -> bool {
+        self.state == OperationState::InProgress
+    }
+}
+
+/// A broker registered (`crate::brokers`): where it is, its credentials (a
+/// secret, shown nowhere) and its catalog as last fetched.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct Broker {
+    pub guid: String,
+    pub name: String,
+    pub url: String,
+    pub username: String,
+    pub password: String,
+    /// A space-scoped broker's space: its plans are that space's alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<String>,
+    pub offerings: Vec<Offering>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl std::fmt::Debug for Broker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Broker")
+            .field("guid", &self.guid)
+            .field("name", &self.name)
+            .field("url", &self.url)
+            .field("username", &self.username)
+            .field("password", &"***")
+            .field("space", &self.space)
+            .field("offerings", &self.offerings)
+            .finish()
+    }
+}
+
+/// A service offering of a broker's catalog: the catalog's object as the
+/// broker gave it, checked (`crate::osb::catalog`), less its plans.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Offering {
+    pub guid: String,
+    pub catalog: serde_json::Map<String, serde_json::Value>,
+    pub plans: Vec<BrokerPlan>,
+    /// Gone from the catalog, kept for the instances of its plans.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gone: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A plan of a broker's offering: the catalog's object, and who sees it.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BrokerPlan {
+    pub guid: String,
+    pub catalog: serde_json::Map<String, serde_json::Value>,
+    /// `admin` (none but who edits the brokers), `public`, `organization`
+    /// (the one) or `space` (a space-scoped broker's).
+    pub visibility: String,
+    /// Gone from the catalog, kept for its instances.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gone: bool,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A field of a catalog object: checked when fetched, so its type holds.
+fn text<'a>(catalog: &'a serde_json::Map<String, serde_json::Value>, key: &str) -> &'a str {
+    catalog
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+}
+
+fn flag(catalog: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<bool> {
+    catalog.get(key).and_then(serde_json::Value::as_bool)
+}
+
+impl Offering {
+    /// The broker's id of it.
+    pub fn id(&self) -> &str {
+        text(&self.catalog, "id")
+    }
+
+    pub fn name(&self) -> &str {
+        text(&self.catalog, "name")
+    }
+
+    /// A feature of it (`bindable`, `plan_updateable`, `instances_retrievable`,
+    /// `bindings_retrievable`, `allow_context_updates`), false unless said.
+    pub fn feature(&self, key: &str) -> bool {
+        flag(&self.catalog, key).unwrap_or(false)
+    }
+
+    pub fn plan(&self, guid: &str) -> Option<&BrokerPlan> {
+        self.plans.iter().find(|plan| plan.guid == guid)
+    }
+}
+
+impl BrokerPlan {
+    pub fn id(&self) -> &str {
+        text(&self.catalog, "id")
+    }
+
+    pub fn name(&self) -> &str {
+        text(&self.catalog, "name")
+    }
+
+    /// Its own `bindable` or `plan_updateable`, else its offering's.
+    pub fn feature(&self, offering: &Offering, key: &str) -> bool {
+        flag(&self.catalog, key).unwrap_or_else(|| offering.feature(key))
+    }
+
+    /// How long the broker may take an operation: its
+    /// `maximum_polling_duration`, seconds.
+    pub fn maximum_polling_duration(&self) -> Option<u64> {
+        self.catalog
+            .get("maximum_polling_duration")
+            .and_then(serde_json::Value::as_u64)
+    }
+
+    pub fn maintenance_info(&self) -> Option<&serde_json::Value> {
+        self.catalog.get("maintenance_info")
+    }
+
+    /// Whether the space's apps may have instances of it.
+    pub fn visible(&self) -> bool {
+        self.visibility != "admin" && !self.gone
+    }
+}
+
+/// A plan of a broker found by its guid, with its offering and broker.
+#[derive(Clone, Copy)]
+pub struct Brokered<'a> {
+    pub broker: &'a Broker,
+    pub offering: &'a Offering,
+    pub plan: &'a BrokerPlan,
 }
 
 /// A security group (`crate::security_groups`): its rules, as given, and where they apply.
@@ -277,8 +538,27 @@ pub struct Binding {
     /// The keyvalue identifier the app opens the namespace by; empty for a
     /// capability.
     pub identifier: String,
+    /// What the broker of a broker's instance gave the app: a secret.
+    #[serde(default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub credentials: serde_json::Map<String, serde_json::Value>,
+    /// The last operation of a broker's binding; None: made at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub operation: Option<Operation>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl Binding {
+    /// Whether the app has it: made, not only asked of the broker.
+    pub fn made(&self) -> bool {
+        self.operation.as_ref().is_none_or(|operation| {
+            operation.kind != OperationKind::Create || operation.state == OperationState::Succeeded
+        })
+    }
+
+    pub fn busy(&self) -> bool {
+        self.operation.as_ref().is_some_and(Operation::under_way)
+    }
 }
 
 /// The data of a deleted keyvalue instance, deleted once no app maps it.
@@ -406,8 +686,30 @@ pub struct Job {
     pub errors: Vec<JobError>,
     /// A link besides `self`: its name and path.
     pub resource: Option<(String, String)>,
+    /// What it waits for (the guids of the instances and bindings a broker
+    /// operates on, an app to delete once they are unbound): PROCESSING
+    /// until none is left.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub waits: Vec<String>,
+    /// Whether the broker took its operation and is polled: POLLING.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub polling: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl Job {
+    /// `PROCESSING`, `POLLING`, `COMPLETE` or `FAILED`.
+    pub fn state(&self) -> &'static str {
+        match (self.waits.is_empty(), self.polling, self.errors.is_empty()) {
+            (false, false, _) => "PROCESSING",
+            (false, true, _) => "POLLING",
+            (true, _, true) => "COMPLETE",
+            (true, _, false) => "FAILED",
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -530,6 +832,43 @@ impl State {
         self.bindings.iter().find(|binding| binding.guid == guid)
     }
 
+    pub fn instance_mut(&mut self, guid: &str) -> Option<&mut Instance> {
+        self.instances
+            .iter_mut()
+            .find(|instance| instance.guid == guid)
+    }
+
+    pub fn binding_mut(&mut self, guid: &str) -> Option<&mut Binding> {
+        self.bindings
+            .iter_mut()
+            .find(|binding| binding.guid == guid)
+    }
+
+    pub fn broker(&self, guid: &str) -> Option<&Broker> {
+        self.brokers.iter().find(|broker| broker.guid == guid)
+    }
+
+    /// The broker's plan of the guid `plan`, with its offering and broker.
+    pub fn brokered(&self, plan: &str) -> Option<Brokered<'_>> {
+        self.brokers.iter().find_map(|broker| {
+            broker.offerings.iter().find_map(|offering| {
+                offering.plan(plan).map(|plan| Brokered {
+                    broker,
+                    offering,
+                    plan,
+                })
+            })
+        })
+    }
+
+    /// The plan of a broker's instance.
+    pub fn brokered_of(&self, instance: &Instance) -> Option<Brokered<'_>> {
+        instance
+            .broker
+            .as_ref()
+            .and_then(|_| self.brokered(&instance.plan))
+    }
+
     /// The bindings of the app `guid`, as they were made.
     pub fn bindings_of(&self, guid: &str) -> impl Iterator<Item = &Binding> {
         self.bindings
@@ -627,21 +966,55 @@ impl State {
         errors: Vec<JobError>,
         resource: Option<(String, String)>,
     ) -> String {
+        let guid = self.add_waiting_job(operation, Vec::new(), resource);
+        self.job_mut(&guid).expect("just added").errors = errors;
+        guid
+    }
+
+    /// Records a job waiting for `waits` ([`Job::waits`]).
+    pub fn add_waiting_job(
+        &mut self,
+        operation: &str,
+        waits: Vec<String>,
+        resource: Option<(String, String)>,
+    ) -> String {
         let at = now();
         let job = Job {
             guid: guid(),
             operation: operation.to_string(),
-            errors,
+            errors: Vec::new(),
             resource,
+            waits,
+            polling: false,
+            warnings: Vec::new(),
             created_at: at.clone(),
             updated_at: at,
         };
         let guid = job.guid.clone();
         self.jobs.push(job);
         if self.jobs.len() > 1000 {
-            self.jobs.remove(0);
+            // the oldest settled: one waiting is still polled by its CLI
+            let settled = self.jobs.iter().position(|job| job.waits.is_empty());
+            self.jobs.remove(settled.unwrap_or(0));
         }
         guid
+    }
+
+    pub fn job_mut(&mut self, guid: &str) -> Option<&mut Job> {
+        self.jobs.iter_mut().find(|job| job.guid == guid)
+    }
+
+    /// Takes `what` off the waits of the job `guid`, failed with `error`
+    /// if it did.
+    pub fn settle(&mut self, guid: &str, what: &str, error: Option<JobError>) {
+        if let Some(job) = self.job_mut(guid) {
+            job.waits.retain(|waited| waited != what);
+            job.errors.extend(error);
+            if job.waits.is_empty() {
+                job.polling = false;
+            }
+            job.updated_at = now();
+        }
     }
 
     /// Removes the app, its routes' mapping, its bindings, packages, builds,
@@ -743,6 +1116,37 @@ impl State {
         }
     }
 
+    /// Settles what the jobs wait for that no operation under way will: an app's delete
+    /// after its unbinds, which a stop of the cf-api cut short, fails.
+    pub fn settle_unfinished_waits(&mut self) {
+        let under_way: Vec<String> = self
+            .instances
+            .iter()
+            .filter(|instance| instance.busy())
+            .map(|instance| instance.guid.clone())
+            .chain(
+                self.bindings
+                    .iter()
+                    .filter(|binding| binding.busy())
+                    .map(|binding| binding.guid.clone()),
+            )
+            .collect();
+        for job in &mut self.jobs {
+            let before = job.waits.len();
+            job.waits.retain(|wait| under_way.contains(wait));
+            if job.waits.len() < before && job.errors.is_empty() {
+                job.errors.push(JobError {
+                    code: 10001,
+                    title: "UnknownError".into(),
+                    detail: "cut short by a restart of the cf-api: try again".into(),
+                });
+            }
+            if job.waits.is_empty() {
+                job.polling = false;
+            }
+        }
+    }
+
     /// Whether `package` is the newest of the app `app`: an older one is gone with a newer's
     /// upload.
     pub fn is_newest_package(&self, package: &str, app: &str) -> bool {
@@ -835,6 +1239,7 @@ impl Store {
                     .map_err(|e| format!("{}: {e}", file.display()))?;
                 state.follow_domains(domains);
                 state.fail_unfinished_builds();
+                state.settle_unfinished_waits();
                 state
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::new(org, space, domains),
@@ -1185,6 +1590,8 @@ mod tests {
                 app: bound.into(),
                 instance: "i".into(),
                 identifier: String::new(),
+                credentials: Default::default(),
+                operation: None,
                 created_at: now(),
                 updated_at: now(),
             });

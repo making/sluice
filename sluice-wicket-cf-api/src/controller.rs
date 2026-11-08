@@ -72,6 +72,23 @@ impl Controller {
         held
     }
 
+    /// Deletes the app `guid` (`name`): gone from the wicket first; if it does not take that,
+    /// the watch removes it when it does.
+    pub async fn remove(&self, guid: &str, name: &str) {
+        let _app = self.hold(guid).await;
+        let removed = self.apply(guid, None).await;
+        let blobs = self.store.update(|state| {
+            if removed.as_ref().is_err_and(Failure::retried) {
+                state.removals.push(guid.to_string());
+            }
+            state.remove_app(guid)
+        });
+        self.store.delete(&blobs);
+        self.logs.forget(guid);
+        self.forget(guid);
+        println!("[{guid}] API: deleted app {name}");
+    }
+
     /// `guid`, deleted, is held no more.
     pub fn forget(&self, guid: &str) {
         self.held
