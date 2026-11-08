@@ -100,6 +100,10 @@ struct Session {
     expires: u64,
 }
 
+/// The most sessions kept: a login past it evicts the one expiring soonest,
+/// so an open mode's unauthenticated grants cannot grow the store forever.
+const MAX_SESSIONS: usize = 10_000;
+
 /// The sessions by their refresh token's `jti`, in `sessions.json`.
 struct Sessions {
     file: PathBuf,
@@ -117,6 +121,25 @@ impl Sessions {
             Err(e) => return Err(format!("{}: {e}", file.display())),
         };
         Ok(Sessions { file, by_jti })
+    }
+
+    /// Adds a session, evicting the expired ones and then those expiring
+    /// soonest to keep at most [`MAX_SESSIONS`].
+    fn insert(&mut self, jti: String, session: Session) {
+        let now = epoch_secs();
+        self.by_jti.retain(|_, session| session.expires > now);
+        while self.by_jti.len() >= MAX_SESSIONS {
+            let Some(oldest) = self
+                .by_jti
+                .iter()
+                .min_by_key(|(_, session)| session.expires)
+                .map(|(jti, _)| jti.clone())
+            else {
+                break;
+            };
+            self.by_jti.remove(&oldest);
+        }
+        self.by_jti.insert(jti, session);
     }
 
     /// Writes the sessions still valid.
@@ -207,7 +230,7 @@ impl Uaa {
         };
         {
             let mut sessions = self.sessions.lock().expect("no panic held it");
-            sessions.by_jti.insert(
+            sessions.insert(
                 refresh.jti.clone(),
                 Session {
                     subject,
@@ -698,5 +721,56 @@ mod tests {
                 .contains("used already")
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+
+    fn subject() -> Subject {
+        Subject {
+            user_name: "me".into(),
+            email: "me@example.com".into(),
+            client: "cf".into(),
+            origin: "open".into(),
+            claims: Value::Null,
+        }
+    }
+
+    fn session(expires: u64) -> Session {
+        Session {
+            subject: subject(),
+            expires,
+        }
+    }
+
+    #[test]
+    fn the_session_store_keeps_at_most_the_cap_evicting_expired_then_soonest() {
+        let now = epoch_secs();
+        let mut sessions = Sessions {
+            file: PathBuf::from("sessions.json"),
+            by_jti: HashMap::new(),
+        };
+        // an expired one goes with the next insert of a live one
+        sessions
+            .by_jti
+            .insert("expired".into(), session(now.saturating_sub(1)));
+        sessions.insert("first".into(), session(now + 1000));
+        assert!(!sessions.by_jti.contains_key("expired"));
+        assert!(sessions.by_jti.contains_key("first"));
+        for i in 0..MAX_SESSIONS {
+            sessions.insert(format!("s{i}"), session(now + 1000 + i as u64));
+        }
+        assert_eq!(sessions.by_jti.len(), MAX_SESSIONS);
+        sessions.insert("newest".into(), session(now + 100_000));
+        assert_eq!(sessions.by_jti.len(), MAX_SESSIONS);
+        assert!(!sessions.by_jti.contains_key("s0"), "the soonest expiring");
+        assert!(sessions.by_jti.contains_key("newest"));
+        assert!(
+            sessions
+                .by_jti
+                .contains_key(&format!("s{}", MAX_SESSIONS - 1))
+        );
     }
 }
