@@ -206,6 +206,22 @@ class RedactFilterTest {
 		return new String(chunk, StandardCharsets.ISO_8859_1);
 	}
 
+	/**
+	 * A rule whose length is bounded but whose backtracking is not: the body passes as it
+	 * came.
+	 */
+	@Test
+	void aRuleThatBacktracksRelaysTheBodyUnredacted() throws Exception {
+		UpstreamFilter filter = filter(Map.of("key.regex", "(a{1,3}){1,20}z", "key.replacement", "!"));
+		byte[] body = utf8("a".repeat(30) + "!");
+		String request = "GET /api HTTP/1.1\r\nHost: a\r\n\r\n";
+		FilterTests.Chunked relayed = assertTimeoutPreemptively(TIMEOUT, () -> FilterTests.Chunked.of(FilterTests
+			.exchange(filter, request, response("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n", body), 64 * 1024)
+			.relayed()));
+		assertThat(relayed.body()).isEqualTo(body);
+		assertThat(FilterTests.counters(this.registry)).containsEntry("redact.bodies unredacted response", 1L);
+	}
+
 	@Test
 	void aRuleItCannotBoundStopsTheStart() {
 		List<Map<String, String>> refused = List.of(Map.of(), Map.of("key.literal", ""),

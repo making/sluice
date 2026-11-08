@@ -13,6 +13,8 @@ import java.util.regex.Pattern;
 import java.util.regex.PatternSyntaxException;
 
 import org.jspecify.annotations.Nullable;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 
 import am.ik.sluice.tunnel.TunnelBudget;
 import io.micrometer.core.instrument.Counter;
@@ -34,6 +36,17 @@ final class RedactFilter implements UpstreamFilter {
 
 	/** The most bytes a match may take. */
 	static final int MAX_MATCH = 4096;
+
+	private static final Logger log = LoggerFactory.getLogger(RedactFilter.class);
+
+	/**
+	 * The char reads one scan may make before the rest of the body relays unredacted:
+	 * enough for a linear scan of it, so a rule that backtracks stops holding the relay.
+	 */
+	private static final long MAX_STEPS = 200_000;
+
+	/** The steps a scan may make for each byte it reads: a linear match's few. */
+	private static final long STEPS_PER_BYTE = 16;
 
 	private static final String DEFAULT_TYPES = "text/*,application/json,application/*+json,application/x-ndjson";
 
@@ -303,6 +316,9 @@ final class RedactFilter implements UpstreamFilter {
 
 		private boolean closed;
 
+		/** Set once a rule's match spent the scan's steps: the rest passes as it came. */
+		private boolean exhausted;
+
 		Redaction(String side) {
 			this.side = side;
 		}
@@ -317,6 +333,10 @@ final class RedactFilter implements UpstreamFilter {
 					throw new IllegalStateException("filter " + NAME + " has no tunnel budget left to hold a match");
 				}
 			}
+			if (this.exhausted) {
+				this.output = Arrays.copyOfRange(bytes, offset, offset + length);
+				return this.output;
+			}
 			byte[] buffer = bytes;
 			int base = offset;
 			int end = length;
@@ -327,6 +347,12 @@ final class RedactFilter implements UpstreamFilter {
 				end = buffer.length;
 			}
 			int held = scan(buffer, base, end, false);
+			if (this.exhausted) {
+				// nothing is held: every byte on passes as it came
+				this.carry = EMPTY;
+				this.kept = 0;
+				return this.output;
+			}
 			int keep = Math.min(RedactFilter.this.behind, held);
 			this.carry = held - keep == end ? EMPTY : Arrays.copyOfRange(buffer, base + held - keep, base + end);
 			this.kept = keep;
@@ -359,19 +385,29 @@ final class RedactFilter implements UpstreamFilter {
 			ByteArrayOutputStream replaced = null;
 			int from = this.kept;
 			int stop = end;
-			while (from < end) {
-				if (!finder.find(from)) {
-					stop = finder.stop();
-					break;
+			try {
+				while (from < end) {
+					if (!finder.find(from)) {
+						stop = finder.stop();
+						break;
+					}
+					if (replaced == null) {
+						replaced = new ByteArrayOutputStream(end - from + 64);
+					}
+					replaced.write(buffer, base + from, finder.start() - from);
+					byte[] replacement = RedactFilter.this.rules.get(finder.rule()).replacement;
+					replaced.write(replacement, 0, replacement.length);
+					this.made[finder.rule()]++;
+					from = finder.end();
 				}
-				if (replaced == null) {
-					replaced = new ByteArrayOutputStream(end - from + 64);
-				}
-				replaced.write(buffer, base + from, finder.start() - from);
-				byte[] replacement = RedactFilter.this.rules.get(finder.rule()).replacement;
-				replaced.write(replacement, 0, replacement.length);
-				this.made[finder.rule()]++;
-				from = finder.end();
+			}
+			catch (Steps steps) {
+				// a rule backtracks: past what a linear scan takes, the rest passes
+				this.exhausted = true;
+				stop = end;
+				log.warn(
+						"filter {} route {}: a rule's match spent {} steps on {} bytes: the rest of the {} body relays unredacted",
+						NAME, RedactFilter.this.route, MAX_STEPS + STEPS_PER_BYTE * end, end, this.side);
 			}
 			if (replaced == null) {
 				this.output = Arrays.copyOfRange(buffer, base + from, base + stop);
@@ -406,7 +442,69 @@ final class RedactFilter implements UpstreamFilter {
 						.increment(this.made[i]);
 				}
 			}
-			bodies(this.side, !this.ended ? "cut" : replacements > 0 ? "redacted" : "clean");
+			bodies(this.side,
+					this.exhausted ? "unredacted" : !this.ended ? "cut" : replacements > 0 ? "redacted" : "clean");
+		}
+
+	}
+
+	/** Thrown when a match spends the steps of its scan: the rest passes as it came. */
+	private static final class Steps extends RuntimeException {
+
+		private Steps() {
+			super(null, null, false, false);
+		}
+
+	}
+
+	/** What a scan's match attempts may read, and no more. */
+	private static final class Budget {
+
+		private long left;
+
+		Budget(long left) {
+			this.left = left;
+		}
+
+		void spend() {
+			if (--this.left < 0) {
+				throw new Steps();
+			}
+		}
+
+	}
+
+	/** The bytes as ISO-8859-1 chars, each read spending the scan's budget. */
+	private static final class Counted implements CharSequence {
+
+		private final String text;
+
+		private final Budget budget;
+
+		Counted(String text, Budget budget) {
+			this.text = text;
+			this.budget = budget;
+		}
+
+		@Override
+		public char charAt(int index) {
+			this.budget.spend();
+			return this.text.charAt(index);
+		}
+
+		@Override
+		public int length() {
+			return this.text.length();
+		}
+
+		@Override
+		public CharSequence subSequence(int start, int end) {
+			return new Counted(this.text.substring(start, end), this.budget);
+		}
+
+		@Override
+		public String toString() {
+			return this.text;
 		}
 
 	}
@@ -444,6 +542,8 @@ final class RedactFilter implements UpstreamFilter {
 
 		private final String text;
 
+		private final Counted counted;
+
 		private final boolean last;
 
 		private @Nullable Matcher probe;
@@ -456,12 +556,13 @@ final class RedactFilter implements UpstreamFilter {
 		private int rule;
 
 		RegexFinder(Pattern pattern, String text, boolean last) {
-			this.matcher = matcher(pattern, text);
 			this.text = text;
+			this.counted = new Counted(text, new Budget(MAX_STEPS + STEPS_PER_BYTE * text.length()));
+			this.matcher = matcher(pattern, this.counted);
 			this.last = last;
 		}
 
-		private static Matcher matcher(Pattern pattern, String text) {
+		private static Matcher matcher(Pattern pattern, CharSequence text) {
 			// what is before and after the region is seen, and no bound is an anchor
 			return pattern.matcher(text).useTransparentBounds(true).useAnchoringBounds(false);
 		}
@@ -502,7 +603,7 @@ final class RedactFilter implements UpstreamFilter {
 		private int holdPoint(int from, int end) {
 			Matcher probe = this.probe;
 			if (probe == null) {
-				probe = matcher(this.matcher.pattern(), this.text);
+				probe = matcher(this.matcher.pattern(), this.counted);
 				this.probe = probe;
 			}
 			for (int at = Math.max(from, end - RedactFilter.this.reach); at < end; at++) {
