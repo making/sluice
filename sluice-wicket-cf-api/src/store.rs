@@ -241,6 +241,9 @@ pub struct Process {
     pub log_rate_limit: i64,
     pub command: Option<String>,
     pub health_check: HealthCheck,
+    /// Its readiness check: what has the wicket take an instance's connections.
+    #[serde(default)]
+    pub readiness_health_check: ReadinessCheck,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -260,6 +263,27 @@ impl Default for HealthCheck {
             timeout: None,
             invocation_timeout: None,
             endpoint: None,
+        }
+    }
+}
+
+/// A process's readiness check, as a manifest's `readiness-health-check-*` keys set it: `process`,
+/// `port` or `http`, its seconds.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ReadinessCheck {
+    pub kind: String,
+    pub endpoint: Option<String>,
+    pub invocation_timeout: Option<u64>,
+    pub interval: Option<u64>,
+}
+
+impl Default for ReadinessCheck {
+    fn default() -> Self {
+        ReadinessCheck {
+            kind: "process".into(),
+            endpoint: None,
+            invocation_timeout: None,
+            interval: None,
         }
     }
 }
@@ -296,6 +320,9 @@ pub struct Running {
     /// (`crate::manifest::live_lifetime`).
     #[serde(default)]
     pub lifetime: Lifetime,
+    /// The process's readiness check as it was: another one waits for the next start, as on CF.
+    #[serde(default)]
+    pub readiness: ReadinessCheck,
     /// The capabilities the bindings granted.
     #[serde(default)]
     pub wasi: Vec<String>,
@@ -1185,6 +1212,7 @@ impl State {
                 log_rate_limit: -1,
                 command: None,
                 health_check: HealthCheck::default(),
+                readiness_health_check: ReadinessCheck::default(),
                 created_at: at.clone(),
                 updated_at: at,
             },

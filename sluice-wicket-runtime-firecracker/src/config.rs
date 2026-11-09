@@ -48,6 +48,12 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
                                   per-client=N a client address's connections at once,
                                   idle-ms=N a connection may relay no byte, cpu=N (jail
                                   mode) a VM's host CPU in percent of one,
+                                  readiness=process|port|http (boot, pool: a VM takes
+                                  connections once its probe passes; process: once up),
+                                  readiness-endpoint=<path> (http: answered 200, /),
+                                  readiness-timeout-ms=N a probe (1000),
+                                  readiness-interval-ms=N between those of a VM ready
+                                  (30000; not ready, 500 at most),
                                   egress=<host>:<port>,... the destinations its guests may
                                   connect to through the wicket: names, addresses, ranges
                                   (10.0.0.0/24:5432, [2001:db8::/32]:443)
@@ -790,6 +796,10 @@ pub(crate) struct FileRoute {
     cpu: Option<u32>,
     per_client: Option<u32>,
     idle_ms: Option<u32>,
+    readiness: Option<String>,
+    readiness_endpoint: Option<String>,
+    readiness_timeout_ms: Option<u32>,
+    readiness_interval_ms: Option<u32>,
     egress: Option<Vec<String>>,
     disk: Option<String>,
     disk_mib: Option<u32>,
@@ -797,7 +807,7 @@ pub(crate) struct FileRoute {
 
 impl FileRoute {
     /// The keys of [`FileRoute::options`], in their order.
-    pub(crate) const KEYS: [&'static str; 19] = [
+    pub(crate) const KEYS: [&'static str; 23] = [
         "mode",
         "vcpus",
         "memory-mib",
@@ -814,6 +824,10 @@ impl FileRoute {
         "concurrency",
         "per-client",
         "idle-ms",
+        "readiness",
+        "readiness-endpoint",
+        "readiness-timeout-ms",
+        "readiness-interval-ms",
         "egress",
         "disk",
         "disk-mib",
@@ -839,6 +853,18 @@ impl FileRoute {
             ("per-client", self.per_client),
             ("idle-ms", self.idle_ms),
         ];
+        let readiness = [
+            ("readiness", self.readiness.clone()),
+            ("readiness-endpoint", self.readiness_endpoint.clone()),
+            (
+                "readiness-timeout-ms",
+                self.readiness_timeout_ms.map(|ms| ms.to_string()),
+            ),
+            (
+                "readiness-interval-ms",
+                self.readiness_interval_ms.map(|ms| ms.to_string()),
+            ),
+        ];
         self.mode
             .iter()
             .map(|mode| ("mode", mode.clone()))
@@ -846,6 +872,11 @@ impl FileRoute {
                 numbers
                     .into_iter()
                     .filter_map(|(key, value)| Some((key, value?.to_string()))),
+            )
+            .chain(
+                readiness
+                    .into_iter()
+                    .filter_map(|(key, value)| Some((key, value?))),
             )
             .chain(self.egress.iter().map(|rules| ("egress", rules.join(","))))
             .chain(self.disk.iter().map(|mount| ("disk", mount.clone())))
@@ -934,7 +965,8 @@ mod tests {
         )
         .unwrap();
         let vm = format!(
-            "b.local={}?mode=pool&instances=4&warm=1&concurrency=8&keep-ms=60000&boot-ms=90000",
+            "b.local={}?mode=pool&instances=4&warm=1&concurrency=8&keep-ms=60000&boot-ms=90000\
+             &readiness-interval-ms=5000&readiness-endpoint=/healthz&readiness=http",
             rootfs.display()
         );
         let config_flag = config.display().to_string();
@@ -1001,10 +1033,11 @@ mod tests {
         assert_eq!(
             settings.specs[1].target(),
             format!(
-                "firecracker:{}?mode=pool&boot-ms=90000&warm=1&instances=4&concurrency=8",
+                "firecracker:{}?mode=pool&boot-ms=90000&warm=1&instances=4&concurrency=8\
+                 &readiness=http&readiness-endpoint=/healthz&readiness-interval-ms=5000",
                 rootfs.display()
             ),
-            "a pool's warm by default its instances"
+            "a pool's warm by default its instances, the options in one order"
         );
 
         let settings = run(

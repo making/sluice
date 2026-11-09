@@ -5,6 +5,12 @@
 //! which tell when every server took a generation
 //! ([`Routes::acknowledged`]). A removed target is served until then: the
 //! server may have routed a connection to it before it took the new routes.
+//!
+//! A stream advertises the routes ready alone ([`Table::ready`]): one with no
+//! instance to serve it leaves the advertisement, so the server sends its
+//! host to another client serving it, or falls through as for a host no client
+//! advertises, until it is ready again ([`Routes::readiness_changed`]). It is
+//! still bound: the server may have routed a connection to it before.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -24,8 +30,20 @@ pub trait Table: Send + Sync + Sized + 'static {
     /// generation whose routes the server took.
     fn generation(&self) -> u64;
 
-    /// The upstreams every stream advertises.
+    /// The upstreams of the routes: every stream advertises those [`Table::ready`].
     fn advertised(&self) -> &[Upstream];
+
+    /// Whether `route` has an instance ready to serve its next connection: as it is now, not as
+    /// the table was published. The wicket tells a change ([`Routes::readiness_changed`]).
+    fn ready(&self, _route: &Upstream) -> bool {
+        true
+    }
+
+    /// What a stream advertises: [`Table::advertised`], those [`Table::ready`].
+    fn offered(&self) -> Vec<Upstream> {
+        let advertised = self.advertised().iter();
+        advertised.filter(|up| self.ready(up)).cloned().collect()
+    }
 
     /// Whether `route`, advertised alone, takes any host on a wicket's listener:
     /// the local loop of a route given by a flag. Not on a wicket whose routes are
@@ -104,6 +122,13 @@ impl<T> Routes<T> {
         self.table.send_replace(Arc::new(table));
     }
 
+    /// The readiness of the current table's routes ([`Table::ready`]) may have changed: every
+    /// stream advertises those ready again, if they are not what it advertised. The same
+    /// generation: the server takes no other routes than the table's.
+    pub fn readiness_changed(&self) {
+        self.table.send_modify(|_| {});
+    }
+
     /// Registers a live stream, unregistered when the guard drops.
     pub fn stream(&self) -> StreamAcks {
         let id = self.acks.next_stream.fetch_add(1, Ordering::Relaxed);
@@ -173,6 +198,8 @@ pub(crate) mod testing {
         pub(crate) advertised: Vec<Upstream>,
         /// See [`Table::takes_any_host`].
         pub(crate) takes_any_host: bool,
+        /// The hosts with no instance ready, as they are now ([`Table::ready`]).
+        pub(crate) unready: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl Fixed {
@@ -189,6 +216,7 @@ pub(crate) mod testing {
                     })
                     .collect(),
                 takes_any_host: false,
+                unready: Arc::default(),
             }
         }
     }
@@ -202,6 +230,10 @@ pub(crate) mod testing {
 
         fn advertised(&self) -> &[Upstream] {
             &self.advertised
+        }
+
+        fn ready(&self, route: &Upstream) -> bool {
+            !self.unready.lock().unwrap().contains(&route.host)
         }
 
         fn takes_any_host(&self, _route: &Upstream) -> bool {

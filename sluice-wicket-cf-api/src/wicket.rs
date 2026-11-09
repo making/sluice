@@ -142,6 +142,15 @@ pub struct VmSandbox {
     /// How long a VM's process may take to listen.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub boot_ms: Option<u64>,
+    /// Its readiness check, `port` or `http`, and its endpoint, timeout and interval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub readiness_interval_ms: Option<u64>,
     /// The destinations its VMs may connect to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<String>,
@@ -369,6 +378,9 @@ pub struct ListedInstance {
     pub index: u64,
     /// Its start, in seconds since the epoch.
     pub since: u64,
+    /// Of a wicket checking its readiness: whether it takes requests. None: it does.
+    #[serde(default)]
+    pub ready: Option<bool>,
 }
 
 #[derive(Deserialize, Debug)]

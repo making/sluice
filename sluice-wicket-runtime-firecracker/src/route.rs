@@ -38,6 +38,7 @@ use crate::disk::{self, Disk};
 use crate::egress::Egress;
 use crate::keeper::Role;
 use crate::output::{self, Ended, Hosts, Output, Sink};
+use crate::readiness::{self, Check, Readiness};
 use crate::vm::{self, Place, Places, Snapshot, Spec, Vm};
 use crate::wire::{self, Rule};
 
@@ -175,9 +176,9 @@ pub struct RouteSpec {
     pub bounds: Bounds,
 }
 
-/// What says how many VMs a route keeps and how long, not what they are: a running route takes a
-/// change of it ([`Route::adjust`]).
-#[derive(Clone, Copy, Debug, PartialEq)]
+/// What says how many VMs a route keeps, how long and when one serves, not what they are: a running
+/// route takes a change of it ([`Route::adjust`]).
+#[derive(Clone, Debug, PartialEq)]
 pub struct Bounds {
     /// How long a cold-booted guest may take to listen on its port.
     pub boot: Duration,
@@ -204,6 +205,8 @@ pub struct Bounds {
     /// How long a connection may relay no byte, either way, before it is failed (and
     /// its VM killed); None = no bound of its own.
     pub idle: Option<Duration>,
+    /// Boot and pool modes: what tells a VM ready to take connections.
+    pub readiness: Readiness,
 }
 
 impl Bounds {
@@ -225,10 +228,14 @@ const BOUNDS: &[&str] = &[
     "concurrency",
     "per-client",
     "idle-ms",
+    "readiness",
+    "readiness-endpoint",
+    "readiness-timeout-ms",
+    "readiness-interval-ms",
 ];
 
 impl RouteSpec {
-    /// Parses `host=<rootfs>[?mode=boot|per-connection|reuse|pool&vcpus=N&memory-mib=N&cpu=N&port=N&boot-ms=N&warm=N&prime=N&instances=N&wait-ms=N&keep-ms=N&uses=N&lifetime-ms=N&concurrency=N&per-client=N&idle-ms=N&egress=<rule>,...&disk=<path>&disk-mib=N]`.
+    /// Parses `host=<rootfs>[?mode=boot|per-connection|reuse|pool&vcpus=N&memory-mib=N&cpu=N&port=N&boot-ms=N&warm=N&prime=N&instances=N&wait-ms=N&keep-ms=N&uses=N&lifetime-ms=N&concurrency=N&per-client=N&idle-ms=N&readiness=process|port|http&readiness-endpoint=<path>&readiness-timeout-ms=N&readiness-interval-ms=N&egress=<rule>,...&disk=<path>&disk-mib=N]`.
     pub fn parse(
         flag: &str,
         firecracker: &std::path::Path,
@@ -313,10 +320,12 @@ impl RouteSpec {
                 concurrency: DEFAULT_CONCURRENCY,
                 per_client: None,
                 idle: None,
+                readiness: Readiness::default(),
             },
         };
         let mut given = Vec::new();
         let (mut mount, mut disk_mib) = (None, None);
+        let mut endpoint = None;
         for (key, value) in options {
             given.push(key);
             let number = || -> Result<u32, String> {
@@ -351,6 +360,16 @@ impl RouteSpec {
                 "cpu" => spec.vm.cpu = Some(positive()?),
                 "per-client" => spec.bounds.per_client = Some(positive()? as usize),
                 "idle-ms" => spec.bounds.idle = Some(millis()?),
+                "readiness" => {
+                    spec.bounds.readiness.check =
+                        Check::named(value).map_err(|e| format!("{named}: {e}"))?;
+                }
+                "readiness-endpoint" => {
+                    endpoint =
+                        Some(readiness::endpoint(value).map_err(|e| format!("{named}: {e}"))?);
+                }
+                "readiness-timeout-ms" => spec.bounds.readiness.timeout = millis()?,
+                "readiness-interval-ms" => spec.bounds.readiness.interval = millis()?,
                 "egress" => {
                     for rule in value.split(',').filter(|rule| !rule.is_empty()) {
                         let rule: Rule =
@@ -417,6 +436,7 @@ impl RouteSpec {
                 ));
             }
         }
+        spec.bounds.readiness = Self::readiness(named, &spec, &given, endpoint)?;
         if spec.mode == Mode::Boot {
             let vms = spec.bounds.instances.unwrap_or(1);
             spec.bounds.instances = Some(vms);
@@ -441,6 +461,46 @@ impl RouteSpec {
             ));
         }
         Ok(spec)
+    }
+
+    /// The readiness check of `spec` as the options `given` set it, `endpoint` that of
+    /// `readiness-endpoint`: what does not apply refused. A VM of a connection's own takes it as it
+    /// comes: only VMs serving connections ahead of them are probed, a pool's or booted ones.
+    fn readiness(
+        named: &str,
+        spec: &RouteSpec,
+        given: &[&str],
+        endpoint: Option<Arc<str>>,
+    ) -> Result<Readiness, String> {
+        let mut readiness = spec.bounds.readiness.clone();
+        let check = readiness.check.name();
+        let needs = |key: &str, what: &str| -> Result<(), String> {
+            match given.contains(&key) {
+                true => Err(format!("{named}: {key} needs {what}")),
+                false => Ok(()),
+            }
+        };
+        match &mut readiness.check {
+            Check::Process => {
+                needs("readiness-endpoint", "readiness=http")?;
+                needs("readiness-timeout-ms", "readiness=port or readiness=http")?;
+                needs("readiness-interval-ms", "readiness=port or readiness=http")?;
+                return Ok(readiness);
+            }
+            Check::Port => needs("readiness-endpoint", "readiness=http")?,
+            Check::Http(asked) => {
+                if let Some(endpoint) = endpoint {
+                    *asked = endpoint;
+                }
+            }
+        }
+        if matches!(spec.mode, Mode::PerConnection | Mode::Reuse) {
+            return Err(format!(
+                "{named}: readiness={check} needs mode=boot or mode=pool: a VM per connection \
+                 takes its connection as it comes, none serves ahead of them to be probed"
+            ));
+        }
+        Ok(readiness)
     }
 
     /// Whether `other` asks for the same VMs, its host and its [`Bounds`] aside.
@@ -544,6 +604,31 @@ impl RouteSpec {
                 options.push((key, value.to_string()));
             }
         }
+        let readiness = &bounds.readiness;
+        if readiness.check != Check::Process {
+            options.push(("readiness", readiness.check.name().to_string()));
+        }
+        if let Check::Http(endpoint) = &readiness.check
+            && &**endpoint != readiness::DEFAULT_ENDPOINT
+        {
+            options.push(("readiness-endpoint", endpoint.to_string()));
+        }
+        for (key, value, default) in [
+            (
+                "readiness-timeout-ms",
+                readiness.timeout,
+                readiness::DEFAULT_TIMEOUT,
+            ),
+            (
+                "readiness-interval-ms",
+                readiness.interval,
+                readiness::DEFAULT_INTERVAL,
+            ),
+        ] {
+            if value != default {
+                options.push((key, value.as_millis().to_string()));
+            }
+        }
         if !self.vm.egress.is_empty() {
             options.push(("egress", vm::egress_list(&self.vm.egress)));
         }
@@ -606,6 +691,8 @@ pub struct Vms {
     pub connections: u64,
     /// Boot and pool modes: VMs up in the place of one that went down.
     pub restarts: u64,
+    /// Boot and pool modes: the VMs taking connections, their readiness check passed.
+    pub ready: Option<usize>,
 }
 
 /// A cloned route's snapshot of its template.
@@ -725,6 +812,10 @@ impl Instance {
     }
 }
 
+/// Tells the advertisement that a route's readiness ([`Route::ready`]) may have moved: its streams
+/// look again.
+pub type ReadyChanged = Arc<dyn Fn() + Send + Sync>;
+
 /// Where a route starts, and what it is given to.
 pub struct Starting {
     pub places: Arc<Places>,
@@ -739,6 +830,8 @@ pub struct Starting {
     pub stops: TaskTracker,
     /// What the console shows: its VMs coming and going change it.
     pub status: watch::Sender<Status>,
+    /// Where its readiness moving is told.
+    pub ready_changed: ReadyChanged,
 }
 
 pub struct Route {
@@ -767,6 +860,8 @@ pub struct Route {
     taken: Option<Taken>,
     /// Held by what stops its VMs ([`Route::stopping`]), for [`Route::stop`] to wait for.
     stops: Arc<tokio::sync::Mutex<()>>,
+    /// Where its readiness moving is told.
+    ready_changed: ReadyChanged,
 }
 
 enum Backend {
@@ -788,7 +883,7 @@ struct Current(Arc<Mutex<Bounds>>);
 
 impl Current {
     fn get(&self) -> Bounds {
-        *self.0.lock().unwrap()
+        self.0.lock().unwrap().clone()
     }
 }
 
@@ -813,6 +908,8 @@ struct Warm {
     route: u64,
     /// Wakes what keeps them: a clone taken, their number changed, the route gone.
     changed: Arc<Notify>,
+    /// Where the route's readiness moving is told ([`Warm::ready`]).
+    ready_changed: ReadyChanged,
 }
 
 impl Warm {
@@ -820,8 +917,19 @@ impl Warm {
         let clone = self.clones.lock().unwrap().pop_front();
         if clone.is_some() {
             self.changed.notify_one();
+            // the last one, restores failing: none left to serve
+            if self.failed.lock().unwrap().down.is_some() {
+                (self.ready_changed)();
+            }
         }
         clone
+    }
+
+    /// Whether a connection of the route finds a clone: one restored ahead, else one of its own,
+    /// unless the restores fail.
+    fn ready(&self) -> bool {
+        let failing = self.failed.lock().unwrap().down.is_some();
+        !failing || !self.clones.lock().unwrap().is_empty()
     }
 
     /// The clones missing to `warm`.
@@ -846,10 +954,17 @@ impl Warm {
     /// A clone's restore failed with `e`, as a connection's or its own: both tell the same, so the
     /// next one waits, however many came. Those under way are given up ([`keep_warm`]).
     fn failing(&self, e: &BoxError) {
-        let mut failed = self.failed.lock().unwrap();
-        Shortage::keep(&mut failed.down, format!("its restore failed: {e}"));
-        failed.retry = Some(Instant::now() + failed.backoff.failed());
+        let began = {
+            let mut failed = self.failed.lock().unwrap();
+            let began = failed.down.is_none();
+            Shortage::keep(&mut failed.down, format!("its restore failed: {e}"));
+            failed.retry = Some(Instant::now() + failed.backoff.failed());
+            began
+        };
         self.changed.notify_one();
+        if began {
+            (self.ready_changed)();
+        }
     }
 
     /// A clone's restore succeeded, as a connection's or its own: the wait is over and starts
@@ -858,7 +973,9 @@ impl Warm {
         let mut failed = self.failed.lock().unwrap();
         if failed.down.is_some() {
             *failed = Failing::default();
+            drop(failed);
             self.changed.notify_one();
+            (self.ready_changed)();
         }
     }
 
@@ -1046,7 +1163,11 @@ struct VmPool {
     /// A VM started or failed, its last connection ended: the waiting connections and
     /// the tending ([`tend`]) look again.
     changed: Arc<Notify>,
+    /// The readiness check changed: each VM's probe ([`probed`]) is made again at once.
+    probes: Arc<Notify>,
     status: watch::Sender<Status>,
+    /// Where the route's readiness moving is told ([`VmPool::ready`]).
+    ready_changed: ReadyChanged,
 }
 
 /// What starts a pool's VMs, in tasks of their own that end with the pool.
@@ -1066,6 +1187,14 @@ enum Kind {
 impl Starter {
     fn boots(&self) -> bool {
         matches!(self.kind, Kind::Boots(_))
+    }
+
+    /// The hosts its route serves.
+    fn hosts(&self) -> &Arc<Hosts> {
+        match &self.kind {
+            Kind::Clones(cloner) => &cloner.hosts,
+            Kind::Boots(booter) => &booter.hosts,
+        }
     }
 
     /// A VM of the index `index` holds, its guest accepting: on the room `held` holds, else room
@@ -1216,12 +1345,19 @@ struct Member {
     /// Its instance index, what tells which VMs are past `instances`.
     index: usize,
     instance: Arc<Instance>,
+    /// It takes connections: its readiness check passed last, or it was started for connections
+    /// waiting, which take it unprobed.
+    ready: bool,
+    /// Why its last probe failed, as the log told it.
+    unready: Option<String>,
     /// Its connections open.
     conns: usize,
     /// Since when it serves none.
     since: Instant,
     /// Has its watch look at it: a connection failed.
     suspects: mpsc::Sender<()>,
+    /// Ends its probes ([`probed`]) as it leaves the pool.
+    _probed: tokio_util::sync::DropGuard,
     /// The wait before the next VM in its place, should it go down.
     backoff: Backoff,
 }
@@ -1307,7 +1443,7 @@ impl Members {
         first_past(self.vms.iter().map(|vm| vm.index).collect(), max)
     }
 
-    /// The VM within `max` holding the fewest connections, the one after the last seat
+    /// The VM within `max` ready holding the fewest connections, the one after the last seat
     /// taken first among them.
     fn least(&self, max: usize) -> Option<usize> {
         let n = self.vms.len();
@@ -1315,8 +1451,17 @@ impl Members {
         let past = self.past(max);
         (0..n)
             .map(|i| (start + i) % n)
-            .filter(|&i| self.vms[i].index < past)
+            .filter(|&i| self.vms[i].index < past && self.vms[i].ready)
             .min_by_key(|&i| self.vms[i].conns)
+    }
+
+    /// Why no VM within `max` takes a connection: none up, or none ready.
+    fn none(&self, max: usize) -> &'static str {
+        let past = self.past(max);
+        match self.vms.iter().any(|vm| vm.index < past) {
+            true => "none ready, its readiness check failing",
+            false => "none up",
+        }
     }
 
     /// A seat on the VM at `at`: its connections counted one more.
@@ -1413,20 +1558,70 @@ impl VmPool {
         }
     }
 
-    /// Has the pool's VMs looked at, and the console told.
+    /// Has the pool's VMs looked at, the console told, and the advertisement.
     fn told(&self) {
         self.changed.notify_waiters();
         self.status.send_modify(|status| status.revision += 1);
+        (self.ready_changed)();
+    }
+
+    /// Whether a connection finds a VM: one within `instances` ready, or, keeping none (`warm`
+    /// 0), one started for it, unless the starts fail or the pool is full. Stopped, none.
+    fn ready(&self) -> bool {
+        let bounds = self.bounds.get();
+        let members = self.members.lock().unwrap();
+        let max = bounds.pool_size();
+        if members.halted {
+            return false;
+        }
+        if members.least(max).is_some() {
+            return true;
+        }
+        let made = !self.starter.boots() && bounds.warm == 0;
+        made && members.failing.is_none() && members.kept() < max
+    }
+
+    /// The probe of the VM `id` found it ready, or why not: true while it is in the pool. A change
+    /// is logged and told; a failure going on in other words, logged.
+    fn probed(&self, id: u64, probed: Result<(), String>) -> bool {
+        let label = self.starter_label();
+        let moved = {
+            let mut members = self.members.lock().unwrap();
+            let Some(member) = members.vms.iter_mut().find(|vm| vm.id == id) else {
+                return false;
+            };
+            let index = member.index;
+            match probed {
+                Ok(()) if member.ready => false,
+                Ok(()) => {
+                    (member.ready, member.unready) = (true, None);
+                    eprintln!("route {label}: VM {index} ready");
+                    true
+                }
+                Err(why) if member.unready.as_ref() == Some(&why) => false,
+                Err(why) => {
+                    eprintln!("route {label}: VM {index} not ready: {why}");
+                    member.unready = Some(why);
+                    std::mem::replace(&mut member.ready, false)
+                }
+            }
+        };
+        if moved {
+            self.told();
+        }
+        true
     }
 
     /// Starts a VM in the background, of the index `index` holds, on the room `held` holds: into
-    /// the pool, watched from then on; or as [`Members::failed`] says.
+    /// the pool, watched from then on; or as [`Members::failed`] says. `unprobed`: for connections
+    /// waiting, which take it as it comes, its readiness probed after.
     fn spawn_start(
         self: &Arc<Self>,
         members: &mut Members,
         index: Arc<Index>,
         held: Option<Arc<Slot>>,
         wait: Duration,
+        unprobed: bool,
     ) {
         members.starting += 1;
         let (pool, starter) = (Arc::downgrade(self), self.starter.clone());
@@ -1438,7 +1633,7 @@ impl VmPool {
                 started = starter.start(index.clone(), held, wait) => Some(started),
             };
             if let Some(pool) = pool.upgrade() {
-                pool.started(epoch, index, started);
+                pool.started(epoch, index, started, unprobed);
             }
         };
         // the wicket's end waits for what stops a VM on a disk: this is where it starts from
@@ -1449,43 +1644,58 @@ impl VmPool {
     }
 
     /// Starts one more VM at the lowest index free, unless the pool holds `instances` with those
-    /// starting and waiting to.
-    fn start_fresh(self: &Arc<Self>, members: &mut Members, wait: Duration) -> bool {
+    /// starting and waiting to (`unprobed`: see [`VmPool::spawn_start`]).
+    fn start_fresh(
+        self: &Arc<Self>,
+        members: &mut Members,
+        wait: Duration,
+        unprobed: bool,
+    ) -> bool {
         if members.kept() >= self.bounds.get().pool_size() {
             return false;
         }
         let index = Arc::new(self.starter.indices.take(0));
-        self.spawn_start(members, index, None, wait);
+        self.spawn_start(members, index, None, wait, unprobed);
         true
     }
 
     /// Starts the VM in the place of the one at `at` of [`Members::fallen`].
-    fn start_fallen(self: &Arc<Self>, members: &mut Members, at: usize, wait: Duration) {
+    fn start_fallen(
+        self: &Arc<Self>,
+        members: &mut Members,
+        at: usize,
+        wait: Duration,
+        unprobed: bool,
+    ) {
         let fallen = members.fallen.get_mut(&at).expect("one of them");
         fallen.starting = true;
         let (index, held) = (fallen.index.clone(), fallen.held.clone());
-        self.spawn_start(members, index, held, wait);
+        self.spawn_start(members, index, held, wait, unprobed);
     }
 
-    /// Starts a VM for a connection waiting: one in the place of a VM down first, its wait aside.
+    /// Starts a VM for a connection waiting, which takes it unprobed: one in the place of a VM down
+    /// first, its wait aside.
     fn grow(self: &Arc<Self>, members: &mut Members, wait: Duration) -> bool {
         let waiting = members.fallen.iter().find(|(_, fallen)| !fallen.starting);
         if let Some(at) = waiting.map(|(at, _)| *at) {
-            self.start_fallen(members, at, wait);
+            self.start_fallen(members, at, wait, true);
             return true;
         }
-        self.start_fresh(members, wait)
+        self.start_fresh(members, wait, true)
     }
 
     /// A start ended (None: cancelled, as one of before a halt is). A VM into the pool from now on,
-    /// connections reaching it.
+    /// connections reaching it once ready, `unprobed` at once ([`VmPool::spawn_start`]); watched
+    /// and probed.
     fn started(
         self: &Arc<Self>,
         epoch: u64,
         index: Arc<Index>,
         started: Option<Result<Instance, BoxError>>,
+        unprobed: bool,
     ) {
-        let warm = self.bounds.get().warm;
+        let bounds = self.bounds.get();
+        let warm = bounds.warm;
         let mut late = None;
         {
             let mut members = self.members.lock().unwrap();
@@ -1504,14 +1714,19 @@ impl VmPool {
                     let (suspects, suspected) = mpsc::channel(1);
                     let instance = Arc::new(instance);
                     let (pool, vm) = (Arc::downgrade(self), Arc::downgrade(&instance));
-                    tokio::spawn(watched(pool, id, vm, output, suspected));
+                    tokio::spawn(watched(pool.clone(), id, vm.clone(), output, suspected));
+                    let probing = CancellationToken::new();
+                    tokio::spawn(probed(pool, id, vm, probing.clone()));
                     members.vms.push(Member {
                         id,
                         index: instance.index.index,
                         instance,
+                        ready: unprobed || bounds.readiness.check == Check::Process,
+                        unready: None,
                         conns: 0,
                         since: Instant::now(),
                         suspects,
+                        _probed: probing.drop_guard(),
                         backoff: fallen.map(|fallen| fallen.backoff).unwrap_or_default(),
                     });
                 }
@@ -1530,10 +1745,7 @@ impl VmPool {
 
     /// The hosts it serves, for the log.
     fn starter_label(&self) -> String {
-        match &self.starter.kind {
-            Kind::Clones(cloner) => cloner.hosts.current().label.clone(),
-            Kind::Boots(booter) => booter.hosts.current().label.clone(),
-        }
+        self.starter.hosts().current().label.clone()
     }
 
     /// Starts `warm` VMs: all of them up within `wait` or the first failed, of clones; of booted
@@ -1556,7 +1768,7 @@ impl VmPool {
                     false if members.vms.len() >= min => return Ok(()),
                     _ => {}
                 }
-                while members.kept() < min && self.start_fresh(&mut members, wait) {}
+                while members.kept() < min && self.start_fresh(&mut members, wait, false) {}
             }
             notified.await;
         }
@@ -1605,8 +1817,9 @@ impl VmPool {
                             Some(at) if members.starting == 0 || late => Some(at),
                             None if late => {
                                 return Err(format!(
-                                    "no VM of the pool within {}ms",
-                                    wait.as_millis()
+                                    "no VM of the pool within {}ms: {}",
+                                    wait.as_millis(),
+                                    members.none(bounds.pool_size())
                                 )
                                 .into());
                             }
@@ -1620,9 +1833,8 @@ impl VmPool {
                         members.waiting -= 1;
                     }
                     let seat = members.seat(at);
-                    if members.starting == 0
-                        && members.vms.iter().all(|vm| vm.conns >= bounds.concurrency)
-                    {
+                    let mut ready = members.vms.iter().filter(|vm| vm.ready);
+                    if members.starting == 0 && ready.all(|vm| vm.conns >= bounds.concurrency) {
                         self.grow(&mut members, wait);
                     }
                     seat
@@ -1654,8 +1866,12 @@ impl VmPool {
     async fn open_booted(self: &Arc<Self>) -> Result<(UnixStream, Seat), BoxError> {
         let (id, instance) = {
             let mut members = self.members.lock().unwrap();
-            let least = members.least(self.bounds.get().pool_size());
-            let at = least.ok_or("no VM up: the route is restarting")?;
+            let max = self.bounds.get().pool_size();
+            let least = members.least(max);
+            let at = least.ok_or_else(|| match members.none(max) {
+                "none up" => "no VM up: the route is restarting".to_string(),
+                none => format!("no VM: {none}"),
+            })?;
             members.seat(at)
         };
         let seat = Seat {
@@ -1759,23 +1975,31 @@ impl VmPool {
                 Some(retry) if retry > now => {
                     next = Some(next.map_or(retry, |next| next.min(retry)));
                 }
-                _ => self.start_fallen(&mut members, at, wait),
+                _ => self.start_fallen(&mut members, at, wait, false),
             }
         }
-        while members.kept() < up && self.start_fresh(&mut members, wait) {}
+        while members.kept() < up && self.start_fresh(&mut members, wait, false) {}
+        drop(members);
+        if !gone.is_empty() {
+            (self.ready_changed)();
+        }
         (gone, next)
     }
 
     /// Takes out its VMs for good, its connections failing from then on, and has it start none:
     /// those under way cancelled, what is held for them given back.
     fn halt(&self) -> Vec<Member> {
-        let mut members = self.members.lock().unwrap();
-        members.halted = true;
-        members.epoch += 1;
-        members.cancel.cancel();
-        members.cancel = CancellationToken::new();
-        members.fallen.clear();
-        std::mem::take(&mut members.vms)
+        let halted = {
+            let mut members = self.members.lock().unwrap();
+            members.halted = true;
+            members.epoch += 1;
+            members.cancel.cancel();
+            members.cancel = CancellationToken::new();
+            members.fallen.clear();
+            std::mem::take(&mut members.vms)
+        };
+        (self.ready_changed)();
+        halted
     }
 }
 
@@ -1787,6 +2011,9 @@ impl Pool for VmPool {
             let at = members.idlest(bounds.warm, bounds.pool_size());
             at.map(|at| members.vms.remove(at))
         };
+        if gone.is_some() {
+            (self.ready_changed)();
+        }
         // dropped: killed, its slot given back
         gone.is_some()
     }
@@ -2049,6 +2276,54 @@ async fn watched(
     }
 }
 
+/// Probes the pool's VM `id` as the route's readiness check has it ([`readiness::probe`]), from
+/// its start until it is gone from the pool (`probing` cancelled), each outcome to the pool
+/// ([`VmPool::probed`]): at once, then as [`Readiness::next`] has it, at once again when the check
+/// changed. A probe holds the VM only as long as it takes: a stop kills it.
+async fn probed(pool: Weak<VmPool>, id: u64, vm: Weak<Instance>, probing: CancellationToken) {
+    let Some((port, bounds, hosts, probes)) = pool.upgrade().map(|pool| {
+        let hosts = pool.starter.hosts().clone();
+        (pool.port, pool.bounds.clone(), hosts, pool.probes.clone())
+    }) else {
+        return;
+    };
+    loop {
+        let changed = probes.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let readiness = bounds.get().readiness;
+        let probed = match readiness.check {
+            Check::Process => Ok(()),
+            _ => {
+                let Some(held) = vm.upgrade() else {
+                    return;
+                };
+                let host = hosts.current().key.clone();
+                readiness::probe(&held.vm, port, &readiness, &host).await
+            }
+        };
+        let ready = probed.is_ok();
+        match pool.upgrade() {
+            Some(pool) if pool.probed(id, probed) => {}
+            _ => return,
+        }
+        if bounds.get().readiness != readiness {
+            continue;
+        }
+        let wait = async {
+            match readiness.next(ready) {
+                Some(wait) => tokio::time::sleep(wait).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            () = wait => {}
+            () = changed => {}
+            () = probing.cancelled() => return,
+        }
+    }
+}
+
 /// A pool's VMs not started for `e`, named after the route `label`: for room still.
 fn pool_failure(label: &str, e: BoxError) -> BoxError {
     match e.downcast::<Full>() {
@@ -2088,10 +2363,11 @@ impl Route {
             workers,
             stops,
             status,
+            ready_changed,
         } = starting;
         let hosts = Hosts::new(hosts);
         let label = hosts.current().label.clone();
-        let bounds = Current(Arc::new(Mutex::new(spec.bounds)));
+        let bounds = Current(Arc::new(Mutex::new(spec.bounds.clone())));
         let need = Need {
             memory: u64::from(spec.vm.memory_mib),
             route: NEXT_ROUTE.fetch_add(1, Ordering::Relaxed),
@@ -2137,7 +2413,9 @@ impl Route {
             need,
             members: Mutex::default(),
             changed: changed.clone(),
+            probes: Arc::default(),
             status,
+            ready_changed: ready_changed.clone(),
         });
         pool.fill(START_WAIT)
             .await
@@ -2164,6 +2442,7 @@ impl Route {
             open: Arc::default(),
             taken: None,
             stops: Arc::default(),
+            ready_changed,
         })
     }
 
@@ -2182,10 +2461,11 @@ impl Route {
             workers,
             stops,
             status,
+            ready_changed,
         } = starting;
         let hosts = Hosts::new(hosts);
         let label = hosts.current().label.clone();
-        let bounds = Current(Arc::new(Mutex::new(spec.bounds)));
+        let bounds = Current(Arc::new(Mutex::new(spec.bounds.clone())));
         let need = Need {
             memory: u64::from(spec.vm.memory_mib),
             route: NEXT_ROUTE.fetch_add(1, Ordering::Relaxed),
@@ -2292,7 +2572,9 @@ impl Route {
                 need,
                 members: Mutex::default(),
                 changed: changed.clone(),
+                probes: Arc::default(),
                 status,
+                ready_changed: ready_changed.clone(),
             });
             pool.fill(START_WAIT)
                 .await
@@ -2329,6 +2611,7 @@ impl Route {
                 capacity: capacity.clone(),
                 route: need.route,
                 changed: changed.clone(),
+                ready_changed: ready_changed.clone(),
             });
             let spare: Arc<dyn Pool> = warm.clone();
             capacity.register(need.route, Arc::downgrade(&spare));
@@ -2358,6 +2641,7 @@ impl Route {
             open: Arc::default(),
             taken,
             stops: Arc::default(),
+            ready_changed,
         })
     }
 
@@ -2394,14 +2678,17 @@ impl Route {
     /// theirs ended, and of a VM per connection what serves none goes at once. What waits to be
     /// tried again is tried at once.
     pub fn adjust(&self, bounds: Bounds) -> bool {
-        {
+        let instances = bounds.instances;
+        let rechecked = {
             let mut current = self.bounds.0.lock().unwrap();
             if *current == bounds {
                 return false;
             }
+            let rechecked = current.readiness != bounds.readiness;
             *current = bounds;
-        }
-        self.capacity.cap(self.need.route, bounds.instances);
+            rechecked
+        };
+        self.capacity.cap(self.need.route, instances);
         match &self.backend {
             Backend::Cloned { warm, kept, .. } => {
                 warm.adjust();
@@ -2416,8 +2703,13 @@ impl Route {
             Backend::Pool(pool) => {
                 pool.members.lock().unwrap().bounds_changed();
                 pool.changed.notify_waiters();
+                if rechecked {
+                    pool.probes.notify_waiters();
+                }
             }
         }
+        // a VM past `instances` takes no connection, one may be made for the next
+        (self.ready_changed)();
         true
     }
 
@@ -2436,24 +2728,44 @@ impl Route {
                     .map_or(0, |kept| kept.idle.lock().unwrap().len());
             }
             Backend::Pool(pool) => {
+                let max = self.bounds.get().pool_size();
                 let members = pool.members.lock().unwrap();
                 vms.pooled = members.vms.len();
                 vms.starting = members.starting;
                 vms.restarts = members.restarts;
+                let past = members.past(max);
+                let ready = members.vms.iter().filter(|vm| vm.ready && vm.index < past);
+                vms.ready = Some(ready.count());
             }
         }
         vms
     }
 
-    /// The instance indices of its VMs alive and their starts: each from its guest accepting on.
-    pub fn alive(&self) -> BTreeMap<usize, SystemTime> {
+    /// The instance indices of its VMs alive, their starts, each from its guest accepting on, and
+    /// whether each takes connections: a pool's VM ready, within `instances`; a clone as it comes.
+    pub fn alive(&self) -> BTreeMap<usize, (SystemTime, bool)> {
         match &self.backend {
-            Backend::Cloned { cloner, .. } => cloner.indices.held(),
-            Backend::Pool(pool) => {
-                let members = pool.members.lock().unwrap();
-                let vms = members.vms.iter();
-                vms.map(|vm| (vm.index, vm.instance.since)).collect()
+            Backend::Cloned { cloner, .. } => {
+                let held = cloner.indices.held().into_iter();
+                held.map(|(index, since)| (index, (since, true))).collect()
             }
+            Backend::Pool(pool) => {
+                let max = self.bounds.get().pool_size();
+                let members = pool.members.lock().unwrap();
+                let past = members.past(max);
+                let vms = members.vms.iter();
+                vms.map(|vm| (vm.index, (vm.instance.since, vm.ready && vm.index < past)))
+                    .collect()
+            }
+        }
+    }
+
+    /// Whether its next connection finds a VM to serve it ([`VmPool::ready`], [`Warm::ready`]):
+    /// every stream advertises it only then.
+    pub fn ready(&self) -> bool {
+        match &self.backend {
+            Backend::Pool(pool) => pool.ready(),
+            Backend::Cloned { warm, .. } => warm.ready(),
         }
     }
 
@@ -2553,6 +2865,7 @@ impl Route {
         if let Backend::Pool(pool) = &self.backend {
             pool.members.lock().unwrap().halted = false;
             pool.changed.notify_waiters();
+            (self.ready_changed)();
         }
     }
 
@@ -3053,6 +3366,7 @@ mod tests {
             capacity: Capacity::new(1, None),
             route: 1,
             changed: changed.clone(),
+            ready_changed: Arc::new(|| {}),
         };
         assert_eq!(warm.wanted(Instant::now()), (2, None));
         let failure: BoxError = "gone".into();

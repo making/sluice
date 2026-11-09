@@ -72,6 +72,12 @@ const LAUNCH_CONFIG: &str = "/sluice/init.json";
 
 static SERVED: AtomicU64 = AtomicU64::new(0);
 
+/// Hello mode's `/ready` requests answered so far ([`ready_answer`]).
+static READIES: AtomicU64 = AtomicU64::new(0);
+
+/// Hello mode's `/ready` requests below this one answer 503 (`POST /ready?fail=N`).
+static FAIL_UNTIL: AtomicU64 = AtomicU64::new(0);
+
 /// Reaps every child of /init in launcher mode.
 static REAPER: Reaper = Reaper::new();
 
@@ -872,12 +878,43 @@ fn next_random() -> u64 {
     z ^ (z >> 31)
 }
 
+/// Hello mode's `/ready`, as a readiness check asks it, of no count of the requests served: 200,
+/// but 503 to the first `after=N` of them and, once `POST /ready?fail=N` said so, to the next N;
+/// the POST's answer names the boot id.
+fn ready_answer(method: &hyper::Method, query: &str, boot_id: &str) -> Response<Full<Bytes>> {
+    let number = |name: &str| {
+        let value = query
+            .split('&')
+            .find_map(|pair| pair.strip_prefix(name)?.strip_prefix('='));
+        value
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(0)
+    };
+    if method == hyper::Method::POST {
+        let failing = number("fail");
+        FAIL_UNTIL.store(READIES.load(Ordering::Relaxed) + failing, Ordering::Relaxed);
+        let text = format!("the next {failing} /ready answered 503\nboot id: {boot_id}\n");
+        return Response::new(Full::new(Bytes::from(text)));
+    }
+    let n = READIES.fetch_add(1, Ordering::Relaxed);
+    let mut answer = Response::new(Full::new(Bytes::from_static(b"ready\n")));
+    if n < number("after") || n < FAIL_UNTIL.load(Ordering::Relaxed) {
+        *answer.body_mut() = Full::new(Bytes::from_static(b"not ready\n"));
+        *answer.status_mut() = hyper::StatusCode::SERVICE_UNAVAILABLE;
+    }
+    answer
+}
+
 async fn answer(
     request: Request<hyper::body::Incoming>,
     booted: Instant,
     boot_id: &str,
     log: Arc<Log>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
+    if request.uri().path() == "/ready" {
+        let query = request.uri().query().unwrap_or_default();
+        return Ok(ready_answer(request.method(), query, boot_id));
+    }
     let served = SERVED.fetch_add(1, Ordering::Relaxed) + 1;
     let (head, body) = request.into_parts();
     let body = body

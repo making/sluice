@@ -188,7 +188,9 @@ a cold-booted guest may take to listen, 10000; its process exiting first fails i
 JVM on one vCPU can take more), `per-client=N`,
 `idle-ms=N`, `cpu=N` (jail mode), `instances=N`, for the cloned modes `warm=N`, `prime=N` and
 `wait-ms=N` (see [Limits](#limits)), `keep-ms=N` (reuse, pool), `uses=N` and `lifetime-ms=N`
-(reuse), `concurrency=N` (pool), `egress=<host>:<port>,...` (see [Egress](#egress)). The advertised
+(reuse), `concurrency=N` (pool), `readiness=process|port|http`, `readiness-endpoint=<path>`,
+`readiness-timeout-ms=N` and `readiness-interval-ms=N` (boot, pool: see [Readiness](#readiness)),
+`egress=<host>:<port>,...` (see [Egress](#egress)). The advertised
 target is `firecracker:<rootfs>` plus the options set to other than their defaults; the server
 dials it verbatim, and the hosts of one target share its VMs.
 
@@ -269,7 +271,7 @@ routes:
      prime: 200, warm: 4, instances: 16, wait-ms: 10000, per-client: 4, idle-ms: 30000,
      egress: [db.internal:5432, 10.0.0.0/24:6379, '[2001:db8::/32]:443']}
   - {host: api.local, rootfs: go.ext4, mode: pool, instances: 8, warm: 1, concurrency: 16,
-     keep-ms: 60000}
+     keep-ms: 60000, readiness: http, readiness-endpoint: /healthz}
   - {host: fn.local, rootfs: go.ext4, mode: reuse, keep-ms: 60000, uses: 1000,
      lifetime-ms: 3600000}
 ```
@@ -305,9 +307,10 @@ at startup. The console's edits go through the same reload (see [Console](#conso
 
 ### How many VMs and how long
 
-`instances`, `warm`, `concurrency`, `wait-ms`, `keep-ms`, `uses`, `lifetime-ms`, `per-client`, `idle-ms` and
-`boot-ms` say how many VMs and how long, not what a VM is: a running target takes a change of them
-as it is, by a reload or a console's edit, its VMs and their snapshot kept (`adjusted <host>`):
+`instances`, `warm`, `concurrency`, `wait-ms`, `keep-ms`, `uses`, `lifetime-ms`, `per-client`, `idle-ms`,
+`boot-ms` and the [readiness check](#readiness) say how many VMs, how long and when one serves, not what
+a VM is: a running target takes a change of them as it is, by a reload or a console's edit, its VMs and
+their snapshot kept (`adjusted <host>`):
 
 - `instances` or `warm` up: VMs cloned as there is room, in a restore's time, or at `mode=boot` booted, a
   connection reaching one once its guest accepts, none other touched; a connection waiting for
@@ -317,6 +320,7 @@ as it is, by a reload or a console's edit, its VMs and their snapshot kept (`adj
   connection); up again before that, they serve on. Per connection and reused, what serves none past it is killed at once, and the connections open
   finish
 - `warm` down: warm clones are killed at once, a pool's VMs serving none after `keep-ms`
+- the readiness check: each VM probed at once as it asks
 - the others bound the next connections, and the next boot (`boot-ms`)
 
 Anything else is what a VM is and [restarts the target](#reloading-routes): `mode` too, and `prime`, what
@@ -351,7 +355,8 @@ A change of its bounds (`warm`, `instances`, `cf scale -i`, ...) starts it at on
 `instances.down` says why (the lowest index's), an app's listing `crashed` for each index. With none up,
 a booted route's connections fail at once (`guest unreachable: no VM up: the route is restarting`;
 the open ones end with their VM), a boot long when all goes well; a clone pool's wait for its
-`wait-ms`, one asking for a VM ahead of its wait.
+`wait-ms`, one asking for a VM ahead of its wait. The route leaves the advertisement meanwhile
+([Readiness](#readiness)).
 
 The starts run beside the reloads: a route failing holds no edit, and fails no reload, of another
 one. A reload keeps a route down as it is, unless its spec or files changed: that start then
@@ -376,6 +381,44 @@ is alive and the restore failed for anything but room: then `warm=0` would read 
 (gone again as `warm=0` has it). `instances.down` is `{"why": ..., "since": <seconds since the epoch>}`,
 `since` the start of what goes on, each failure after it changing only `why`.
 
+### Readiness
+
+A VM serves once its guest accepts on the route's port. `readiness=port|http` (`mode=boot`, `mode=pool`)
+has it serve once its readiness check passed as well, as a CF app's readiness health check;
+`readiness=process`, the default, asks nothing more:
+
+- **the check**: `port`, a connection to the process's port, which it accepts; `http`, a `GET` of
+  `readiness-endpoint` (`/`; a path, its query with it) naming the route's first host, answered 200.
+  The wicket makes it through the guest's relay, as a connection reaches the process: any rootfs
+  takes it ([findings](../.kb/wicket-firecracker-findings.md#readiness))
+- **when**: from a VM's start, once its guest accepts: at once, then every 500ms (`readiness-interval-ms`,
+  if shorter) until it passes, then every `readiness-interval-ms` (30000), each within
+  `readiness-timeout-ms` (1000). Failing, the VM takes no new connection, its open ones going on, and
+  is probed every 500ms again until it passes. It is not restarted: what ends is ([A VM going
+  down](#a-vm-going-down))
+- **a connection** goes to the VM ready holding the fewest; one finding none is as one finding no
+  VM up: a booted route's fails at once, a pool's waits for a VM started for it, up to `wait-ms`. A
+  pool's VM started for connections waiting (as it grows, or at `warm=0`) takes them as it comes,
+  unprobed, and is probed from then on
+- **the advertisement**: a route whose next connection finds no VM -- none up, every one failing its
+  check, or none alive and its starts failing -- leaves it on every node stream until one does, a
+  route starting with the wicket included: the server sends its host to another client serving it,
+  else as for a host no client advertises (a host pattern route, the catch-all, else its `503`).
+  Its target stays bound: a connection the server routed before fails. `--listen` routes its host
+  as ever, its connections failing alike
+- **per connection, reused**: refused, a connection's VM being its own, restored as it comes
+- **told**: the log says each change (`route app.local: VM 1 not ready: GET /ready: HTTP/1.1 503
+  Service Unavailable`, `route app.local: VM 1 ready`); the console's listing a route's `ready`
+  (advertised) and `instances.ready` (its VMs taking connections), an app's `alive` each VM's `ready`
+- **a change** of the check is taken as the route runs ([How many VMs and how
+  long](#how-many-vms-and-how-long)), its VMs probed at once
+
+```yaml
+routes:
+  - {host: app.local, rootfs: upstream.ext4, mode: pool, instances: 4, warm: 2, readiness: http,
+     readiness-endpoint: /actuator/health/readiness, readiness-interval-ms: 10000}
+```
+
 ### Console
 
 `--console <host:port>` (`console`) serves a page and a JSON API deploying rootfs images as
@@ -384,7 +427,8 @@ host and the route's options, and it is served -- on the tunnel and on `--listen
 Dropped on a route of the console, an image replaces its own; renamed, a route moves to
 another host with its image and options. The routes of the config file and the `--vm` flags
 are listed too, read-only. The page shows what the wasm wicket's has no counterpart for:
-each route's VMs (up or pooled and their restarts, warm, kept, starting, all alive), its connections, a cloned
+each route's VMs (up or pooled and their restarts, ready, warm, kept, starting, all alive) and whether it is
+advertised ([Readiness](#readiness)), its connections, a cloned
 route's snapshot (its memory file, the template's boot and snapshot times) and the budget
 (`--max-instances`, `--max-memory-mib`) taken. It takes 64 connections at once; TCP keepalive ends one whose
 client is gone, and a client that leaves one waiting for 60s, not sending a request or not reading
@@ -465,7 +509,8 @@ the image is read: a client sending `Expect: 100-continue` (curl does for a larg
 refused before it uploads. The listing names each route's `origin` (`config`, `flag`,
 `console`, `api`), its advertised `target`, its `rootfs` (a console route's path in the directory
 and its digest), its `options` set to other than their defaults, its `instances` and `snapshot`, an
-app's name and owner, and the names of its env.
+app's name and owner, the names of its env, and whether it is `ready`: its next connection finds a
+VM, every stream advertising it ([Readiness](#readiness)).
 
 #### Apps
 
@@ -499,8 +544,9 @@ digest, or made of an OCI image, first; the app names it:
   listings name the variables only (`"env": ["GREETING"]`), never a value
 - `tag` (optional) is opaque to the wicket, kept and listed as given: a controller tells by it
   what it put, an env it cannot read back included. A tag or hosts alone start no VM
-- `alive` in a listing: its VMs alive, lowest first, `{"index": 0, "since": 1793000000}`: the
-  `instance` index and its start in seconds since the epoch, its guest accepting; `crashed`, those it
+- `alive` in a listing: its VMs alive, lowest first, `{"index": 0, "since": 1793000000, "ready":
+  true}`: the `instance` index, its start in seconds since the epoch, its guest accepting, and whether
+  it takes connections ([Readiness](#readiness)); `crashed`, those it
   keeps that are down, `{"index": 1, "why": "its process ended", "since": 1793000000}`, each until
   another one is up there; `down`, when told: why it is short of VMs, and since when (`instances.down`),
   until they are up
@@ -1052,8 +1098,10 @@ VMs killed (unjailed) or their processes ended, a route's and an app's VMs kept 
 change, the VMs' output (a booted VM's, a template's, a clone's) on the wicket's
 stdout / stderr and on a flume (`sluice-wicket-tunnel`'s double), the guests' egress (a booted
 VM's and a clone's, to a destination on the host by name, address, range and IPv6, and its
-records), reloads of the config file, an edit taking over from a reload on a disk, and a route
-given by `--vm` alone handing through a guest speaking first. It needs Firecracker
+records), reloads of the config file, an edit taking over from a reload on a disk, a route
+given by `--vm` alone handing through a guest speaking first, and a booted route checking its VMs'
+readiness: one failing its check taking no connection, none ready leaving the advertisement until
+one answers again, a process ending likewise. It needs Firecracker
 (`SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER`, else `firecracker` on the PATH) and a guest
 kernel (`SLUICE_WICKET_RUNTIME_FIRECRACKER_KERNEL`, else `~/.local/firecracker/vmlinux`), the
 variables of the wicket's own `--firecracker` and `--kernel`, and builds the sample rootfs.
@@ -1087,7 +1135,8 @@ Benchmarks and design findings: [.kb/wicket-firecracker-findings.md](../.kb/wick
 
 ## Not yet
 
-A health check of a process that lives and does not answer (a VM is seen by [what ends or
+A liveness check (a process that lives and does not answer is restarted by nothing: a
+[readiness check](#readiness) takes it out of the rotation, and a VM is seen down by [what ends or
 refuses](#a-vm-going-down); a clone goes on a failed dial), a disk on a route of the
 config file, a flag or the page, a backup of a running disk, a pool
 spreading by load rather than by connections, CPU limits without the jail, an image of the

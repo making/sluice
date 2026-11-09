@@ -52,7 +52,7 @@ use futures_util::future::join_all;
 use crate::logs::Logs;
 use crate::placement::Budget;
 use crate::services::Offer;
-use crate::store::{App, Lifetime, Outcome, Purge, Removal, State, Store};
+use crate::store::{App, Lifetime, Outcome, Purge, ReadinessCheck, Removal, State, Store};
 use crate::wicket::{
     AppBody, ComponentRef, Failure, FilesRef, ListedApp, Listing, MadeImage, Runtime, Sandbox,
     VmSandbox, WasmSandbox, Wicket,
@@ -220,6 +220,7 @@ impl Controller {
                         warm,
                         ..running.lifetime.clone()
                     },
+                    &running.readiness,
                 )),
                 false => Sandbox::Wasm(WasmSandbox {
                     wasi: running.wasi.clone(),
@@ -1050,6 +1051,11 @@ const WICKET_DEFAULT_BOOT_MS: u64 = 10_000;
 /// What a Firecracker wicket does not list of a route's `keep-ms`: its default.
 const WICKET_DEFAULT_KEEP_MS: u64 = 60_000;
 
+/// What a Firecracker wicket does not list of a route's readiness check: its defaults.
+const WICKET_DEFAULT_READINESS_ENDPOINT: &str = "/";
+const WICKET_DEFAULT_READINESS_TIMEOUT_MS: u64 = 1_000;
+const WICKET_DEFAULT_READINESS_INTERVAL_MS: u64 = 30_000;
+
 /// What an instance takes at once, unannotated: a component's requests, a pool VM's connections.
 /// Cloud Run's 80 is where it adds an instance; at `-i 1` this is where a request is turned
 /// away, so it is what a CF app's one instance takes, as many as a JVM's request threads.
@@ -1063,7 +1069,9 @@ const WICKET_DEFAULT_CONCURRENCY: u64 = 16;
 /// size: a scale adds to the VMs running, and takes from them, in a restore's time (`boot`, annotated,
 /// a boot's). What is not annotated is the wicket's default, but a pool's `concurrency`
 /// ([`DEFAULT_CONCURRENCY`]). Its process has `timeout` seconds to
-/// listen, and connects to the destinations of `egress`.
+/// listen, and connects to the destinations of `egress`. A VM takes connections once its
+/// `readiness` check passes, `port` or `http` (`process`: once up, what the wicket does unasked).
+#[allow(clippy::too_many_arguments)]
 fn vm_sandbox(
     memory_mib: u64,
     instances: u64,
@@ -1071,8 +1079,11 @@ fn vm_sandbox(
     env: &BTreeMap<String, String>,
     egress: &[String],
     lifetime: &Lifetime,
+    readiness: &ReadinessCheck,
 ) -> VmSandbox {
     let mode = lifetime.mode.as_deref().unwrap_or("pool");
+    let checked = readiness.kind != "process";
+    let millis = |seconds: Option<u64>| seconds.filter(|_| checked).map(|seconds| seconds * 1000);
     VmSandbox {
         mode: Some(mode.into()),
         memory_mib: Some(memory_mib),
@@ -1087,6 +1098,12 @@ fn vm_sandbox(
             _ => lifetime.concurrency,
         },
         boot_ms: Some(timeout.clamp(1, MAXIMUM_HEALTH_CHECK_TIMEOUT) * 1000),
+        readiness: checked.then(|| readiness.kind.clone()),
+        readiness_endpoint: (readiness.kind == "http")
+            .then(|| readiness.endpoint.clone())
+            .flatten(),
+        readiness_timeout_ms: millis(readiness.invocation_timeout),
+        readiness_interval_ms: millis(readiness.interval),
         egress: egress.to_vec(),
         env: env.clone(),
     }
@@ -1146,6 +1163,21 @@ fn same_vm(listed: &VmSandbox, desired: &VmSandbox) -> bool {
     let keep_ms = |sandbox: &VmSandbox| sandbox.keep_ms.unwrap_or(WICKET_DEFAULT_KEEP_MS);
     let concurrency =
         |sandbox: &VmSandbox| sandbox.concurrency.unwrap_or(WICKET_DEFAULT_CONCURRENCY);
+    let readiness = |sandbox: &VmSandbox| {
+        let check = sandbox.readiness.clone();
+        let endpoint = sandbox.readiness_endpoint.as_deref();
+        let endpoint = endpoint
+            .unwrap_or(WICKET_DEFAULT_READINESS_ENDPOINT)
+            .to_string();
+        let timeout = sandbox.readiness_timeout_ms;
+        let interval = sandbox.readiness_interval_ms;
+        (
+            check.unwrap_or_else(|| "process".into()),
+            endpoint,
+            timeout.unwrap_or(WICKET_DEFAULT_READINESS_TIMEOUT_MS),
+            interval.unwrap_or(WICKET_DEFAULT_READINESS_INTERVAL_MS),
+        )
+    };
     sorted(&listed.egress) == sorted(&desired.egress)
         && listed.mode == desired.mode
         && listed.memory_mib == desired.memory_mib
@@ -1155,6 +1187,7 @@ fn same_vm(listed: &VmSandbox, desired: &VmSandbox) -> bool {
         && concurrency(listed) == concurrency(desired)
         && listed.uses == desired.uses
         && listed.lifetime_ms == desired.lifetime_ms
+        && readiness(listed) == readiness(desired)
         && desired
             .boot_ms
             .is_none_or(|boot_ms| listed.boot_ms.unwrap_or(WICKET_DEFAULT_BOOT_MS) == boot_ms)
@@ -1200,6 +1233,7 @@ mod tests {
             memory_mib: 64,
             budget_ms: Some(5000),
             lifetime: Lifetime::default(),
+            readiness: ReadinessCheck::default(),
             wasi: vec!["keyvalue".into(), "cli".into()],
             keyvalue: [(String::new(), "local/cf/i".to_string())].into(),
             env: [("GREETING".to_string(), "hello".to_string())].into(),
@@ -1454,7 +1488,15 @@ mod tests {
                 None,
             ),
         ] {
-            let sandbox = vm_sandbox(64, instances, 60, &BTreeMap::new(), &[], &annotated);
+            let sandbox = vm_sandbox(
+                64,
+                instances,
+                60,
+                &BTreeMap::new(),
+                &[],
+                &annotated,
+                &ReadinessCheck::default(),
+            );
             assert_eq!(
                 (sandbox.mode.as_deref(), sandbox.instances, sandbox.warm),
                 (Some(mode), cap, warm)
@@ -1496,6 +1538,7 @@ mod tests {
                 concurrency: Some(16),
                 ..annotated(Some(2), Some(60_000))
             },
+            &ReadinessCheck::default(),
         );
         let mut told = asked.clone();
         (told.warm, told.keep_ms, told.concurrency) = (None, None, None);
@@ -1507,14 +1550,62 @@ mod tests {
         assert!(!same(&body(told.clone()), &body(asked.clone())));
         told.keep_ms = None;
         told.concurrency = Some(3);
-        assert!(!same(&body(told), &body(asked)));
+        assert!(!same(&body(told.clone()), &body(asked.clone())));
+        // a readiness check, listed away from its defaults
+        told.concurrency = None;
+        let checked = |kind: &str, endpoint: Option<&str>, interval| {
+            let readiness = ReadinessCheck {
+                kind: kind.into(),
+                endpoint: endpoint.map(String::from),
+                invocation_timeout: None,
+                interval,
+            };
+            let lifetime = Lifetime {
+                concurrency: Some(16),
+                ..annotated(Some(2), Some(60_000))
+            };
+            vm_sandbox(64, 2, 60, &BTreeMap::new(), &[], &lifetime, &readiness)
+        };
+        let http = checked("http", Some("/"), Some(5));
+        assert_eq!(
+            (
+                http.readiness.as_deref(),
+                http.readiness_endpoint.as_deref(),
+                http.readiness_interval_ms
+            ),
+            (Some("http"), Some("/"), Some(5_000))
+        );
+        assert_eq!(
+            checked("process", Some("/ready"), Some(5)),
+            asked,
+            "nothing to put"
+        );
+        (told.readiness, told.readiness_interval_ms) = (Some("http".into()), Some(5_000));
+        assert!(
+            same(&body(told.clone()), &body(http.clone())),
+            "its endpoint the default"
+        );
+        assert!(!same(
+            &body(told.clone()),
+            &body(checked("port", None, Some(5)))
+        ));
+        assert!(!same(&body(told), &body(checked("http", Some("/"), None))));
         // booted, one VM unlisted, more listed
         let booted = |instances| {
             let lifetime = Lifetime {
                 mode: Some("boot".into()),
                 ..Lifetime::default()
             };
-            vm_sandbox(64, instances, 60, &BTreeMap::new(), &[], &lifetime)
+            let readiness = ReadinessCheck::default();
+            vm_sandbox(
+                64,
+                instances,
+                60,
+                &BTreeMap::new(),
+                &[],
+                &lifetime,
+                &readiness,
+            )
         };
         let mut told = booted(1);
         told.instances = None;

@@ -3,7 +3,9 @@
 //! snapshot's), the requests it served, its uid and gid, whether it opens `/dev/stdout` and
 //! `/dev/stderr` by path, the owner and mode of each path of its arguments, its environment --
 //! and printing a line per request, as a process's output. `/egress?to=<host>:<port>` connects
-//! as a process does, half-closes and answers with what came, `/exit` answers and exits.
+//! as a process does, half-closes and answers with what came, `/exit` answers and exits,
+//! `/ready?after=N` answers 503 to the first N of them, as a readiness check sees a process
+//! starting, 200 after, counting none served.
 //! `SAMPLE_WAIT_MS` delays its listening, `SAMPLE_EXIT` has it exit instead, as a process failing
 //! to start does; `SAMPLE_SPEAK_FIRST` has it send that line as each connection opens, as a
 //! protocol whose server speaks first does.
@@ -15,6 +17,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The requests the process served.
 static SERVED: AtomicU64 = AtomicU64::new(0);
+
+/// The `/ready` requests it answered.
+static READIES: AtomicU64 = AtomicU64::new(0);
 
 fn main() {
     if std::env::var_os("SAMPLE_EXIT").is_some() {
@@ -48,24 +53,37 @@ fn main() {
         let line = String::from_utf8_lossy(&request);
         let first = line.lines().next().unwrap_or_default();
         println!("{first}");
+        let path = first.split(' ').nth(1).unwrap_or_default();
         // a stream dropped with no request, a dial looking at the process, counts none
-        if !first.is_empty() {
+        if !first.is_empty() && !path.starts_with("/ready") {
             SERVED.fetch_add(1, Ordering::Relaxed);
         }
-        let path = first.split(' ').nth(1).unwrap_or_default();
-        let body = match path.strip_prefix("/egress?to=") {
-            Some(to) => egress(to),
-            None => answer(),
+        let (status, body) = match path.strip_prefix("/egress?to=") {
+            Some(to) => ("200 OK", egress(to)),
+            None if path.starts_with("/ready") => ready(path),
+            None => ("200 OK", answer()),
         };
         let _ = write!(
             stream,
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         );
         if path == "/exit" {
             drop(stream);
             std::process::exit(83);
         }
+    }
+}
+
+/// `/ready?after=N`: 503 to the first N, 200 after.
+fn ready(path: &str) -> (&'static str, String) {
+    let after = path
+        .split_once("after=")
+        .and_then(|(_, after)| after.parse::<u64>().ok())
+        .unwrap_or(0);
+    match READIES.fetch_add(1, Ordering::Relaxed) < after {
+        true => ("503 Service Unavailable", "not ready\n".into()),
+        false => ("200 OK", "ready\n".into()),
     }
 }
 

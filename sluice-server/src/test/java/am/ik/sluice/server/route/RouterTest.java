@@ -482,11 +482,21 @@ class RouterTest {
 	@Test
 	void exactMatchBeatsThePatternAndThePatternBeatsTheCatchAll() {
 		Router router = new Router();
-		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3001")));
+		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3001"),
+				upstream("kept.local", "http://127.0.0.1:3004")));
 		router.register("c2", List.of(patternUpstream(".*", "http://127.0.0.1:3002")));
 		router.register("c3", List.of(upstream("", "http://127.0.0.1:3003")));
 		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c1");
 		assertThat(router.lookup("anything.example").orElseThrow().clientId()).isEqualTo("c2");
+		// a host its client advertises no more (a wicket's route without an instance
+		// ready) falls through as an unknown host: the pattern, the catch-all, else none
+		router.register("c1", List.of(upstream("kept.local", "http://127.0.0.1:3004")));
+		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c2");
+		router.register("c2", List.of());
+		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c3");
+		router.remove("c3");
+		assertThat(router.lookup("demo.local")).isEmpty();
+		assertThat(router.lookup("kept.local").orElseThrow().clientId()).isEqualTo("c1");
 	}
 
 	@Test

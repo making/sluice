@@ -2468,6 +2468,61 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     cf.ok(&["unset-env", "fc", "SAMPLE_WAIT_MS"]);
     cf.ok(&["restart", "fc"]);
 
+    // a readiness check, the manifest's alone (the CLI has no command setting it): kept, shown,
+    // the route's options; the instance running, not routable until its endpoint answers 200,
+    // each of its first 40 checks answered 503
+    let manifest = dir.join("ready.yml");
+    let ready = format!(
+        "applications:\n- name: ready\n  docker:\n    image: {image}\n    username: robot\n  \
+         routes:\n  - route: ready.localhost\n  readiness-health-check-type: http\n  \
+         readiness-health-check-http-endpoint: /ready?after=40\n  \
+         readiness-health-check-interval: 1\n"
+    );
+    std::fs::write(&manifest, ready).unwrap();
+    let mut push = cf.command(&["push", "-f", manifest.to_str().unwrap()]);
+    push.env("CF_DOCKER_PASSWORD", "p4ss");
+    let (ok, output) = cf.output(push, "");
+    assert!(ok, "{output}");
+    let stats = format!(
+        "/v3/apps/{}/processes/web/stats",
+        cf.ok(&["app", "ready", "--guid"]).trim()
+    );
+    let routable = || {
+        let stats: Value = serde_json::from_str(&cf.ok(&["curl", &stats])).unwrap();
+        let entry = &stats["resources"][0];
+        (entry["state"].clone(), entry["routable"].clone())
+    };
+    assert_eq!(routable(), (json!("RUNNING"), json!(false)));
+    let shown = cf.ok(&["get-readiness-health-check", "ready"]);
+    let web = shown.lines().find(|line| line.starts_with("web"));
+    let web: Vec<&str> = web.unwrap_or_default().split_whitespace().collect();
+    assert_eq!(web, ["web", "http", "/ready?after=40", "1"], "{shown}");
+    let apps = listing(&console)["apps"].as_array().unwrap().clone();
+    let listed = apps
+        .iter()
+        .find(|app| app["hosts"] == json!(["ready.localhost"]));
+    let sandbox = &listed.expect("the app listed")["sandbox"];
+    assert_eq!(
+        (
+            &sandbox["readiness"],
+            &sandbox["readiness-endpoint"],
+            &sandbox["readiness-interval-ms"]
+        ),
+        (&json!("http"), &json!("/ready?after=40"), &json!(1000)),
+        "{sandbox}"
+    );
+    let deadline = Instant::now() + HANG;
+    while routable() != (json!("RUNNING"), json!(true)) {
+        assert!(
+            Instant::now() < deadline,
+            "never routable: {:?}",
+            routable()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(get(&listen, "ready.localhost", "/", None).0, 200);
+    cf.ok(&["delete", "ready", "-f"]);
+
     let shows = |app: &str, state: &str| {
         let deadline = Instant::now() + HANG;
         loop {

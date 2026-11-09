@@ -19,6 +19,9 @@ pub struct Alive {
     pub index: usize,
     /// Its start, in seconds since the epoch.
     pub since: u64,
+    /// Of a wicket checking its instances' readiness: whether it takes connections.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ready: Option<bool>,
 }
 
 /// `held`, the instances alive and their starts, lowest index first.
@@ -27,6 +30,19 @@ pub fn alive(held: BTreeMap<usize, SystemTime>) -> Vec<Alive> {
         .map(|(index, start)| Alive {
             index,
             since: epoch_secs(start),
+            ready: None,
+        })
+        .collect()
+}
+
+/// [`alive`] of instances whose readiness is checked: `held` has each one's start and whether
+/// it is ready.
+pub fn alive_ready(held: BTreeMap<usize, (SystemTime, bool)>) -> Vec<Alive> {
+    held.into_iter()
+        .map(|(index, (start, ready))| Alive {
+            index,
+            since: epoch_secs(start),
+            ready: Some(ready),
         })
         .collect()
 }

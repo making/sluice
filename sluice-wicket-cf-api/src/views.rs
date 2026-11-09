@@ -275,6 +275,13 @@ pub fn process(base: &str, app: &App) -> Value {
     if check.kind == "http" {
         data["endpoint"] = json!(check.endpoint.clone().unwrap_or_else(|| "/".into()));
     }
+    let readiness = &process.readiness_health_check;
+    let mut readiness_data = json!({
+        "invocation_timeout": readiness.invocation_timeout, "interval": readiness.interval,
+    });
+    if readiness.kind == "http" {
+        readiness_data["endpoint"] = json!(readiness.endpoint.as_deref().unwrap_or("/"));
+    }
     json!({
         "guid": process.guid, "created_at": process.created_at, "updated_at": process.updated_at,
         "type": "web",
@@ -284,7 +291,7 @@ pub fn process(base: &str, app: &App) -> Value {
         "disk_in_mb": process.disk_mb,
         "log_rate_limit_in_bytes_per_second": process.log_rate_limit,
         "health_check": {"type": check.kind, "data": data},
-        "readiness_health_check": {"type": "process", "data": {"invocation_timeout": null}},
+        "readiness_health_check": {"type": readiness.kind, "data": readiness_data},
         "relationships": {"app": rel(Some(&app.guid)), "revision": rel(None)},
         "metadata": metadata(None),
         "version": process.guid,
@@ -327,6 +334,7 @@ pub fn stats(state: &State, app: &App, owner: &str, listed: &BTreeMap<String, Li
                             state: shown,
                             details: details.cloned(),
                             since: running.since,
+                            ready: false,
                         })
                         .collect()
                 };
@@ -352,6 +360,7 @@ pub fn stats(state: &State, app: &App, owner: &str, listed: &BTreeMap<String, Li
                     state: "DOWN",
                     details: None,
                     since: epoch_secs(),
+                    ready: false,
                 })
                 .collect()
         }
@@ -361,7 +370,7 @@ pub fn stats(state: &State, app: &App, owner: &str, listed: &BTreeMap<String, Li
         .map(|entry| {
             json!({
                 "type": "web", "index": entry.index, "state": entry.state,
-                "routable": entry.state == "RUNNING",
+                "routable": entry.state == "RUNNING" && entry.ready,
                 "usage": {"time": now(), "cpu": 0.0, "cpu_entitlement": 0.0, "mem": 0, "disk": 0, "log_rate": 0},
                 "host": entry.host, "instance_internal_ip": "127.0.0.1", "instance_ports": [],
                 "uptime": epoch_secs().saturating_sub(entry.since),
@@ -376,23 +385,25 @@ pub fn stats(state: &State, app: &App, owner: &str, listed: &BTreeMap<String, Li
     json!({"resources": resources})
 }
 
-/// An entry of [`stats`], on the wicket `host`, up `since` a time in seconds since the epoch.
+/// An entry of [`stats`], on the wicket `host`, up `since` a time in seconds since the epoch,
+/// `ready` when running and taking requests (a VM failing its readiness check takes none).
 struct Entry {
     index: u64,
     host: String,
     state: &'static str,
     details: Option<String>,
     since: u64,
+    ready: bool,
 }
 
 /// The entries of what `wicket` lists alive of its share, the app's `indices` (the lowest first)
 /// of `instances`: its index `k` the share's `k`th, of those past it the remainder's, as `cf logs`
 /// names it. Those it names by one index are one, up since the start of the lowest of them, the
-/// one staying as the others finish; each VM it lists as down at its own index, since that goes
-/// on; and what else it is short of, at the first of its indices no other holds. Nothing down,
-/// the VMs it keeps and has not up yet are starting, at the lowest of its indices free: one down,
-/// an entry `STARTING` beside it would keep the CLI's wait going where all that it lists has
-/// failed.
+/// one staying as the others finish, ready as one of them is; each VM it lists as down at its own
+/// index, since that goes on; and what else it is short of, at the first of its indices no other
+/// holds. Nothing down, the VMs it keeps and has not up yet are starting, at the lowest of its
+/// indices free: one down, an entry `STARTING` beside it would keep the CLI's wait going where all
+/// that it lists has failed.
 fn alive(listed: &ListedApp, wicket: &str, indices: &[u64], instances: u64) -> Vec<Entry> {
     if indices.is_empty() {
         return Vec::new();
@@ -404,10 +415,15 @@ fn alive(listed: &ListedApp, wicket: &str, indices: &[u64], instances: u64) -> V
         state,
         details,
         since,
+        ready: false,
     };
-    let mut up = BTreeMap::new();
+    let mut up: BTreeMap<u64, (u64, bool)> = BTreeMap::new();
     for instance in &listed.alive {
-        up.entry(named(instance.index)).or_insert(instance.since);
+        let ready = instance.ready.unwrap_or(true);
+        let (_, any) = up
+            .entry(named(instance.index))
+            .or_insert((instance.since, ready));
+        *any |= ready;
     }
     let mut crashed = BTreeMap::new();
     for down in &listed.crashed {
@@ -440,7 +456,10 @@ fn alive(listed: &ListedApp, wicket: &str, indices: &[u64], instances: u64) -> V
         down.extend(starting.map(|index| entry(index, "STARTING", None, epoch_secs())));
     }
     let mut entries: Vec<_> = (up.into_iter())
-        .map(|(index, since)| entry(index, "RUNNING", None, since))
+        .map(|(index, (since, ready))| Entry {
+            ready,
+            ..entry(index, "RUNNING", None, since)
+        })
         .chain(down)
         .collect();
     entries.sort_by_key(|entry| entry.index);
@@ -679,6 +698,27 @@ pub fn manifest(state: &State, app: &App) -> String {
     }
     if let Some(command) = &app.process.command {
         text.push_str(&format!("  command: {command}\n"));
+    }
+    let readiness = &app.process.readiness_health_check;
+    if readiness.kind != "process" {
+        text.push_str(&format!(
+            "  readiness-health-check-type: {}\n",
+            readiness.kind
+        ));
+    }
+    if let Some(endpoint) = &readiness.endpoint {
+        text.push_str(&format!(
+            "  readiness-health-check-http-endpoint: {}\n",
+            quoted(endpoint)
+        ));
+    }
+    for (key, seconds) in [
+        ("invocation-timeout", readiness.invocation_timeout),
+        ("interval", readiness.interval),
+    ] {
+        if let Some(seconds) = seconds {
+            text.push_str(&format!("  readiness-health-check-{key}: {seconds}\n"));
+        }
     }
     let routes: Vec<String> = state
         .routes_of(&app.guid)
@@ -964,6 +1004,7 @@ mod tests {
             memory_mib: 64,
             budget_ms: None,
             lifetime: crate::store::Lifetime::default(),
+            readiness: Default::default(),
             wasi: Vec::new(),
             keyvalue: Default::default(),
             env: Default::default(),
@@ -1139,6 +1180,19 @@ mod tests {
         assert_eq!(uptimes["resources"][1]["state"], "RUNNING");
         assert_eq!(uptimes["resources"][1]["routable"], true);
         assert_eq!(uptimes["resources"][0]["routable"], false, "CRASHED");
+        // running, routable as one of its VMs is ready
+        for (ready, routable) in [([false, true], true), ([false, false], false)] {
+            let mut alive = one.clone();
+            for (instance, ready) in alive.alive.iter_mut().zip(ready) {
+                instance.ready = Some(ready);
+            }
+            let stats = stats(&state, state.app(&guid).unwrap(), "cf", &on_w(Some(&alive)));
+            let entry = &stats["resources"][1];
+            assert_eq!(
+                (&entry["state"], &entry["routable"]),
+                (&json!("RUNNING"), &json!(routable))
+            );
+        }
         assert!((100..110).contains(&uptime(1)), "{uptimes}");
         assert_eq!(uptimes["resources"][0]["state"], "CRASHED");
         assert!((50..60).contains(&uptime(0)), "{uptimes}");

@@ -529,7 +529,7 @@ pub fn options(host: &str, pairs: &[(String, String)]) -> Result<Options, String
             return Err(format!("{key} given twice"));
         }
         let value = match key.as_str() {
-            "mode" | "egress" | "disk" => value.clone(),
+            "mode" | "egress" | "disk" | "readiness" | "readiness-endpoint" => value.clone(),
             _ => value
                 .parse::<u32>()
                 .map_err(|_| format!("{key}={value} is not a number"))?
@@ -670,7 +670,7 @@ fn write(routes: &[Route], apps: &[App]) -> String {
         yaml.push_str(&format!("    deployed: {}\n", quote(&route.deployed)));
         for (key, value) in &route.options {
             let value = match key.as_str() {
-                "mode" => quote(value),
+                "mode" | "readiness" | "readiness-endpoint" => quote(value),
                 "egress" => {
                     let rules: Vec<String> = value
                         .split(',')
@@ -745,12 +745,18 @@ mod tests {
     fn the_options_and_the_routes_file() {
         let kept = options(
             "a.local",
-            &pairs("egress=db.internal:5432,10.0.0.0/24:6379&warm=02&mode=pool&instances=4"),
+            &pairs(
+                "egress=db.internal:5432,10.0.0.0/24:6379&readiness-endpoint=/ready?after=3\
+                 &warm=02&mode=pool&instances=4&readiness=http",
+            ),
         )
         .unwrap();
         assert_eq!(
             kept,
-            pairs("mode=pool&warm=2&instances=4&egress=db.internal:5432,10.0.0.0/24:6379"),
+            pairs(
+                "mode=pool&warm=2&instances=4&readiness=http&readiness-endpoint=/ready?after=3\
+                 &egress=db.internal:5432,10.0.0.0/24:6379"
+            ),
             "in the file's order, the numbers normalized"
         );
         for (query, error) in [
@@ -780,6 +786,31 @@ mod tests {
             (
                 "disk=/data&instances=2",
                 "disk needs instances=1: one VM writes",
+            ),
+            ("readiness=tcp", "readiness=tcp: process, port or http"),
+            (
+                "readiness=http&mode=reuse",
+                "readiness=http needs mode=boot or mode=pool",
+            ),
+            (
+                "readiness-endpoint=/a",
+                "readiness-endpoint needs readiness=http",
+            ),
+            (
+                "readiness=port&readiness-endpoint=/a",
+                "readiness-endpoint needs readiness=http",
+            ),
+            (
+                "readiness-interval-ms=10",
+                "readiness-interval-ms needs readiness=port or readiness=http",
+            ),
+            (
+                "readiness=http&readiness-endpoint=a",
+                "readiness-endpoint=a: a path from /",
+            ),
+            (
+                "readiness=port&readiness-timeout-ms=0",
+                "readiness-timeout-ms must be at least 1",
             ),
         ] {
             let refused = options("a.local", &pairs(query));

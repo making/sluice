@@ -12,6 +12,9 @@ import {
 
 const CLONED = ["per-connection", "reuse", "pool"];
 const MODES = ["boot", ...CLONED];
+// the modes taking a readiness check: those whose VMs serve connections ahead of them
+const POOLED = ["boot", "pool"];
+const CHECKS = ["process", "port", "http"];
 
 // what each mode does, after the README's table
 const MODE_HINTS = {
@@ -23,7 +26,8 @@ const MODE_HINTS = {
 
 /**
  * The numeric options of a route: the `--vm` query's key, the mode(s) taking it, the default
- * (null: none, unbounded), the least value, and where the form puts it.
+ * (null: none, unbounded), the least value, and where the form puts it; `checked`, a readiness
+ * check's (port, http) alone.
  */
 const NUMBERS = [
   { key: "vcpus", group: "vm", label: "vCPUs", unit: "", fallback: 1, min: 1, modes: MODES },
@@ -41,9 +45,11 @@ const NUMBERS = [
   { key: "concurrency", group: "clones", label: "Concurrency", unit: "conns per VM", fallback: 16, min: 1, modes: ["pool"] },
   { key: "per-client", group: "connections", label: "Per client", unit: "conns", fallback: null, min: 1, modes: MODES },
   { key: "idle-ms", group: "connections", label: "Idle", unit: "ms", fallback: null, min: 1, modes: MODES },
+  { key: "readiness-timeout-ms", group: "readiness", label: "A probe within", unit: "ms", fallback: 1000, min: 1, modes: POOLED, checked: true },
+  { key: "readiness-interval-ms", group: "readiness", label: "Ready, every", unit: "ms", fallback: 30000, min: 1, modes: POOLED, checked: true },
 ];
 
-const GROUPS = { vm: "Each VM", clones: "Clones", connections: "Connections" };
+const GROUPS = { vm: "Each VM", clones: "Clones", connections: "Connections", readiness: "Its probes" };
 
 // the ext2/3/4 superblock's magic: 0xEF53, little-endian, at byte 1080
 const MAGIC_AT = 1080;
@@ -82,23 +88,37 @@ function fallbackOf(number, options) {
   return number.fallback;
 }
 
+/** The readiness check `options` ask, if their mode takes one: port or http; null else. */
+function checkOf(options) {
+  const check = options.values.readiness;
+  return POOLED.includes(options.mode) && check && check !== "process" ? check : null;
+}
+
 /**
  * `options` as query pairs: the mode unless boot, each option its mode takes that is set to
- * other than its default, the egress rules. No value needs escaping but the egress (a host
- * name, an address, a range and a port).
+ * other than its default, the readiness check, the egress rules. No value needs escaping but
+ * the egress (a host name, an address, a range and a port) and the readiness endpoint.
  */
 function optionPairs(options) {
   const pairs = [];
   if (options.mode !== "boot") {
     pairs.push(`mode=${options.mode}`);
   }
+  const check = checkOf(options);
   for (const number of NUMBERS) {
     const value = options.values[number.key];
-    if (!number.modes.includes(options.mode) || value === undefined || value === "") {
+    if (!number.modes.includes(options.mode) || value === undefined || value === "" || (number.checked && !check)) {
       continue;
     }
     if (Number(value) !== fallbackOf(number, options)) {
       pairs.push(`${number.key}=${Number(value)}`);
+    }
+  }
+  if (check) {
+    pairs.push(`readiness=${check}`);
+    const endpoint = options.values["readiness-endpoint"];
+    if (check === "http" && endpoint && endpoint !== "/") {
+      pairs.push(`readiness-endpoint=${encodeURIComponent(endpoint)}`);
     }
   }
   const egress = (options.values.egress ?? "").split(/[\s,]+/).filter(Boolean);
@@ -110,8 +130,8 @@ function optionPairs(options) {
 
 /**
  * The option fields of a route, `initial` filled in: the mode as a choice, then the options
- * the mode takes (the others hidden), then the egress. `read()` returns the options, or
- * throws (marking the field) when a value is out of range.
+ * the mode takes (the others hidden), the readiness check, then the egress. `read()` returns the
+ * options, or throws (marking the field) when a value is out of range.
  */
 function optionFields(initial, onChange) {
   const id = nextId("options");
@@ -149,6 +169,19 @@ function optionFields(initial, onChange) {
   });
   egress.style.width = "min(100%, 34rem)";
   egress.value = initial.values.egress ?? "";
+  const readiness = h("select", { id: `${id}-readiness`, "aria-describedby": `${id}-readiness-note` },
+    CHECKS.map((check) => h("option", { value: check }, check)));
+  readiness.value = initial.values.readiness ?? "process";
+  const endpoint = h("input", {
+    type: "text", id: `${id}-readiness-endpoint`, autocomplete: "off", autocapitalize: "none", spellcheck: "false",
+    placeholder: "/", "aria-label": "Readiness endpoint",
+  });
+  endpoint.value = initial.values["readiness-endpoint"] ?? "";
+  const readinessField = h("div", { class: "field" },
+    h("label", { for: readiness.id }, "Readiness"),
+    h("div", { class: "field__control" }, readiness, " ", endpoint,
+      h("p", { class: "field__note", id: `${id}-readiness-note` },
+        "When a VM takes connections: process, once up; port, once its port accepts; http, once a GET of the path is answered 200. With no VM ready the route leaves the advertisement.")));
   const note = h("p", { class: "sandbox__note", id: `${id}-note` });
 
   const groupFields = new Map();
@@ -160,7 +193,9 @@ function optionFields(initial, onChange) {
   const element = h("fieldset", { class: "sandbox" },
     h("legend", { class: "visually-hidden" }, "Options"),
     h("div", { class: "field" }, h("span", { class: "field__label", id: `${id}-mode` }, "Mode"), modes),
-    [...groupFields.values()],
+    [...groupFields.values()].filter((field) => field !== groupFields.get("readiness")),
+    readinessField,
+    groupFields.get("readiness") ?? [],
     h("div", { class: "field" },
       h("label", { for: egress.id }, "Egress"),
       h("div", { class: "field__control" }, egress,
@@ -169,23 +204,26 @@ function optionFields(initial, onChange) {
     h("div", { class: "field" }, h("span", { class: "field__label" }), h("div", { class: "field__control" }, note)));
 
   const mode = () => [...radios].find(([, radio]) => radio.checked)?.[0] ?? "boot";
-  /** Shows the options the mode takes, and a pool's warm default. */
+  /** Shows the options the mode takes, a readiness check's with one, and a pool's warm default. */
   const show = () => {
     const chosen = mode();
+    const check = checkOf({ mode: chosen, values: { readiness: readiness.value } });
     for (const [group, entries] of limits) {
       let shown = 0;
       for (const { number, element: limit } of entries) {
-        limit.hidden = !number.modes.includes(chosen);
+        limit.hidden = !number.modes.includes(chosen) || (number.checked && !check);
         shown += limit.hidden ? 0 : 1;
       }
       groupFields.get(group).hidden = shown === 0;
     }
+    readinessField.hidden = !POOLED.includes(chosen);
+    endpoint.hidden = check !== "http";
     const warm = inputs.get("warm");
     warm.placeholder = chosen === "pool" ? "instances" : "0";
   };
   show();
   element.addEventListener("change", (event) => {
-    if (event.target.type === "radio") {
+    if (event.target.type === "radio" || event.target === readiness) {
       show();
     }
     onChange?.();
@@ -199,10 +237,14 @@ function optionFields(initial, onChange) {
     read() {
       note.textContent = "";
       inputs.forEach((input) => input.removeAttribute("aria-invalid"));
-      const options = { mode: mode(), values: {} };
+      const options = { mode: mode(), values: { readiness: readiness.value } };
+      const check = checkOf(options);
+      if (!check) {
+        delete options.values.readiness;
+      }
       for (const number of NUMBERS) {
         const input = inputs.get(number.key);
-        if (!input || !number.modes.includes(options.mode)) {
+        if (!input || !number.modes.includes(options.mode) || (number.checked && !check)) {
           continue;
         }
         const text = input.value.trim();
@@ -222,6 +264,13 @@ function optionFields(initial, onChange) {
       if (values.instances !== undefined && values.warm !== undefined && Number(values.instances) < Number(values.warm)) {
         fail(inputs.get("instances"), "VMs must be at least warm: the warm clones are among them.");
       }
+      const path = endpoint.value.trim();
+      if (check === "http" && path !== "") {
+        if (!/^\/[!-~]*$/.test(path) || path.includes("#")) {
+          fail(endpoint, `Readiness endpoint ${path}: a path from /, of visible ASCII and no fragment.`);
+        }
+        values["readiness-endpoint"] = path;
+      }
       const rules = egress.value.trim();
       if (rules !== "") {
         const bad = rules.split(/[\s,]+/).filter(Boolean).find((rule) => !/^.+:\d{1,5}$/.test(rule));
@@ -240,6 +289,8 @@ function optionFields(initial, onChange) {
         input.value = options.values[key] ?? "";
       }
       egress.value = options.values.egress ?? "";
+      readiness.value = options.values.readiness ?? "process";
+      endpoint.value = options.values["readiness-endpoint"] ?? "";
       show();
     },
     focus() {
@@ -272,6 +323,10 @@ function modeCell(route) {
     }
     parts.push(limit(number.unit === "ms" ? `${number.key.replace(/-ms$/, "")} ${formatMs(Number(value))}` : `${number.key} ${value}`));
   }
+  if (route.options.readiness) {
+    const endpoint = route.options.readiness === "http" ? ` ${route.options["readiness-endpoint"] ?? "/"}` : "";
+    parts.push(limit(`readiness ${route.options.readiness}${endpoint}`, "when a VM takes connections: its check passed"));
+  }
   if (route.options.egress) {
     parts.push(h("span", { class: "route__env mono", title: "the destinations its guests may connect to through the wicket" },
       `egress ${route.options.egress.split(",").join(", ")}`));
@@ -292,6 +347,9 @@ function vmsView(route) {
     if (vms.restarts) {
       counts.push(`restarted ${plural(vms.restarts, "time")}`);
     }
+    if (route.options.readiness && vms.ready !== null && vms.ready !== undefined) {
+      counts.push(`${vms.ready} ready`);
+    }
   }
   else {
     counts.push(`${vms.warm} warm`);
@@ -303,6 +361,10 @@ function vmsView(route) {
   const lines = [h("span", { class: "route__meta", "data-testid": "instances" }, joined(counts))];
   if (vms.down) {
     lines.push(h("span", { class: "route__meta", title: "its VM starts again by itself" }, vms.down.why));
+  }
+  if (route.ready === false) {
+    lines.push(h("span", { class: "route__meta", title: "every node stream leaves it out until a VM is ready" },
+      "not advertised: no VM ready"));
   }
   if (snapshot) {
     lines.push(h("span", { class: "route__meta", title: `snapshot taken ${snapshot.at}` }, joined([
@@ -363,7 +425,7 @@ consolePage({
 
 // ----------------------------------------------------------------------- the link
 
-const counts = (listing) => JSON.stringify(listing && [listing.budget, listing.routes.map((route) => [route.instances, route.snapshot])]);
+const counts = (listing) => JSON.stringify(listing && [listing.budget, listing.routes.map((route) => [route.instances, route.ready, route.snapshot])]);
 
 follow((listing, moved) => {
   showListing(listing, moved || counts(currentListing()) !== counts(listing));

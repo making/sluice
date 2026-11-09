@@ -53,6 +53,7 @@ pub mod jail;
 pub mod keeper;
 pub mod listener;
 pub mod output;
+pub mod readiness;
 pub mod rootfs;
 pub mod route;
 pub mod routes;

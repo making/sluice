@@ -712,6 +712,7 @@ The wicket's listing says `runtime: firecracker`.
 | web process `instances` | `instances`, [the limit](#instances) of the app's VMs: `mode=pool`, that many VMs cloned from a snapshot, one too; [annotated](#how-long-a-vm-lives), any mode. 0 is [as on CF](#mapping): no VM and no app in the wicket |
 | web process `memory` | `memory-mib`, 1G by default as on CF: less fails a CNB Java image's memory calculator at its start. The snapshot takes what its guest wrote of it on the host's memory (`--tmpfs /run/sluice`; [measured](../.kb/wicket-firecracker-findings.md#a-snapshots-memory)), and at most all of it |
 | web process `health_check` `timeout` (`cf push -t`) | `boot-ms`, 60s by default and 180s at most as on CF: how long the process may take to listen, in the request that starts it. A process exiting first is refused at once |
+| web process `readiness_health_check` (the manifest's `readiness-health-check-type: port` or `http`, its `-http-endpoint`, `-invocation-timeout` and `-interval`, in seconds) | the route's [readiness check](../sluice-wicket-runtime-firecracker/README.md#readiness), `readiness`, `readiness-endpoint`, `readiness-timeout-ms` and `readiness-interval-ms`: a VM takes requests once its check passed and none while it fails, not restarted; the process stats list it `routable` then alone. A wicket whose VMs of the app are all down or failing it leaves the route's advertisement, the server sending the requests to the other wickets serving it. Taken at the next start, as on CF. Refused (`cf push`, the v3 API, an annotation's edit) with mode `per-connection` or `reuse`, and at `warm: 0`: no VM serves ahead of the requests to probe |
 | environment variables, `VCAP_APPLICATION`, `VCAP_SERVICES` | the sandbox's `env`: the process's environment, over the image's (its `PORT` is `/init`'s) |
 | disk | no effect: the rootfs is read-only and `/tmp` a tmpfs of the VM's memory; a persistent disk is the wicket API's, with no CF counterpart |
 | services | [user-provided](#user-provided-services) ones and a [service broker](#service-brokers)'s: the listing offers neither capabilities nor keyvalue stores |
@@ -875,9 +876,11 @@ mode stays one wicket.
   maps it (`GET /api/keyvalue/<store>/<namespace>`), a draining one included
 - **Updating the wickets**, one at a time: a wicket stopping drains (`--drain-grace`, 20s), its
   routes withdrawn on every node, and the server sends their hosts to the other wicket; started
-  again, it serves the apps of its console directory before it advertises them, and the cf-api
-  puts nothing again. An app of `-i 2` or more serves on; one of `-i 1`, or one mapping a store of
-  each wicket's host (all its instances on one wicket), answers 503 until its wicket is back. The server's default `sluice.http-load-balance`, `smallest-client-id`, sends
+  again, it serves the apps of its console directory before it advertises them (a Firecracker
+  wicket each once a VM of it is up and passed its [readiness check](#mapping-to-vms)), and the
+  cf-api puts nothing again. An app of `-i 2` or more serves on; one of `-i 1`, or one mapping a
+  store of each wicket's host (all its instances on one wicket), answers 503 until its wicket is
+  back. The server's default `sluice.http-load-balance`, `smallest-client-id`, sends
   every request to one wicket, the other standing by; `round-robin` shares them. Let a stop take
   longer than the drain (`stop_grace_period` / `terminationGracePeriodSeconds` 30s, a Firecracker
   wicket's 40s), and update the next wicket once the first serves again (`cf app` shows its
@@ -1012,10 +1015,11 @@ What holds on both wickets; a component's and a VM's are in
 | app stopped, scaled to 0, or without a route | no app in the wickets: a request gets a wicket's 404, as gorouter answers a route with no instance registered. `cf app` shows `0/0` (stopped: `0/N`, each `DOWN`), `cf push` of `instances: 0` waits for none |
 | route `<host>.<domain>` | a host: labels of `a-z`, `0-9` and `-`. No path, port or wildcard (422). A route serves one app: a second destination is refused; zero-downtime updates are `--strategy rolling` |
 | shared domain | `--domain` |
-| instance state | once the wicket took the app, an entry per [instance alive](#instances), `RUNNING`, its `since` its own start, for a VM it keeps and has not up yet `STARTING`, and for a VM it keeps gone down or not starting (no room in the wicket's budget, a snapshot gone), or none alive at `warm: 0` with a request's restore failing for anything but room, `CRASHED` with why as `details`, `since` the failure began, until it is up; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable or has not taken the app. These two list an entry per index the wicket holds. Each entry's `host` is its wicket's name |
+| instance state | once the wicket took the app, an entry per [instance alive](#instances), `RUNNING`, its `since` its own start, `routable` unless it fails its [readiness check](#mapping-to-vms), for a VM it keeps and has not up yet `STARTING`, and for a VM it keeps gone down or not starting (no room in the wicket's budget, a snapshot gone), or none alive at `warm: 0` with a request's restore failing for anything but room, `CRASHED` with why as `details`, `since` the failure began, until it is up; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable or has not taken the app. These two list an entry per index the wicket holds. Each entry's `host` is its wicket's name |
 | rolling deployment | the app put with the new droplet: each wicket swaps it in place, all at once; finalized at once |
 | org / space | the cf-api's own ([Organizations, spaces and roles](#organizations-spaces-and-roles)): the wicket knows none, its hosts are every space's |
-| health check, log rate, stack, buildpacks | accepted and shown, no effect |
+| readiness check (`readiness-health-check-*`, a manifest's alone, as on CF) | kept and shown (`cf get-readiness-health-check`, the process's `readiness_health_check`); `process`, the default, on both wickets; `port` and `http` on a Firecracker wicket ([Mapping to VMs](#mapping-to-vms)), refused on a wasm wicket, where an instance takes requests as they come |
+| liveness health check, log rate, stack, buildpacks | accepted and shown, no effect (but a VM's `timeout`) |
 
 ### Instances
 

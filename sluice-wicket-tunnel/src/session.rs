@@ -338,13 +338,10 @@ impl<T: Table> NodeTask<T> {
         let acks = self.shared.routes.stream();
         let mut table = self.shared.routes.subscribe();
         let routes = table.borrow_and_update().clone();
-        outbound.control(advertise(
-            routes.advertised().to_vec(),
-            false,
-            &self.shared.build,
-        ));
+        let offered = routes.offered();
+        outbound.control(advertise(offered.clone(), false, &self.shared.build));
         let advertised = Advertised {
-            upstreams: routes.advertised().to_vec(),
+            upstreams: offered,
             unacked: VecDeque::from([routes.generation()]),
             acks,
         };
@@ -398,7 +395,8 @@ impl<T: Table> NodeTask<T> {
     /// ends it at once too.
     ///
     /// Until the drain, a reload that changed the routes (`table`) is
-    /// advertised again; each acknowledgement tells the routes which
+    /// advertised again, and so is a change of which are ready
+    /// ([`Table::ready`]); each acknowledgement tells the routes which
     /// generation the server took on this stream.
     async fn stream(
         &self,
@@ -460,11 +458,16 @@ impl<T: Table> NodeTask<T> {
                             false,
                             &self.shared.build,
                         ));
+                        let withheld = routes.advertised().len() - advertised.upstreams.len();
                         println!(
-                            "[{}] advertising the reloaded routes ({} upstream(s), generation {})",
+                            "[{}] advertising the routes ({} upstream(s), generation {}{})",
                             self.label,
                             advertised.upstreams.len(),
-                            routes.generation()
+                            routes.generation(),
+                            match withheld {
+                                0 => String::new(),
+                                n => format!("; {n} left out with no instance ready"),
+                            }
                         );
                     }
                     continue;
@@ -596,13 +599,14 @@ struct Advertised {
 }
 
 impl Advertised {
-    /// Takes the reloaded `routes`; true when their upstreams changed and
-    /// are to be advertised. Unchanged, the server already has them: the
-    /// generation counts as acknowledged with the advertise still pending,
-    /// or at once.
+    /// Takes the reloaded `routes`, or their readiness changed; true when the
+    /// upstreams offered ([`Table::offered`]) changed and are to be
+    /// advertised. Unchanged, the server already has them: the generation
+    /// counts as acknowledged with the advertise still pending, or at once.
     fn update(&mut self, routes: &impl Table) -> bool {
-        if routes.advertised() != self.upstreams {
-            self.upstreams = routes.advertised().to_vec();
+        let offered = routes.offered();
+        if offered != self.upstreams {
+            self.upstreams = offered;
             self.unacked.push_back(routes.generation());
             return true;
         }
@@ -833,21 +837,44 @@ mod tests {
     }
 
     /// A table published with other upstreams is advertised on the live
-    /// stream; one with the same upstreams is not.
+    /// stream; one with the same upstreams is not. A route with no instance
+    /// ready is left out, from the first advertise on, until it is ready.
     #[tokio::test]
     async fn a_published_table_is_advertised_when_its_upstreams_changed() {
-        let routes = Routes::new(Fixed::hosts(1, &["a.local"]));
+        let hosts = |advertise: &Advertise| -> Vec<String> {
+            advertise
+                .upstreams
+                .iter()
+                .map(|up| up.host.clone())
+                .collect()
+        };
+        let first = Fixed::hosts(1, &["a.local", "c.local"]);
+        first.unready.lock().unwrap().push("c.local".into());
+        let routes = Routes::new(first);
         let (shared, _) = shared_on(&routes, Duration::ZERO);
         let (mut stream, _events) = served_session(&shared).await;
-        assert_eq!(stream.advertise().await.upstreams.len(), 1);
+        assert_eq!(hosts(&stream.advertise().await), ["a.local"]);
         stream.ack(false);
 
         routes.publish(Fixed::hosts(2, &["a.local"]));
         routes.publish(Fixed::hosts(3, &["a.local", "b.local"]));
         let readvertised = stream.advertise().await;
-        let hosts: Vec<_> = readvertised.upstreams.iter().map(|up| &up.host).collect();
-        assert_eq!(hosts, ["a.local", "b.local"], "the changed table only");
+        assert_eq!(
+            hosts(&readvertised),
+            ["a.local", "b.local"],
+            "the changed table only"
+        );
         assert!(!readvertised.withdraw);
+        stream.ack(false);
+
+        let unready = routes.current().unready.clone();
+        unready.lock().unwrap().push("b.local".into());
+        routes.readiness_changed();
+        assert_eq!(hosts(&stream.advertise().await), ["a.local"]);
+        stream.ack(false);
+        unready.lock().unwrap().clear();
+        routes.readiness_changed();
+        assert_eq!(hosts(&stream.advertise().await), ["a.local", "b.local"]);
     }
 
     /// Each acknowledgement tells which generation the server took: the one
@@ -871,7 +898,7 @@ mod tests {
         let table = |generation, hosts: &[&str]| Fixed {
             generation,
             advertised: hosts.iter().map(|host| upstream(host)).collect(),
-            takes_any_host: false,
+            ..Fixed::hosts(generation, &[])
         };
         assert!(!advertised.update(&table(2, &["a"])), "the same routes");
         assert!(!acknowledged(1));
@@ -1220,6 +1247,8 @@ pub mod testing {
     pub struct ServerTunnel {
         state: Arc<TunnelState>,
         advertises: mpsc::UnboundedReceiver<Advertise>,
+        /// The wicket's last Advertise taken.
+        latest: Advertise,
     }
 
     type PumpedConnection = (mpsc::UnboundedSender<Body>, Arc<Semaphore>);
@@ -1292,15 +1321,37 @@ pub mod testing {
                 // the stream ended: so do its connections
                 demux.connections.lock().unwrap().clear();
             });
-            (ServerTunnel { state, advertises }, advertise)
+            let latest = advertise.clone();
+            let tunnel = ServerTunnel {
+                state,
+                advertises,
+                latest,
+            };
+            (tunnel, advertise)
         }
 
         /// The wicket's next Advertise after the first, acknowledged.
         pub async fn advertise(&mut self) -> Advertise {
-            tokio::time::timeout(HANG, self.advertises.recv())
+            let advertise = tokio::time::timeout(HANG, self.advertises.recv())
                 .await
                 .expect("hang guard")
-                .expect("the stream is open")
+                .expect("the stream is open");
+            self.latest = advertise.clone();
+            advertise
+        }
+
+        /// The wicket's Advertise once it is as `what` takes it: the last one come, else the
+        /// next until one is. What an edit is waited for by: the routes a stream advertises
+        /// move with their readiness too (a route left out while its instances restart), and
+        /// those advertises are passed over.
+        pub async fn advertise_where(&mut self, what: impl Fn(&Advertise) -> bool) -> Advertise {
+            while let Ok(advertise) = self.advertises.try_recv() {
+                self.latest = advertise;
+            }
+            while !what(&self.latest) {
+                self.advertise().await;
+            }
+            self.latest.clone()
         }
 
         /// Opens connection `conn_id` to the dial address `address`, as the

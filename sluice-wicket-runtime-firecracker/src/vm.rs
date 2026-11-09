@@ -104,7 +104,7 @@ pub const STOP_WRITES: Duration = Duration::from_secs(10);
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long `/init` may take to drop a stream the process refuses.
-const REFUSAL_TIMEOUT: Duration = Duration::from_secs(1);
+pub const REFUSAL_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The longest answer of a guest's control stream the wicket reads.
 const MAX_CONTROL_ANSWER: usize = 1024;
@@ -904,16 +904,21 @@ impl Vm {
             .map_err(|_| format!("vsock handshake: no answer within {DIAL_TIMEOUT:?}"))?
     }
 
-    /// [`Vm::dial`] retried until the guest listens on `port`, within `timeout`.
     /// Whether the guest's process accepts on `port`: a dial alone says nothing, `/init`'s vsock
     /// port stays open once the process listened; `/init` drops a stream the process refuses
     /// at once. A process's first bytes, or no drop in time, are its answer.
     pub async fn accepting(&self, port: u32) -> bool {
-        let Ok(mut stream) = self.dial(port).await else {
-            return false;
-        };
+        match self.dial(port).await {
+            Ok(stream) => Vm::accepted(stream, REFUSAL_TIMEOUT).await,
+            Err(_) => false,
+        }
+    }
+
+    /// Whether the process took `stream`, a stream to the guest's port: not dropped within
+    /// `within`, or its first bytes came. Taken, it is closed as by a client.
+    pub async fn accepted(mut stream: UnixStream, within: Duration) -> bool {
         let mut first = [0u8];
-        let accepted = match tokio::time::timeout(REFUSAL_TIMEOUT, stream.read(&mut first)).await {
+        let accepted = match tokio::time::timeout(within, stream.read(&mut first)).await {
             Err(_) | Ok(Ok(1..)) => true,
             Ok(Ok(0) | Err(_)) => false,
         };
@@ -924,6 +929,7 @@ impl Vm {
         accepted
     }
 
+    /// [`Vm::dial`] retried until the guest listens on `port`, within `timeout`.
     pub async fn dial_ready(&self, port: u32, timeout: Duration) -> Result<UnixStream, BoxError> {
         let deadline = Instant::now() + timeout;
         loop {

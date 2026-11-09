@@ -27,6 +27,11 @@
 //! nothing until a restart succeeds, which the failure says. Its connections fail
 //! meanwhile, a boot long.
 //!
+//! Every node stream advertises the routes whose next connection finds a VM ([`Route::ready`]):
+//! one with none, every VM down or failing its readiness check, leaves the advertisement until it
+//! has one, a route starting with the wicket included, and is still bound (the server may have
+//! routed a connection to it before).
+//!
 //! A VM that goes down is the route's to replace (`route::VmPool`), its start not the reloads':
 //! one route failing holds no other's edit, and no reload fails for it. A change of the target
 //! takes over from it. A route stopped with none to follow goes on once nothing starts a VM on
@@ -166,6 +171,12 @@ impl sluice_wicket_tunnel::routes::Table for Table {
 
     fn advertised(&self) -> &[Upstream] {
         &self.advertised
+    }
+
+    /// Whether its route finds a VM for its next connection ([`Route::ready`]).
+    fn ready(&self, route: &Upstream) -> bool {
+        let route = self.routes.get(&route.target_url);
+        route.is_none_or(|route| route.ready())
     }
 
     /// A `--vm` route, on a wicket without a console: not a config file's, whose
@@ -1269,7 +1280,7 @@ impl Reloader {
             let Some(mut started) = ready.remove(&target) else {
                 let of = moved.get(&target).unwrap_or(&target);
                 if let Some(running) = self.started.get(of)
-                    && running.route.adjust(spec.bounds)
+                    && running.route.adjust(spec.bounds.clone())
                 {
                     change.adjusted.extend(hosts.iter().cloned());
                 }
@@ -1281,7 +1292,7 @@ impl Reloader {
             }
             started.route.rename(&hosts);
             // they may have changed as it started
-            started.route.adjust(spec.bounds);
+            started.route.adjust(spec.bounds.clone());
             started.spec = spec;
             new.insert(target, started);
         }
@@ -1380,6 +1391,7 @@ impl Reloader {
         } = start;
         let n = self.next_place;
         self.next_place += 1;
+        let routes = Arc::downgrade(&self.routes);
         let starting = Starting {
             places: self.places.clone(),
             n,
@@ -1388,6 +1400,11 @@ impl Reloader {
             workers: self.workers.clone(),
             stops: self.stops.clone(),
             status: self.status.clone(),
+            ready_changed: Arc::new(move || {
+                if let Some(routes) = routes.upgrade() {
+                    routes.readiness_changed();
+                }
+            }),
         };
         async move {
             let route = Route::start(spec.clone(), &hosts, starting)

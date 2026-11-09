@@ -24,7 +24,8 @@
 //! its app's removal, one VM at a time on it, an edit taking over from a reload, or from a restart
 //! there, or from a VM whose `/init` does not answer its stop; a VM
 //! never listening holding no other edit, by an app's edit, in the place of a disk's VM and
-//! through the config file;
+//! through the config file; a readiness check deciding which VMs take connections and whether
+//! the route is advertised, a process ending alike;
 //! both served again after a restart from the console's directory (not with the
 //! image: its directory is the test's).
 //!
@@ -431,7 +432,7 @@ async fn every_route_serves_http_through_the_tunnel() {
     // reloads, once a poll found the files quiet: the config file's alone
     // (capped.local removed), then the booted rootfs replaced
     std::fs::write(&config, &routes).unwrap();
-    let reloaded = tunnel.advertise().await;
+    let reloaded = advertised_as(&mut tunnel, &["capped.local"], true).await;
     let hosts: Vec<_> = reloaded.upstreams.iter().map(|up| &up.host).collect();
     assert!(!hosts.contains(&&"capped.local".to_string()), "{hosts:?}");
     assert_eq!(hosts.len(), 5 + extra.len(), "{hosts:?}");
@@ -581,6 +582,7 @@ async fn every_route_serves_http_through_the_tunnel() {
             sole_routes(&dir.0, &rootfs, |args| start(&url, args)).await;
             giving_way(&dir.0, &rootfs, |args| start(&url, args)).await;
             below_warm(&dir.0, &rootfs, |args| start(&url, args)).await;
+            readiness(&dir.0, &rootfs, &start).await;
         }
     }
 }
@@ -762,6 +764,123 @@ async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> 
     drop(clones);
     listed_as(wicket, POOL, up(2)).await;
     drop(on_the_pool);
+}
+
+/// A booted route checking its VMs' readiness (`readiness=http`): advertised once a VM passed its
+/// check, listed so; a VM failing it takes no connection, and with none ready the route leaves the
+/// advertisement until one answers again, its connections failing meanwhile, on the tunnel and on
+/// `--listen`; a process ending likewise, until the VM in its place is ready.
+async fn readiness(scratch: &Path, rootfs: &Path, start: impl Fn(&str, &[String]) -> Wicket) {
+    const READY: &str = "ready.local";
+    let config = scratch.join("readiness.yaml");
+    // each process fails its first 20 checks, 200ms apart: seconds after its VM is up
+    let route = format!(
+        "routes:\n- {{host: {READY}, rootfs: {}, instances: 2, boot-ms: {}, readiness: http, \
+         readiness-endpoint: '/ready?after=20', readiness-interval-ms: 200}}\n",
+        rootfs.display(),
+        LOOKING.as_millis()
+    );
+    std::fs::write(&config, route).unwrap();
+    let args = [
+        "--config",
+        &config.display().to_string(),
+        "--listen",
+        "127.0.0.1:0",
+        "--console",
+        "127.0.0.1:0",
+        "--console-token",
+        CONSOLE_TOKEN,
+        "--console-dir",
+        "readiness-console",
+    ]
+    .map(String::from);
+    let (url, mut streams) = tunnel_server(None).await;
+    let wicket = start(&url, &args);
+    let wicket = &wicket;
+    let stream = tokio::time::timeout(HANG, streams.recv()).await;
+    let stream = stream.ok().flatten();
+    let stream = stream.unwrap_or_else(|| panic!("no tunnel stream; {}", wicket.log()));
+    let (mut tunnel, first) = ServerTunnel::new(stream).await;
+    let hosts = |advertise: &sluice_wicket_tunnel::proto::Advertise| -> Vec<String> {
+        advertise
+            .upstreams
+            .iter()
+            .map(|up| up.host.clone())
+            .collect()
+    };
+    assert_eq!(hosts(&first), Vec::<String>::new(), "{}", wicket.log());
+    said(wicket, "VM 0 not ready: GET /ready?after=20: HTTP/1.1 503").await;
+    let advertised = tunnel.advertise().await;
+    assert_eq!(hosts(&advertised), [READY], "{}", wicket.log());
+    let address = dial_address(&advertised.upstreams[0].target_url);
+    fn on<'a>(tunnel: &'a ServerTunnel, address: &str) -> Route<'a> {
+        Route {
+            tunnel,
+            host: READY,
+            address: address.to_string(),
+            listen: None,
+        }
+    }
+    let ready = |n: u64| move |route: &serde_json::Value| route["instances"]["ready"] == n;
+    let both = listed_as(wicket, READY, ready(2)).await;
+    assert_eq!(both["ready"], true, "{both}");
+
+    let mut conn_id = 0;
+    let mut next = || {
+        conn_id += 1;
+        conn_id
+    };
+    let boot_id = |answer: &str| field(answer, "boot id: ").to_string();
+    // a VM's check failing for good: the other one serves
+    let failing = on(&tunnel, &address)
+        .post(next(), "/ready?fail=1000000", "")
+        .await;
+    let failing = field(&failing, "boot id: ").to_string();
+    listed_as(wicket, READY, ready(1)).await;
+    for _ in 0..4 {
+        let served = boot_id(&on(&tunnel, &address).get(next(), "/").await);
+        assert_ne!(served, failing, "a VM not ready took a connection");
+    }
+
+    // the other's for 15 checks: none ready, the route left out until it answers again
+    let answer = on(&tunnel, &address)
+        .post(next(), "/ready?fail=15", "")
+        .await;
+    let other = field(&answer, "boot id: ").to_string();
+    assert_ne!(other, failing);
+    let withdrawn = tunnel.advertise().await;
+    assert_eq!(hosts(&withdrawn), Vec::<String>::new(), "{}", wicket.log());
+    let none = listed(wicket, READY).await;
+    assert_eq!(
+        (&none["ready"], &none["instances"]["ready"]),
+        (&false.into(), &0.into()),
+        "{none}"
+    );
+    // still bound: a connection routed before fails, as one on --listen
+    assert_eq!(on(&tunnel, &address).half_closed(next()).await, "");
+    let listening = tokio::net::TcpStream::connect(wicket.listening())
+        .await
+        .unwrap();
+    let request = format!("GET / HTTP/1.1\r\nhost: {READY}\r\n\r\n");
+    assert_eq!(exchange(listening, &request).await, "");
+    let back = tunnel.advertise().await;
+    assert_eq!(hosts(&back), [READY], "{}", wicket.log());
+    assert_eq!(
+        boot_id(&on(&tunnel, &address).get(next(), "/").await),
+        other
+    );
+
+    // its process ended: none up nor ready until the VM in its place passes its check
+    on(&tunnel, &address).post(next(), "/exit", "").await;
+    let gone = tunnel.advertise().await;
+    assert_eq!(hosts(&gone), Vec::<String>::new(), "{}", wicket.log());
+    said(wicket, "its process ended; killed").await;
+    let again = tunnel.advertise().await;
+    assert_eq!(hosts(&again), [READY], "{}", wicket.log());
+    let replaced = boot_id(&on(&tunnel, &address).get(next(), "/").await);
+    assert!(replaced != other && replaced != failing, "{}", wicket.log());
+    let restarted = listed(wicket, READY).await;
+    assert_eq!(restarted["instances"]["restarts"], 1, "{restarted}");
 }
 
 /// The instances the listing of the app `name` has alive, as `(index, since)`, and its `down`.
@@ -1073,7 +1192,7 @@ async fn deploy(
     let routes = std::fs::read_to_string(dir.join("routes.yaml")).unwrap();
     assert!(routes.contains("host: \"console.local\""), "{routes}");
 
-    let advertised = tunnel.advertise().await;
+    let advertised = advertised_as(tunnel, &["console.local"], false).await;
     let up = advertised
         .upstreams
         .iter()
@@ -1160,7 +1279,7 @@ async fn deploy(
     let (status, put) = console(at, "PUT", "/api/apps/shop", true, body()).await;
     assert_eq!(status, 200, "{put}; {}", wicket.log());
     assert_eq!(put["message"], "added app1.local, app2.local");
-    let advertised = tunnel.advertise().await;
+    let advertised = advertised_as(tunnel, &["app1.local", "app2.local"], false).await;
     let target = |host: &str| {
         let up = advertised.upstreams.iter().find(|up| up.host == host);
         up.unwrap_or_else(|| panic!("{host} not advertised"))
@@ -1282,7 +1401,7 @@ async fn another_app(tunnel: &mut ServerTunnel, wicket: &Wicket, sha256: &str) {
     let other = app_body("other.local", sha256, serde_json::json!({}));
     let (status, put) = console(at, "PUT", "/api/apps/other", true, other).await;
     assert_eq!(status, 200, "{put}; {}", wicket.log());
-    let advertised = tunnel.advertise().await;
+    let advertised = advertised_as(tunnel, &["other.local"], false).await;
     let hosts: Vec<_> = advertised.upstreams.iter().map(|up| &up.host).collect();
     assert!(
         !hosts.iter().any(|host| host.starts_with("hung")),
@@ -1291,7 +1410,7 @@ async fn another_app(tunnel: &mut ServerTunnel, wicket: &Wicket, sha256: &str) {
     let gone = "/api/apps/other?owner=cf";
     let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
     assert_eq!(status, 200, "{removed}");
-    tunnel.advertise().await;
+    advertised_as(tunnel, &["other.local"], true).await;
 }
 
 /// How long a wicket's log may take to say what comes next.
@@ -1339,7 +1458,7 @@ async fn never_listening_app(
     let fixed = body("hung.local", serde_json::json!({"memory-mib": 128}));
     let (status, put) = console(at, "PUT", "/api/apps/hung", true, fixed).await;
     assert_eq!(status, 200, "{put}; {}", wicket.log());
-    tunnel.advertise().await;
+    advertised_as(tunnel, &["hung.local"], false).await;
     let (status, refused) = hanging.await.unwrap();
     assert_eq!(status, 422, "{refused}");
     assert!(
@@ -1361,7 +1480,7 @@ async fn never_listening_app(
     let gone = "/api/apps/hung?owner=cf";
     let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
     assert_eq!(status, 200, "{removed}");
-    tunnel.advertise().await;
+    advertised_as(tunnel, &["hung.local"], true).await;
 
     let written = std::fs::read_to_string(config).unwrap();
     let hung = "- {host: hung.config.local, rootfs: booted.ext4, port: 9999, boot-ms: 60000}\n";
@@ -1431,7 +1550,7 @@ async fn restarting_app(
     let body = Bytes::from(app.to_string());
     let (status, put) = console(at, "PUT", "/api/apps/crash", true, body).await;
     assert_eq!(status, 200, "{put}; {}", wicket.log());
-    let advertised = tunnel.advertise().await;
+    let advertised = advertised_as(tunnel, &["crash.local"], false).await;
     let up = advertised
         .upstreams
         .iter()
@@ -1512,7 +1631,7 @@ async fn restarting_app(
     let gone = "/api/apps/crash?owner=cf";
     let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
     assert_eq!(status, 200, "{removed}");
-    tunnel.advertise().await;
+    advertised_as(tunnel, &["crash.local"], true).await;
 }
 
 /// An app of several VMs booted, none restored: each its own, connections going to the one holding
@@ -1544,7 +1663,7 @@ async fn booted_app(tunnel: &mut ServerTunnel, wicket: &Wicket, sha256: &str, co
         (200, &format!("added {HOST}").into()),
         "{added}"
     );
-    let address = advertised_at(&tunnel.advertise().await, HOST);
+    let address = advertised_anew(tunnel, HOST, None).await;
     assert!(address.ends_with("?app=several"), "{address}");
     listed_as(wicket, HOST, pooled(2)).await;
     let route = Route {
@@ -1655,7 +1774,7 @@ async fn booted_app(tunnel: &mut ServerTunnel, wicket: &Wicket, sha256: &str, co
     let gone = "/api/apps/several?owner=cf";
     let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
     assert_eq!(status, 200, "{removed}");
-    tunnel.advertise().await;
+    advertised_as(tunnel, &[HOST], true).await;
 }
 
 /// The sample guest's answer to one more `GET /` of `host` on the connection of `sender`.
@@ -1726,11 +1845,42 @@ fn pooled(n: u64) -> impl Fn(&serde_json::Value) -> bool {
 
 /// The address `host` is advertised at in `advertised`.
 fn advertised_at(advertised: &sluice_wicket_tunnel::proto::Advertise, host: &str) -> String {
+    target_at(advertised, host).unwrap_or_else(|| panic!("{host} not advertised"))
+}
+
+/// The address `host` is advertised at in `advertised`, if it is.
+fn target_at(advertised: &sluice_wicket_tunnel::proto::Advertise, host: &str) -> Option<String> {
     let up = advertised.upstreams.iter().find(|up| up.host == host);
-    dial_address(
-        &up.unwrap_or_else(|| panic!("{host} not advertised"))
-            .target_url,
-    )
+    up.map(|up| dial_address(&up.target_url))
+}
+
+/// The address `host` is advertised at once it is another than `was` (None: once it is advertised
+/// at all), as an edit has it: what a route's readiness moving advertised meanwhile (one left out
+/// while its VMs restart) passed over.
+async fn advertised_anew(tunnel: &mut ServerTunnel, host: &str, was: Option<&str>) -> String {
+    let advertised = tunnel
+        .advertise_where(|advertised| {
+            target_at(advertised, host).is_some_and(|at| Some(at.as_str()) != was)
+        })
+        .await;
+    advertised_at(&advertised, host)
+}
+
+/// The routes once `hosts` are all advertised, or none of them (`gone`), as an edit has it.
+async fn advertised_as(
+    tunnel: &mut ServerTunnel,
+    hosts: &[&str],
+    gone: bool,
+) -> sluice_wicket_tunnel::proto::Advertise {
+    tunnel
+        .advertise_where(|advertised| {
+            let on = |host: &&str| target_at(advertised, host).is_some();
+            match gone {
+                true => !hosts.iter().any(on),
+                false => hosts.iter().all(on),
+            }
+        })
+        .await
 }
 
 /// A route of the config file, its numbers changed (its target names them, so another one is
@@ -1775,7 +1925,7 @@ async fn adjusted_route(
     let more = written.replace("instances: 2, warm: 1", "instances: 3, warm: 2");
     assert_ne!(more, written);
     std::fs::write(config, &more).unwrap();
-    let address = advertised_at(&tunnel.advertise().await, HOST);
+    let address = advertised_anew(tunnel, HOST, Some(&address)).await;
     assert!(address.contains("warm=2&instances=3"), "{address}");
     listed_as(wicket, HOST, pooled(2)).await;
     if let (Some(before), Some(after)) = (&before, vms()) {
@@ -1796,7 +1946,7 @@ async fn adjusted_route(
 
     let less = written.replace("instances: 2, warm: 1", "instances: 1, warm: 1");
     std::fs::write(config, &less).unwrap();
-    let address = advertised_at(&tunnel.advertise().await, HOST);
+    let address = advertised_anew(tunnel, HOST, Some(&address)).await;
     assert!(address.contains("instances=1"), "{address}");
     assert_eq!(served(&[again(&mut held, HOST).await]), [count + 2]);
     assert_eq!(
@@ -1855,7 +2005,7 @@ async fn adjusted_pool_app(
     let pool = |vms: u64| serde_json::json!({"mode": "pool", "instances": vms, "keep-ms": keep, "warm": vms});
 
     assert_eq!(put(pool(1)).await, format!("added {HOST}"));
-    let address = advertised_at(&tunnel.advertise().await, HOST);
+    let address = advertised_anew(tunnel, HOST, None).await;
     assert!(address.ends_with("?app=sized&mode=pool"), "{address}");
     let of = generation().await;
     let route = Route {
@@ -1919,7 +2069,7 @@ async fn adjusted_pool_app(
     let gone = "/api/apps/sized?owner=cf";
     let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
     assert_eq!(status, 200, "{removed}");
-    tunnel.advertise().await;
+    advertised_as(tunnel, &[HOST], true).await;
 }
 
 /// An app's numbers of a VM per connection changed: a connection waiting for room finds it as
@@ -1946,12 +2096,12 @@ async fn adjusted_clones_app(
     };
     let each = |vms: u64, warm: u64| serde_json::json!({"mode": "per-connection", "instances": vms, "warm": warm, "wait-ms": 60_000});
     assert_eq!(put(each(1, 0)).await, format!("added {HOST}"));
-    let address = advertised_at(&tunnel.advertise().await, HOST);
+    let address = advertised_anew(tunnel, HOST, None).await;
     {
         let route = Route {
             tunnel,
             host: HOST,
-            address,
+            address: address.clone(),
             listen: None,
         };
         let (first, _, _) = route.held(next(), "").await;
@@ -1975,7 +2125,7 @@ async fn adjusted_clones_app(
 
     let reused = |uses: u64| serde_json::json!({"mode": "reuse", "instances": 2, "uses": uses});
     assert_eq!(put(reused(9)).await, format!("restarted {HOST}"));
-    let address = advertised_at(&tunnel.advertise().await, HOST);
+    let address = advertised_anew(tunnel, HOST, Some(&address)).await;
     let route = Route {
         tunnel,
         host: HOST,
@@ -1992,7 +2142,7 @@ async fn adjusted_clones_app(
     let gone = "/api/apps/clones?owner=cf";
     let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
     assert_eq!(status, 200, "{removed}");
-    tunnel.advertise().await;
+    advertised_as(tunnel, &[HOST], true).await;
 }
 
 /// A pool's VM, its process ended: told, and looked at as a booted VM is ([`restarting_app`]);
@@ -2010,7 +2160,7 @@ async fn restarting_pool(
     let body = app_body(HOST, sha256, sandbox);
     let (status, put) = console(at, "PUT", "/api/apps/ending", true, body).await;
     assert_eq!(status, 200, "{put}; {}", wicket.log());
-    let address = advertised_at(&tunnel.advertise().await, HOST);
+    let address = advertised_anew(tunnel, HOST, None).await;
     let route = Route {
         tunnel,
         host: HOST,
@@ -2066,7 +2216,7 @@ async fn restarting_pool(
     let gone = "/api/apps/ending?owner=cf";
     let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;
     assert_eq!(status, 200, "{removed}");
-    tunnel.advertise().await;
+    advertised_as(tunnel, &[HOST], true).await;
 }
 
 /// The app `data` with `sandbox`, of the image `sha256`, on the wicket at `at`.
@@ -2135,7 +2285,7 @@ async fn disk_app(
     let (status, put) = put_data(at, sha256, sandbox(64, "1")).await;
     assert_eq!(status, 200, "{put}; {}", wicket.log());
     assert_eq!(put["message"], "added data.local");
-    let advertised = tunnel.advertise().await;
+    let advertised = advertised_as(tunnel, &["data.local"], false).await;
     let target_of = |advertised: &sluice_wicket_tunnel::proto::Advertise| {
         let up = advertised
             .upstreams
@@ -2222,7 +2372,7 @@ async fn disk_app(
     // is touched
     let (status, put) = put_data(at, sha256, sandbox(128, "2")).await;
     assert_eq!(status, 200, "{put}; {}", wicket.log());
-    address = target_of(&tunnel.advertise().await);
+    address = advertised_anew(tunnel, "data.local", Some(&address)).await;
     assert_eq!(std::fs::metadata(&file).unwrap().len(), 128 << 20);
     let answer = on_data(tunnel, &address, conn_id, "/disk", "").await;
     assert!(mib(&answer) > first_size + 32, "{first_size}: {answer}");
@@ -2440,7 +2590,7 @@ async fn disk_kept(
     let path = "/api/apps/data?owner=cf";
     let (status, removed) = console(at, "DELETE", path, true, Bytes::new()).await;
     assert_eq!(status, 200, "{removed}");
-    tunnel.advertise().await;
+    advertised_as(tunnel, &["data.local"], true).await;
     let (_, disks) = console(at, "GET", "/api/disks", true, Bytes::new()).await;
     assert_eq!(disks["disks"][0]["app"], false, "{disks}");
 
@@ -2452,7 +2602,7 @@ async fn disk_kept(
     )
     .await;
     assert_eq!(status, 200, "{put}; {}", wicket.log());
-    let advertised = tunnel.advertise().await;
+    let advertised = advertised_as(tunnel, &["data.local"], false).await;
     let up = advertised
         .upstreams
         .iter()
@@ -2463,7 +2613,7 @@ async fn disk_kept(
 
     let (status, removed) = console(at, "DELETE", path, true, Bytes::new()).await;
     assert_eq!(status, 200, "{removed}");
-    tunnel.advertise().await;
+    advertised_as(tunnel, &["data.local"], true).await;
     let deadline = Instant::now() + HANG;
     let gone = "/api/disks/data?owner=cf";
     loop {

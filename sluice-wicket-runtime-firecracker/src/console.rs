@@ -56,7 +56,7 @@ use sluice_wicket_console::http::{
 use sluice_wicket_console::identity::{Budget, Identity};
 use sluice_wicket_console::serve::{self, Service};
 use sluice_wicket_console::status::{
-    Alive, Crashed, FailureView, Shortage, Status, alive, crashed, settled,
+    Alive, Crashed, FailureView, Shortage, Status, alive_ready, crashed, settled,
 };
 use sluice_wicket_console::store::{
     check_digest, check_host, check_hosts, check_name, check_tag, rfc3339,
@@ -230,10 +230,12 @@ impl Console {
                         kept: vms.kept,
                         pooled: vms.pooled,
                         starting: vms.starting,
+                        ready: vms.ready,
                         connections: vms.connections,
                         restarts: vms.restarts,
                         down: route.down(),
                     },
+                    ready: route.ready(),
                     snapshot: route.taken().map(|taken| SnapshotView {
                         memory_bytes: taken.memory,
                         booted_ms: taken.booted.as_millis() as u64,
@@ -300,7 +302,7 @@ impl Console {
                 sandbox: sandbox_view(&route.spec()),
                 tag: tag.clone(),
                 deployed: deployed.clone(),
-                alive: alive(route.alive()),
+                alive: alive_ready(route.alive()),
                 crashed: crashed(route.crashed()),
                 down: route.down(),
             });
@@ -665,7 +667,7 @@ fn sandbox_view(spec: &RouteSpec) -> Map<String, Value> {
         let value = match key {
             "mode" => continue,
             "egress" => value.split(',').collect::<Vec<_>>().into(),
-            "disk" => value.into(),
+            "disk" | "readiness" | "readiness-endpoint" => value.into(),
             _ => value.parse::<u64>().map_or(Value::Null, Value::from),
         };
         sandbox.insert(key.into(), value);
@@ -821,6 +823,8 @@ struct RouteView {
     vcpus: u32,
     /// Its VMs, as the budget counts them.
     instances: InstancesView,
+    /// Whether its next connection finds a VM: advertised only then.
+    ready: bool,
     /// Cloned modes: the template's snapshot.
     snapshot: Option<SnapshotView>,
 }
@@ -842,6 +846,8 @@ struct InstancesView {
     kept: usize,
     pooled: usize,
     starting: usize,
+    /// Boot and pool modes: those taking connections, their readiness check passed.
+    ready: Option<usize>,
     connections: u64,
     restarts: u64,
     down: Option<Shortage>,

@@ -133,6 +133,9 @@ mod tests {
         let alone = Fixed::hosts(1, &["a.local"]);
         assert_eq!(routed(&alone, "A.local").as_deref(), Some("a.local"));
         assert_eq!(routed(&alone, "b.local"), None);
+        // left out of the advertisement, still the host's here: no other client may take it
+        alone.unready.lock().unwrap().push("a.local".into());
+        assert_eq!(routed(&alone, "a.local").as_deref(), Some("a.local"));
         let sole = Fixed {
             takes_any_host: true,
             ..alone

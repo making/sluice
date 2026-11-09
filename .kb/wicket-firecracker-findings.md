@@ -315,6 +315,40 @@ build, through `--listen` (no server), `oha` for 5s, memory after that load:
 - **A dial failing kills a clone but has a booted VM looked at**: a restore is 20ms, a boot may be 12s,
   and what fails a dial may be a guest that is only busy (`DIAL_TIMEOUT`)
 
+## Readiness
+
+What the [readiness check](../sluice-wicket-runtime-firecracker/README.md#readiness) is made of, and why:
+
+- **The wicket probes, through the guest's relay**, not `/init` on 127.0.0.1 reporting over its wire,
+  as Diego runs its check in the container: the probe takes the way a connection takes (vsock, `/init`'s
+  relay, the process), so a VM passing it serves; it needs nothing of the guest, an older `/init`
+  included; its timing is the wicket's, where a snapshot would have every clone carry the template's
+  probe loop; and it costs a vsock dial and a request per VM every `readiness-interval-ms` (30s)
+- **`port` sees a refusal as `/init` dropping the stream**: `/init` connects to the process once it took
+  the vsock stream, and drops it when the process refuses. A probe of a process accepting takes the
+  wait for that drop, `min(readiness-timeout-ms, 1s)`, as the watch's look at a VM does
+- **Not ready, every 500ms**: Diego probes an instance not ready every 2s
+  (`unhealthy_monitoring_interval_in_seconds`) and a ready one every `interval` (30s,
+  `healthy_monitoring_interval_in_seconds`). A VM's first probe comes as its guest accepts, so a process
+  ready a moment after it listens serves 500ms later at most, not 2s
+- **Boot and pool only**: a VM per connection (or the one its previous connection left, reused) takes
+  its connection as it is restored; a check would gate the warm clones alone, and the advertisement
+  would move with the warm clones taken. A pool's VM started for connections waiting takes them unprobed
+  (they wait for it already) and is probed from then on; at `warm=0` the route is ready while a
+  connection can have one started (not at `instances`, its starts not failing), as it has no VM ahead
+  to probe
+- **The advertisement asks the routes as it goes**: the tunnel's `Table::ready` is asked of each route
+  as a stream advertises, the routes' readiness being live state, not the table's; the wicket tells
+  every change (`Routes::readiness_changed`: a pool's VMs coming, going or changing readiness, a cloned
+  route's restores starting or ending to fail) and a stream advertises only when what is ready changed.
+  The generation stays: the server takes no other routes. A route whose VMs all go down a moment (a
+  pool's one VM replaced in a restore's time) may leave the advertisement and come back, or not, as
+  the stream looks at it: the tests wait for an edit's advertise by what it shows
+  (`ServerTunnel::advertise_where`), not as the next one
+- **No liveness check on them** (a VM failing a probe restarted, `health-check-type: http`): CF's liveness
+  check is its startup check as well, so it changes how a VM starts (booted, a template snapshotted, once
+  its endpoint answers), beyond what a probe's outcome changes
+
 ## Jail mode
 
 [Jail mode](../sluice-wicket-runtime-firecracker/README.md#jail-mode), on the same host through `--listen` (no server), `oha` for 5s:
