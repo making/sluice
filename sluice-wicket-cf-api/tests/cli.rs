@@ -12,7 +12,8 @@
 //! clients configured, who is refused, who may edit the security groups --, a second
 //! wicket -- the one wicket's indices placed again, an app's instances spread over both,
 //! one stopped and back, a rolling push a wicket at a time, one refused, taken up by a restart
-//! of the cf-api and canceled, a canary continued, a scale --, a component the wicket refuses
+//! of the cf-api and canceled, a canary continued, a scale, one told to stop moving its apps to
+//! the other first and back taking an app's spread again --, a component the wicket refuses
 //! until a service binding grants what it needs, the services' lifecycle -- a store of each
 //! wicket's host keeping its apps on one wicket, one they share (Redis) counting once over
 //! both --, a service broker
@@ -195,6 +196,26 @@ impl Process {
     fn kill(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+    }
+
+    /// SIGTERM: a wicket evacuates, then ends.
+    fn terminate(&self) {
+        let pid = self.child.id().to_string();
+        let killed = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+        assert!(killed.success());
+    }
+
+    /// Waits for its exit, a success, [`HANG`] at most.
+    fn exited(&mut self) {
+        let deadline = Instant::now() + HANG;
+        loop {
+            if let Some(status) = self.child.try_wait().unwrap() {
+                assert!(status.success(), "{status:?}");
+                return;
+            }
+            assert!(Instant::now() < deadline, "still running");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -1542,8 +1563,10 @@ fn the_cf_cli_deploys_to_the_wicket() {
     let shown = cf.ok(&["app", "spread"]);
     let starting = |line: &&str| line.starts_with("#0") && line.contains("starting");
     assert!(shown.lines().any(|line| starting(&line)), "{shown}");
-    // back with room for 3 instances: hello's, spread's and one more
-    (wicket_b, listen_b, _) = start_wicket(&console_b, "-b", &["--max-instances", "3"]);
+    // back with room for 3 instances: hello's, spread's and one more; told to stop, it serves on
+    // while its apps move, 60s at most
+    let restarted = ["--max-instances", "3", "--evacuation-grace", "60"];
+    (wicket_b, listen_b, _) = start_wicket(&console_b, "-b", &restarted);
     let spread = guid_of("spread");
     api.line(&format!("[{spread}] CELL: Found in the wicket b as wanted"));
     assert_eq!(deployed(&console_b), kept);
@@ -1675,6 +1698,38 @@ fn the_cf_cli_deploys_to_the_wicket() {
         (None, Some(json!(1)))
     );
     assert_eq!(get(&listen, "spread.localhost", "/", None).0, 404);
+
+    // the second wicket told to stop: spread's one index and hello's second start on the
+    // first, then leave the second, which exits once they are gone, before its bound, the first
+    // answering spread from then on
+    let stopped = Instant::now();
+    wicket_b.terminate();
+    eventually("spread put on the first wicket", || {
+        spread_on(&console) == Some(json!(1))
+    });
+    let hammering = Hammer::start(&[&listen], "spread.localhost");
+    for step in [
+        "moves to the wicket a: the wicket b is leaving",
+        "runs on the wicket a: out of the wicket b's share",
+    ] {
+        api.line(&format!("[{spread}] CELL: Index 0 {step}"));
+    }
+    wicket_b.line("evacuated: no app left to wait for");
+    wicket_b.exited();
+    assert!(stopped.elapsed() < Duration::from_secs(60), "the bound");
+    hammering.stop();
+    assert_eq!(instances(&console, "hello.localhost"), Some(json!(2)));
+    // back, it takes hello's second index again the same way round: the spread restored
+    (wicket_b, listen_b, _) = start_wicket(&console_b, "-b", &restarted);
+    api.line(&format!(
+        "[{hello}] CELL: Index 1 moves to the wicket b: the app's instances spread over the \
+         wickets again"
+    ));
+    eventually("hello spread over both wickets again", || {
+        let hello_on = |console: &str| instances(console, "hello.localhost");
+        (hello_on(&console), hello_on(&console_b)) == (Some(json!(1)), Some(json!(1)))
+    });
+    assert_eq!(spread_on(&console_b), None, "of one index: none to spread");
     cf.ok(&["delete", "spread", "-r", "-f"]);
 
     // the second wicket's budget taken but for hello's (a route of its console keeping 2 warm):

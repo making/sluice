@@ -1,17 +1,24 @@
 //! The signals of the process: SIGHUP reloads the routes; SIGTERM starts the
-//! drain and a second one ends it at once; with `--drain-grace 0` SIGTERM ends
+//! evacuation of the console's apps (`--evacuation-grace`), a second one the
+//! drain and a third one ends it at once; with `--drain-grace 0` SIGTERM ends
 //! the process at once, through its handler (exit 0, not the default action:
 //! the init of a container has none). The readiness probe (`--health`) says
-//! ready once the server took the routes, not from the drain on.
+//! ready once the server took the routes, not from the drain on (an evacuation
+//! is none).
 #![cfg(unix)]
 
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use sha2::Digest as _;
+
 /// Hang guard of every wait; the first one covers the component's load.
 const HANG: Duration = Duration::from_secs(60);
+
+/// The console's token.
+const TOKEN: &str = "s3cret";
 
 /// The hello guest, built as the unit tests build it (the fetch guest beside
 /// it).
@@ -99,15 +106,18 @@ impl Drop for Wicket {
 
 /// The wicket on `server` serving `component` for `hello.local`, polling
 /// nothing (SIGHUP alone reloads), its readiness probe on a port of its
-/// choosing, its stdout lines on the receiver.
+/// choosing, `more` besides, its stdout lines on the receiver.
 fn wicket(
     server: &str,
     drain_grace: &str,
     component: &std::path::Path,
+    more: &[&str],
 ) -> (Wicket, mpsc::Receiver<String>) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-runtime-wasi"))
         .args(["--server", server, "--drain-grace", drain_grace])
-        .args(["--watch-interval", "0", "--health", "127.0.0.1:0", "--wasm"])
+        .args(["--watch-interval", "0", "--health", "127.0.0.1:0"])
+        .args(more)
+        .arg("--wasm")
         .arg(format!("hello.local={}", component.display()))
         .stdout(Stdio::piped())
         .spawn()
@@ -159,6 +169,23 @@ fn probe(url: &str) -> (bool, String) {
     )
 }
 
+/// A request of the console at `address`, with its token: the status and the body.
+fn console(address: &str, method: &str, path: &str, body: &[u8]) -> (u16, String) {
+    let mut stream = std::net::TcpStream::connect(address).unwrap();
+    let head = format!(
+        "{method} {path} HTTP/1.1\r\nhost: {address}\r\nauthorization: Bearer {TOKEN}\r\n\
+         connection: close\r\ncontent-length: {}\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).unwrap();
+    stream.write_all(body).unwrap();
+    let mut answer = String::new();
+    stream.read_to_string(&mut answer).unwrap();
+    let (head, body) = answer.split_once("\r\n\r\n").unwrap();
+    let status = head.split(' ').nth(1).unwrap().parse().unwrap();
+    (status, body.to_string())
+}
+
 fn sigterm(child: &Child) {
     signal(child, "-TERM");
 }
@@ -184,7 +211,7 @@ fn exit_within(child: &mut Child, within: Duration) -> std::process::ExitStatus 
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn sigterm_drains_and_a_second_one_ends_the_drain() {
+async fn sigterm_evacuates_then_drains_each_ended_by_the_next() {
     let server = acking_server().await;
 
     // a copy of the guest, replaced below
@@ -193,10 +220,24 @@ async fn sigterm_drains_and_a_second_one_ends_the_drain() {
         std::env::temp_dir().join(format!("sluice-signals-{}.wasm", std::process::id()));
     std::fs::copy(&hello, &component).unwrap();
 
-    // the server never acknowledges the withdrawal: only the second signal
+    // the server never acknowledges the withdrawal: only the third signal
     // ends the drain before its 60s grace
-    let (mut child, lines) = wicket(&server, "60", &component);
+    let console_dir =
+        std::env::temp_dir().join(format!("sluice-signals-console-{}", std::process::id()));
+    let evacuating = [
+        "--evacuation-grace",
+        "60",
+        "--console",
+        "127.0.0.1:0",
+        "--console-token",
+        TOKEN,
+        "--console-dir",
+        console_dir.to_str().unwrap(),
+    ];
+    let (mut child, lines) = wicket(&server, "60", &component, &evacuating);
     let probed = await_line(&lines, "readiness probe on ");
+    let at = await_line(&lines, "console on http://");
+    let at = at["console on http://".len()..].split(' ').next().unwrap();
     await_line(&lines, "advertise acked by");
     assert_eq!(probe(&probed), (true, "ready\n".to_string()));
     // SIGHUP reloads the routes, and ends nothing
@@ -208,15 +249,39 @@ async fn sigterm_drains_and_a_second_one_ends_the_drain() {
         &lines,
         "routes reloaded (SIGHUP), generation 2: updated hello.local",
     );
+    // an app of the console's API, which the wicket told to stop serves on for until its
+    // controller moved it or the second signal
+    let app = std::fs::read(&hello).unwrap();
+    let sha256: String = (sha2::Sha256::digest(&app).iter())
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    let uploaded = console(at, "PUT", &format!("/api/components/{sha256}"), &app);
+    assert_eq!(uploaded.0, 200, "{uploaded:?}");
+    let body = format!(
+        r#"{{"owner": "cf", "hosts": ["app.local"], "component": {{"sha256": "{sha256}", "name": "hello.wasm"}}}}"#
+    );
+    let put = console(at, "PUT", "/api/apps/app", body.as_bytes());
+    assert_eq!(put.0, 200, "{put:?}");
+    sigterm(&child);
+    await_line(
+        &lines,
+        "leaving: serving on while the controllers move 1 app(s) elsewhere, 60s at most",
+    );
+    // not draining (this server acknowledges a stream's first routes alone)
+    let (_, said) = probe(&probed);
+    assert!(!said.contains("draining"), "{said}");
+    let (_, apps) = console(at, "GET", "/api/apps", b"");
+    assert!(apps.contains(r#""leaving":{"since":"#), "{apps}");
     sigterm(&child);
     await_line(&lines, "withdrawing the routes");
     assert_eq!(probe(&probed), (false, "not ready: draining\n".to_string()));
     sigterm(&child);
     let status = exit_within(&mut child, Duration::from_secs(15));
     assert!(status.success(), "{status:?}");
+    let _ = std::fs::remove_dir_all(&console_dir);
 
     // no drain: the handler ends the process at once
-    let (mut child, lines) = wicket(&server, "0", &hello);
+    let (mut child, lines) = wicket(&server, "0", &hello, &[]);
     await_line(&lines, "advertise acked by");
     sigterm(&child);
     await_line(&lines, "SIGTERM: ending at once (--drain-grace 0)");

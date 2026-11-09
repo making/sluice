@@ -127,6 +127,17 @@ pub struct Table {
 }
 
 impl Table {
+    /// The apps of the console's API, by owner and name: what a controller may serve on another
+    /// wicket, which the wicket leaving waits for (`sluice_wicket_console::leaving`).
+    pub fn waited(&self) -> Vec<sluice_wicket_console::leaving::Waited> {
+        let apps = self.origins.values().filter_map(|origin| match origin {
+            Origin::Api { name, owner, .. } => Some((owner.clone(), name.clone())),
+            _ => None,
+        });
+        let apps: std::collections::BTreeSet<_> = apps.collect();
+        apps.into_iter().collect()
+    }
+
     /// The instance slots the advertised routes' pools hold for good: what an edit's routes
     /// may not need more of than `--max-instances`.
     pub fn pooled(&self) -> usize {
@@ -521,9 +532,10 @@ impl Reloader {
         &self.stores
     }
 
-    /// Follows what the console shows of the reloads.
-    pub fn status(&self) -> watch::Receiver<Status> {
-        self.status.subscribe()
+    /// What the console shows of the reloads, which it follows and tells of the wicket
+    /// leaving (`sluice_wicket_console::leaving`).
+    pub fn status(&self) -> watch::Sender<Status> {
+        self.status.clone()
     }
 
     /// Reloads until `stop`: polls the watched files every `interval` (zero:

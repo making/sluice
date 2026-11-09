@@ -25,7 +25,8 @@
 //! On SIGTERM / SIGINT the wicket drains ([`drain`], the Java client's
 //! `TunnelClient#drain`): every node stream withdraws the routes and ends
 //! once the server acknowledged it and no connection is left on it, within
-//! the drain grace ([`serve`]).
+//! the drain grace ([`serve`]). A wicket evacuating first serves on, its streams
+//! advertising its routes, until its apps' controllers moved them elsewhere.
 //!
 //! A wicket serves its routes over plain TCP as well in local mode
 //! ([`listener`]: `--listen`), routed by the host its client asks for.
@@ -85,13 +86,16 @@ const MAX_FIELD_CHARS: usize = 64;
 
 /// Serves the routes of `shared` through the server at `server` (asked for
 /// its nodes, see [`supervisor::supervise`]) until SIGTERM / SIGINT
-/// (`signals`), then drains (see [`drain::drain`]) within `drain_grace`; a
-/// second signal ends the drain at once, a zero `drain_grace` skips it.
+/// (`signals`), then on until `leave` resolves (the wicket's evacuation: its
+/// streams up, following the membership), then drains (see [`drain::drain`])
+/// within `drain_grace`. Each signal after the first ends what is under way at
+/// once, the evacuation then the drain; a zero `drain_grace` skips the drain.
 pub async fn serve<T: Table>(
     shared: Arc<Shared<T>>,
     server: String,
     drain_grace: Duration,
     signals: &mut Signals,
+    leave: impl Future<Output = ()>,
 ) -> Result<(), BoxError> {
     println!("connection limit {}", shared.limit.max());
     println!(
@@ -104,11 +108,20 @@ pub async fn serve<T: Table>(
     );
     println!("drain grace {}s (0 = off)", drain_grace.as_secs());
     let (tx, rx) = mpsc::channel(32);
-    let supervisor = supervisor::supervise(rx, tx, shared.clone(), server);
-    let name = tokio::select! {
-        result = supervisor => return result,
+    let name = {
+        let supervisor = supervisor::supervise(rx, tx, shared.clone(), server);
+        tokio::pin!(supervisor);
+        let name = tokio::select! {
+            result = &mut supervisor => return result,
+            name = signals.recv() => name,
+        };
+        tokio::select! {
+            result = &mut supervisor => return result,
+            () = leave => {}
+            name = signals.recv() => eprintln!("{name} during the evacuation: ending it at once"),
+        }
         // dropping the supervisor: no membership change opens a stream from now on
-        name = signals.recv() => name,
+        name
     };
     if drain_grace.is_zero() {
         println!("{name}: ending at once (--drain-grace 0)");

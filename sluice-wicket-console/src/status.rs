@@ -1,5 +1,5 @@
-//! What the page shows of a wicket's reloads besides its routes, the long poll
-//! following them, and what a listing says of an app's instances.
+//! What the page shows of a wicket's reloads besides its routes, whether it is leaving, the long
+//! poll following them, and what a listing says of an app's instances.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -7,6 +7,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use tokio::sync::watch;
 
+use crate::leaving::{Leaving, LeavingView};
 use crate::store::rfc3339;
 
 /// How long `GET /api/routes?after=<the current revision>` waits for a change.
@@ -93,10 +94,13 @@ impl Shortage {
 #[derive(Clone, Default)]
 pub struct Status {
     /// Changes with every change the console shows: a table published, a
-    /// reload of the files failing, or the next reload succeeding.
+    /// reload of the files failing, or the next reload succeeding, the
+    /// wicket leaving and an owner's word then.
     pub revision: u64,
     /// The last reload of the files that failed, unless one succeeded since.
     pub failure: Option<Failure>,
+    /// Told to stop with an evacuation bound, from then on (`crate::leaving`).
+    pub leaving: Option<Leaving>,
 }
 
 /// A failed reload of the files.
@@ -133,6 +137,11 @@ impl Status {
         });
     }
 
+    /// Whether the wicket is leaving, as the listings show it.
+    pub fn leaving_view(&self) -> Option<LeavingView> {
+        self.leaving.as_ref().map(Leaving::view)
+    }
+
     /// The failure as the listing shows it.
     pub fn failure_view(&self) -> Option<FailureView> {
         self.failure.as_ref().map(|failure| FailureView {
@@ -152,18 +161,15 @@ pub struct FailureView {
 
 /// The status once the routes moved past `after` of `query` (the current
 /// revision) or [`LONG_POLL`] passed; at once without `after`.
-pub async fn settled(status: &watch::Receiver<Status>, query: Option<&str>) -> Status {
+pub async fn settled(status: &watch::Sender<Status>, query: Option<&str>) -> Status {
     let after = form_urlencoded::parse(query.unwrap_or_default().as_bytes())
         .find(|(key, _)| key == "after")
         .and_then(|(_, value)| value.parse::<u64>().ok());
-    let mut status = status.clone();
+    let mut status = status.subscribe();
     if let Some(after) = after {
         let changed = status.wait_for(|status| status.revision != after);
-        let ended = matches!(tokio::time::timeout(LONG_POLL, changed).await, Ok(Err(_)));
-        if ended {
-            // the reloader ended (the drain): nothing changes from now on
-            tokio::time::sleep(LONG_POLL).await;
-        }
+        // the console holds a sender: the channel stays open
+        let _ = tokio::time::timeout(LONG_POLL, changed).await;
     }
     status.borrow().clone()
 }

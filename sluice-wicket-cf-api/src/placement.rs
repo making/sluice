@@ -20,12 +20,34 @@
 //! its home ([`State::homes`]): the wicket of index 0 of the first app whose start maps it. An
 //! app whose last start maps one has all its indices there (the first namespace's home), no index
 //! passed elsewhere; a store the wickets share pins nothing.
+//!
+//! A running index moves the way Diego evacuates a cell: started on its new wicket first
+//! ([`App::moving`]: both wickets' shares hold it, the new one's room taken), placed there once
+//! that one serves it, which takes it out of the old one's share ([`State::moved`]). A wicket
+//! leaving (told to stop, it serves on until its apps are elsewhere) has no room, and each index
+//! of its started apps moves to a wicket with room for it, as a new index goes
+//! ([`State::evacuate`]); with none, or its keyvalue data there, it stays until the wicket stops.
+//! A wicket back, or a new one, takes the indices that spread an app again, one at a time
+//! ([`State::respread`]): from the wicket holding the most of the app's, while that one holds two
+//! more than it.
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::store::{App, State};
+
+/// An index of an app and the wicket it moves to.
+pub type Move = (u64, String);
+
+/// What [`State::evacuate`] makes of an app's indices on a wicket leaving.
+#[derive(Debug, Default, PartialEq)]
+pub struct Evacuated {
+    pub moves: Vec<Move>,
+    /// Those with nowhere to go, and why.
+    pub stay: Vec<u64>,
+    pub why: &'static str,
+}
 
 /// The most instances an app has: each index is placed, kept in the state and listed.
 pub const MAX_INSTANCES: u64 = 1000;
@@ -45,6 +67,9 @@ pub struct Wickets {
     pub full: BTreeMap<String, u64>,
     /// The wicket of each flume node (`wicket:<client-id>`), as each last listed it.
     pub nodes: BTreeMap<String, String>,
+    /// Those leaving, told to stop: when each drains at the latest, in seconds since the epoch,
+    /// as it last listed it. No room there.
+    pub leaving: BTreeMap<String, u64>,
     /// Each keyvalue store the wickets list, by name: whether it is one store of them all, else
     /// each wicket's host's own (`crate::services::Offer::stores`).
     pub stores: BTreeMap<String, bool>,
@@ -156,6 +181,30 @@ fn placed(
     placed.into_iter().flatten().cloned().collect()
 }
 
+/// The indices of `app`, placed as `placement` has it, on `wicket`: those of its count placed
+/// there and those moving there.
+fn held(app: &App, placement: &[String], wicket: &str) -> usize {
+    let count = count(app);
+    let placed = placement.iter().take(count).filter(|on| *on == wicket);
+    let moving = (app.moving.iter()).filter(|(index, to)| **index < count as u64 && *to == wicket);
+    placed.count() + moving.count()
+}
+
+/// The moves of `app`, placed as `placement` has it, that still are: of a started app, of an
+/// index it has, to a configured wicket other than the one it is on.
+fn moving<'a>(
+    app: &'a App,
+    placement: &'a [String],
+    configured: &'a [String],
+) -> impl Iterator<Item = (u64, &'a String)> + 'a {
+    let running = takes_room(app);
+    (app.moving.iter())
+        .filter(move |_| running)
+        .filter(|(index, to)| (placement.get(**index as usize)).is_some_and(|on| on != *to))
+        .filter(|(_, to)| configured.contains(to))
+        .map(|(index, to)| (*index, to))
+}
+
 /// The index of an app of `instances` that a wicket's instance `index` is, of a share of
 /// `indices` (the lowest first): its `k`th the share's `k`th, those past it the remainder's (a
 /// wasm wicket's route runs more at once, the requests of an instance), as `cf app` lists them.
@@ -222,19 +271,19 @@ impl State {
     }
 
     /// The room for the indices of `app` on each wicket of a known budget: the indices of its
-    /// that fit beside those of the other started apps placed there (as kept), 0 at most on one
-    /// that refused a share for room.
+    /// that fit beside those of the other started apps placed there or moving there (as kept), 0
+    /// at most on one that refused a share for room or is leaving.
     pub fn rooms(&self, app: &App) -> BTreeMap<String, i64> {
         let mut rooms = BTreeMap::new();
         for wicket in &self.wickets.configured {
-            let full = self.wickets.full.contains_key(wicket);
+            let full =
+                self.wickets.full.contains_key(wicket) || self.wickets.leaving.contains_key(wicket);
             let mut room = match self.wickets.budgets.get(wicket) {
                 Some(budget) => {
                     let (instances, memory) = (self.apps.iter())
                         .filter(|other| other.guid != app.guid && takes_room(other))
                         .map(|other| {
-                            let placed = other.placement.iter().take(count(other));
-                            let on = placed.filter(|on| *on == wicket).count() as i64;
+                            let on = held(other, &other.placement, wicket) as i64;
                             (on, on * need(other) as i64)
                         })
                         .fold((0, 0), |(i, m), (on, mib)| (i + on, m + mib));
@@ -297,25 +346,162 @@ impl State {
         app_index(indices, index, app.process.instances)
     }
 
-    /// The indices of `app` each wicket holds, the lowest first.
+    /// The indices of `app` each wicket holds, the lowest first: an index moving on both
+    /// wickets.
     pub fn indices(&self, app: &App) -> BTreeMap<String, Vec<u64>> {
         let mut indices: BTreeMap<String, Vec<u64>> = BTreeMap::new();
-        for (index, wicket) in self.placement(app).iter().enumerate() {
+        let placement = self.placement(app);
+        for (index, wicket) in placement.iter().enumerate() {
             indices
                 .entry(wicket.clone())
                 .or_default()
                 .push(index as u64);
         }
+        for (index, to) in moving(app, &placement, &self.wickets.configured) {
+            let held = indices.entry(to.clone()).or_default();
+            held.push(index);
+            held.sort();
+        }
         indices
     }
 
+    /// Moves the indices of the app `guid` placed on `from`, a wicket leaving, each to a wicket
+    /// with room for it, not leaving, holding the fewest of the app's, of them the one with the
+    /// most room, the first configured of those ([`App::moving`]): those with nowhere to go
+    /// stay, as they all do with its keyvalue data there. Of a started app only, its indices
+    /// moving already moving on.
+    pub fn evacuate(&mut self, guid: &str, from: &str) -> Evacuated {
+        let Some(app) = self.app(guid).filter(|app| takes_room(app)) else {
+            return Evacuated::default();
+        };
+        let placement = self.placement(app).into_owned();
+        let leaving: Vec<u64> = (0..placement.len() as u64)
+            .filter(|index| placement[*index as usize] == from)
+            .filter(|index| !app.moving.contains_key(index))
+            .collect();
+        if self.pin(app).is_some() {
+            return Evacuated {
+                moves: Vec::new(),
+                stay: leaving,
+                why: "its keyvalue data is there",
+            };
+        }
+        let rooms = self.rooms(app);
+        let candidates: Vec<&String> = (self.wickets.configured.iter())
+            .filter(|wicket| *wicket != from && self.takes_more(wicket))
+            .collect();
+        let mut held: Vec<i64> = (candidates.iter())
+            .map(|wicket| held(app, &placement, wicket) as i64)
+            .collect();
+        let (mut moves, mut stay) = (Vec::new(), Vec::new());
+        for index in leaving {
+            let left = |at: usize| rooms.get(candidates[at]).map(|room| room - held[at]);
+            let best = (0..candidates.len())
+                .filter(|at| left(*at).is_none_or(|left| left >= 1))
+                .min_by_key(|at| (held[*at], Reverse(left(*at).unwrap_or(i64::MAX))));
+            match best {
+                Some(at) => {
+                    held[at] += 1;
+                    moves.push((index, candidates[at].clone()));
+                }
+                None => stay.push(index),
+            }
+        }
+        let app = self.app_mut(guid).expect("read above");
+        app.moving.extend(moves.iter().cloned());
+        Evacuated {
+            moves,
+            stay,
+            why: "no other wicket has room for it",
+        }
+    }
+
+    /// The next index to move to `to`, a wicket back or new, for an app's spread
+    /// ([`App::moving`]): of a started app but those `skipped`, not pinned to a keyvalue home,
+    /// none of its indices moving, `to` with room for one more of it and holding two fewer of
+    /// its indices than the wicket holding the most (not leaving, the first configured of
+    /// those), the highest index there. None: no spread is better for one.
+    pub fn respread(&mut self, to: &str, skipped: &BTreeSet<String>) -> Option<(String, Move)> {
+        if !self.wickets.configured.iter().any(|wicket| wicket == to) || !self.takes_more(to) {
+            return None;
+        }
+        let found = self.apps.iter().find_map(|app| {
+            let movable = takes_room(app) && app.moving.is_empty() && self.pin(app).is_none();
+            if skipped.contains(&app.guid) || !movable {
+                return None;
+            }
+            let placement = self.placement(app);
+            let on = |wicket: &str| placement.iter().filter(|on| *on == wicket).count() as i64;
+            let here = on(to);
+            if (self.rooms(app).get(to)).is_some_and(|room| room - here < 1) {
+                return None;
+            }
+            // of the wickets holding the most, the first configured
+            let from = (self.wickets.configured.iter())
+                .filter(|wicket| *wicket != to && !self.wickets.leaving.contains_key(*wicket))
+                .rev()
+                .max_by_key(|wicket| on(wicket))?;
+            if on(from) < here + 2 {
+                return None;
+            }
+            let index = placement.iter().rposition(|on| on == from)? as u64;
+            Some((app.guid.clone(), index))
+        });
+        let (guid, index) = found?;
+        let app = self.app_mut(&guid)?;
+        app.moving.insert(index, to.to_string());
+        Some((guid, (index, to.to_string())))
+    }
+
+    /// The index `index` of the app `guid`, moving to `to`, serves there: placed there, out of
+    /// the share of the wicket it was on, which is said. None when it moves there no more (the
+    /// app stopped, scaled below it).
+    pub fn moved(&mut self, guid: &str, index: u64, to: &str) -> Option<String> {
+        let app = self.app(guid)?;
+        if app.moving.get(&index).map(String::as_str) != Some(to) {
+            return None;
+        }
+        let mut placement = self.placement(app).into_owned();
+        let from = std::mem::replace(placement.get_mut(index as usize)?, to.to_string());
+        let app = self.app_mut(guid)?;
+        app.moving.remove(&index);
+        app.placement = placement;
+        Some(from)
+    }
+
+    /// The index `index` of the app `guid` moves to `to` no more: it stays where it is placed,
+    /// which is said. None when it was not moving there.
+    pub fn unmoved(&mut self, guid: &str, index: u64, to: &str) -> Option<String> {
+        let app = self.app_mut(guid)?;
+        if app.moving.get(&index).map(String::as_str) != Some(to) {
+            return None;
+        }
+        app.moving.remove(&index);
+        let app = self.app(guid)?;
+        self.placement(app).get(index as usize).cloned()
+    }
+
+    /// Whether `wicket` takes indices: of the wickets' runtime, a second name of none, not
+    /// leaving.
+    fn takes_more(&self, wicket: &str) -> bool {
+        !self.wickets.odd.contains(wicket) && !self.wickets.leaving.contains_key(wicket)
+    }
+
     /// Keeps the placement of every app as [`State::placement`] has it, in turn: at every
-    /// change. A namespace of a store of each wicket's host an app maps without a home has it
-    /// where the app's index 0 is.
+    /// change, its moves those that still are ([`moving`]). A namespace of a store of each
+    /// wicket's host an app maps without a home has it where the app's index 0 is.
     pub fn place(&mut self) {
         for at in 0..self.apps.len() {
             if let Cow::Owned(placed) = self.placement(&self.apps[at]) {
                 self.apps[at].placement = placed;
+            }
+            let app = &self.apps[at];
+            if !app.moving.is_empty() {
+                let still: BTreeMap<u64, String> =
+                    moving(app, &app.placement, &self.wickets.configured)
+                        .map(|(index, to)| (index, to.clone()))
+                        .collect();
+                self.apps[at].moving = still;
             }
             let app = &self.apps[at];
             let Some(home) = app.placement.first() else {
@@ -482,10 +668,11 @@ mod tests {
         }
     }
 
-    /// A wicket's room is its budget less the indices of the other started apps placed there, a
-    /// VM's memory too, none on a wicket that refused a share for room; such a refusal passes the
-    /// app's highest index there to a wicket with room. A wicket's instance is the app's index of
-    /// its share.
+    /// A wicket's room is its budget less the indices of the other started apps placed there or
+    /// moving there, a VM's memory too, none on a wicket that refused a share for room or is
+    /// leaving; such a refusal passes the app's highest index there to a wicket with room. A
+    /// wicket leaving has its indices moved to wickets with room, as new ones go, a wicket back
+    /// those that spread an app again. A wicket's instance is the app's index of its share.
     #[test]
     fn the_room_is_what_the_budget_leaves_and_a_refusal_passes_an_index() {
         let mut state = State::new("o", "s", &["localhost".into()]);
@@ -582,6 +769,17 @@ mod tests {
         assert_eq!(state.app(&small).unwrap().placement, ["a"]);
         state.wickets.full.insert("a".into(), 9);
         assert_eq!(state.pass(&big, "a"), None);
+        // nor moved off it leaving: they stay until it stops
+        state.wickets.leaving.insert("a".into(), 60);
+        assert_eq!(
+            state.evacuate(&big, "a"),
+            Evacuated {
+                moves: Vec::new(),
+                stay: vec![0, 1, 2],
+                why: "its keyvalue data is there"
+            }
+        );
+        state.wickets.leaving.clear();
         // its home no longer named: the data stays there, the apps run on another without it
         let said = state.follow_wickets(&names(&["b"]));
         assert!(
@@ -591,5 +789,88 @@ mod tests {
         );
         assert_eq!(state.app(&big).unwrap().placement, ["b", "b", "b"]);
         assert_eq!(state.homes, [("local/cf/l".into(), "b".into())].into());
+
+        // b leaving: no room there; each index of a started app on it moves to a wicket with
+        // room holding the fewest of the app's (two's 1 to c, which holds none of it), the room
+        // of the one it moves to taken (one's 0 to a: c is full); with none, it stays
+        let mut state = State::new("o", "s", &["localhost".into()]);
+        state.follow_wickets(&names(&["a", "b", "c"]));
+        let space = state.spaces[0].guid.clone();
+        let mut started = |name: &str, placement: &[&str]| {
+            let app = state.create_app(name, crate::store::STACK, &space);
+            app.started = true;
+            app.process.instances = placement.len() as u64;
+            app.running = Some(Running::default());
+            app.placement = names(placement);
+            app.guid.clone()
+        };
+        let two = started("two", &["a", "b"]);
+        let one = started("one", &["b"]);
+        let three = started("three", &["a", "a", "c"]);
+        let stopped = started("stopped", &["b"]);
+        state.app_mut(&stopped).unwrap().started = false;
+        state.wickets.budgets = [("a", 4), ("b", 4), ("c", 2)]
+            .map(|(name, instances)| {
+                let budget = Budget {
+                    instances,
+                    memory_mib: None,
+                };
+                (name.to_string(), budget)
+            })
+            .into();
+        state.wickets.leaving.insert("b".into(), 60);
+        assert_eq!(state.rooms(state.app(&one).unwrap())["b"], 0, "leaving");
+        let moved = |moves: &[(u64, &str)], stay: &[u64]| Evacuated {
+            moves: (moves.iter())
+                .map(|(index, to)| (*index, to.to_string()))
+                .collect(),
+            stay: stay.to_vec(),
+            why: "no other wicket has room for it",
+        };
+        assert_eq!(state.evacuate(&two, "b"), moved(&[(1, "c")], &[]));
+        let indices = state.indices(state.app(&two).unwrap());
+        assert_eq!(
+            indices,
+            [("a", vec![0]), ("b", vec![1]), ("c", vec![1])]
+                .map(|(wicket, indices)| (wicket.to_string(), indices))
+                .into(),
+            "both hold it"
+        );
+        state.wickets.full.insert("a".into(), 1);
+        assert_eq!(state.evacuate(&one, "b"), moved(&[], &[0]));
+        state.wickets.full.clear();
+        assert_eq!(state.evacuate(&one, "b"), moved(&[(0, "a")], &[]));
+        assert_eq!(state.evacuate(&one, "b"), moved(&[], &[]), "moving already");
+        assert_eq!(state.evacuate(&stopped, "b"), Evacuated::default());
+        // two's served on c: placed there, out of b's share; one's not: back on b alone
+        assert_eq!(state.moved(&two, 1, "c").as_deref(), Some("b"));
+        assert_eq!(state.app(&two).unwrap().placement, ["a", "c"]);
+        assert_eq!(state.unmoved(&one, 0, "a").as_deref(), Some("b"));
+        assert_eq!(state.moved(&one, 0, "a"), None, "moving no more");
+        assert_eq!(state.indices(state.app(&one).unwrap()).len(), 1);
+        // a stop ends a move
+        state.evacuate(&one, "b");
+        state.app_mut(&one).unwrap().started = false;
+        state.place();
+        assert!(state.app(&one).unwrap().moving.is_empty());
+
+        // b back: of the apps holding two more indices on a wicket than on b, the highest
+        // there moves to b, one app at a time; none once spread, nor to a wicket leaving
+        state.wickets.leaving.clear();
+        let none = BTreeSet::new();
+        let respread = state.respread("b", &none);
+        assert_eq!(respread, Some((three.clone(), (1, "b".to_string()))));
+        assert_eq!(state.respread("b", &none), None, "three moving already");
+        assert_eq!(state.moved(&three, 1, "b").as_deref(), Some("a"));
+        assert_eq!(state.app(&three).unwrap().placement, ["a", "b", "c"]);
+        assert_eq!(state.respread("b", &none), None);
+        state.app_mut(&three).unwrap().placement = names(&["a", "a", "c"]);
+        assert_eq!(
+            state.respread("b", &[three.clone()].into()),
+            None,
+            "skipped"
+        );
+        state.wickets.leaving.insert("b".into(), 60);
+        assert_eq!(state.respread("b", &none), None, "leaving");
     }
 }

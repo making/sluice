@@ -87,6 +87,9 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
   --tunnel-stall-timeout <secs>   give a stream up once its frames wait that long untaken
                                   (default 60, 0 = off)
   --drain-grace <secs>            the SIGTERM drain's bound (default 20, 0 = no drain)
+  --evacuation-grace <secs>       on SIGTERM, before the drain: serve on while the controllers
+                                  move the apps of the console's API elsewhere (but those
+                                  with a disk), this long at most (default 0 = drain at once)
   --watch-interval <secs>         poll the routes' files: the config file, the rootfs
                                   images, the kernel (default 1, 0 = SIGHUP only)
   --flume <url>                   feed the VMs' output to a sluice-flume while someone
@@ -165,6 +168,8 @@ pub struct Settings {
     pub max_connections: usize,
     pub stall_timeout: Duration,
     pub drain_grace: Duration,
+    /// How long a wicket told to stop serves on while its apps are moved elsewhere; zero: none.
+    pub evacuation_grace: Duration,
     pub max_instances: usize,
     /// MiB; None = no memory budget.
     pub max_memory_mib: Option<u64>,
@@ -219,6 +224,7 @@ const VALUED: &[&str] = &[
     "workers",
     "tunnel-stall-timeout",
     "drain-grace",
+    "evacuation-grace",
     "watch-interval",
     "flume",
     "flume-token",
@@ -515,6 +521,11 @@ pub fn parse(
             file.and_then(|file| file.drain_grace.as_ref()),
             DEFAULT_DRAIN_GRACE,
         )?,
+        evacuation_grace: seconds(
+            "evacuation-grace",
+            file.and_then(|file| file.evacuation_grace.as_ref()),
+            Duration::ZERO,
+        )?,
         max_instances,
         max_memory_mib,
         workers,
@@ -748,6 +759,7 @@ pub struct File {
     workers: Option<u64>,
     tunnel_stall_timeout: Option<Scalar>,
     drain_grace: Option<Scalar>,
+    evacuation_grace: Option<Scalar>,
     watch_interval: Option<Scalar>,
     flume: Option<String>,
     flume_token: Option<String>,
@@ -978,7 +990,7 @@ mod tests {
             &config,
             "server: grpc://file:8001\ntoken: from-file\nkernel: vmlinux\nmax-instances: 8\nworkers: 2\n\
              health: 127.0.0.1:8081\n\
-             drain-grace: 5s\nflume: grpc://file:8002\nflume-token: from-file\n\
+             drain-grace: 5s\nevacuation-grace: 1m\nflume: grpc://file:8002\nflume-token: from-file\n\
              flume-ca-cert: flume-ca.pem\njail-ids: 900000-900063\njail-user: from-file\n\
              console: 127.0.0.1:9090\nconsole-dir: kept\noidc-claim: [email=*]\n\
              routes:\n  - {host: a.local, rootfs: app.ext4, mode: per-connection, warm: 2, cpu: 50,\n     \
@@ -1039,6 +1051,7 @@ mod tests {
         assert_eq!(settings.max_instances, 8);
         assert_eq!(settings.workers, 2);
         assert_eq!(settings.drain_grace, Duration::from_secs(5));
+        assert_eq!(settings.evacuation_grace, Duration::from_secs(60));
         assert_eq!(settings.max_connections, DEFAULT_MAX_CONNECTIONS);
         assert_eq!(settings.stall_timeout, DEFAULT_STALL_TIMEOUT);
         let hosts: Vec<_> = settings.specs.iter().map(|spec| &spec.host).collect();

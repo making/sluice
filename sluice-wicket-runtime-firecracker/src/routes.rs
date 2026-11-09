@@ -120,6 +120,22 @@ impl Table {
         self.generation
     }
 
+    /// The apps of the console's API, by owner and name, but those on a disk, whose data no
+    /// other wicket has: what a controller may serve on another wicket, which the wicket leaving
+    /// waits for (`sluice_wicket_console::leaving`).
+    pub fn waited(&self) -> Vec<sluice_wicket_console::leaving::Waited> {
+        let apps = self.served().filter_map(|(_, origin, route)| match origin {
+            Origin::Api { name, owner, .. } if route.vm().disk.is_none() => {
+                Some((owner.clone(), name.clone()))
+            }
+            _ => None,
+        });
+        let apps: HashSet<_> = apps.collect();
+        let mut apps: Vec<_> = apps.into_iter().collect();
+        apps.sort();
+        apps
+    }
+
     /// The advertised hosts, for the log.
     pub fn advertised_hosts(&self) -> String {
         match &self.advertised[..] {
@@ -695,9 +711,10 @@ impl Reloader {
         &self.routes
     }
 
-    /// Follows what the console shows of the reloads.
-    pub fn status(&self) -> watch::Receiver<Status> {
-        self.status.subscribe()
+    /// What the console shows of the reloads, which it follows and tells of the wicket
+    /// leaving (`sluice_wicket_console::leaving`).
+    pub fn status(&self) -> watch::Sender<Status> {
+        self.status.clone()
     }
 
     /// Reloads on SIGHUP (`hangups`) and on a change of the routes' files,

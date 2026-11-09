@@ -3,8 +3,9 @@
 //! wicket ([`Routes::publish`]) and followed by every stream, which
 //! advertises a changed table again; and the streams' acknowledgements,
 //! which tell when every server took a generation
-//! ([`Routes::acknowledged`]). A removed target is served until then: the
-//! server may have routed a connection to it before it took the new routes.
+//! ([`Routes::acknowledged`]), and a route ([`Routes::taken`]). A removed
+//! target is served until then: the server may have routed a connection to it
+//! before it took the new routes.
 //!
 //! A stream advertises the routes ready alone ([`Table::ready`]): one with no
 //! instance to serve it leaves the advertisement, so the server sends its
@@ -91,12 +92,20 @@ pub struct Routes<T> {
     acks: Arc<Acks>,
 }
 
-/// Live stream -> the newest generation the server acknowledged on it (0
-/// before its first acknowledgement).
+/// Live stream -> what the server acknowledged on it.
 #[derive(Default)]
 struct Acks {
-    streams: watch::Sender<HashMap<u64, u64>>,
+    streams: watch::Sender<HashMap<u64, Took>>,
     next_stream: AtomicU64,
+}
+
+/// What the server took on a stream: nothing before its first acknowledgement.
+#[derive(Default)]
+struct Took {
+    /// The newest generation.
+    generation: u64,
+    /// The routes of the newest advertise.
+    upstreams: Vec<Upstream>,
 }
 
 impl<T> Routes<T> {
@@ -133,7 +142,7 @@ impl<T> Routes<T> {
     pub fn stream(&self) -> StreamAcks {
         let id = self.acks.next_stream.fetch_add(1, Ordering::Relaxed);
         self.acks.streams.send_modify(|streams| {
-            streams.insert(id, 0);
+            streams.insert(id, Took::default());
         });
         StreamAcks {
             acks: self.acks.clone(),
@@ -146,8 +155,15 @@ impl<T> Routes<T> {
     pub async fn acknowledged(&self, generation: u64) {
         let mut streams = self.acks.streams.subscribe();
         let _ = streams
-            .wait_for(|streams| streams.values().all(|acked| *acked >= generation))
+            .wait_for(|streams| streams.values().all(|took| took.generation >= generation))
             .await;
+    }
+
+    /// Whether the server of every live stream took `route` as it is, in its stream's newest
+    /// advertise acknowledged: it sends a connection to it. So without a live stream.
+    pub fn taken(&self, route: &Upstream) -> bool {
+        let streams = self.acks.streams.borrow();
+        streams.values().all(|took| took.upstreams.contains(route))
     }
 }
 
@@ -181,11 +197,13 @@ pub struct StreamAcks {
 }
 
 impl StreamAcks {
-    /// The server took the routes of `generation` on this stream.
-    pub fn acked(&self, generation: u64) {
+    /// The server took the routes of `generation` on this stream, `upstreams` those it was
+    /// last advertised.
+    pub fn acked(&self, generation: u64, upstreams: &[Upstream]) {
         self.acks.streams.send_modify(|streams| {
-            if let Some(acked) = streams.get_mut(&self.id) {
-                *acked = (*acked).max(generation);
+            if let Some(took) = streams.get_mut(&self.id) {
+                took.generation = took.generation.max(generation);
+                upstreams.clone_into(&mut took.upstreams);
             }
         });
     }

@@ -20,6 +20,8 @@
 //! DELETE /api/apps/<name>?owner=<owner>         removes the app
 //! GET    /api/keyvalue/<store>/<namespace>      the routes mapping a namespace
 //! DELETE /api/keyvalue/<store>/<namespace>      deletes the data of a namespace no route maps
+//! PUT    /api/evacuated/<owner>                 a wicket leaving: the owner moved what of its
+//!                                               apps it could (`sluice_wicket_console::leaving`)
 //! ```
 //!
 //! The options are the `--wasm` route's (`budget-ms`, `concurrency`, `instances`, `keep-ms`,
@@ -33,7 +35,9 @@
 //! routes' does. An app's files, a tar uploaded by digest too, are its
 //! instances' read-only at `/` (`files`). The apps' listing names the wicket too -- its id, kept
 //! in the console's directory, its flume node, its build -- and its budget: `--max-instances` and
-//! the slots the routes' pools hold for good; an edit needing more is refused `no_room`.
+//! the slots the routes' pools hold for good; an edit needing more is refused `no_room`. Both
+//! listings say when the wicket is leaving: told to stop, it waits for the apps of the API to be
+//! moved elsewhere (`--evacuation-grace`).
 //!
 //! The credentials, the page's shared files and the persistence layout are
 //! `sluice-wicket-console`'s.
@@ -52,6 +56,7 @@ use sluice_wicket_console::http::{
     Body, Edited, Intake, Refusal, Response, error, json, pairs, read, receive,
 };
 use sluice_wicket_console::identity::{Budget, Identity};
+use sluice_wicket_console::leaving::{self, LeavingView};
 use sluice_wicket_console::serve::{self, Service};
 use sluice_wicket_console::status::{Alive, Status, alive, settled};
 use sluice_wicket_console::store;
@@ -77,7 +82,8 @@ const SCRIPT: &str = include_str!("console/console.js");
 /// What the console serves and edits.
 pub struct Console {
     pub routes: Arc<Routes>,
-    pub status: watch::Receiver<Status>,
+    /// What the listings show besides the routes, the wicket leaving among it.
+    pub status: watch::Sender<Status>,
     /// To the reloader, which applies the edits.
     pub requests: mpsc::Sender<Request>,
     /// The keyvalue stores an app's map may name.
@@ -148,6 +154,11 @@ impl Console {
                     match *method {
                         Method::PUT => self.upload_files(sha256, parts, take()).await,
                         _ => error(StatusCode::METHOD_NOT_ALLOWED, "files take PUT"),
+                    }
+                } else if let Some(owner) = path.strip_prefix("/api/evacuated/") {
+                    match *method {
+                        Method::PUT => leaving::evacuated(&self.status, owner),
+                        _ => error(StatusCode::METHOD_NOT_ALLOWED, "an owner's word takes PUT"),
                     }
                 } else if let Some(place) = path.strip_prefix("/api/keyvalue/") {
                     match *method {
@@ -223,6 +234,7 @@ impl Console {
             },
             keyvalue_stores: self.store_views(),
             reload_failure: status.failure_view(),
+            leaving: status.leaving_view(),
             routes,
         }
     }
@@ -242,8 +254,10 @@ impl Console {
             else {
                 continue;
             };
+            let taken = self.routes.taken(up);
             if let Some(app) = apps.iter_mut().find(|app| app.name == *name) {
                 app.hosts.push(up.host.clone());
+                app.advertised &= taken;
                 continue;
             }
             let Some(handler) = table.handler(&up.target_url) else {
@@ -270,11 +284,13 @@ impl Console {
                 tag: tag.clone(),
                 deployed: deployed.clone(),
                 alive: alive(handler.alive()),
+                advertised: taken,
             });
         }
         AppsView {
             revision: status.revision,
             generation: table.generation,
+            leaving: status.leaving_view(),
             wicket: self.identity.clone(),
             budget: Budget {
                 max_instances: self.max_instances,
@@ -686,6 +702,9 @@ struct Listing {
     defaults: Defaults,
     keyvalue_stores: Vec<StoreView>,
     reload_failure: Option<sluice_wicket_console::status::FailureView>,
+    /// Told to stop, until when it serves on at most.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leaving: Option<LeavingView>,
     routes: Vec<RouteView>,
 }
 
@@ -779,6 +798,9 @@ struct BucketView {
 struct AppsView {
     revision: u64,
     generation: u64,
+    /// Told to stop, until when it serves on at most, while its apps are moved elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leaving: Option<LeavingView>,
     wicket: Identity,
     budget: Budget,
     capabilities: &'static [&'static str],
@@ -802,6 +824,9 @@ struct AppView {
     deployed: String,
     /// Its instances alive, lowest index first.
     alive: Vec<Alive>,
+    /// Whether the server of every tunnel stream took its routes as they are: it sends them
+    /// connections. So in local mode.
+    advertised: bool,
 }
 
 /// An app's sandbox as listed: the env's names in place of the env, left

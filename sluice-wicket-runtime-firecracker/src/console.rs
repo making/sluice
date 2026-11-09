@@ -23,6 +23,8 @@
 //! DELETE /api/apps/<name>?owner=<owner>         removes the app
 //! GET    /api/disks                             the apps' disks, which outlive them
 //! DELETE /api/disks/<name>?owner=<owner>        removes the disk of an app that was
+//! PUT    /api/evacuated/<owner>                 a wicket leaving: the owner moved what of its
+//!                                               apps it could (`sluice_wicket_console::leaving`)
 //! ```
 //!
 //! The options are the `--vm` route's (`mode`, `vcpus`, `memory-mib`, `warm`, `instances`,
@@ -35,7 +37,8 @@
 //! and its `disk` (`disk`). The apps' listing names the wicket too -- its id, kept in the
 //! console's directory, its flume node, its build -- and its budget: `--max-instances`,
 //! `--max-memory-mib` and what the routes keep of them for good; an edit needing more is
-//! refused `no_room`.
+//! refused `no_room`. Both listings say when the wicket is leaving: told to stop, it waits for
+//! the apps of the API but those with a disk to be moved elsewhere (`--evacuation-grace`).
 //!
 //! The credentials, the page's shared files and the directory's layout are
 //! `sluice-wicket-console`'s.
@@ -54,6 +57,7 @@ use sluice_wicket_console::http::{
     Body, Edited, Intake, Received, Refusal, Response, error, json, pairs, read, receive,
 };
 use sluice_wicket_console::identity::{Budget, Identity};
+use sluice_wicket_console::leaving::{self, LeavingView};
 use sluice_wicket_console::serve::{self, Service};
 use sluice_wicket_console::status::{
     Alive, Crashed, FailureView, Shortage, Status, alive_ready, crashed, settled,
@@ -92,7 +96,8 @@ const SCRIPT: &str = include_str!("console/console.js");
 /// What the console serves and edits.
 pub struct Console {
     pub routes: Arc<Routes<Table>>,
-    pub status: watch::Receiver<Status>,
+    /// What the listings show besides the routes, the wicket leaving among it.
+    pub status: watch::Sender<Status>,
     /// To the reloader, which applies the edits.
     pub requests: mpsc::Sender<Request>,
     /// The VMs' budget, which the page shows.
@@ -169,6 +174,12 @@ impl Service for Console {
             return match *method {
                 Method::PUT => self.upload(sha256, parts, take()).await,
                 _ => error(StatusCode::METHOD_NOT_ALLOWED, "an image takes PUT"),
+            };
+        }
+        if let Some(owner) = path.strip_prefix("/api/evacuated/") {
+            return match *method {
+                Method::PUT => leaving::evacuated(&self.status, owner),
+                _ => error(StatusCode::METHOD_NOT_ALLOWED, "an owner's word takes PUT"),
             };
         }
         error(StatusCode::NOT_FOUND, format!("nothing at {path}"))
@@ -263,6 +274,7 @@ impl Console {
                 memory_mib: memory,
             },
             reload_failure: status.failure_view(),
+            leaving: status.leaving_view(),
             routes,
         }
     }
@@ -282,8 +294,10 @@ impl Console {
             else {
                 continue;
             };
+            let taken = self.routes.taken(up);
             if let Some(app) = apps.iter_mut().find(|app| app.name == *name) {
                 app.hosts.push(up.host.clone());
+                app.advertised &= taken;
                 continue;
             }
             let rootfs = &route.vm().rootfs;
@@ -305,12 +319,14 @@ impl Console {
                 alive: alive_ready(route.alive()),
                 crashed: crashed(route.crashed()),
                 down: route.down(),
+                advertised: taken,
             });
         }
         let (instances, memory_mib) = table.resident();
         AppsView {
             revision: status.revision,
             generation: table.generation(),
+            leaving: status.leaving_view(),
             wicket: self.identity.clone(),
             budget: Budget {
                 max_instances: self.capacity.max_instances(),
@@ -721,6 +737,9 @@ struct Uploaded {
 struct AppsView {
     revision: u64,
     generation: u64,
+    /// Told to stop, until when it serves on at most, while its apps are moved elsewhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leaving: Option<LeavingView>,
     wicket: Identity,
     budget: Budget,
     runtime: &'static str,
@@ -749,6 +768,9 @@ struct AppView {
     /// Why it is short of VMs, since when ([`Route::down`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     down: Option<Shortage>,
+    /// Whether the server of every tunnel stream took its routes as they are, a VM of them
+    /// ready: it sends them connections. So in local mode.
+    advertised: bool,
 }
 
 /// The body of an app's PUT.
@@ -790,6 +812,9 @@ struct Listing {
     jailed: bool,
     budget: BudgetView,
     reload_failure: Option<FailureView>,
+    /// Told to stop, until when it serves on at most.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leaving: Option<LeavingView>,
     routes: Vec<RouteView>,
 }
 

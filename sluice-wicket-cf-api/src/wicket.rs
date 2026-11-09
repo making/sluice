@@ -13,6 +13,8 @@
 //! PUT    /api/apps/<name>                      serves the app of the body
 //! DELETE /api/apps/<name>?owner=<owner>        removes the app
 //! DELETE /api/keyvalue/<store>/<namespace>     deletes the data of a namespace no route maps
+//! PUT    /api/evacuated/<owner>                a wicket leaving: the owner moved what of its
+//!                                              apps it could, the rest staying until it drains
 //! ```
 
 use std::collections::BTreeMap;
@@ -264,6 +266,10 @@ pub struct Listing<S = Sandbox> {
     /// Its budget: none from a wicket predating it.
     #[serde(default)]
     pub budget: Option<ListedBudget>,
+    /// Told to stop, it serves on until the apps it waits for are elsewhere: none while it is
+    /// not, as from a wicket predating it.
+    #[serde(default)]
+    pub leaving: Option<ListedLeaving>,
     /// `firecracker`, or none from a wasm wicket.
     #[serde(default)]
     pub runtime: Option<String>,
@@ -298,6 +304,7 @@ impl Listing<serde_json::Value> {
             generation: self.generation,
             wicket: self.wicket,
             budget: self.budget,
+            leaving: self.leaving,
             runtime: self.runtime,
             capabilities: self.capabilities,
             keyvalue_stores: self.keyvalue_stores,
@@ -329,6 +336,16 @@ pub struct ListedBudget {
     pub memory_mib: Option<u64>,
 }
 
+/// A wicket leaving: serving on until the apps of its app API are elsewhere, or its bound.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct ListedLeaving {
+    /// When it drains at the latest, in seconds since the epoch.
+    pub until: u64,
+    /// The owners that said they moved what of their apps they could.
+    #[serde(default)]
+    pub evacuated: Vec<String>,
+}
+
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct ListedStore {
     pub name: String,
@@ -357,6 +374,10 @@ pub struct ListedApp<S = Sandbox> {
     /// their restores fail.
     #[serde(default)]
     pub down: Option<ListedDown>,
+    /// Whether the server of every tunnel stream of the wicket took its routes as they are: it
+    /// sends them connections. None from a wicket predating it.
+    #[serde(default)]
+    pub advertised: Option<bool>,
 }
 
 impl ListedApp<serde_json::Value> {
@@ -369,6 +390,7 @@ impl ListedApp<serde_json::Value> {
             alive: self.alive,
             crashed: self.crashed,
             down: self.down,
+            advertised: self.advertised,
         })
     }
 }
@@ -593,6 +615,21 @@ impl Wicket {
             return Err(refused(status, &body));
         }
         serde_json::from_slice(&body).map_err(|e| Failure::Unreachable(format!("the answer: {e}")))
+    }
+
+    /// Tells the wicket, leaving, that the owner moved what of its apps it could: those left stay
+    /// until it drains, no longer waited for.
+    pub async fn evacuated(&self) -> Result<(), Failure> {
+        let owner: String = form_urlencoded::byte_serialize(self.owner.as_bytes()).collect();
+        let request = self
+            .client
+            .put(format!("{}/api/evacuated/{owner}", self.base))
+            .timeout(READ_TIMEOUT);
+        let (status, body) = self.send(request).await?;
+        if !status.is_success() {
+            return Err(refused(status, &body));
+        }
+        Ok(())
     }
 
     /// Removes the app; None when the wicket has none of the name.

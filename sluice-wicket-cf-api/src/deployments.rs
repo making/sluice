@@ -610,7 +610,7 @@ impl Controller {
 
     /// Why the share `share` of the app `guid` on `wicket` is not ready, with a readiness check:
     /// the VMs it keeps not all ready as the wicket lists them now.
-    async fn unready(
+    pub(crate) async fn unready(
         &self,
         wicket: &Wicket,
         guid: &str,
@@ -658,9 +658,10 @@ impl Controller {
         self.cancel_held(&guid, &deployment).await;
     }
 
-    /// Takes up what a stop of the cf-api left under way: the deployments taking steps, and
-    /// those canceling.
+    /// Takes up what a stop of the cf-api left under way: the deployments taking steps, those
+    /// canceling, and the indices moving to another wicket ([`Controller::resume_moves`]).
     pub fn resume(self: &Arc<Self>) {
+        self.resume_moves();
         let under_way: Vec<(String, String, bool)> = self.store.read(|state| {
             let deployments = state.deployments.iter();
             deployments

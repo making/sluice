@@ -12,8 +12,10 @@
 //! The tunnel client is `sluice-wicket-tunnel`'s, as the other Rust wickets': the
 //! `--server` endpoint is asked for the node list, one tunnel stream per node
 //! advertises the routes and serves their connections, and SIGTERM / SIGINT
-//! drains the streams within `--drain-grace`. Each connection is served by
-//! the component of its target (`wasm_host::serve`).
+//! drains the streams within `--drain-grace`; with `--evacuation-grace`, once the
+//! controllers of the console's apps moved them elsewhere
+//! (`sluice_wicket_console::leaving`). Each connection is served by the component of
+//! its target (`wasm_host::serve`).
 //!
 //! The routes come from `--wasm` flags and / or a `--config` YAML file
 //! (`config`) and are reloaded without a restart (`routes::Reloader`): on a
@@ -68,6 +70,7 @@ mod wasm_host;
 
 use sluice_wicket_console::env;
 use sluice_wicket_console::identity::Identity;
+use sluice_wicket_console::leaving;
 
 use std::sync::Arc;
 
@@ -122,8 +125,9 @@ pub fn describe_build() -> String {
 }
 
 /// Serves the routes of `settings` (through the server, on `--listen`, or
-/// both) until SIGTERM / SIGINT: until the drain after it ended, or at once
-/// where nothing drains (without `--server`, or with `--drain-grace 0`).
+/// both) until SIGTERM / SIGINT: on while the apps of the console's API are
+/// moved elsewhere (`--evacuation-grace`), then until the drain ended, or at
+/// once where nothing drains (without `--server`, or with `--drain-grace 0`).
 pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
     let config::Settings {
         server,
@@ -137,6 +141,7 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         max_instances,
         stall_timeout,
         drain_grace,
+        evacuation_grace,
         watch_interval,
         mut console,
         flume,
@@ -166,6 +171,17 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
     // handler on `instances`.
     let reloader = Reloader::start(routes, instances.clone()).await?;
     let routes = reloader.routes().clone();
+    // told to stop: on until the apps of the console's API are elsewhere, or the bound
+    let leave = {
+        let (status, routes) = (reloader.status(), routes.clone());
+        async move {
+            if evacuation_grace.is_zero() {
+                return;
+            }
+            let waited = || routes.current().waited();
+            leaving::evacuate(&status, evacuation_grace, waited).await;
+        }
+    };
     let listener = match &listen {
         Some(address) => Some(listener::bind(address).await?),
         None => None,
@@ -237,17 +253,20 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
     let mut signals = Signals::install()?;
     let Some(server) = server else {
         readiness.local(routes);
-        // local mode alone: nothing to drain, a signal ends the process at once
-        let reloads = reloader.run(
+        // local mode alone: nothing to drain, a signal ends the process once evacuated (the
+        // edits taken meanwhile), a second one at once
+        tokio::spawn(reloader.run(
             watch_interval,
             hangups_received,
             requests_received,
             CancellationToken::new(),
-        );
+        ));
+        let name = signals.recv().await;
         tokio::select! {
-            () = reloads => {}
-            name = signals.recv() => println!("{name}: ending at once"),
+            () = leave => {}
+            name = signals.recv() => eprintln!("{name} during the evacuation: ending it at once"),
         }
+        println!("{name}: ending at once");
         return Ok(());
     };
 
@@ -280,5 +299,5 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         shared.drain.begin.clone(),
     ));
 
-    sluice_wicket_tunnel::serve(shared, server, drain_grace, &mut signals).await
+    sluice_wicket_tunnel::serve(shared, server, drain_grace, &mut signals, leave).await
 }

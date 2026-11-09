@@ -45,5 +45,10 @@ The PoC was verified by hand only; nothing runs it in `./mvnw verify`.
   core module is stopped before the upload; a broken config file shows the reload-failure
   banner and the fix clears it
 
+- evacuation (257): two wickets with `--evacuation-grace` and the cf-api on them, an app of
+  `-i 1` on the one told to stop (SIGTERM) moves to the other with no request failing
+  through the server, the stopped one exiting before its bound; checked by hand only
+  (`.kb/wicket-cf-api-findings.md`, Evacuation), `tests/cli.rs` asks each listener directly
+
 Acceptance: `./mvnw verify` covers the wasm path; CI without rust still passes
 (skipped, not failed).

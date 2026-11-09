@@ -44,15 +44,25 @@
 //! routes maps it. Tried at the deletion and again after each listing. Which stores they share
 //! is what they list (`crate::services::Offer::stores`); an app mapping a namespace of a store of
 //! each one's host runs on the wicket holding its data (`crate::placement`).
+//!
+//! A wicket listing itself leaving (told to stop, it serves on until the apps it waits for are
+//! elsewhere) has the indices of the started apps on it moved to the wickets with room, every
+//! app's at once ([`Controller::evacuate`]): each started on its new wicket, then, once that one
+//! serves it, out of the leaving one's share ([`Controller::relocate`]), which removes the app
+//! from it with its last index; then the wicket is told the owner moved what it could, the
+//! indices with nowhere to go staying until it stops. A wicket back, or new, takes the indices
+//! that spread an app again the same way round, one at a time ([`Controller::respread`]). A
+//! restart of the cf-api takes up the moves under way ([`Controller::resume_moves`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_util::future::join_all;
+use tokio::time::Instant;
 
 use crate::logs::Logs;
-use crate::placement::Budget;
+use crate::placement::{Budget, Evacuated, Move};
 use crate::services::Offer;
 use crate::store::{App, Lifetime, Outcome, Purge, ReadinessCheck, Removal, State, Store};
 use crate::wicket::{
@@ -62,6 +72,32 @@ use crate::wicket::{
 
 /// A lock of each key: what is done one at a time.
 type Locks<K> = Mutex<HashMap<K, Arc<tokio::sync::Mutex<()>>>>;
+
+/// Between two looks at whether a wicket serves an index moved to it: its servers' acknowledgement
+/// comes within a round trip.
+const LOOK: Duration = Duration::from_millis(100);
+
+/// A wicket's leaving, as the cf-api goes through it while it lists itself so.
+#[derive(Default)]
+struct Evacuation {
+    /// Its task runs ([`Controller::evacuate`]).
+    running: bool,
+    /// The apps of which an index stays on it: not tried again.
+    stayed: BTreeSet<String>,
+    /// It was told the owner moved what it could.
+    told: bool,
+}
+
+/// What became of an app's moves ([`Controller::relocate`]).
+#[derive(Debug, PartialEq)]
+enum Relocated {
+    /// Each index serves on its new wicket.
+    All,
+    /// Some stay where they were, for room alone.
+    NoRoom,
+    /// Some stay where they were, refused or not served.
+    Undone,
+}
 
 /// What a wicket listed of itself.
 struct Noted {
@@ -91,6 +127,11 @@ pub struct Controller {
     strangers: Mutex<BTreeSet<(String, String)>>,
     /// Held deleting the data of a store the wickets share: through one wicket at a time.
     purging: tokio::sync::Mutex<()>,
+    /// The wickets leaving, by name, while they list themselves so.
+    evacuations: Mutex<BTreeMap<String, Evacuation>>,
+    /// The wickets whose apps' spread the indices moving to them restore, by name, while they do
+    /// ([`Controller::respread`]).
+    respreading: Mutex<BTreeSet<String>>,
 }
 
 impl Controller {
@@ -105,6 +146,8 @@ impl Controller {
             listed: Mutex::default(),
             strangers: Mutex::default(),
             purging: tokio::sync::Mutex::default(),
+            evacuations: Mutex::default(),
+            respreading: Mutex::default(),
         }
     }
 
@@ -425,6 +468,10 @@ impl Controller {
             if full.is_some_and(|revision| *revision != listing.revision) {
                 wickets.full.remove(&wicket.name);
             }
+            match &listing.leaving {
+                Some(leaving) => wickets.leaving.insert(wicket.name.clone(), leaving.until),
+                None => wickets.leaving.remove(&wicket.name),
+            };
         });
         let Some(id) = id else {
             return false;
@@ -983,15 +1030,21 @@ impl Controller {
     /// Lists `wicket`'s apps and fixes the difference at startup, whenever its revision moves and
     /// when it answers again, then tries its pending removals and purges (after a hold too: a
     /// drained route's end moves no revision); while it is unreachable, every share placed on it
-    /// is `STARTING`, and it is tried again with a growing pause.
+    /// is `STARTING`, and it is tried again with a growing pause. Listing itself leaving, the
+    /// apps' indices on it move elsewhere ([`Controller::start_evacuation`]); serving at startup,
+    /// or again after it left or was unreachable, it takes those that spread an app again
+    /// ([`Controller::start_respread`]).
     async fn watch_one(self: Arc<Self>, wicket: Arc<Wicket>) {
         let mut after: Option<u64> = None;
         let mut pause = Duration::from_secs(1);
+        // not seen serving since the start, or since it left or was unreachable
+        let mut away = true;
         loop {
             let listing = match wicket.list(after).await {
                 Ok(listing) => listing,
                 Err(e) => {
                     self.unreachable(&wicket, &e);
+                    away = true;
                     // back, it is looked at whatever its revision: a wicket restarted
                     // may have come to the one it had
                     after = None;
@@ -1015,10 +1068,367 @@ impl Controller {
             }
             if moved {
                 self.fix(&wicket, &listing.apps);
+                match &listing.leaving {
+                    Some(leaving) => {
+                        away = true;
+                        let told = leaving.evacuated.contains(&wicket.owner);
+                        self.start_evacuation(&wicket, told);
+                    }
+                    None => {
+                        (self.evacuations.lock().expect("no panic under the lock"))
+                            .remove(&wicket.name);
+                        if std::mem::take(&mut away) {
+                            self.start_respread(&wicket);
+                        }
+                    }
+                }
             }
             self.remove_pending(&wicket).await;
             self.purge_on(&wicket).await;
         }
+    }
+
+    /// Moves the apps' indices off `wicket`, leaving ([`Controller::evacuate`]), unless that runs;
+    /// `told`: it lists the owner as having moved what it could (before a restart of the cf-api).
+    fn start_evacuation(self: &Arc<Self>, wicket: &Arc<Wicket>, told: bool) {
+        {
+            let mut evacuations = self.evacuations.lock().expect("no panic under the lock");
+            let evacuation = evacuations.entry(wicket.name.clone()).or_insert_with(|| {
+                println!(
+                    "CELL: {} is leaving: the apps' indices on it move to the other wickets",
+                    wicket.label
+                );
+                Evacuation::default()
+            });
+            evacuation.told |= told;
+            if std::mem::replace(&mut evacuation.running, true) {
+                return;
+            }
+        }
+        let (controller, wicket) = (self.clone(), wicket.clone());
+        tokio::spawn(async move {
+            controller.evacuate(&wicket).await;
+            let mut evacuations = controller
+                .evacuations
+                .lock()
+                .expect("no panic under the lock");
+            if let Some(evacuation) = evacuations.get_mut(&wicket.name) {
+                evacuation.running = false;
+            }
+        });
+    }
+
+    /// What `f` makes of the evacuation of the wicket `name`, if it is leaving.
+    fn evacuation<R>(&self, name: &str, f: impl FnOnce(&mut Evacuation) -> R) -> Option<R> {
+        let mut evacuations = self.evacuations.lock().expect("no panic under the lock");
+        evacuations.get_mut(name).map(f)
+    }
+
+    /// Moves the indices of the started apps off `wicket`, leaving, to the wickets with room
+    /// ([`State::evacuate`]), every app's at once ([`Controller::relocate`]), as long as some are
+    /// left to try: an index with nowhere to go, or not taken elsewhere for another reason than
+    /// room, stays until the wicket stops. Then, once no index moves off it any more (or it
+    /// drains), tells it the owner moved what it could.
+    async fn evacuate(&self, wicket: &Wicket) {
+        let name = &wicket.name;
+        // a refusal for room has the wicket hold none until its revision moves: each pass
+        // tries the indices on another, as many as there are
+        for _ in 0..=self.wickets.len() {
+            let stayed = self.evacuation(name, |evacuation| evacuation.stayed.clone());
+            let guids: Vec<String> = self.store.read(|state| {
+                (state.apps.iter())
+                    .filter(|app| {
+                        !stayed
+                            .as_ref()
+                            .is_some_and(|stayed| stayed.contains(&app.guid))
+                    })
+                    .filter(|app| state.placement(app).contains(name))
+                    .map(|app| app.guid.clone())
+                    .collect()
+            });
+            // each app apart: one under a long edit holds no other's move
+            let moved = join_all(guids.into_iter().map(|guid| async move {
+                let moves = {
+                    let _app = self.hold(&guid).await;
+                    let Evacuated { moves, stay, why } =
+                        self.store.update(|state| state.evacuate(&guid, name));
+                    for (index, to) in &moves {
+                        let line = format!(
+                            "Index {index} moves to the wicket {to}: {} is leaving",
+                            wicket.label
+                        );
+                        self.logs.add(&guid, "CELL", line);
+                    }
+                    if !stay.is_empty() {
+                        let line =
+                            format!("{} on {} until it stops: {why}", stays(&stay), wicket.label);
+                        self.logs.add(&guid, "CELL", line);
+                        self.evacuation(name, |evacuation| evacuation.stayed.insert(guid.clone()));
+                    }
+                    moves
+                };
+                if moves.is_empty() {
+                    return false;
+                }
+                if self.relocate(&guid, moves).await == Relocated::Undone {
+                    self.evacuation(name, |evacuation| evacuation.stayed.insert(guid));
+                }
+                true
+            }))
+            .await;
+            if !moved.contains(&true) {
+                break;
+            }
+        }
+        // the moves off it others started (a wicket back taking indices, the cf-api's restart)
+        let until = self
+            .store
+            .read(|state| state.wickets.leaving.get(name).copied());
+        while let Some(until) = until {
+            let moving = self.store.read(|state| {
+                state.apps.iter().any(|app| {
+                    let placement = state.placement(app);
+                    let off = |index: &&u64| placement.get(**index as usize) == Some(name);
+                    app.moving.keys().any(|index| off(&index))
+                })
+            });
+            if !moving || crate::store::epoch_secs() >= until {
+                break;
+            }
+            tokio::time::sleep(LOOK).await;
+        }
+        if self.evacuation(name, |evacuation| {
+            std::mem::replace(&mut evacuation.told, true)
+        }) == Some(false)
+        {
+            match wicket.evacuated().await {
+                Ok(()) => println!(
+                    "CELL: {} told the apps' indices left on it stay until it stops",
+                    wicket.label
+                ),
+                Err(e) => println!(
+                    "CELL: {} not told the apps' indices left on it stay: {e}",
+                    wicket.label
+                ),
+            }
+        }
+    }
+
+    /// Moves to `wicket`, back or new, the indices that spread an app again
+    /// ([`Controller::respread`]), unless that runs.
+    fn start_respread(self: &Arc<Self>, wicket: &Arc<Wicket>) {
+        let mut respreading = self.respreading.lock().expect("no panic under the lock");
+        if !respreading.insert(wicket.name.clone()) {
+            return;
+        }
+        let (controller, wicket) = (self.clone(), wicket.clone());
+        tokio::spawn(async move {
+            controller.respread(&wicket).await;
+            let mut respreading = controller
+                .respreading
+                .lock()
+                .expect("no panic under the lock");
+            respreading.remove(&wicket.name);
+        });
+    }
+
+    /// Moves to `wicket`, back or new, the indices that spread an app again, one at a time
+    /// ([`State::respread`], [`Controller::relocate`]): an app one of whose moves stays where it
+    /// was is not tried again.
+    async fn respread(&self, wicket: &Wicket) {
+        let mut skipped = BTreeSet::new();
+        loop {
+            let found = self
+                .store
+                .update(|state| state.respread(&wicket.name, &skipped));
+            let Some((guid, (index, to))) = found else {
+                return;
+            };
+            let line = format!(
+                "Index {index} moves to {}: the app's instances spread over the wickets again",
+                wicket.label
+            );
+            self.logs.add(&guid, "CELL", line);
+            if self.relocate(&guid, vec![(index, to)]).await != Relocated::All {
+                skipped.insert(guid);
+            }
+        }
+    }
+
+    /// Takes up the moves a stop of the cf-api left under way ([`Controller::relocate`]).
+    pub fn resume_moves(self: &Arc<Self>) {
+        let moving: Vec<(String, Vec<Move>)> = self.store.read(|state| {
+            (state.apps.iter())
+                .filter(|app| !app.moving.is_empty())
+                .map(|app| {
+                    let moves = app.moving.iter();
+                    let moves = moves.map(|(index, to)| (*index, to.clone())).collect();
+                    (app.guid.clone(), moves)
+                })
+                .collect()
+        });
+        for (guid, moves) in moving {
+            let controller = self.clone();
+            tokio::spawn(async move { controller.relocate(&guid, moves).await });
+        }
+    }
+
+    /// Moves the indices `moves` of the app `guid`, each recorded moving to its wicket
+    /// ([`App::moving`]): the shares they grow put, the app held as an edit holds it, then each
+    /// index placed on its wicket once that one serves it ([`Controller::serves`]), the shares
+    /// it leaves applied. A move its wicket refuses, or does not serve within the app's health
+    /// check timeout, is undone: the index stays where it was. Logged.
+    async fn relocate(&self, guid: &str, moves: Vec<Move>) -> Relocated {
+        let mut undone: Vec<(Move, String)> = Vec::new();
+        // of them those refused for room
+        let mut for_room = 0;
+        let mut moves = moves;
+        {
+            let _app = self.hold(guid).await;
+            let targets: BTreeSet<String> = moves.iter().map(|(_, to)| to.clone()).collect();
+            let put = join_all(targets.into_iter().map(|to| async move {
+                let put = self.put_share(guid, &to).await;
+                (to, put)
+            }))
+            .await;
+            for (to, put) in put {
+                let Err(e) = put else {
+                    continue;
+                };
+                let why = match e.no_room() {
+                    true => format!("the wicket {to} has no room for it"),
+                    false => format!("the wicket {to} refused it: {e}"),
+                };
+                let (refused, kept): (Vec<Move>, Vec<Move>) =
+                    moves.into_iter().partition(|(_, at)| *at == to);
+                moves = kept;
+                if e.no_room() {
+                    for_room += refused.len();
+                }
+                undone.extend(refused.into_iter().map(|refused| (refused, why.clone())));
+            }
+        }
+        let timeout = self.store.read(|state| {
+            let app = state.app(guid);
+            let timeout = app.and_then(|app| app.process.health_check.timeout);
+            let timeout = timeout.unwrap_or(DEFAULT_HEALTH_CHECK_TIMEOUT);
+            timeout.clamp(1, MAXIMUM_HEALTH_CHECK_TIMEOUT)
+        });
+        let deadline = Instant::now() + Duration::from_secs(timeout);
+        let served = join_all(moves.into_iter().map(|(index, to)| async move {
+            let served = self.serves(guid, index, &to, deadline).await;
+            ((index, to), served)
+        }))
+        .await;
+        let _app = self.hold(guid).await;
+        let mut changed = BTreeSet::new();
+        // every move still asked for placed
+        let mut placed = true;
+        for ((index, to), served) in served {
+            match served {
+                Ok(()) => {
+                    let from = self.store.update(|state| state.moved(guid, index, &to));
+                    if let Some(from) = from {
+                        let line = format!(
+                            "Index {index} runs on the wicket {to}: out of the wicket {from}'s share"
+                        );
+                        self.logs.add(guid, "CELL", line);
+                        changed.insert(from);
+                    }
+                }
+                Err(None) => placed = false,
+                Err(Some(why)) => undone.push(((index, to), why)),
+            }
+        }
+        for ((index, to), why) in &undone {
+            let at = self.store.update(|state| state.unmoved(guid, *index, to));
+            if let Some(at) = at {
+                let line = format!("Index {index} stays on the wicket {at}: {why}");
+                self.logs.add(guid, "CELL", line);
+                changed.insert(to.clone());
+            }
+        }
+        if !changed.is_empty() {
+            let changed: Vec<String> = changed.into_iter().collect();
+            self.sync_on(guid, Some(&changed)).await;
+        }
+        match (placed, undone.len()) {
+            (true, 0) => Relocated::All,
+            (true, undone) if undone == for_room => Relocated::NoRoom,
+            _ => Relocated::Undone,
+        }
+    }
+
+    /// The share of the app `guid` on the wicket `name` now, put, the share held.
+    async fn put_share(&self, guid: &str, name: &str) -> Result<(), Failure> {
+        let Some(wicket) = self.wickets.iter().find(|wicket| wicket.name == name) else {
+            return Err(Failure::refused(409, format!("no --wicket names {name}")));
+        };
+        let _share = self.hold_share(guid, name).await;
+        self.sync_held(wicket, guid).await
+    }
+
+    /// Whether the wicket `to` serves the index `index` of the app `guid`, moving there, by
+    /// `deadline`: it took its share and, with a readiness check, the VMs the share keeps are
+    /// ready, and the server of each of its tunnel streams took the app's routes
+    /// ([`Controller::advertised`]): the wicket it leaves stops advertising them once every
+    /// server sends them here. Err with why not once it refused it or the deadline passed, None
+    /// once the index moves there no more.
+    async fn serves(
+        &self,
+        guid: &str,
+        index: u64,
+        to: &str,
+        deadline: Instant,
+    ) -> Result<(), Option<String>> {
+        let Some(wicket) = self.wickets.iter().find(|wicket| wicket.name == to) else {
+            return Err(None);
+        };
+        loop {
+            let (moving, share, outcome) = self.store.read(|state| {
+                let app = state.app(guid);
+                let moving =
+                    app.is_some_and(|app| app.moving.get(&index).is_some_and(|at| at == to));
+                let share = self.desired_on(state, guid, to);
+                (moving, share, state.outcome(guid, to).cloned())
+            });
+            if !moving {
+                return Err(None);
+            }
+            match (outcome, share) {
+                (Some(Outcome::Running), Some(share)) => {
+                    if self.unready(wicket, guid, &share).await.is_none()
+                        && self.advertised(wicket, guid, &share).await
+                    {
+                        return Ok(());
+                    }
+                }
+                (Some(Outcome::Refused(error)), _) => {
+                    return Err(Some(format!("{} refused it: {error}", wicket.label)));
+                }
+                _ => {}
+            }
+            if Instant::now() >= deadline {
+                return Err(Some(format!(
+                    "{} did not serve it within its health check's timeout",
+                    wicket.label
+                )));
+            }
+            tokio::time::sleep(LOOK).await;
+        }
+    }
+
+    /// Whether `wicket` lists the app `guid` of `share` with its routes taken by the server of
+    /// each of its tunnel streams: so in local mode, and from a wicket predating it.
+    async fn advertised(&self, wicket: &Wicket, guid: &str, share: &AppBody) -> bool {
+        let Ok(listing) = wicket.list(None).await else {
+            return false;
+        };
+        let ours = |listed: &&ListedApp| {
+            listed.name == guid && listed.app.owner == share.owner && listed.app.tag == share.tag
+        };
+        let listed = listing.apps.iter().find(ours);
+        listed.is_some_and(|listed| listed.advertised != Some(false))
     }
 
     /// Every share placed on `wicket` is `STARTING` until it answers.
@@ -1037,6 +1447,16 @@ impl Controller {
         for guid in guids {
             self.record(wicket, &guid, Outcome::Unreachable, &line);
         }
+    }
+}
+
+/// `indices` staying, as a line names them: `Index 0 stays`, `Indices 0 and 2 stay`.
+fn stays(indices: &[u64]) -> String {
+    let named: Vec<String> = indices.iter().map(u64::to_string).collect();
+    match &named[..] {
+        [one] => format!("Index {one} stays"),
+        [first @ .., last] => format!("Indices {} and {last} stay", first.join(", ")),
+        [] => String::new(),
     }
 }
 

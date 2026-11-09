@@ -3,8 +3,9 @@
 //! -- the subset of the Cloud Controller v3 API, the UAA token endpoints and
 //! log-cache's read API it uses -- keeping the desired state of its apps and
 //! having its wickets serve them through each wicket's app API, an app's
-//! instances spread over them (`placement`, `controller`), a deployment put a
-//! wicket's share at a time (`deployments`); a component comes
+//! instances spread over them (`placement`, `controller`) and moved off a wicket
+//! told to stop, a deployment put a wicket's share at a time (`deployments`); a
+//! component comes
 //! in a zip or from an OCI registry (`registry`), a rootfs in a zip or made by
 //! a wicket of an OCI image, and what every wicket offers of its keyvalue stores
 //! and capabilities are its services. With a flume, the apps' output and requests

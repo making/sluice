@@ -223,6 +223,10 @@ pub struct App {
     /// runs while the app is started.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub placement: Vec<String>,
+    /// The indices moving to another wicket, by index: each runs where it is placed and on that
+    /// wicket until that one serves it, then is placed there (`crate::placement`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub moving: BTreeMap<u64, String>,
 }
 
 /// A deployment of an app's `running` snapshot under way (`crate::deployments`): the wickets
@@ -1399,6 +1403,7 @@ impl State {
             running: None,
             rolling: None,
             placement: Vec::new(),
+            moving: BTreeMap::new(),
         });
         self.apps.last_mut().expect("just pushed")
     }
@@ -2168,7 +2173,9 @@ mod tests {
             wicket: wicket.into(),
         };
         assert_eq!(state.removals, [gone("a")]);
-        // written again, none of the one organization or space is kept apart
+        // written again, none of the one organization or space is kept apart; an index moving
+        // kept
+        state.apps[0].moving.insert(1, "b".into());
         let again = serde_json::to_value(&state).unwrap();
         assert!(again.get("org").is_none() && again.get("space").is_none());
         let mut again: State = serde_json::from_value(again).unwrap();
@@ -2176,6 +2183,7 @@ mod tests {
             (&again.apps[0].placement, &again.removals),
             (&names(&["a", "a"]), &vec![gone("a")])
         );
+        assert_eq!(again.apps[0].moving, [(1, "b".to_string())].into());
         assert_eq!(
             again.follow_wickets(&names(&["b", "c"])),
             [

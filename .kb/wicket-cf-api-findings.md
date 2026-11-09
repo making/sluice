@@ -85,6 +85,24 @@ What the CLI (8.19.0) does with them (`cf push`, `restart`, `restage --strategy 
   `GET /v3/deployments?app_guids=<guid>&status_values=ACTIVE&order_by=-created_at&per_page=1`;
   `cf app` shows it (`Active deployment with status ...`) only when it is `ACTIVE`
 
+## Evacuation
+
+Two wasi wickets (debug builds, `--evacuation-grace 60`) through a sluice server
+(`smallest-client-id`: every request to the wicket stopped until its apps left it), the cf-api
+placing an app of `-i 1` and one of `-i 2`, a client sending a request every ~4ms through the
+server, a connection each, both hosts in turn. The wicket holding both told to stop (SIGTERM):
+
+- it exited 0.53s after the signal (3 runs): both apps started on the other wicket, its servers
+  taking their routes (the cf-api looking every 100ms), out of its share and removed from it, then
+  its drain (the server acknowledging the withdrawal at once)
+- no request failed: 0 of 1383-1418 a run. The leaving wicket's removal waits until the
+  replacement lists the app `advertised`: every server of its streams acknowledged the routes
+  holding the host. Without that wait (the removal right after the replacement's put returned)
+  none failed either, 4 runs exiting in 0.42-0.48s: the replacement's advertise leaves as its put
+  returns, the removal a few round trips of the cf-api's later. Under load a stream may hold its
+  advertise behind the data it sends, which the wait covers
+- back, the `-i 2` app's second index moved back to it
+
 ## The demo's GIF
 
 2.5MB ([demo/README.md](../sluice-wicket-cf-api/demo/README.md)).

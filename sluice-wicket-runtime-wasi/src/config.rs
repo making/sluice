@@ -76,6 +76,9 @@ usage: sluice-wicket-runtime-wasi --server <url> --wasm <host>=<locator>[?<optio
   --tunnel-stall-timeout <secs>   give a stream up once its frames wait that long untaken
                                   (default 60, 0 = off)
   --drain-grace <secs>            the SIGTERM drain's bound (default 20, 0 = no drain)
+  --evacuation-grace <secs>       on SIGTERM, before the drain: serve on while the controllers
+                                  move the apps of the console's API elsewhere, this long at
+                                  most (default 0 = drain at once)
   --watch-interval <secs>         poll the routes' files (default 1, 0 = SIGHUP only)
   --probe <host:port>             ask the readiness probe there (--health): exit 0 when
                                   ready, 1 when not (a distroless image's healthcheck)
@@ -112,6 +115,8 @@ pub struct Settings {
     pub max_instances: usize,
     pub stall_timeout: Duration,
     pub drain_grace: Duration,
+    /// How long a wicket told to stop serves on while its apps are moved elsewhere; zero: none.
+    pub evacuation_grace: Duration,
     /// Zero: the files are not polled; only SIGHUP reloads.
     pub watch_interval: Duration,
     pub console: Option<ConsoleSettings>,
@@ -151,6 +156,7 @@ struct Flags {
     max_instances: Option<usize>,
     stall_timeout: Option<Duration>,
     drain_grace: Option<Duration>,
+    evacuation_grace: Option<Duration>,
     watch_interval: Option<Duration>,
     keyvalue_file: Option<PathBuf>,
     console: Option<String>,
@@ -182,6 +188,7 @@ const VALUED: &[&str] = &[
     "max-instances",
     "tunnel-stall-timeout",
     "drain-grace",
+    "evacuation-grace",
     "watch-interval",
     "keyvalue-file",
     "console",
@@ -321,6 +328,7 @@ pub fn parse(
         max_instances: limit("max-instances", Instances::MAX)?,
         stall_timeout: seconds("tunnel-stall-timeout")?,
         drain_grace: seconds("drain-grace")?,
+        evacuation_grace: seconds("evacuation-grace")?,
         watch_interval: seconds("watch-interval")?,
         keyvalue_file: value("keyvalue-file").map(PathBuf::from),
         console: value("console"),
@@ -452,6 +460,12 @@ fn merge(flags: Flags) -> Result<Settings, String> {
         "drain-grace",
         DEFAULT_DRAIN_GRACE,
     )?;
+    let evacuation_grace = duration(
+        flags.evacuation_grace,
+        &settings.evacuation_grace,
+        "evacuation-grace",
+        Duration::ZERO,
+    )?;
     let watch_interval = duration(
         flags.watch_interval,
         &settings.watch_interval,
@@ -514,6 +528,7 @@ fn merge(flags: Flags) -> Result<Settings, String> {
         max_instances,
         stall_timeout,
         drain_grace,
+        evacuation_grace,
         watch_interval,
         console,
         flume,
@@ -674,6 +689,7 @@ struct File {
     max_instances: Option<usize>,
     tunnel_stall_timeout: Option<Scalar>,
     drain_grace: Option<Scalar>,
+    evacuation_grace: Option<Scalar>,
     watch_interval: Option<Scalar>,
     keyvalue: Option<KeyValueFile>,
     console: Option<String>,
@@ -733,6 +749,7 @@ impl File {
             max_instances => "max-instances",
             tunnel_stall_timeout => "tunnel-stall-timeout",
             drain_grace => "drain-grace",
+            evacuation_grace => "evacuation-grace",
             watch_interval => "watch-interval",
             keyvalue => "keyvalue",
             console => "console",
@@ -1316,6 +1333,7 @@ max-connections: 10
 max-instances: 8
 tunnel-stall-timeout: 90s
 drain-grace: 0
+evacuation-grace: 1m
 watch-interval: 250ms
 listen: 127.0.0.1:8080
 health: 127.0.0.1:8081
@@ -1396,6 +1414,7 @@ routes:
         assert_eq!(file.max_instances, 8);
         assert_eq!(file.stall_timeout, Duration::from_secs(90));
         assert_eq!(file.drain_grace, Duration::ZERO);
+        assert_eq!(file.evacuation_grace, Duration::from_secs(60));
         assert_eq!(file.watch_interval, Duration::from_millis(250));
         let console = file.console.as_ref().expect("a console");
         assert_eq!(console.address, "127.0.0.1:9090");
@@ -1549,6 +1568,7 @@ routes:
                 "--max-instances=16",
                 "--drain-grace",
                 "5",
+                "--evacuation-grace=30",
                 "--ca-cert",
                 "flag.pem",
                 "--listen",
@@ -1569,6 +1589,7 @@ routes:
         assert_eq!(flagged.max_instances, 16, "the flag's");
         assert_eq!(flagged.max_connections, 12, "the environment's");
         assert_eq!(flagged.drain_grace, Duration::from_secs(5));
+        assert_eq!(flagged.evacuation_grace, Duration::from_secs(30));
         assert_eq!(flagged.ca_cert, Some(PathBuf::from("flag.pem")));
         assert_eq!(flagged.stall_timeout, Duration::from_secs(90), "the file's");
         assert_eq!(flagged.token, file.token, "an empty variable is unset");
@@ -1622,6 +1643,7 @@ routes:
         assert_eq!(defaults.max_instances, DEFAULT_MAX_INSTANCES);
         assert_eq!(defaults.stall_timeout, DEFAULT_STALL_TIMEOUT);
         assert_eq!(defaults.drain_grace, DEFAULT_DRAIN_GRACE);
+        assert_eq!(defaults.evacuation_grace, Duration::ZERO);
         assert_eq!(defaults.watch_interval, DEFAULT_WATCH_INTERVAL);
         assert!(!defaults.insecure);
         assert_eq!(defaults.listen, None);

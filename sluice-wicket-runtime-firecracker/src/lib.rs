@@ -9,7 +9,9 @@
 //! The tunnel client is `sluice-wicket-tunnel`'s, as sluice-wicket-runtime-wasi's: the
 //! `--server` endpoint is asked for the node list, one tunnel stream per node
 //! advertises the routes and serves their connections, and SIGTERM / SIGINT
-//! drains the streams within `--drain-grace`.
+//! drains the streams within `--drain-grace`; with `--evacuation-grace`, once the
+//! controllers of the console's apps (but those on a disk) moved them elsewhere
+//! (`sluice_wicket_console::leaving`).
 //!
 //! The wicket does not terminate HTTP: each tunnel connection is relayed
 //! verbatim to a vsock stream of a guest (framed, see `wire`, to carry
@@ -68,6 +70,7 @@ pub mod wire;
 use std::sync::Arc;
 
 use sluice_wicket_console::identity::Identity;
+use sluice_wicket_console::leaving;
 use sluice_wicket_tunnel::flume::{self, Tap};
 use sluice_wicket_tunnel::proto::PeerBuild;
 use sluice_wicket_tunnel::ready::Readiness;
@@ -105,9 +108,10 @@ pub fn describe_build() -> String {
 }
 
 /// Boots the routes' VMs as `launcher` starts them and serves them (through the
-/// server, on `--listen`, or both) until SIGTERM / SIGINT: until the drain
-/// after it ended, or at once where nothing drains (without `--server`, or
-/// with `--drain-grace 0`). However that ends, every VM on a disk is stopped by then.
+/// server, on `--listen`, or both) until SIGTERM / SIGINT: on while the apps of
+/// the console's API are moved elsewhere (`--evacuation-grace`), then until the
+/// drain ended, or at once where nothing drains (without `--server`, or with
+/// `--drain-grace 0`). However that ends, every VM on a disk is stopped by then.
 pub async fn run(
     settings: config::Settings,
     launcher: Launcher,
@@ -138,6 +142,7 @@ async fn serving(
         max_connections,
         stall_timeout,
         drain_grace,
+        evacuation_grace,
         max_instances,
         max_memory_mib,
         workers: _,
@@ -202,6 +207,17 @@ async fn serving(
     )
     .await?;
     let routes = reloader.routes().clone();
+    // told to stop: on until the apps of the console's API are elsewhere, or the bound
+    let leave = {
+        let (status, routes) = (reloader.status(), routes.clone());
+        async move {
+            if evacuation_grace.is_zero() {
+                return;
+            }
+            let waited = || routes.current().waited();
+            leaving::evacuate(&status, evacuation_grace, waited).await;
+        }
+    };
     let node = flume.as_ref().map(|_| format!("wicket:{client_id}"));
     if let Some(flume) = flume {
         flume::start(flume, tap, &client_id)?;
@@ -262,17 +278,23 @@ async fn serving(
     }
     let Some(server) = server else {
         readiness.local(routes.clone());
-        // local mode alone: nothing to drain, a signal ends the process at once
-        let reloads = reloader.run(
+        // local mode alone: nothing to drain, a signal ends the process once evacuated (the
+        // edits taken meanwhile), a second one at once
+        let reloads = tokio::spawn(reloader.run(
             watch_interval,
             hangups_received,
             requests_received,
             CancellationToken::new(),
-        );
+        ));
+        let name = signals.recv().await;
         tokio::select! {
-            () = reloads => {}
-            name = signals.recv() => println!("{name}: ending at once"),
+            () = leave => {}
+            name = signals.recv() => eprintln!("{name} during the evacuation: ending it at once"),
         }
+        println!("{name}: ending at once");
+        // ended with what it held, the starts under way among it
+        reloads.abort();
+        let _ = reloads.await;
         routes.current().stop_disks().await;
         return Ok(());
     };
@@ -297,7 +319,8 @@ async fn serving(
         requests_received,
         shared.drain.begin.clone(),
     ));
-    let served = sluice_wicket_tunnel::serve(shared, server, drain_grace, &mut signals).await;
+    let served =
+        sluice_wicket_tunnel::serve(shared, server, drain_grace, &mut signals, leave).await;
     // ended with what it held, the starts under way among it: done whatever ended the serving
     reloads.abort();
     let _ = reloads.await;

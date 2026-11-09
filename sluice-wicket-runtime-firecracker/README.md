@@ -230,9 +230,12 @@ the host's memory: `RuntimeDirectorySize` in `logind.conf`).
 
 The tunnel's settings are `sluice-wicket-runtime-wasi`'s: `--token` (or `--token-file`; on the
 command line every user of the host sees it), `--client-id`, `--ca-cert`,
-`--insecure` (`grpcs://`), `--max-connections` (256), `--tunnel-stall-timeout` (60s) and
+`--insecure` (`grpcs://`), `--max-connections` (256), `--tunnel-stall-timeout` (60s),
 `--drain-grace` (20s: SIGTERM / SIGINT withdraw the routes and end the streams once their
-connections ended; a second signal ends at once). Each also reads
+connections ended; a second signal ends at once) and `--evacuation-grace` (0: before the drain,
+the wicket serves on while the controllers move the apps of the console's API elsewhere, as
+sluice-wicket-runtime-wasi's [Shutdown](../sluice-wicket-runtime-wasi/README.md#shutdown-drain);
+an app with a [disk](#disks) is not waited for: no other wicket has its data). Each also reads
 `SLUICE_WICKET_RUNTIME_FIRECRACKER_<NAME>` from the environment, e.g. `SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN`;
 another variable of that prefix but the two below, a misspelled one, is refused at the start.
 `--workers` (4, at most the CPUs) sets the threads relaying the connections (see
@@ -264,6 +267,7 @@ max-memory-mib: 16384           # of guest memory
 workers: 4                      # threads relaying the connections
 watch-interval: 1s              # 0 = SIGHUP only
 drain-grace: 20s
+evacuation-grace: 0             # 60s: on SIGTERM, serves on while the apps move elsewhere
 # flume: grpc://127.0.0.1:8002  # see Output and the live access log
 # flume-token: ${FLUME_TOKEN}
 # jail-ids: 900000-900127       # see Jail mode
@@ -532,6 +536,7 @@ digest, or made of an OCI image, first; the app names it:
 | `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "wicket", "budget", "runtime": "firecracker", "capabilities": [], "keyvalue_stores": [], "apps": [..]}`; `wicket` which wicket this is: `id`, made at its first start and kept in the console directory (`wicket-id`), `node`, its flume node (`wicket:<client-id>`, null without `--flume`), `build`; `budget` `max_instances`, `max_memory_mib` (with `--max-memory-mib`) and what the routes keep of them for good (their booted and warm VMs): `instances`, `memory_mib`. An app needing more is refused 422 with `"no_room": true` |
 | `PUT /api/apps/<name>` | serves the app of the body (JSON, below) |
 | `DELETE /api/apps/<name>?owner=<owner>` | removes the app of `owner` |
+| `PUT /api/evacuated/<owner>` | a wicket leaving (`"leaving"` in both listings, `--evacuation-grace`): `owner` moved what of its apps it could, those left staying until the drain; 409 unless leaving |
 
 ```json
 {
@@ -554,7 +559,9 @@ digest, or made of an OCI image, first; the app names it:
   it takes connections ([Readiness](#readiness)); `crashed`, those it
   keeps that are down, `{"index": 1, "why": "its process ended", "since": 1793000000}`, each until
   another one is up there; `down`, when told: why it is short of VMs, and since when (`instances.down`),
-  until they are up
+  until they are up; `advertised`, whether the server of every tunnel stream took its routes as
+  they are, a VM of them ready (true in local mode): a controller moving an app here removes it
+  from the wicket it leaves once they are
 - a PUT is one reload: every host of the app or none, kept only when its VMs started; the same
   app again changes nothing. An app's target names it (`?app=<name>`), so its VMs are its own,
   whoever else names the image; the env is in no target: another env starts its VMs anew. Its
@@ -624,7 +631,9 @@ is where `/init` mounts it before the process starts, `disk-mib` its size (defau
   route serves nothing until [its next start](#a-vm-going-down) succeeds
 - **a stop** tells `/init`: SIGTERM to every process, 10s for them to end (then SIGKILL), what
   is dirty written out, the disk unmounted, the VM killed, 20s at most. So does the wicket's own
-  end, after its drain (`--drain-grace` and these 20s: `--stop-timeout`, `TimeoutStopSec`), a
+  end, after its evacuation and its drain (`--evacuation-grace`, `--drain-grace` and these 20s:
+  `--stop-timeout`, `TimeoutStopSec`; an app on a disk moves to no other wicket, its wicket's
+  stop is its downtime), a
   [process's end](#a-vm-going-down), a process exiting before it listens, and a start
   taken over or given up once `/init` mounted the disk: the next start on the disk waits for it.
   A VM simply killed,
@@ -893,7 +902,8 @@ sudo target/release/sluice-wicket-runtime-firecracker --jail-ids 900000-900127 -
 ```
 
 As a systemd service: `ExecStart=` the wicket with its `--config`, `Delegate=yes` (the
-default `--jail-cgroup`), `TimeoutStopSec=` above `--drain-grace`.
+default `--jail-cgroup`), `TimeoutStopSec=` above `--evacuation-grace` and `--drain-grace`
+together (and 20s more with a [disk](#disks)).
 
 ## Host setup
 
@@ -994,9 +1004,9 @@ docker run --rm --device /dev/kvm --group-add $(stat -c %g /dev/kvm) \
   `scripts/build-guest.sh`); the scripts stay out of the image (they need docker and sudo)
 - **`/run/sluice`**, the state dir, on a tmpfs (`--tmpfs`): the snapshots stay off the disk;
   the wicket warns otherwise
-- **`--stop-timeout`** above `--drain-grace` (20s; Docker's default stop timeout is 10s), and
-  20s more with an app's [disk](#disks). The wicket is the container's PID 1: it drains on
-  SIGTERM and reaps its VMs, no init needed
+- **`--stop-timeout`** above `--evacuation-grace` and `--drain-grace` together (20s by default;
+  Docker's default stop timeout is 10s), and 20s more with an app's [disk](#disks). The wicket is
+  the container's PID 1: it evacuates and drains on SIGTERM and reaps its VMs, no init needed
 - **a healthcheck** in its exec form (the image has no shell, which `docker run --health-cmd`
   runs): with `--health 127.0.0.1:8081`, Compose's `healthcheck: {test: [CMD,
   /usr/local/bin/sluice-wicket-runtime-firecracker, --probe, 127.0.0.1:8081]}`
@@ -1042,7 +1052,8 @@ Kubernetes: `/dev/kvm` reaches a Pod through a device plugin (KubeVirt's
 `devices.kubevirt.io/kvm`, or a generic one), or a privileged container;
 `securityContext.supplementalGroups` holds the node's `kvm` gid, `/run/sluice` is an
 `emptyDir` of `medium: Memory` (counted against the Pod's memory limit),
-`terminationGracePeriodSeconds` exceeds `--drain-grace`, and a `readinessProbe`'s `httpGet` asks
+`terminationGracePeriodSeconds` exceeds `--evacuation-grace` and `--drain-grace` together, and a
+`readinessProbe`'s `httpGet` asks
 `/ready` of `--health` (on `0.0.0.0`). Jail mode: `runAsUser: 0`,
 `capabilities.add: [SYS_ADMIN]`, `seccompProfile` (the wicket's filters replace it) and
 `appArmorProfile` `Unconfined` (or a privileged container).

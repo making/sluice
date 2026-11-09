@@ -225,6 +225,7 @@ max-connections: 256
 max-instances: 64
 tunnel-stall-timeout: 60s
 drain-grace: 20s
+evacuation-grace: 0             # see Shutdown: 60s serves on while the apps move elsewhere
 watch-interval: 1s              # 0 = no polling, SIGHUP only
 # listen: 127.0.0.1:8080        # local mode, see Local mode
 # health: 127.0.0.1:8081        # see Readiness probe
@@ -287,8 +288,8 @@ routes:
     files: public               # read-only at / (files= of the flag), relative to this file
 ```
 
-- durations take `ms`, `s`, `m` or `h` (`tunnel-stall-timeout`, `drain-grace` and
-  `watch-interval` also a bare `0` = off); the flags keep whole seconds
+- durations take `ms`, `s`, `m` or `h` (`tunnel-stall-timeout`, `drain-grace`,
+  `evacuation-grace` and `watch-interval` also a bare `0` = off); the flags keep whole seconds
 - sizes take a whole number with `Ki`, `Mi`, `Gi` (or `K`, `M`, `G`); `memory` must be
   whole MiB, the keyvalue limits may be a bare number of bytes
 - `${NAME}` in a plain (unquoted) scalar is the environment variable `NAME`, with the
@@ -447,7 +448,7 @@ services:
     - "127.0.0.1:9090:9090"  # the console, from this host only
     volumes:
     - wicket-data:/data      # deployed/ (the console's routes) and keyvalue.db
-    # with a server: above --drain-grace, see Shutdown (drain)
+    # with a server, or --evacuation-grace: above them, see Shutdown (drain)
     # stop_grace_period: 30s
     healthcheck:             # see Readiness probe
       test: [CMD, /usr/local/bin/sluice-wicket-runtime-wasi, --probe, 127.0.0.1:8081]
@@ -502,11 +503,12 @@ removed by its owner: the API of a controller keeping the desired state of its a
 |---|---|
 | `PUT /api/components/<sha256>` | keeps the body, a component of 128MiB at most, under its digest (400 when the body has another): `{"sha256": .., "bytes": ..}` |
 | `PUT /api/files/<sha256>` | unpacks the body, a tar of an app's files (1GiB at most), under its digest, as the component's: `{"sha256": .., "bytes": ..}`; 400 naming what of the tar is refused |
-| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "wicket", "budget", "capabilities", "keyvalue_stores", "apps": [..]}`; `capabilities` and `keyvalue_stores` name what a sandbox may hold; `wicket` which wicket this is: `id`, made at its first start and kept in the console directory (`wicket-id`), `node`, its flume node (`wicket:<client-id>`, null without `--flume`), `build`; `budget` `max_instances` (`--max-instances`) and `instances`, the slots the routes' pools hold for good. An app needing more is refused 422 with `"no_room": true` |
+| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "wicket", "budget", "capabilities", "keyvalue_stores", "apps": [..]}`; `capabilities` and `keyvalue_stores` name what a sandbox may hold; `wicket` which wicket this is: `id`, made at its first start and kept in the console directory (`wicket-id`), `node`, its flume node (`wicket:<client-id>`, null without `--flume`), `build`; `budget` `max_instances` (`--max-instances`) and `instances`, the slots the routes' pools hold for good. An app needing more is refused 422 with `"no_room": true`. Told to stop with an evacuation bound, `"leaving": {"since", "until", "evacuated": [<owner>, ..]}` too (both listings; see [Shutdown](#shutdown-drain)) |
 | `PUT /api/apps/<name>` | serves the app of the body (JSON, below) |
 | `DELETE /api/apps/<name>?owner=<owner>` | removes the app of `owner` |
 | `GET /api/keyvalue/<store>/<namespace>` | the routes mapping the namespace, one being drained included (`"a route being drained"`): `{"store", "namespace", "mapped_by": [..]}`; 404 for an unknown store. What a controller asks every wicket before it deletes a shared store's namespace through one |
 | `DELETE /api/keyvalue/<store>/<namespace>` | deletes the namespace's keys (its usage too): `{"store", "namespace", "keys": <deleted>}`. Refused (409) while a route maps it, one being drained included; 404 for an unknown store. The namespace may hold `/` (percent-encoded or not) |
+| `PUT /api/evacuated/<owner>` | a wicket leaving: `owner` moved what of its apps it could, those left staying until the drain, no longer waited for: the `leaving` of the listing; 409 unless leaving |
 
 ```json
 {
@@ -550,10 +552,13 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
 - a PUT is one reload, as a deploy: every host of the app or none, kept only when the routes
   load; the same app again changes nothing, and an app keeps its `deployed` time while its
   component and sandbox stay. An app listed by `GET /api/apps` is a body its PUT takes (less
-  `name`, `deployed` and `alive`, and the env's values); a PUT is 1MiB at most
+  `name`, `deployed`, `alive` and `advertised`, and the env's values); a PUT is 1MiB at most
 - `alive` in a listing: its instances alive, lowest first, a warm one's, a spare one's and a
   request's own while it runs, `{"index": 0, "since": 1793000000}`: the [index](#live-access-log) and its start in seconds
   since the epoch, a replacement's its own
+- `advertised` in a listing: whether the server of every tunnel stream took the app's routes as
+  they are, sending them connections (true in local mode): a controller moving an app here
+  removes it from the wicket it leaves once they are
 - an app's routes share a handler, and never with another app (its target names it,
   `…/counter.wasm?app=counter&…`): its pool, its `instances` cap and its guests' output stay
   its own. Its target names none of `warm`, `instances`, `keep-ms` and `concurrency`: a PUT changing them is
@@ -885,7 +890,7 @@ credentials: `200 ready` while the wicket serves, else `503 not ready: <why>`:
 - while the routes start (`starting the routes`): it listens before they do
 - with `--server`, until every node of the membership has a stream up that took the current
   routes (`no stream up that took the routes of generation N to <node>`), a reload's as well;
-  from the drain on (`draining`)
+  from the drain on (`draining`), not during an [evacuation](#shutdown-drain) before it
 - while a route has no instance ready (`no instance ready for <host>`; a wasm route always has
   one, a Firecracker wicket's VMs may not)
 - without `--server`, ready once the routes started
@@ -898,8 +903,24 @@ up --wait`, a script), the next one stops once the one before is ready again.
 
 ## Shutdown (drain)
 
-On SIGTERM / SIGINT the wicket drains as the Java client does (see "Client shutdown
-(drain)" in the root README for what the server does meanwhile):
+With `--evacuation-grace SECONDS` (default 0: none) a SIGTERM / SIGINT first evacuates the
+apps of the console's API, as Diego evacuates a cell:
+
+- the wicket serves on as before -- its streams up, advertising its routes, `--listen`, the
+  console's edits, ready to its probe -- and lists itself leaving (`"leaving"`, its revision
+  moved: a controller's long poll answers at once)
+- the controllers start each app elsewhere, then remove it from this wicket
+  (`sluice-wicket-cf-api` moves each instance to a wicket with room); an owner that moved what
+  it could says so (`PUT /api/evacuated/<owner>`), what is left of its apps staying until the
+  drain
+- once no app of the API is left but those of such owners, or the bound passed (`evacuation
+  grace 60s expired with N app(s) left: ...`), it drains as below; without `--server` it ends.
+  A second signal ends the evacuation at once, a third the drain
+- the routes of the config file, the flags and the page stay as they are: nothing moves them
+- its `routes.yaml` keeps what is left: started again, it serves no app that went elsewhere
+
+On SIGTERM / SIGINT (once evacuated) the wicket drains as the Java client does (see "Client
+shutdown (drain)" in the root README for what the server does meanwhile):
 
 - every node stream withdraws the routes (`Advertise.withdraw`, the routes repeated);
   no stream reconnects from then on
@@ -909,18 +930,20 @@ On SIGTERM / SIGINT the wicket drains as the Java client does (see "Client shutd
 - `--drain-grace SECONDS` (default 20) bounds the wait: the connections still open are
   then closed (`drain grace 20s expired; closing N open connection(s)`). `0` turns the
   drain off: a signal ends the process at once
-- a second SIGTERM / SIGINT ends the drain at once
-- the [readiness probe](#readiness-probe) answers 503 from the first signal on
+- the next SIGTERM / SIGINT ends the drain at once
+- the [readiness probe](#readiness-probe) answers 503 from the drain on: the first signal's,
+  without an evacuation
 - a server predating the drain acknowledges the withdrawal without `withdrawn` and keeps
   routing to the wicket: the wicket closes that stream at once
 
-Where nothing drains (`--drain-grace 0`, or no `--server`) the process exits with 0 at once:
-its handler ends it, as the init (pid 1) of a container too, which ignores a signal it has no
-handler for.
+Where nothing drains (`--drain-grace 0`, or no `--server`) the process exits with 0 at once
+(once evacuated): its handler ends it, as the init (pid 1) of a container too, which ignores a
+signal it has no handler for.
 
 `docker compose stop` (and `up -d` replacing a container) sends SIGKILL 10s after
-SIGTERM: set `stop_grace_period` above `--drain-grace`, e.g. `30s` for the default. On
-Kubernetes, `terminationGracePeriodSeconds` (30s by default) bounds it the same way.
+SIGTERM: set `stop_grace_period` above `--evacuation-grace` and `--drain-grace` together, e.g.
+`30s` for the defaults, `90s` with an evacuation of 60s. On Kubernetes,
+`terminationGracePeriodSeconds` (30s by default) bounds it the same way.
 
 ## Known limitations (PoC scope)
 

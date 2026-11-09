@@ -407,8 +407,8 @@ impl<T: Table> NodeTask<T> {
         let offered = routes.offered();
         outbound.control(advertise(offered.clone(), false, &self.shared.build));
         let advertised = Advertised {
+            unacked: VecDeque::from([(routes.generation(), offered.clone())]),
             upstreams: offered,
-            unacked: VecDeque::from([routes.generation()]),
             acks,
             session: self.session.clone(),
         };
@@ -657,11 +657,11 @@ impl<T: Table> NodeTask<T> {
 }
 
 /// The routes a stream advertised, and the generations its advertises carried
-/// that the server has not acknowledged yet.
+/// that the server has not acknowledged yet, with their routes.
 struct Advertised {
     upstreams: Vec<Upstream>,
     /// Oldest first: acknowledgements come in the order of the advertises.
-    unacked: VecDeque<u64>,
+    unacked: VecDeque<(u64, Vec<Upstream>)>,
     acks: StreamAcks,
     /// The stream's session, told what the server took ([`Session::took`]) until the stream ends.
     session: Arc<Session>,
@@ -675,27 +675,28 @@ impl Advertised {
     fn update(&mut self, routes: &impl Table) -> bool {
         let offered = routes.offered();
         if offered != self.upstreams {
+            self.unacked
+                .push_back((routes.generation(), offered.clone()));
             self.upstreams = offered;
-            self.unacked.push_back(routes.generation());
             return true;
         }
         match self.unacked.back_mut() {
-            Some(pending) => *pending = routes.generation(),
-            None => self.took(routes.generation()),
+            Some((pending, _)) => *pending = routes.generation(),
+            None => self.took(routes.generation(), &self.upstreams),
         }
         false
     }
 
     /// The server acknowledged the oldest advertise.
     fn acked(&mut self) {
-        if let Some(generation) = self.unacked.pop_front() {
-            self.took(generation);
+        if let Some((generation, upstreams)) = self.unacked.pop_front() {
+            self.took(generation, &upstreams);
         }
     }
 
-    /// The server took the routes of `generation` on the stream.
-    fn took(&self, generation: u64) {
-        self.acks.acked(generation);
+    /// The server took the routes of `generation` on the stream, `upstreams` as advertised.
+    fn took(&self, generation: u64, upstreams: &[Upstream]) {
+        self.acks.acked(generation, upstreams);
         let mut took = self.session.took.lock().unwrap();
         *took = Some(took.map_or(generation, |took| took.max(generation)));
     }
@@ -959,7 +960,7 @@ mod tests {
     /// Each acknowledgement tells which generation the server took: the one
     /// of its advertise, or a later one reloaded to the same routes while it
     /// was pending; a reload to the same routes with none pending counts at
-    /// once.
+    /// once. The routes of an advertise acknowledged are taken.
     #[test]
     fn an_advertise_acknowledges_the_generations_carrying_its_routes() {
         use futures_util::FutureExt as _;
@@ -971,10 +972,11 @@ mod tests {
         };
         let mut advertised = Advertised {
             upstreams: vec![upstream("a")],
-            unacked: VecDeque::from([1]),
+            unacked: VecDeque::from([(1, vec![upstream("a")])]),
             acks: routes.stream(),
             session: Arc::new(Session::new("grpc://node".into(), String::new())),
         };
+        assert!(!routes.taken(&upstream("a")), "nothing acknowledged");
         let table = |generation, hosts: &[&str]| Fixed {
             generation,
             advertised: hosts.iter().map(|host| upstream(host)).collect(),
@@ -984,14 +986,18 @@ mod tests {
         assert!(!acknowledged(1));
         advertised.acked();
         assert!(acknowledged(2), "the pending advertise carried 2");
+        assert!(routes.taken(&upstream("a")));
         assert!(!advertised.update(&table(3, &["a"])));
         assert!(acknowledged(3), "none pending: at once");
         assert!(advertised.update(&table(4, &["a", "b"])), "new routes");
         assert!(!acknowledged(4));
+        assert!(!routes.taken(&upstream("b")), "pending");
         advertised.acked();
         assert!(acknowledged(4));
+        assert!(routes.taken(&upstream("b")));
         drop(advertised);
         assert!(acknowledged(99), "no live stream holds anything back");
+        assert!(routes.taken(&upstream("c")), "no live stream to take it");
     }
 
     /// Without the window the server fails the stream (FAILED_PRECONDITION);

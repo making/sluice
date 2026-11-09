@@ -308,7 +308,8 @@ pub fn process(base: &str, app: &App) -> Value {
 /// What `cf app` lists, as the CLI reads it: it counts the entries and, at a start, waits for an
 /// entry `RUNNING` or for none, failing once all are `CRASHED`.
 ///
-/// Each index is on a wicket (`crate::placement`), whose name an entry has as its `host`. `DOWN`
+/// Each index is on a wicket (`crate::placement`), whose name an entry has as its `host`: one
+/// moving to another, the one it is on until the other serves it. `DOWN`
 /// for a stopped app and, of a wicket's indices too, `CRASHED` with its refusal as `details` and
 /// `STARTING` until it serves its share (`listed`, by wicket, as each answers now). Serving it, an
 /// entry `RUNNING` per instance alive, by the index `cf logs` names, up since its own start,
@@ -351,6 +352,9 @@ pub fn stats(state: &State, app: &App, owner: &str, listed: &BTreeMap<String, Li
                     Some(Outcome::Unreachable) | None => all("STARTING", None),
                 });
             }
+            // an index moving: the wicket it is on's, until the other serves it
+            let placement = state.placement(app);
+            entries.retain(|entry| placement.get(entry.index as usize) == Some(&entry.host));
             entries.sort_by_key(|entry| entry.index);
             entries
         }
@@ -1269,6 +1273,22 @@ mod tests {
             hosted(&state, &both),
             [at(1, "RUNNING", "v"), at(2, "RUNNING", "w")]
         );
+        // index 0 moving to v, which lists it as its share's first: w's, until placed on v
+        state.app_mut(&guid).unwrap().moving.insert(0, "v".into());
+        let moving: BTreeMap<String, ListedApp> = [
+            ("w".to_string(), listed(json!([0, 1]), Value::Null)),
+            ("v".to_string(), listed(json!([0, 1]), Value::Null)),
+        ]
+        .into();
+        assert_eq!(
+            hosted(&state, &moving),
+            [
+                at(0, "RUNNING", "w"),
+                at(1, "RUNNING", "v"),
+                at(2, "RUNNING", "w")
+            ]
+        );
+        state.app_mut(&guid).unwrap().moving.clear();
         // stopped: down, each where it is placed
         state.app_mut(&guid).unwrap().started = false;
         assert_eq!(
