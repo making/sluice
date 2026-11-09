@@ -13,7 +13,8 @@ next, and none keeps serving the old droplet while the others take the new one.
 
 - A rolling deployment goes a wicket's share at a time, or `options.max_in_flight` instances (`cf push
   --strategy rolling --max-in-flight N`): the next once the put returned (a Firecracker wicket's when its VMs
-  started, a wasm wicket's when its route loaded). `ACTIVE` / `DEPLOYING` meanwhile, `FINALIZED` / `DEPLOYED`
+  started, a wasm wicket's when its route loaded) and, with a readiness check, once the new instances are
+  ready (259: CF takes old instances down once the new are "healthy and routable"). `ACTIVE` / `DEPLOYING` meanwhile, `FINALIZED` / `DEPLOYED`
   at the end, which `cf push --strategy rolling` waits for
 - A share refused: the deployment stops, the shares not reached on the old snapshot; decide what it shows
   (CC: `ACTIVE`, the new instances crashing, until canceled)
