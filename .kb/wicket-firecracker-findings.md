@@ -345,9 +345,33 @@ What the [readiness check](../sluice-wicket-runtime-firecracker/README.md#readin
   pool's one VM replaced in a restore's time) may leave the advertisement and come back, or not, as
   the stream looks at it: the tests wait for an edit's advertise by what it shows
   (`ServerTunnel::advertise_where`), not as the next one
-- **No liveness check on them** (a VM failing a probe restarted, `health-check-type: http`): CF's liveness
-  check is its startup check as well, so it changes how a VM starts (booted, a template snapshotted, once
-  its endpoint answers), beyond what a probe's outcome changes
+- **The liveness check is another** ([Liveness](#liveness)): its probes are the same, their outcome a
+  restart, never the rotation
+
+## Liveness
+
+What the [liveness check](../sluice-wicket-runtime-firecracker/README.md#liveness) is made of, and why:
+
+- **The start's check too**, as CF's: `liveness=http` has a booted VM up, and a template snapshotted, once
+  its endpoint answered 200 within `boot-ms` (a probe every 100ms, the process exiting first failing it
+  at once), so a clone starts from a process that passed it and is not probed at its restore
+- **One failure restarts**, as Diego's liveness check (its `healthcheck` exits on the first failed
+  probe, the container crashed): a VM failing a probe is gone down as one whose process ended
+  (`VmPool::went_down`), started again after the restart's wait. The readiness check is the lever for
+  a process slow for a while
+- **Probed as the readiness check is** (`health::probe`, through the guest's relay), every
+  `liveness-interval-ms` from the start on, in a task of the VM's own beside its readiness probe: the
+  first an interval after the start check passed. A check changed in place has the running VMs probed
+  an interval of it later; it never makes them start again
+- **Booted VMs and a pool's alone**: a clone of a connection's own (per connection, reused) lives for
+  connections already open, its template's start check being what it passed; `liveness-interval-ms` is
+  refused there
+- **`port` is the watch's**: a VM is up once its guest accepts on the port, down once its process ended
+  or a connection failed and the port refuses (`watch`). A periodic `port` probe adds nothing to it:
+  the guest's kernel accepts on a listening socket whatever the process does, and a probe timing out on
+  a guest busy for a moment (`cpu=N`, a pause of a JVM's) would restart a VM serving. So no `port`
+  timeout or interval, and no `process`: a route relays its connections to a port, a VM up once it
+  accepts there
 
 ## Jail mode
 

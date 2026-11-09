@@ -2703,7 +2703,53 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     assert_eq!(listing(&console)["apps"][0]["sandbox"]["boot-ms"], 20_000);
     assert_eq!(get(&listen, "fc.localhost", "/", None).0, 200);
     cf.ok(&["unset-env", "fc", "SAMPLE_WAIT_MS"]);
+    // cf set-health-check, taken at the restart: an http one the route's liveness check, its VMs
+    // up once the endpoint answered 200 and probed from then on
+    let set = ["set-health-check", "fc", "http", "--endpoint", "/ready"];
+    cf.ok(&[&set[..], &["--invocation-timeout", "2"]].concat());
     cf.ok(&["restart", "fc"]);
+    let shown = cf.ok(&["get-health-check", "fc"]);
+    let web = shown.lines().find(|line| line.starts_with("web"));
+    let web: Vec<&str> = web.unwrap_or_default().split_whitespace().collect();
+    assert_eq!(web, ["web", "http", "/ready", "2"], "{shown}");
+    let apps = listing(&console)["apps"].as_array().unwrap().clone();
+    let listed = apps
+        .iter()
+        .find(|app| app["hosts"] == json!(["fc.localhost"]));
+    let sandbox = &listed.expect("the app listed")["sandbox"];
+    assert_eq!(
+        (
+            &sandbox["liveness"],
+            &sandbox["liveness-endpoint"],
+            &sandbox["liveness-timeout-ms"],
+            &sandbox["boot-ms"]
+        ),
+        (
+            &json!("http"),
+            &json!("/ready"),
+            &json!(2000),
+            &json!(20_000)
+        ),
+        "{sandbox}"
+    );
+    assert_eq!(get(&listen, "fc.localhost", "/", None).0, 200);
+    // port again at the next start, the timeout kept
+    cf.ok(&["set-health-check", "fc", "port"]);
+    let web = format!(
+        "/v3/apps/{}/processes/web",
+        cf.ok(&["app", "fc", "--guid"]).trim()
+    );
+    let web: Value = serde_json::from_str(&cf.ok(&["curl", &web])).unwrap();
+    let check = &web["health_check"];
+    assert_eq!(
+        (
+            &check["type"],
+            &check["data"]["timeout"],
+            &check["data"]["endpoint"]
+        ),
+        (&json!("port"), &json!(20), &Value::Null),
+        "{web}"
+    );
 
     // a readiness check, the manifest's alone (the CLI has no command setting it): kept, shown,
     // the route's options; the instance running, not routable until its endpoint answers 200,

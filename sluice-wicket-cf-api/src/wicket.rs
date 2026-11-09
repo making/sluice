@@ -159,6 +159,16 @@ pub struct VmSandbox {
     pub readiness_timeout_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub readiness_interval_ms: Option<u64>,
+    /// Its liveness check, `http` (none: `port`, a VM up once its port accepts), and its
+    /// endpoint, timeout and interval.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liveness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liveness_endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liveness_timeout_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub liveness_interval_ms: Option<u64>,
     /// The destinations its VMs may connect to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<String>,

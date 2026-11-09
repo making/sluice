@@ -14,9 +14,9 @@ use serde::de::IgnoredAny;
 use crate::placement::MAX_INSTANCES;
 use crate::services::{self, Unbound};
 use crate::store::{
-    App, BUDGET_ANNOTATION, CONCURRENCY_ANNOTATION, INSTANCES_ANNOTATION, KEEP_ANNOTATION,
-    LIFETIME_ANNOTATION, Lifecycle, Lifetime, MODE_ANNOTATION, ReadinessCheck, STACK, State,
-    USES_ANNOTATION, WARM_ANNOTATION, now,
+    App, BUDGET_ANNOTATION, CONCURRENCY_ANNOTATION, HealthCheck, INSTANCES_ANNOTATION,
+    KEEP_ANNOTATION, LIFETIME_ANNOTATION, Lifecycle, Lifetime, MODE_ANNOTATION, ReadinessCheck,
+    STACK, State, USES_ANNOTATION, WARM_ANNOTATION, now,
 };
 use crate::wicket::Runtime;
 
@@ -45,6 +45,7 @@ pub struct AppManifest {
     pub health_check_type: Option<String>,
     pub health_check_http_endpoint: Option<String>,
     pub health_check_invocation_timeout: Option<u64>,
+    pub health_check_interval: Option<u64>,
     pub timeout: Option<u64>,
     #[serde(flatten)]
     pub readiness: ReadinessManifest,
@@ -96,6 +97,7 @@ pub struct ProcessManifest {
     pub health_check_type: Option<String>,
     pub health_check_http_endpoint: Option<String>,
     pub health_check_invocation_timeout: Option<u64>,
+    pub health_check_interval: Option<u64>,
     pub timeout: Option<u64>,
     #[serde(flatten)]
     pub readiness: ReadinessManifest,
@@ -240,6 +242,7 @@ fn apply_app(
         spec.health_check_type.as_deref(),
         spec.health_check_http_endpoint.as_deref(),
         spec.health_check_invocation_timeout,
+        spec.health_check_interval,
         spec.timeout,
     )]
     .into_iter()
@@ -252,10 +255,12 @@ fn apply_app(
             web.health_check_type.as_deref(),
             web.health_check_http_endpoint.as_deref(),
             web.health_check_invocation_timeout,
+            web.health_check_interval,
             web.timeout,
         )
     }));
-    for (instances, memory, disk, command, check, endpoint, invocation, timeout) in fields {
+    for (instances, memory, disk, command, check, endpoint, invocation, interval, timeout) in fields
+    {
         if let Some(instances) = instances {
             check_instances(instances).map_err(|e| format!("{name}: {e}"))?;
             process.instances = instances;
@@ -271,12 +276,19 @@ fn apply_app(
         }
         if let Some(check) = check {
             process.health_check.kind = check.to_string();
+            // what it takes alone, unless set again below
+            if check != "http" {
+                process.health_check.endpoint = None;
+            }
         }
         if let Some(endpoint) = endpoint {
             process.health_check.endpoint = Some(endpoint.to_string());
         }
         if let Some(invocation) = invocation {
             process.health_check.invocation_timeout = Some(invocation);
+        }
+        if let Some(interval) = interval {
+            process.health_check.interval = Some(interval);
         }
         if let Some(timeout) = timeout {
             process.health_check.timeout = Some(timeout);
@@ -292,6 +304,8 @@ fn apply_app(
     let lifetime = check_annotations(&app.annotations, app.process.instances, runtime)
         .map_err(|e| format!("{name}: {e}"))?;
     check_readiness(&app.process.readiness_health_check, &lifetime, runtime)
+        .map_err(|e| format!("{name}: {e}"))?;
+    check_liveness(&app.process.health_check, &lifetime, runtime)
         .map_err(|e| format!("{name}: {e}"))?;
     take_annotations(app);
     apply_routes(state, &guid, spec)?;
@@ -649,36 +663,12 @@ pub fn check_readiness(
 ) -> Result<(), String> {
     const TYPE: &str = "readiness-health-check-type";
     let kind = check.kind.as_str();
-    if !matches!(kind, "process" | "port" | "http") {
-        return Err(format!(
-            "{TYPE}: '{kind}' is no type: port, process or http"
-        ));
-    }
-    if let Some(endpoint) = &check.endpoint
-        && (!endpoint.starts_with('/')
-            || endpoint.contains('#')
-            || !endpoint.bytes().all(|byte| byte.is_ascii_graphic()))
-    {
-        return Err(format!(
-            "readiness-health-check-http-endpoint: '{endpoint}' is no path: from /, of visible \
-             ASCII and no fragment"
-        ));
-    }
-    // the wicket's milliseconds: 32 bits
-    let most = u64::from(u32::MAX) / 1000;
-    for (key, seconds) in [
-        (
-            "readiness-health-check-invocation-timeout",
-            check.invocation_timeout,
-        ),
-        ("readiness-health-check-interval", check.interval),
-    ] {
-        if let Some(seconds) = seconds.filter(|seconds| !(1..=most).contains(seconds)) {
-            return Err(format!(
-                "{key}: {seconds} is no number of seconds from 1 to {most}"
-            ));
-        }
-    }
+    let probe = (
+        check.endpoint.as_deref(),
+        check.invocation_timeout,
+        check.interval,
+    );
+    check_probe("readiness-health-check", kind, probe)?;
     if kind == "process" {
         return Ok(());
     }
@@ -699,6 +689,88 @@ pub fn check_readiness(
         )),
         _ => Ok(()),
     }
+}
+
+/// Whether the (liveness) health check `check` of an app annotated `lifetime` holds on a wicket of
+/// `runtime` (None until it answers), as [`check_readiness`] asks of its readiness check: on a
+/// Firecracker wicket `port` and `process` are the VM's port accepting (a route relays its requests
+/// to it), the wicket's own, `http` its endpoint answered 200, at the start and every interval of a
+/// VM it keeps (booted, a pool's) after; a VM per connection is not probed past its start, so takes
+/// no interval. A component's instance takes requests as they come: `http` would be a request of
+/// its own to a unit kept warm, so `port` or `process` there, which ask nothing.
+pub fn check_liveness(
+    check: &HealthCheck,
+    lifetime: &Lifetime,
+    runtime: Option<Runtime>,
+) -> Result<(), String> {
+    const TYPE: &str = "health-check-type";
+    let kind = check.kind.as_str();
+    let probe = (
+        check.endpoint.as_deref(),
+        check.invocation_timeout,
+        check.interval,
+    );
+    check_probe("health-check", kind, probe)?;
+    if check.endpoint.is_some() && kind != "http" {
+        return Err(format!(
+            "health-check-http-endpoint: the type is {kind}: http alone asks an endpoint"
+        ));
+    }
+    if kind != "http" {
+        return Ok(());
+    }
+    if runtime == Some(Runtime::Wasm) {
+        return Err(format!(
+            "{TYPE} http: this wicket runs components, whose instances take requests as they \
+             come: port or process"
+        ));
+    }
+    match lifetime.mode.as_deref() {
+        Some(mode @ ("per-connection" | "reuse")) if check.interval.is_some() => Err(format!(
+            "health-check-interval: mode {mode} gives a connection a VM of its own, not probed \
+             past its start: annotate {MODE_ANNOTATION} boot or pool"
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// What a check named `prefix` (`health-check`, `readiness-health-check`) of type `kind` takes:
+/// a type, an endpoint of a request line and seconds a wicket's milliseconds hold, of `probe`
+/// (its endpoint, invocation timeout and interval).
+fn check_probe(
+    prefix: &str,
+    kind: &str,
+    probe: (Option<&str>, Option<u64>, Option<u64>),
+) -> Result<(), String> {
+    let (endpoint, invocation_timeout, interval) = probe;
+    if !matches!(kind, "process" | "port" | "http") {
+        return Err(format!(
+            "{prefix}-type: '{kind}' is no type: port, process or http"
+        ));
+    }
+    if let Some(endpoint) = endpoint
+        && (!endpoint.starts_with('/')
+            || endpoint.contains('#')
+            || !endpoint.bytes().all(|byte| byte.is_ascii_graphic()))
+    {
+        return Err(format!(
+            "{prefix}-http-endpoint: '{endpoint}' is no path: from /, of visible ASCII and no \
+             fragment"
+        ));
+    }
+    // the wicket's milliseconds: 32 bits
+    let most = u64::from(u32::MAX) / 1000;
+    for (key, seconds) in [
+        ("invocation-timeout", invocation_timeout),
+        ("interval", interval),
+    ] {
+        if let Some(seconds) = seconds.filter(|seconds| !(1..=most).contains(seconds)) {
+            return Err(format!(
+                "{prefix}-{key}: {seconds} is no number of seconds from 1 to {most}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Whether `lifetime` holds at `instances`: at 0 nothing is kept.
@@ -851,7 +923,7 @@ mod tests {
     fn applies_the_process_the_routes_the_services_and_the_metadata() {
         let mut state = state();
         let manifest = parse(
-            "applications:\n- name: counter\n  path: /tmp/x\n  command: counter.wasm\n  instances: 2\n  memory: 64M\n  default-route: true\n  routes:\n  - route: counter.localhost\n  - route: count.example.com\n  readiness-health-check-type: http\n  readiness-health-check-interval: 5\n  processes:\n  - type: web\n    readiness-health-check-http-endpoint: /ready?after=3\n    readiness-health-check-invocation-timeout: 2\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/budget-ms: 5000\n  env:\n    GREETING: 'a: \"b\"'\n    WORKERS: 4\n  unknown-key: ignored\n",
+            "applications:\n- name: counter\n  path: /tmp/x\n  command: counter.wasm\n  instances: 2\n  memory: 64M\n  default-route: true\n  routes:\n  - route: counter.localhost\n  - route: count.example.com\n  readiness-health-check-type: http\n  readiness-health-check-interval: 5\n  health-check-type: http\n  health-check-interval: 7\n  timeout: 90\n  processes:\n  - type: web\n    readiness-health-check-http-endpoint: /ready?after=3\n    readiness-health-check-invocation-timeout: 2\n    health-check-http-endpoint: /live\n    health-check-invocation-timeout: 3\n  metadata:\n    annotations:\n      wicket.sluice.ik.am/budget-ms: 5000\n  env:\n    GREETING: 'a: \"b\"'\n    WORKERS: 4\n  unknown-key: ignored\n",
         )
         .unwrap();
         let guids = apply(&mut state, &manifest, None).unwrap();
@@ -872,6 +944,19 @@ mod tests {
         assert_eq!(
             crate::views::process("http://api", app)["readiness_health_check"],
             json!({"type": "http", "data": {"endpoint": "/ready?after=3", "invocation_timeout": 2, "interval": 5}})
+        );
+        // and its health check, as `cf get-health-check` reads it
+        let liveness = HealthCheck {
+            kind: "http".into(),
+            timeout: Some(90),
+            invocation_timeout: Some(3),
+            interval: Some(7),
+            endpoint: Some("/live".into()),
+        };
+        assert_eq!(app.process.health_check, liveness);
+        assert_eq!(
+            crate::views::process("http://api", app)["health_check"],
+            json!({"type": "http", "data": {"endpoint": "/live", "timeout": 90, "invocation_timeout": 3, "interval": 7}})
         );
         assert_eq!(app.annotations[BUDGET_ANNOTATION], "5000");
         let env = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
@@ -1008,6 +1093,7 @@ mod tests {
             .unwrap()
             .process
             .readiness_health_check = Default::default();
+        again.app_mut(&guids[0]).unwrap().process.health_check = Default::default();
         apply(&mut again, &written, None).unwrap();
         assert_eq!(
             again.app(&guids[0]).unwrap().env,
@@ -1018,6 +1104,11 @@ mod tests {
             again.app(&guids[0]).unwrap().process.readiness_health_check,
             readiness,
             "and the same readiness check"
+        );
+        assert_eq!(
+            again.app(&guids[0]).unwrap().process.health_check,
+            liveness,
+            "and the same health check"
         );
         let made = |state: &State| -> Vec<(String, String, Option<String>)> {
             state
@@ -1367,6 +1458,7 @@ mod tests {
             apply(&mut state, &parse(&text).unwrap(), runtime).map(|_| ())
         };
         let typed = |kind: &str| format!("  readiness-health-check-type: {kind}\n");
+        let alive = |kind: &str| format!("  health-check-type: {kind}\n");
         let mode = |mode: &str| format!("      wicket.sluice.ik.am/mode: {mode}\n");
         let warm = "      wicket.sluice.ik.am/warm: 0\n";
         for (keys, annotated, runtime, reason) in [
@@ -1406,6 +1498,28 @@ mod tests {
                 None,
                 "0 is no number of seconds",
             ),
+            // a health check: http on a Firecracker wicket alone, probed past its start where a
+            // VM serves many connections
+            (alive("http"), String::new(), Some(Wasm), "port or process"),
+            (
+                format!("{}  health-check-interval: 5\n", alive("http")),
+                mode("per-connection"),
+                Some(Firecracker),
+                "not probed past its start",
+            ),
+            (alive("tcp"), String::new(), None, "'tcp' is no type"),
+            (
+                "  health-check-http-endpoint: /live\n".into(),
+                String::new(),
+                None,
+                "the type is port: http alone",
+            ),
+            (
+                format!("{}  health-check-invocation-timeout: 0\n", alive("http")),
+                String::new(),
+                None,
+                "health-check-invocation-timeout: 0 is no number",
+            ),
         ] {
             let refused = readiness(&keys, &annotated, runtime).unwrap_err();
             assert!(refused.contains(reason), "{keys}{annotated}: {refused}");
@@ -1416,6 +1530,17 @@ mod tests {
             (typed("http"), mode("boot"), Some(Firecracker)),
             (typed("port"), String::new(), None),
             (typed("port"), mode("pool"), Some(Firecracker)),
+            (alive("http"), mode("per-connection"), Some(Firecracker)),
+            (
+                format!("{}  health-check-interval: 5\n", alive("process")),
+                String::new(),
+                Some(Wasm),
+            ),
+            (
+                format!("{}  health-check-interval: 5\n", alive("http")),
+                mode("boot"),
+                Some(Firecracker),
+            ),
         ] {
             let taken = readiness(&keys, &annotated, runtime);
             taken.unwrap_or_else(|e| panic!("{keys}{annotated}: {e}"));

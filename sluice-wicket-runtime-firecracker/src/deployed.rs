@@ -546,7 +546,8 @@ pub fn options(host: &str, pairs: &[(String, String)]) -> Result<Options, String
             return Err(format!("{key} given twice"));
         }
         let value = match key.as_str() {
-            "mode" | "egress" | "disk" | "readiness" | "readiness-endpoint" => value.clone(),
+            "mode" | "egress" | "disk" | "readiness" | "readiness-endpoint" | "liveness"
+            | "liveness-endpoint" => value.clone(),
             _ => value
                 .parse::<u32>()
                 .map_err(|_| format!("{key}={value} is not a number"))?
@@ -693,7 +694,9 @@ fn write(routes: &[Route], apps: &[App]) -> String {
         yaml.push_str(&format!("    deployed: {}\n", quote(&route.deployed)));
         for (key, value) in &route.options {
             let value = match key.as_str() {
-                "mode" | "readiness" | "readiness-endpoint" => quote(value),
+                "mode" | "readiness" | "readiness-endpoint" | "liveness" | "liveness-endpoint" => {
+                    quote(value)
+                }
                 "egress" => {
                     let rules: Vec<String> = value
                         .split(',')
@@ -774,7 +777,8 @@ mod tests {
             "a.local",
             &pairs(
                 "egress=db.internal:5432,10.0.0.0/24:6379&readiness-endpoint=/ready?after=3\
-                 &warm=02&mode=pool&instances=4&readiness=http",
+                 &liveness-endpoint=/live&warm=02&mode=pool&instances=4&liveness=http\
+                 &readiness=http",
             ),
         )
         .unwrap();
@@ -782,7 +786,7 @@ mod tests {
             kept,
             pairs(
                 "mode=pool&warm=2&instances=4&readiness=http&readiness-endpoint=/ready?after=3\
-                 &egress=db.internal:5432,10.0.0.0/24:6379"
+                 &liveness=http&liveness-endpoint=/live&egress=db.internal:5432,10.0.0.0/24:6379"
             ),
             "in the file's order, the numbers normalized"
         );
@@ -838,6 +842,23 @@ mod tests {
             (
                 "readiness=port&readiness-timeout-ms=0",
                 "readiness-timeout-ms must be at least 1",
+            ),
+            ("liveness=process", "a VM up once it accepts there"),
+            (
+                "liveness-endpoint=/a",
+                "liveness-endpoint needs liveness=http: port is the watch's",
+            ),
+            (
+                "liveness=port&liveness-timeout-ms=10",
+                "liveness-timeout-ms needs liveness=http",
+            ),
+            (
+                "liveness=http&liveness-endpoint=a",
+                "liveness-endpoint=a: a path from /",
+            ),
+            (
+                "liveness=http&liveness-interval-ms=10&mode=per-connection",
+                "liveness-interval-ms needs mode=boot, mode=pool",
             ),
         ] {
             let refused = options("a.local", &pairs(query));

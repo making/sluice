@@ -719,7 +719,9 @@ fn sandbox_view(spec: &RouteSpec) -> Map<String, Value> {
         let value = match key {
             "mode" => continue,
             "egress" => value.split(',').collect::<Vec<_>>().into(),
-            "disk" | "readiness" | "readiness-endpoint" => value.into(),
+            "disk" | "readiness" | "readiness-endpoint" | "liveness" | "liveness-endpoint" => {
+                value.into()
+            }
             _ => value.parse::<u64>().map_or(Value::Null, Value::from),
         };
         sandbox.insert(key.into(), value);

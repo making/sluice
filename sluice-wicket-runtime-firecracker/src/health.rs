@@ -1,5 +1,6 @@
-//! A route's readiness check (`readiness`, as a CF app's readiness health check): what tells
-//! the VMs a route keeps ready to take connections, and the probe of one of them.
+//! A route's health checks, as a CF app's: its readiness check (`readiness`), what tells the VMs
+//! it keeps ready to take connections, and its liveness check (`liveness`), what tells a VM up
+//! from its start on, one failing it gone down; and the probe of a VM.
 //!
 //! The wicket probes a VM through its guest's relay, as a connection reaches the process: a
 //! vsock stream to the route's port, which `/init` relays to the process. The probe so takes
@@ -14,10 +15,12 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::vm::Vm;
 use crate::wire;
 
-/// Default of `readiness-timeout-ms`: how long a probe may take, as CF's invocation timeout.
+/// Default of `readiness-timeout-ms` and `liveness-timeout-ms`: how long a probe may take, as
+/// CF's invocation timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// Default of `readiness-interval-ms`: between the probes of a VM ready, as CF's interval.
+/// Default of `readiness-interval-ms` (between the probes of a VM ready) and of
+/// `liveness-interval-ms`, as CF's interval.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Between the probes of a VM not ready, from its start or since a probe failed (its interval,
@@ -27,7 +30,7 @@ pub const UNTIL_READY: Duration = Duration::from_millis(500);
 /// The bytes of an answer a probe reads at most: its status line.
 const STATUS_LINE: usize = 80;
 
-/// The default endpoint of `readiness=http`.
+/// The default endpoint of `readiness=http` and `liveness=http`.
 pub const DEFAULT_ENDPOINT: &str = "/";
 
 /// What tells a route's VMs ready, and how often it is asked.
@@ -62,7 +65,61 @@ impl Readiness {
     }
 }
 
-/// How a VM is found ready.
+/// What tells a route's VM alive, as a CF app's (liveness) health check: its start's check, and
+/// the probes after it of a VM the route keeps (booted, a pool's), a VM failing one gone down.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Liveness {
+    /// `http`'s endpoint, a `GET` of it answered 200. None: `port`, the guest accepting on the
+    /// route's port: up once it does, down once its process ended or a connection failed and it
+    /// refuses, as the VM's watch finds it, with no probe of its own.
+    pub endpoint: Option<Arc<str>>,
+    /// How long a probe may take.
+    pub timeout: Duration,
+    /// Between the probes of a VM up.
+    pub interval: Duration,
+}
+
+impl Default for Liveness {
+    fn default() -> Self {
+        Liveness {
+            endpoint: None,
+            timeout: DEFAULT_TIMEOUT,
+            interval: DEFAULT_INTERVAL,
+        }
+    }
+}
+
+impl Liveness {
+    /// The endpoint `name` of `liveness=<name>` asks: the default one of `http`, none of `port`.
+    pub fn named(name: &str) -> Result<Option<Arc<str>>, String> {
+        match name {
+            "port" => Ok(None),
+            "http" => Ok(Some(DEFAULT_ENDPOINT.into())),
+            "process" => Err(
+                "liveness=process: a route relays its connections to the guest's port, a VM up \
+                 once it accepts there: port or http"
+                    .into(),
+            ),
+            _ => Err(format!(
+                "liveness={name}: port or http, as a CF app's health check"
+            )),
+        }
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self.endpoint {
+            None => "port",
+            Some(_) => "http",
+        }
+    }
+
+    /// What its probe asks: None for `port`, which the watch sees.
+    pub fn check(&self) -> Option<Check> {
+        self.endpoint.clone().map(Check::Http)
+    }
+}
+
+/// How a VM is found ready, or alive.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Check {
     /// Up: its guest accepting on the route's port, nothing more asked.
@@ -95,24 +152,29 @@ impl Check {
     }
 }
 
-/// The endpoint `value` of `readiness-endpoint`: a path (a query with it, no fragment) of what
-/// a request line takes, no space or control character.
-pub fn endpoint(value: &str) -> Result<Arc<str>, String> {
+/// The endpoint `value` of the option `key` (`readiness-endpoint`, `liveness-endpoint`): a path
+/// (a query with it, no fragment) of what a request line takes, no space or control character.
+pub fn endpoint(key: &str, value: &str) -> Result<Arc<str>, String> {
     let visible = value.bytes().all(|byte| byte.is_ascii_graphic());
     if !value.starts_with('/') || !visible || value.contains('#') {
         return Err(format!(
-            "readiness-endpoint={value}: a path from /, of visible ASCII and no fragment"
+            "{key}={value}: a path from /, of visible ASCII and no fragment"
         ));
     }
     Ok(value.into())
 }
 
-/// Probes the process behind the guest's `port` of `vm` as `readiness` asks, `host` the host
-/// an `http` request names: within `readiness.timeout`; why not, when it fails.
-pub async fn probe(vm: &Vm, port: u32, readiness: &Readiness, host: &str) -> Result<(), String> {
-    let within = readiness.timeout;
+/// Probes the process behind the guest's `port` of `vm` as `check` asks, `host` the host an
+/// `http` request names: within `within`; why not, when it fails.
+pub async fn probe(
+    vm: &Vm,
+    port: u32,
+    check: &Check,
+    within: Duration,
+    host: &str,
+) -> Result<(), String> {
     let late = || format!("no answer within {}ms", within.as_millis());
-    match &readiness.check {
+    match check {
         Check::Process => Ok(()),
         Check::Port => {
             let dialed = tokio::time::timeout(within, vm.dial(port)).await;
@@ -249,9 +311,27 @@ mod tests {
                 .unwrap_err()
                 .contains("process, port or http")
         );
+        let endpoint = |value| endpoint("readiness-endpoint", value);
         assert_eq!(&*endpoint("/ready?after=3").unwrap(), "/ready?after=3");
         for refused in ["ready", "/a b", "/a\r\nX: y", "/a#b", ""] {
             assert!(endpoint(refused).is_err(), "{refused:?}");
+        }
+        // liveness: port, the watch's, or http; process refused
+        assert_eq!(Liveness::named("port").unwrap(), None);
+        let alive = Liveness {
+            endpoint: Liveness::named("http").unwrap(),
+            ..Liveness::default()
+        };
+        assert_eq!(
+            (alive.name(), alive.check()),
+            ("http", Some(Check::Http(DEFAULT_ENDPOINT.into())))
+        );
+        for (refused, why) in [
+            ("process", "a VM up once it accepts"),
+            ("tcp", "port or http"),
+        ] {
+            let refused = Liveness::named(refused).unwrap_err();
+            assert!(refused.contains(why), "{refused}");
         }
         let http = Readiness {
             check: Check::Http("/".into()),

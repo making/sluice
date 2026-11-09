@@ -270,8 +270,10 @@ pub fn app(base: &str, app: &App) -> Value {
 pub fn process(base: &str, app: &App) -> Value {
     let process = &app.process;
     let check = &process.health_check;
-    let mut data =
-        json!({"timeout": check.timeout, "invocation_timeout": check.invocation_timeout});
+    let mut data = json!({
+        "timeout": check.timeout, "invocation_timeout": check.invocation_timeout,
+        "interval": check.interval,
+    });
     if check.kind == "http" {
         data["endpoint"] = json!(check.endpoint.clone().unwrap_or_else(|| "/".into()));
     }
@@ -731,6 +733,28 @@ pub fn manifest(state: &State, app: &App) -> String {
     if let Some(command) = &app.process.command {
         text.push_str(&format!("  command: {command}\n"));
     }
+    let liveness = &app.process.health_check;
+    if liveness.kind != "port" {
+        text.push_str(&format!("  health-check-type: {}\n", liveness.kind));
+    }
+    if let Some(endpoint) = &liveness.endpoint {
+        text.push_str(&format!(
+            "  health-check-http-endpoint: {}\n",
+            quoted(endpoint)
+        ));
+    }
+    for (key, seconds) in [
+        (
+            "health-check-invocation-timeout",
+            liveness.invocation_timeout,
+        ),
+        ("health-check-interval", liveness.interval),
+        ("timeout", liveness.timeout),
+    ] {
+        if let Some(seconds) = seconds {
+            text.push_str(&format!("  {key}: {seconds}\n"));
+        }
+    }
     let readiness = &app.process.readiness_health_check;
     if readiness.kind != "process" {
         text.push_str(&format!(
@@ -1039,6 +1063,7 @@ mod tests {
             budget_ms: None,
             lifetime: crate::store::Lifetime::default(),
             readiness: Default::default(),
+            liveness: Default::default(),
             wasi: Vec::new(),
             keyvalue: Default::default(),
             env: Default::default(),

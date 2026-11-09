@@ -58,6 +58,12 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
                                   readiness-timeout-ms=N a probe (1000),
                                   readiness-interval-ms=N between those of a VM ready
                                   (30000; not ready, 500 at most),
+                                  liveness=port|http (port: a VM up once its port
+                                  accepts, down once it refuses; http: up once
+                                  liveness-endpoint=<path> (/) answered 200 within boot-ms,
+                                  down once a probe fails), liveness-timeout-ms=N a probe
+                                  (1000), liveness-interval-ms=N (boot, pool) between
+                                  those of a VM up (30000),
                                   egress=<host>:<port>,... the destinations its guests may
                                   connect to through the wicket: names, addresses, ranges
                                   (10.0.0.0/24:5432, [2001:db8::/32]:443)
@@ -835,6 +841,10 @@ pub(crate) struct FileRoute {
     readiness_endpoint: Option<String>,
     readiness_timeout_ms: Option<u32>,
     readiness_interval_ms: Option<u32>,
+    liveness: Option<String>,
+    liveness_endpoint: Option<String>,
+    liveness_timeout_ms: Option<u32>,
+    liveness_interval_ms: Option<u32>,
     egress: Option<Vec<String>>,
     disk: Option<String>,
     disk_mib: Option<u32>,
@@ -842,7 +852,7 @@ pub(crate) struct FileRoute {
 
 impl FileRoute {
     /// The keys of [`FileRoute::options`], in their order.
-    pub(crate) const KEYS: [&'static str; 23] = [
+    pub(crate) const KEYS: [&'static str; 27] = [
         "mode",
         "vcpus",
         "memory-mib",
@@ -863,6 +873,10 @@ impl FileRoute {
         "readiness-endpoint",
         "readiness-timeout-ms",
         "readiness-interval-ms",
+        "liveness",
+        "liveness-endpoint",
+        "liveness-timeout-ms",
+        "liveness-interval-ms",
         "egress",
         "disk",
         "disk-mib",
@@ -888,17 +902,16 @@ impl FileRoute {
             ("per-client", self.per_client),
             ("idle-ms", self.idle_ms),
         ];
-        let readiness = [
+        let millis = |ms: Option<u32>| ms.map(|ms| ms.to_string());
+        let checks = [
             ("readiness", self.readiness.clone()),
             ("readiness-endpoint", self.readiness_endpoint.clone()),
-            (
-                "readiness-timeout-ms",
-                self.readiness_timeout_ms.map(|ms| ms.to_string()),
-            ),
-            (
-                "readiness-interval-ms",
-                self.readiness_interval_ms.map(|ms| ms.to_string()),
-            ),
+            ("readiness-timeout-ms", millis(self.readiness_timeout_ms)),
+            ("readiness-interval-ms", millis(self.readiness_interval_ms)),
+            ("liveness", self.liveness.clone()),
+            ("liveness-endpoint", self.liveness_endpoint.clone()),
+            ("liveness-timeout-ms", millis(self.liveness_timeout_ms)),
+            ("liveness-interval-ms", millis(self.liveness_interval_ms)),
         ];
         self.mode
             .iter()
@@ -909,7 +922,7 @@ impl FileRoute {
                     .filter_map(|(key, value)| Some((key, value?.to_string()))),
             )
             .chain(
-                readiness
+                checks
                     .into_iter()
                     .filter_map(|(key, value)| Some((key, value?))),
             )
@@ -996,13 +1009,14 @@ mod tests {
              flume-ca-cert: flume-ca.pem\njail-ids: 900000-900063\njail-user: from-file\n\
              console: 127.0.0.1:9090\nconsole-dir: kept\noidc-claim: [email=*]\n\
              routes:\n  - {host: a.local, rootfs: app.ext4, mode: per-connection, warm: 2, cpu: 50,\n     \
-             per-client: 4, idle-ms: 30000, egress: [DB.internal:5432, '[2001:db8::/32]:443',\n     \
-             10.0.0.0/24:6379]}\n",
+             per-client: 4, idle-ms: 30000, liveness: http, liveness-timeout-ms: 2000,\n     \
+             egress: [DB.internal:5432, '[2001:db8::/32]:443', 10.0.0.0/24:6379]}\n",
         )
         .unwrap();
         let vm = format!(
             "b.local={}?mode=pool&instances=4&warm=1&concurrency=8&keep-ms=60000&boot-ms=90000\
-             &readiness-interval-ms=5000&readiness-endpoint=/healthz&readiness=http",
+             &readiness-interval-ms=5000&readiness-endpoint=/healthz&readiness=http\
+             &liveness-interval-ms=10000&liveness=http&liveness-endpoint=/livez",
             rootfs.display()
         );
         let config_flag = config.display().to_string();
@@ -1063,7 +1077,7 @@ mod tests {
             settings.specs[0].target(),
             format!(
                 "firecracker:{}?mode=per-connection&cpu=50&warm=2&per-client=4&idle-ms=30000\
-                 &egress=db.internal:5432,10.0.0.0/24:6379,[2001:db8::/32]:443",
+                 &liveness=http&liveness-timeout-ms=2000&egress=db.internal:5432,10.0.0.0/24:6379,[2001:db8::/32]:443",
                 rootfs.display()
             ),
             "the options set to other than their defaults, the egress in one order"
@@ -1072,7 +1086,8 @@ mod tests {
             settings.specs[1].target(),
             format!(
                 "firecracker:{}?mode=pool&boot-ms=90000&warm=1&instances=4&concurrency=8\
-                 &readiness=http&readiness-endpoint=/healthz&readiness-interval-ms=5000",
+                 &readiness=http&readiness-endpoint=/healthz&readiness-interval-ms=5000\
+                 &liveness=http&liveness-endpoint=/livez&liveness-interval-ms=10000",
                 rootfs.display()
             ),
             "a pool's warm by default its instances, the options in one order"

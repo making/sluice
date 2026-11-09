@@ -190,7 +190,8 @@ JVM on one vCPU can take more), `per-client=N`,
 `wait-ms=N` (see [Limits](#limits)), `keep-ms=N` (reuse, pool), `uses=N` and `lifetime-ms=N`
 (reuse), `concurrency=N` (pool), `readiness=process|port|http`, `readiness-endpoint=<path>`,
 `readiness-timeout-ms=N` and `readiness-interval-ms=N` (boot, pool: see [Readiness](#readiness)),
-`egress=<host>:<port>,...` (see [Egress](#egress)). The advertised
+`liveness=port|http`, `liveness-endpoint=<path>`, `liveness-timeout-ms=N` and `liveness-interval-ms=N`
+(see [Liveness](#liveness)), `egress=<host>:<port>,...` (see [Egress](#egress)). The advertised
 target is `firecracker:<rootfs>` plus the options set to other than their defaults; the server
 dials it verbatim, and the hosts of one target share its VMs.
 
@@ -316,7 +317,8 @@ at startup. The console's edits go through the same reload (see [Console](#conso
 ### How many VMs and how long
 
 `instances`, `warm`, `concurrency`, `wait-ms`, `keep-ms`, `uses`, `lifetime-ms`, `per-client`, `idle-ms`,
-`boot-ms` and the [readiness check](#readiness) say how many VMs, how long and when one serves, not what
+`boot-ms`, the [readiness check](#readiness) and the [liveness check](#liveness) say how many VMs, how
+long and when one serves, not what
 a VM is: a running target takes a change of them as it is, by a reload or a console's edit, its VMs and
 their snapshot kept (`adjusted <host>`):
 
@@ -329,6 +331,7 @@ their snapshot kept (`adjusted <host>`):
   finish
 - `warm` down: warm clones are killed at once, a pool's VMs serving none after `keep-ms`
 - the readiness check: each VM probed at once as it asks
+- the liveness check: each VM probed an interval of it later, none started again for it
 - the others bound the next connections, and the next boot (`boot-ms`)
 
 Anything else is what a VM is and [restarts the target](#reloading-routes): `mode` too, and `prime`, what
@@ -352,8 +355,10 @@ its place, from the same spec, under its instance index:
 - the VM's log stream ends: its `firecracker` ended, or the guest's kernel did
 - a connection fails, and the port goes on refusing for the route's `boot-ms`: the daemon's end,
   a process that closed its port, a guest that no longer answers
+- a probe of its [liveness check](#liveness) fails (`liveness=http`): a process that lives, keeps its
+  port and answers nothing, or answers its health endpoint other than 200
 
-A process that lives, keeps its port and answers nothing is not seen.
+Without a liveness check, a process that lives, keeps its port and answers nothing is not seen.
 
 The others serve on, its connections alone cut. The old VM is killed (on a [disk](#disks), stopped
 first: SIGTERM to what is left, all written out, the disk free), the new one on the room in the
@@ -427,6 +432,36 @@ has it serve once its readiness check passed as well, as a CF app's readiness he
 routes:
   - {host: app.local, rootfs: upstream.ext4, mode: pool, instances: 4, warm: 2, readiness: http,
      readiness-endpoint: /actuator/health/readiness, readiness-interval-ms: 10000}
+```
+
+### Liveness
+
+A VM is up once its guest accepts on the route's port, and down as [A VM going down](#a-vm-going-down)
+says. `liveness=http` asks more, as a CF app's health check (`health-check-type: http`); `liveness=port`,
+the default, nothing:
+
+- **at its start**: a booted VM is up, and a cloned route's template snapshotted, once a `GET` of
+  `liveness-endpoint` (`/`) naming the route's first host is answered 200, asked every 100ms from its
+  guest's accepting, within `boot-ms` from its boot; its process exiting first fails it at once. A
+  clone starts from the snapshot of a process that passed it
+- **after it**: a VM `mode=boot` or `mode=pool` keeps is probed every `liveness-interval-ms` (30000),
+  each probe within `liveness-timeout-ms` (1000), through the guest's relay as the readiness check is.
+  One probe failing has it gone down (`route app.local: VM 1: its liveness check failed: GET /livez:
+  HTTP/1.1 500 Internal Server Error; killed`), another one started in its place, as Diego restarts an
+  instance at its first failure; the readiness check takes a VM slow for a while out of the rotation
+  instead. A clone of a connection's own is not probed past its template: `liveness-interval-ms` needs
+  `mode=boot` or `mode=pool`
+- **`port`** is the watch's, with no probe of its own (no timeout nor interval): a periodic connection
+  to the port adds nothing to it, the guest's kernel accepting on a listening socket whatever the
+  process does. `liveness=process` is refused: a route relays its connections to the port
+- **a change** of the check is taken as the route runs ([How many VMs and how
+  long](#how-many-vms-and-how-long)): the VMs up are probed an interval of it later, never started
+  again for it ([findings](../.kb/wicket-firecracker-findings.md#liveness))
+
+```yaml
+routes:
+  - {host: app.local, rootfs: upstream.ext4, instances: 2, liveness: http,
+     liveness-endpoint: /actuator/health/liveness, liveness-interval-ms: 10000}
 ```
 
 ### Console
@@ -1127,9 +1162,11 @@ change, the VMs' output (a booted VM's, a template's, a clone's) on the wicket's
 stdout / stderr and on a flume (`sluice-wicket-tunnel`'s double), the guests' egress (a booted
 VM's and a clone's, to a destination on the host by name, address, range and IPv6, and its
 records), reloads of the config file, an edit taking over from a reload on a disk, a route
-given by `--vm` alone handing through a guest speaking first, and a booted route checking its VMs'
+given by `--vm` alone handing through a guest speaking first, a booted route checking its VMs'
 readiness: one failing its check taking no connection, none ready leaving the advertisement until
-one answers again, a process ending likewise. It needs Firecracker
+one answers again, a process ending likewise, and their liveness: one whose endpoint fails
+restarted, the other serving meanwhile, a start whose endpoint never answers 200 failing at
+`boot-ms`. It needs Firecracker
 (`SLUICE_WICKET_RUNTIME_FIRECRACKER_FIRECRACKER`, else `firecracker` on the PATH) and a guest
 kernel (`SLUICE_WICKET_RUNTIME_FIRECRACKER_KERNEL`, else `~/.local/firecracker/vmlinux`), the
 variables of the wicket's own `--firecracker` and `--kernel`, and builds the sample rootfs.
@@ -1163,10 +1200,8 @@ Benchmarks and design findings: [.kb/wicket-firecracker-findings.md](../.kb/wick
 
 ## Not yet
 
-A liveness check (a process that lives and does not answer is restarted by nothing: a
-[readiness check](#readiness) takes it out of the rotation, and a VM is seen down by [what ends or
-refuses](#a-vm-going-down); a clone goes on a failed dial), a disk on a route of the
-config file, a flag or the page, a backup of a running disk, a pool
+A liveness check of a VM per connection past its template (a clone goes on a failed dial), a disk on
+a route of the config file, a flag or the page, a backup of a running disk, a pool
 spreading by load rather than by connections, CPU limits without the jail, an image of the
 page rather than the API (`PUT /api/images`), a docker-archive upload, the requests on the
 flume (the VMs' output alone: `cf logs` shows no `RTR` line here), and egress over UDP or to

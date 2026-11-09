@@ -1772,8 +1772,11 @@ impl Api {
         Ok(self.located(req, &located))
     }
 
-    /// The command and the health checks, the readiness check refused when the app as annotated
-    /// would not take it (`manifest::check_readiness`); both taken at the next start, as on CF.
+    /// The command and the health checks, a check refused when the app as annotated would not take
+    /// it (`manifest::check_readiness`, `manifest::check_liveness`); both taken at the next start,
+    /// as on CF (`cf set-health-check` asks for a restart). Of a health check's `data`, what it
+    /// names alone changes (`cf set-health-check` names no `timeout`), and a type but `http` takes
+    /// no endpoint.
     async fn patch_process(&self, req: &Req, process: &str) -> Reply {
         let body: Value = req.json()?;
         let app = self.app_of_process(req, process, Need::Operate)?;
@@ -1802,23 +1805,40 @@ impl Api {
                 manifest::check_readiness(&readiness, &lifetime, runtime)?;
                 app.process.readiness_health_check = readiness;
             }
+            let given = &body["health_check"];
+            if given.is_object() {
+                let mut liveness = app.process.health_check.clone();
+                if let Some(kind) = given["type"].as_str() {
+                    liveness.kind = kind.to_string();
+                    if kind != "http" {
+                        liveness.endpoint = None;
+                    }
+                }
+                if let Some(data) = given["data"].as_object() {
+                    let seconds = |key: &str| data.get(key).map(Value::as_u64);
+                    if let Some(timeout) = seconds("timeout") {
+                        liveness.timeout = timeout;
+                    }
+                    if let Some(timeout) = seconds("invocation_timeout") {
+                        liveness.invocation_timeout = timeout;
+                    }
+                    if let Some(interval) = seconds("interval") {
+                        liveness.interval = interval;
+                    }
+                    if let Some(endpoint) = data.get("endpoint") {
+                        liveness.endpoint = endpoint.as_str().map(String::from);
+                    }
+                }
+                let lifetime =
+                    manifest::check_annotations(&app.annotations, app.process.instances, runtime)?;
+                manifest::check_liveness(&liveness, &lifetime, runtime)?;
+                app.process.health_check = liveness;
+            }
             if let Some(command) = body.get("command") {
                 app.process.command = command
                     .as_str()
                     .map(String::from)
                     .filter(|command| !command.is_empty());
-            }
-            if let Some(kind) = body["health_check"]["type"].as_str() {
-                app.process.health_check.kind = kind.to_string();
-            }
-            if let Some(data) = body["health_check"]["data"].as_object() {
-                app.process.health_check.timeout = data.get("timeout").and_then(Value::as_u64);
-                app.process.health_check.invocation_timeout =
-                    data.get("invocation_timeout").and_then(Value::as_u64);
-                app.process.health_check.endpoint = data
-                    .get("endpoint")
-                    .and_then(Value::as_str)
-                    .map(String::from);
             }
             app.process.updated_at = now();
             Ok::<_, ApiError>(views::process(&req.base, app))
@@ -2507,6 +2527,8 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
         manifest::check_annotations(&app.annotations, app.process.instances, Some(runtime))?;
     let readiness = app.process.readiness_health_check.clone();
     manifest::check_readiness(&readiness, &lifetime, Some(runtime))?;
+    let liveness = app.process.health_check.clone();
+    manifest::check_liveness(&liveness, &lifetime, Some(runtime))?;
     let annotation = |key: &str| {
         app.annotations
             .get(key)
@@ -2528,6 +2550,7 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
         budget_ms: annotation(BUDGET_ANNOTATION),
         lifetime,
         readiness,
+        liveness,
         wasi,
         keyvalue,
         env: {
@@ -2626,6 +2649,7 @@ fn apply_metadata(
     }
     let lifetime = manifest::check_annotations(&annotations, app.process.instances, runtime)?;
     manifest::check_readiness(&app.process.readiness_health_check, &lifetime, runtime)?;
+    manifest::check_liveness(&app.process.health_check, &lifetime, runtime)?;
     app.labels = labels;
     app.annotations = annotations;
     Ok(())

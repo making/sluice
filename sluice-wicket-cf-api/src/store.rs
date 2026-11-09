@@ -302,11 +302,16 @@ pub struct Process {
     pub updated_at: String,
 }
 
+/// A process's (liveness) health check, as `cf push -u`, `cf set-health-check` and a manifest's
+/// `health-check-*` keys set it: `port`, `process` or `http`, its seconds; `timeout` that of its
+/// start.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct HealthCheck {
     pub kind: String,
     pub timeout: Option<u64>,
     pub invocation_timeout: Option<u64>,
+    #[serde(default)]
+    pub interval: Option<u64>,
     pub endpoint: Option<String>,
 }
 
@@ -316,6 +321,7 @@ impl Default for HealthCheck {
             kind: "port".into(),
             timeout: None,
             invocation_timeout: None,
+            interval: None,
             endpoint: None,
         }
     }
@@ -377,6 +383,9 @@ pub struct Running {
     /// The process's readiness check as it was: another one waits for the next start, as on CF.
     #[serde(default)]
     pub readiness: ReadinessCheck,
+    /// The process's health check as it was, likewise.
+    #[serde(default)]
+    pub liveness: HealthCheck,
     /// The capabilities the bindings granted.
     #[serde(default)]
     pub wasi: Vec<String>,

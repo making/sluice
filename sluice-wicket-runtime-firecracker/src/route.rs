@@ -7,7 +7,8 @@
 //! clone holds it from its guest accepting on; the template, alone as it lives, is 0.
 //!
 //! A pool's VMs ([`VmPool`]), booted (`mode=boot`) or cloned (`mode=pool`), are watched
-//! ([`watch`]), each going down replaced by the pool.
+//! ([`watch`]) and, with a liveness check, probed ([`lived`]), each going down replaced by the
+//! pool.
 //!
 //! What says how many VMs and how long ([`Bounds`]) a running route takes as it is, its VMs and
 //! their snapshot kept ([`Route::adjust`]): VMs are started for more, and those past a lower
@@ -36,9 +37,9 @@ use crate::BoxError;
 use crate::capacity::{Capacity, Full, Need, Pool, Slot};
 use crate::disk::{self, Disk};
 use crate::egress::Egress;
+use crate::health::{self, Check, Liveness, Readiness};
 use crate::keeper::Role;
 use crate::output::{self, Ended, Hosts, Output, Sink};
-use crate::readiness::{self, Check, Readiness};
 use crate::vm::{self, Place, Places, Snapshot, Spec, Vm};
 use crate::wire::{self, Rule};
 
@@ -158,6 +159,7 @@ const MODE_OPTIONS: &[(&str, &[Mode])] = &[
     ("uses", &[Mode::Reuse]),
     ("lifetime-ms", &[Mode::Reuse]),
     ("concurrency", &[Mode::Pool]),
+    ("liveness-interval-ms", &[Mode::Boot, Mode::Pool]),
 ];
 
 /// One route as configured: a `--vm` flag, or a route of the `--config` file.
@@ -207,6 +209,9 @@ pub struct Bounds {
     pub idle: Option<Duration>,
     /// Boot and pool modes: what tells a VM ready to take connections.
     pub readiness: Readiness,
+    /// What tells a VM up at its start (a booted VM's, a template's) and alive after it (a booted
+    /// VM's, a pool's).
+    pub liveness: Liveness,
 }
 
 impl Bounds {
@@ -232,10 +237,14 @@ const BOUNDS: &[&str] = &[
     "readiness-endpoint",
     "readiness-timeout-ms",
     "readiness-interval-ms",
+    "liveness",
+    "liveness-endpoint",
+    "liveness-timeout-ms",
+    "liveness-interval-ms",
 ];
 
 impl RouteSpec {
-    /// Parses `host=<rootfs>[?mode=boot|per-connection|reuse|pool&vcpus=N&memory-mib=N&cpu=N&port=N&boot-ms=N&warm=N&prime=N&instances=N&wait-ms=N&keep-ms=N&uses=N&lifetime-ms=N&concurrency=N&per-client=N&idle-ms=N&readiness=process|port|http&readiness-endpoint=<path>&readiness-timeout-ms=N&readiness-interval-ms=N&egress=<rule>,...&disk=<path>&disk-mib=N]`.
+    /// Parses `host=<rootfs>[?mode=boot|per-connection|reuse|pool&vcpus=N&memory-mib=N&cpu=N&port=N&boot-ms=N&warm=N&prime=N&instances=N&wait-ms=N&keep-ms=N&uses=N&lifetime-ms=N&concurrency=N&per-client=N&idle-ms=N&readiness=process|port|http&readiness-endpoint=<path>&readiness-timeout-ms=N&readiness-interval-ms=N&liveness=port|http&liveness-endpoint=<path>&liveness-timeout-ms=N&liveness-interval-ms=N&egress=<rule>,...&disk=<path>&disk-mib=N]`.
     pub fn parse(
         flag: &str,
         firecracker: &std::path::Path,
@@ -321,11 +330,12 @@ impl RouteSpec {
                 per_client: None,
                 idle: None,
                 readiness: Readiness::default(),
+                liveness: Liveness::default(),
             },
         };
         let mut given = Vec::new();
         let (mut mount, mut disk_mib) = (None, None);
-        let mut endpoint = None;
+        let (mut endpoint, mut alive_at) = (None, None);
         for (key, value) in options {
             given.push(key);
             let number = || -> Result<u32, String> {
@@ -364,12 +374,21 @@ impl RouteSpec {
                     spec.bounds.readiness.check =
                         Check::named(value).map_err(|e| format!("{named}: {e}"))?;
                 }
-                "readiness-endpoint" => {
-                    endpoint =
-                        Some(readiness::endpoint(value).map_err(|e| format!("{named}: {e}"))?);
+                "readiness-endpoint" | "liveness-endpoint" => {
+                    let path = health::endpoint(key, value).map_err(|e| format!("{named}: {e}"))?;
+                    match key {
+                        "readiness-endpoint" => endpoint = Some(path),
+                        _ => alive_at = Some(path),
+                    }
                 }
                 "readiness-timeout-ms" => spec.bounds.readiness.timeout = millis()?,
                 "readiness-interval-ms" => spec.bounds.readiness.interval = millis()?,
+                "liveness" => {
+                    spec.bounds.liveness.endpoint =
+                        Liveness::named(value).map_err(|e| format!("{named}: {e}"))?;
+                }
+                "liveness-timeout-ms" => spec.bounds.liveness.timeout = millis()?,
+                "liveness-interval-ms" => spec.bounds.liveness.interval = millis()?,
                 "egress" => {
                     for rule in value.split(',').filter(|rule| !rule.is_empty()) {
                         let rule: Rule =
@@ -437,6 +456,7 @@ impl RouteSpec {
             }
         }
         spec.bounds.readiness = Self::readiness(named, &spec, &given, endpoint)?;
+        Self::liveness(named, &mut spec.bounds.liveness, &given, alive_at)?;
         if spec.mode == Mode::Boot {
             let vms = spec.bounds.instances.unwrap_or(1);
             spec.bounds.instances = Some(vms);
@@ -501,6 +521,36 @@ impl RouteSpec {
             ));
         }
         Ok(readiness)
+    }
+
+    /// The liveness check `liveness` as the options `given` set it, `endpoint` that of
+    /// `liveness-endpoint`: what does not apply refused. `port` is the watch's, with no probe of
+    /// its own to time or space; a VM of a connection's own is not probed past its template
+    /// (`liveness-interval-ms`, [`MODE_OPTIONS`]).
+    fn liveness(
+        named: &str,
+        liveness: &mut Liveness,
+        given: &[&str],
+        endpoint: Option<Arc<str>>,
+    ) -> Result<(), String> {
+        let Some(asked) = &mut liveness.endpoint else {
+            let probing = [
+                "liveness-endpoint",
+                "liveness-timeout-ms",
+                "liveness-interval-ms",
+            ];
+            return match probing.into_iter().find(|key| given.contains(key)) {
+                Some(key) => Err(format!(
+                    "{named}: {key} needs liveness=http: port is the watch's, a VM down once its \
+                     process ended or a connection failed and its port refuses"
+                )),
+                None => Ok(()),
+            };
+        };
+        if let Some(endpoint) = endpoint {
+            *asked = endpoint;
+        }
+        Ok(())
     }
 
     /// What the route advertises as its weight: its `instances` (a booted route's VMs, a pool's or
@@ -612,29 +662,37 @@ impl RouteSpec {
                 options.push((key, value.to_string()));
             }
         }
-        let readiness = &bounds.readiness;
-        if readiness.check != Check::Process {
-            options.push(("readiness", readiness.check.name().to_string()));
-        }
-        if let Check::Http(endpoint) = &readiness.check
-            && &**endpoint != readiness::DEFAULT_ENDPOINT
-        {
-            options.push(("readiness-endpoint", endpoint.to_string()));
-        }
-        for (key, value, default) in [
+        let (readiness, liveness) = (&bounds.readiness, &bounds.liveness);
+        let checks = [
             (
-                "readiness-timeout-ms",
-                readiness.timeout,
-                readiness::DEFAULT_TIMEOUT,
+                ["readiness", "readiness-endpoint"],
+                ["readiness-timeout-ms", "readiness-interval-ms"],
+                Some(readiness.check.clone()).filter(|check| *check != Check::Process),
+                (readiness.timeout, readiness.interval),
             ),
             (
-                "readiness-interval-ms",
-                readiness.interval,
-                readiness::DEFAULT_INTERVAL,
+                ["liveness", "liveness-endpoint"],
+                ["liveness-timeout-ms", "liveness-interval-ms"],
+                liveness.check(),
+                (liveness.timeout, liveness.interval),
             ),
-        ] {
-            if value != default {
-                options.push((key, value.as_millis().to_string()));
+        ];
+        for ([name, path], [timeout, interval], check, times) in checks {
+            if let Some(check) = check {
+                options.push((name, check.name().to_string()));
+                if let Check::Http(endpoint) = check
+                    && &*endpoint != health::DEFAULT_ENDPOINT
+                {
+                    options.push((path, endpoint.to_string()));
+                }
+            }
+            for (key, value, default) in [
+                (timeout, times.0, health::DEFAULT_TIMEOUT),
+                (interval, times.1, health::DEFAULT_INTERVAL),
+            ] {
+                if value != default {
+                    options.push((key, value.as_millis().to_string()));
+                }
             }
         }
         if !self.vm.egress.is_empty() {
@@ -1171,7 +1229,8 @@ struct VmPool {
     /// A VM started or failed, its last connection ended: the waiting connections and
     /// the tending ([`tend`]) look again.
     changed: Arc<Notify>,
-    /// The readiness check changed: each VM's probe ([`probed`]) is made again at once.
+    /// A health check changed: each VM's readiness probe ([`probed`]) is made again at once, its
+    /// liveness probe ([`lived`]) an interval of the new check after.
     probes: Arc<Notify>,
     status: watch::Sender<Status>,
     /// Where the route's readiness moving is told ([`VmPool::ready`]).
@@ -1241,7 +1300,8 @@ struct Booter {
 }
 
 impl Booter {
-    /// A VM booted on `slot`, its guest listening on `port` within `boot-ms`, its output named
+    /// A VM booted on `slot`, its guest listening on `port` and passing its liveness check
+    /// ([`alive`]) within `boot-ms`, its output named
     /// after `index` from its boot on. On a disk, once no other VM is on it; what it wrote before
     /// it failed is on its disk all the same.
     async fn boot(&self, slot: Slot, port: u32, index: Arc<Index>) -> Result<Instance, BoxError> {
@@ -1264,8 +1324,18 @@ impl Booter {
             &self.stops,
         )
         .await?;
-        let boot = self.bounds.get().boot;
+        let Bounds { boot, liveness, .. } = self.bounds.get();
+        let deadline = Instant::now() + boot;
         let followed = ready(&vm, port, boot, &self.sink, &self.hosts, &name, index.index).await;
+        let followed = match followed {
+            Ok(mut output) => {
+                let host = self.hosts.current().key.clone();
+                let within = (deadline, boot);
+                let passed = alive(&vm, port, &liveness, &host, within, output.as_mut()).await;
+                passed.map(|()| output)
+            }
+            Err(e) => Err(e),
+        };
         let output = match followed {
             Ok(output) => output,
             Err(e) => {
@@ -1277,8 +1347,12 @@ impl Booter {
                 return Err(e);
             }
         };
+        let alive = match liveness.endpoint {
+            Some(endpoint) => format!(", GET {endpoint} answered"),
+            None => String::new(),
+        };
         println!(
-            "route {label}: {name} booted, guest listening after {}ms",
+            "route {label}: {name} booted, guest listening{alive} after {}ms",
             started.elapsed().as_millis()
         );
         Ok(Instance {
@@ -1724,6 +1798,7 @@ impl VmPool {
                     let (pool, vm) = (Arc::downgrade(self), Arc::downgrade(&instance));
                     tokio::spawn(watched(pool.clone(), id, vm.clone(), output, suspected));
                     let probing = CancellationToken::new();
+                    tokio::spawn(lived(pool.clone(), id, vm.clone(), probing.clone()));
                     tokio::spawn(probed(pool, id, vm, probing.clone()));
                     members.vms.push(Member {
                         id,
@@ -2284,7 +2359,7 @@ async fn watched(
     }
 }
 
-/// Probes the pool's VM `id` as the route's readiness check has it ([`readiness::probe`]), from
+/// Probes the pool's VM `id` as the route's readiness check has it ([`health::probe`]), from
 /// its start until it is gone from the pool (`probing` cancelled), each outcome to the pool
 /// ([`VmPool::probed`]): at once, then as [`Readiness::next`] has it, at once again when the check
 /// changed. A probe holds the VM only as long as it takes: a stop kills it.
@@ -2307,7 +2382,8 @@ async fn probed(pool: Weak<VmPool>, id: u64, vm: Weak<Instance>, probing: Cancel
                     return;
                 };
                 let host = hosts.current().key.clone();
-                readiness::probe(&held.vm, port, &readiness, &host).await
+                let (check, within) = (&readiness.check, readiness.timeout);
+                health::probe(&held.vm, port, check, within, &host).await
             }
         };
         let ready = probed.is_ok();
@@ -2329,6 +2405,62 @@ async fn probed(pool: Weak<VmPool>, id: u64, vm: Weak<Instance>, probing: Cancel
             () = changed => {}
             () = probing.cancelled() => return,
         }
+    }
+}
+
+/// Probes the pool's VM `id` as the route's liveness check has it (`liveness=http`), from its
+/// start until it is gone from the pool (`probing` cancelled): every `liveness-interval-ms`, the
+/// wait starting anew as the check changes. One probe failing has it gone down, as Diego's does
+/// ([`VmPool::went_down`]). `port` probes nothing: the watch sees what refuses ([`watched`]). A
+/// probe holds the VM only as long as it takes: a stop kills it.
+async fn lived(pool: Weak<VmPool>, id: u64, vm: Weak<Instance>, probing: CancellationToken) {
+    let Some((port, bounds, hosts, probes)) = pool.upgrade().map(|pool| {
+        let hosts = pool.starter.hosts().clone();
+        (pool.port, pool.bounds.clone(), hosts, pool.probes.clone())
+    }) else {
+        return;
+    };
+    let mut liveness = bounds.get().liveness;
+    let mut next = Instant::now() + liveness.interval;
+    loop {
+        let changed = probes.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        let check = liveness.check();
+        let wait = async {
+            match check {
+                Some(_) => tokio::time::sleep_until(next.into()).await,
+                None => std::future::pending().await,
+            }
+        };
+        tokio::select! {
+            () = wait => {}
+            () = changed => {
+                let now = bounds.get().liveness;
+                if now != liveness {
+                    next = Instant::now() + now.interval;
+                    liveness = now;
+                }
+                continue;
+            }
+            () = probing.cancelled() => return,
+        }
+        let Some(check) = check else {
+            continue;
+        };
+        let Some(held) = vm.upgrade() else {
+            return;
+        };
+        let host = hosts.current().key.clone();
+        let probed = health::probe(&held.vm, port, &check, liveness.timeout, &host).await;
+        drop(held);
+        if let Err(why) = probed {
+            if let Some(pool) = pool.upgrade() {
+                pool.went_down(id, &format!("its liveness check failed: {why}"));
+            }
+            return;
+        }
+        next = Instant::now() + liveness.interval;
     }
 }
 
@@ -2504,7 +2636,13 @@ impl Route {
             &stops,
         )
         .await?;
+        let deadline = Instant::now() + spec.bounds.boot;
         let mut output = ready(&vm, spec.port, spec.bounds.boot, &sink, &hosts, name, 0).await?;
+        // its clones start from a process that passed it
+        let within = (deadline, spec.bounds.boot);
+        let host = hosts.current().key.clone();
+        let liveness = &spec.bounds.liveness;
+        alive(&vm, spec.port, liveness, &host, within, output.as_mut()).await?;
         let booted = started.elapsed();
         // its clones are told they were restored: a guest predating the
         // notice would fail every one of them
@@ -2692,7 +2830,8 @@ impl Route {
             if *current == bounds {
                 return false;
             }
-            let rechecked = current.readiness != bounds.readiness;
+            let rechecked =
+                current.readiness != bounds.readiness || current.liveness != bounds.liveness;
             *current = bounds;
             rechecked
         };
@@ -3009,6 +3148,56 @@ async fn ready(
         );
     }
     Ok(output)
+}
+
+/// Waits for a guest listening ([`ready`]) to pass the route's liveness check at its start, as
+/// `host` names it: of `http`, its endpoint answered 200, probed every [`LOOK_AGAIN`] until the
+/// deadline of `within` (`boot-ms`, that of the boot), its process exiting first failing it at
+/// once; `port` asks nothing more.
+async fn alive(
+    vm: &Vm,
+    port: u32,
+    liveness: &Liveness,
+    host: &str,
+    within: (Instant, Duration),
+    output: Option<&mut Output>,
+) -> Result<(), BoxError> {
+    let Some(check) = liveness.check() else {
+        return Ok(());
+    };
+    let (deadline, boot) = within;
+    let passed = async {
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let timeout = liveness.timeout.min(left);
+            let why = match health::probe(vm, port, &check, timeout, host).await {
+                Ok(()) => return Ok(()),
+                Err(why) => why,
+            };
+            if Instant::now() + LOOK_AGAIN >= deadline {
+                return Err::<(), BoxError>(
+                    format!(
+                        "its liveness check did not pass within {}ms: {why}",
+                        boot.as_millis()
+                    )
+                    .into(),
+                );
+            }
+            tokio::time::sleep(LOOK_AGAIN).await;
+        }
+    };
+    let Some(output) = output else {
+        return passed.await;
+    };
+    tokio::select! {
+        passed = passed => passed,
+        () = output.exited() => {
+            // its last lines first: what says why
+            output.sync(END_SYNC_TIMEOUT).await;
+            Err("the guest's process exited before its liveness check passed (see its output)"
+                .into())
+        }
+    }
 }
 
 /// [`ready`]'s course: the log stream dialed (`dial_log`, again each millisecond while

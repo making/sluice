@@ -25,7 +25,9 @@
 //! there, or from a VM whose `/init` does not answer its stop; a VM
 //! never listening holding no other edit, by an app's edit, in the place of a disk's VM and
 //! through the config file; a readiness check deciding which VMs take connections and whether
-//! the route is advertised, a process ending alike; told to stop, the wicket waiting for the
+//! the route is advertised, a process ending alike; a liveness check restarting a VM whose
+//! endpoint fails, the other serving meanwhile, and failing a start whose endpoint never answers
+//! 200 at its `boot-ms`; told to stop, the wicket waiting for the
 //! apps but those on a disk until their owner moved them;
 //! both served again after a restart from the console's directory (not with the
 //! image: its directory is the test's).
@@ -606,6 +608,7 @@ async fn every_route_serves_http_through_the_tunnel() {
             giving_way(&dir.0, &rootfs, |args| start(&url, args)).await;
             below_warm(&dir.0, &rootfs, |args| start(&url, args)).await;
             readiness(&dir.0, &rootfs, &start).await;
+            liveness(&dir.0, &rootfs, |args| start(&url, args)).await;
         }
     }
 }
@@ -921,6 +924,64 @@ async fn readiness(scratch: &Path, rootfs: &Path, start: impl Fn(&str, &[String]
     assert!(replaced != other && replaced != failing, "{}", wicket.log());
     let restarted = listed(wicket, READY).await;
     assert_eq!(restarted["instances"]["restarts"], 1, "{restarted}");
+}
+
+/// A booted route checking its VMs' liveness (`liveness=http`): a VM whose endpoint fails is
+/// killed at its next probe and another one booted in its place, passing the check as it starts,
+/// the route served by the other meanwhile.
+async fn liveness(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> Wicket) {
+    const ALIVE: &str = "alive.local";
+    let config = scratch.join("liveness.yaml");
+    let route = format!(
+        "routes:\n- {{host: {ALIVE}, rootfs: {}, instances: 2, boot-ms: {}, liveness: http, \
+         liveness-endpoint: /ready, liveness-interval-ms: 200}}\n",
+        rootfs.display(),
+        LOOKING.as_millis()
+    );
+    std::fs::write(&config, route).unwrap();
+    let args = [
+        "--config",
+        &config.display().to_string(),
+        "--listen",
+        "127.0.0.1:0",
+        "--console",
+        "127.0.0.1:0",
+        "--console-token",
+        CONSOLE_TOKEN,
+        "--console-dir",
+        "liveness-console",
+    ]
+    .map(String::from);
+    let wicket = start(&args);
+    let wicket = &wicket;
+    listed_as(wicket, ALIVE, pooled(2)).await;
+    // the boot id of the VM answering
+    let asked = async |method: &str, path: &str| {
+        let client = tokio::net::TcpStream::connect(wicket.listening())
+            .await
+            .unwrap();
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nhost: {ALIVE}\r\ncontent-length: 0\r\n\
+             connection: close\r\n\r\n"
+        );
+        let answer = exchange(client, &request).await;
+        field(&answer, "boot id: ").to_string()
+    };
+    let failing = asked("POST", "/ready?fail=1000000").await;
+    said(
+        wicket,
+        "its liveness check failed: GET /ready: HTTP/1.1 503 Service Unavailable; killed",
+    )
+    .await;
+    for _ in 0..4 {
+        let served = asked("GET", "/").await;
+        assert_ne!(served, failing, "a VM killed served; {}", wicket.log());
+    }
+    listed_as(wicket, ALIVE, |route| {
+        pooled(2)(route) && route["instances"]["restarts"] == 1
+    })
+    .await;
+    said(wicket, "GET /ready answered after").await;
 }
 
 /// What the readiness probe at `health` answers, head and body.
@@ -1522,6 +1583,27 @@ async fn never_listening_app(
     assert_eq!(
         (status, &refused["did_not_start"]),
         (422, &true.into()),
+        "{refused}"
+    );
+    // VMs of other memory, listening, their liveness endpoint never answering 200: failed at
+    // boot-ms alike (on the VMs running, a check is taken as they run)
+    let dead = body(
+        "hung.local",
+        serde_json::json!({"memory-mib": 192, "boot-ms": 2000, "liveness": "http",
+            "liveness-endpoint": "/ready?after=1000000"}),
+    );
+    let (status, refused) = console(at, "PUT", "/api/apps/hung", true, dead).await;
+    assert_eq!(
+        (status, &refused["did_not_start"]),
+        (422, &true.into()),
+        "{refused}"
+    );
+    let why = refused["error"].as_str().unwrap();
+    assert!(
+        why.contains(
+            "its liveness check did not pass within 2000ms: GET /ready?after=1000000: \
+             HTTP/1.1 503"
+        ),
         "{refused}"
     );
     let gone = "/api/apps/hung?owner=cf";
