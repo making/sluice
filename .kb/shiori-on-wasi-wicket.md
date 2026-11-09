@@ -8,7 +8,9 @@ credentials' `uri` of a service bound to it and tagged `postgresql`, a user-prov
 
 Measured 2026-11-09: an Apple silicon Mac, OrbStack, the cf-api README's [Docker Compose](../sluice-wicket-cf-api/README.md#docker-compose)
 (cf-api `8f73939`, wicket `6de06c4`), PostgreSQL 18.6, rontolisp 0.1.0-SNAPSHOT (`6686836`, the native
-executable; Shiori from `04cea9c`, which reads `VCAP_SERVICES`), the OSS `cf` 8.19.0.
+executable; Shiori from `04cea9c`, which reads `VCAP_SERVICES`), the OSS `cf` 8.19.0. The steps, the
+broker's instance, [The first start](#the-first-start) and [Latency](#latency) again with rontolisp
+`bdcb55eb9` (the jar built from source) and cf-api `126ed35`.
 
 ## Steps
 
@@ -17,12 +19,8 @@ executable; Shiori from `04cea9c`, which reads `VCAP_SERVICES`), the OSS `cf` 8.
    on the Compose network alone by its service name, without Redis (the keyvalue store is the default
    `local`; Shiori uses none), the wicket's and Dex's configuration inlined (`configs:`).
 
-   - md5, not the default SCRAM-SHA-256: Shiori opens a connection per request, and a SCRAM login costs the
-     guest 0.7s (`authentication=698.039 ms` in the server's log; 1.18s a page against 0.47s). PostgreSQL 18
-     deprecates md5 and warns once at initdb. It goes in `POSTGRES_INITDB_ARGS`: initdb stores the password,
-     and the image's entrypoint takes the `host` rule's method from the setting (`host all all all md5`);
-     `command: [postgres, -c, password_encryption=md5]` makes the rule md5 but leaves the password a SCRAM
-     one, which the md5 rule then logs in with
+   - the default SCRAM-SHA-256: Shiori opens a connection per request, and a login costs the guest about
+     55ms (see [Latency](#latency))
    - the image from 18 keeps its data in `/var/lib/postgresql/18/docker`: the volume is `/var/lib/postgresql`
 
    ```text
@@ -31,11 +29,15 @@ executable; Shiori from `04cea9c`, which reads `VCAP_SERVICES`), the OSS `cf` 8.
    ```
 
 2. The component, beside the manifest in `shiori/` (`cf push` takes a directory or a zip), from a rontolisp
-   checkout:
+   checkout at `bdcb55eb9` or later:
 
    ```text
    rontolisp examples/db/shiori/shiori.lisp -o <the directory>/shiori/shiori.wasm --component --optimize   # 7s
    ```
+
+   The snapshot's native executables of 2026-11-09 00:38 UTC predate it, and a SCRAM login there costs the
+   guest 0.7s: until they are rebuilt, `./mvnw -DskipTests package` and `java -jar
+   target/rontolisp-0.1.0-SNAPSHOT-exec.jar` in place of `rontolisp` (11s).
 
 3. The services `shiori/manifest.yml` names, the push:
 
@@ -51,8 +53,8 @@ executable; Shiori from `04cea9c`, which reads `VCAP_SERVICES`), the OSS `cf` 8.
    The `uri`'s password is `.env`'s `POSTGRES_PASSWORD`: change both together. `cf env shiori` shows it
    under `user-provided`, tagged `postgresql`.
 
-The first request took 15.6s (the schema and eighteen sample books), the other instance's first 1.8s (the
-schema statements again), then 0.49s a page (see [Latency](#latency)). On the README's
+The first request took 0.32s (the schema and eighteen sample books), the other instance's first 0.28s (the
+schema statements again), then 0.077s a page (see [Latency](#latency)). On the README's
 [Run](../sluice-wicket-cf-api/README.md#run) (the binaries on the macOS host, PostgreSQL 17 on trust) the
 forms, the same-origin check (`403` to a cross-site POST), htmx's in-place updates in a browser (the CDN's
 htmx under the app's CSP, no console error), `cf scale -i 3`, `cf logs` and a rolling `cf push` under load
@@ -95,23 +97,32 @@ security groups have no effect.
 ## The first start
 
 Shiori's top level creates the schema and the sample data, and a component's top level runs in the first
-request of each instance, under that request's `budget-ms` (10s by default). On an empty database the
-default budget is overrun: the store is stopped, the transaction rolled back, and the next request starts
-over, so it never finishes (`504` after 10s, every time), while `cf app` shows the instances running. The
-annotation above lets it finish; it applies at the next start (`cf restart`), not at once.
+request of each instance, under that request's `budget-ms` (10s by default). Shiori's takes 0.32s on an
+empty database. A top level overrunning the budget never finishes: the store is stopped, the transaction
+rolled back, and the next request starts over (`504` after 10s, every time), while `cf app` shows the
+instances running. Shiori's did with rontolisp `6686836` (15.6s, see [Latency](#latency)); the
+annotation `wicket.sluice.ik.am/budget-ms` in the manifest's `metadata.annotations` raises the budget, at
+the next start (`cf restart`), not at once.
 
 ## Latency
 
 | | `/books` (6 statements) | first start |
 |---|---|---|
-| SCRAM-SHA-256 | 1.18s | 17.9s |
-| md5 | 0.47s | 15.6s |
-| md5, delayed ACK off on PostgreSQL's side (`ip route change ... quickack 1` in its network namespace) | 0.025s | 0.24s |
-| a static file (`/favicon.svg`) | 0.0015s | |
+| SCRAM-SHA-256 | 0.077s | 0.32s |
+| md5 (`POSTGRES_INITDB_ARGS: -c password_encryption=md5`) | 0.024s | 0.15s |
+| a static file (`/favicon.svg`) | 0.0008s | |
+| SCRAM-SHA-256, rontolisp `6686836` | 1.18s | 17.9s |
+| md5, rontolisp `6686836` | 0.47s | 15.6s |
 
-The guest's TCP socket has no `TCP_NODELAY` (wasmtime-wasi sets none; wasi:sockets has no option for it), and
-cl-postgres writes a statement's messages in more than one write: each waits on PostgreSQL's delayed ACK,
-84ms from a `parse` to its `bind` and 43ms to the next `parse` in the server's statement log.
+A SCRAM login costs the guest about 55ms (`authentication=` in the server's `log_connections` log; 0.7s
+with `6686836`). md5 saves it, but PostgreSQL 18 deprecates md5. Set it in `POSTGRES_INITDB_ARGS`: initdb
+stores the password, and the image's entrypoint takes the `host` rule's method from the setting;
+`command: [postgres, -c, password_encryption=md5]` makes the rule md5 but leaves the password a SCRAM one.
+
+The guest's TCP socket has no `TCP_NODELAY` (wasmtime-wasi sets none; wasi:sockets has no option for it).
+With rontolisp `6686836` cl-postgres wrote a statement's messages in more than one write, each waiting on
+PostgreSQL's delayed ACK: 84ms from a `parse` to its `bind` and 43ms to the next `parse` in the server's
+statement log, most of its rows above. rontolisp buffers a connection's writes since `442dca5f2`.
 
 ## When the database is not there
 
@@ -144,7 +155,6 @@ services:
     pull_policy: always
     environment:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD}
-      POSTGRES_INITDB_ARGS: -c password_encryption=md5    # not SCRAM: see Steps
     volumes:
       - postgres:/var/lib/postgresql
     restart: unless-stopped
@@ -335,9 +345,6 @@ applications:
 - name: shiori
   instances: 2
   memory: 256M
-  metadata:
-    annotations:
-      wicket.sluice.ik.am/budget-ms: "60000"   # the first start: see The first start
   services:
   - shiori-network
   - shiori-dns
