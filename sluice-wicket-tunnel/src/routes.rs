@@ -13,16 +13,18 @@
 //! advertises, until it is ready again ([`Routes::readiness_changed`]). It is
 //! still bound: the server may have routed a connection to it before. So is a
 //! route held ([`Table::held`]): an app a wicket serves once its controller
-//! confirmed it since the wicket's start.
+//! confirmed it since the wicket's start. Routes note the hosts that had an
+//! instance ready since the wicket's start: what its readiness waits for
+//! ([`Routes::readiness`]).
 //!
 //! A route's weight (`Upstream::weight`: its instances, by which the server
 //! spreads its host over the clients serving it) is no change of the routes
 //! ([`same_routes`]): a wicket publishes a change of it in the generation it
 //! was, which every stream advertises all the same.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
 
@@ -108,6 +110,10 @@ pub trait Binding: Send + 'static {
 pub struct Routes<T> {
     table: watch::Sender<Arc<T>>,
     acks: Arc<Acks>,
+    /// The hosts of the routes that had an instance ready ([`Table::ready`]) since the wicket's
+    /// start, as a publish, a change told ([`Routes::readiness_changed`]) or a readiness asked
+    /// saw them.
+    were_ready: Mutex<HashSet<String>>,
 }
 
 /// Live stream -> what the server acknowledged on it.
@@ -127,13 +133,6 @@ struct Took {
 }
 
 impl<T> Routes<T> {
-    pub fn new(table: T) -> Arc<Routes<T>> {
-        Arc::new(Routes {
-            table: watch::Sender::new(Arc::new(table)),
-            acks: Arc::default(),
-        })
-    }
-
     pub fn current(&self) -> Arc<T> {
         self.table.borrow().clone()
     }
@@ -141,19 +140,6 @@ impl<T> Routes<T> {
     /// Follows the table: a stream re-advertises on a change.
     pub fn subscribe(&self) -> watch::Receiver<Arc<T>> {
         self.table.subscribe()
-    }
-
-    /// Makes `table` the current one: every stream advertises it, if its
-    /// upstreams changed, and binds its connections by it from now on.
-    pub fn publish(&self, table: T) {
-        self.table.send_replace(Arc::new(table));
-    }
-
-    /// The readiness of the current table's routes ([`Table::ready`]) may have changed: every
-    /// stream advertises those ready again, if they are not what it advertised. The same
-    /// generation: the server takes no other routes than the table's.
-    pub fn readiness_changed(&self) {
-        self.table.send_modify(|_| {});
     }
 
     /// Registers a live stream, unregistered when the guard drops.
@@ -186,39 +172,92 @@ impl<T> Routes<T> {
 }
 
 impl<T: Table> Routes<T> {
+    pub fn new(table: T) -> Arc<Routes<T>> {
+        let routes = Routes {
+            table: watch::Sender::new(Arc::new(table)),
+            acks: Arc::default(),
+            were_ready: Mutex::default(),
+        };
+        routes.unready();
+        Arc::new(routes)
+    }
+
+    /// Makes `table` the current one: every stream advertises it, if its
+    /// upstreams changed, and binds its connections by it from now on.
+    pub fn publish(&self, table: T) {
+        self.table.send_replace(Arc::new(table));
+        self.unready();
+    }
+
+    /// The readiness of the current table's routes ([`Table::ready`]) may have changed: every
+    /// stream advertises those ready again, if they are not what it advertised. The same
+    /// generation: the server takes no other routes than the table's.
+    pub fn readiness_changed(&self) {
+        self.table.send_modify(|_| {});
+        self.unready();
+    }
+
     /// What serves a connection to `address`, see [`Table::bind`].
     pub fn bind(self: &Arc<Self>, address: &str) -> Result<T::Binding, String> {
         T::bind(self, address)
     }
 
-    /// Whether every route of the current table has an instance ready ([`Table::ready`]) and
-    /// none is held ([`Table::held`]); Err names the hosts of those that are not.
-    pub fn readiness(&self) -> Result<(), String> {
-        let table = self.current();
-        let hosts = |unready: &dyn Fn(&Upstream) -> bool| -> Vec<&str> {
-            let routes = table.advertised().iter();
-            routes
-                .filter(|route| unready(route))
-                .map(|route| route.host.as_str())
-                .collect()
-        };
-        let held = hosts(&|route| table.held(route));
-        let unready = hosts(&|route| !table.held(route) && !table.ready(route));
-        let mut why = Vec::new();
-        if !held.is_empty() {
-            why.push(format!(
-                "held until their owners confirm them: {}",
-                held.join(", ")
-            ));
-        }
-        if !unready.is_empty() {
-            why.push(format!("no instance ready for {}", unready.join(", ")));
-        }
+    /// Whether the current table's routes let the wicket serve: none held ([`Table::held`]),
+    /// and, while `waiting` (for a bound from the wicket's start), each with an instance ready
+    /// since then ([`Table::ready`]). Ok names the hosts of the routes with no instance ready
+    /// now, if any; Err those of the routes that are not as told, then them.
+    pub fn readiness(&self, waiting: bool) -> Result<Option<String>, String> {
+        let Unready { held, none } = self.unready();
+        let (yet, now): (Vec<_>, Vec<_>) = none.into_iter().partition(|(_, was)| waiting && !was);
+        let hosts = |hosts: Vec<String>| (!hosts.is_empty()).then(|| hosts.join(", "));
+        let routes =
+            |routes: Vec<(String, bool)>| hosts(routes.into_iter().map(|(host, _)| host).collect());
+        let why = [
+            hosts(held).map(|held| format!("held until their owners confirm them: {held}")),
+            routes(yet).map(|yet| format!("no instance ready yet for {yet}")),
+        ];
+        let note = routes(now).map(|now| format!("no instance ready for {now}"));
+        let why: Vec<String> = why.into_iter().flatten().collect();
         match why.is_empty() {
-            true => Ok(()),
-            false => Err(why.join("; ")),
+            true => Ok(note),
+            false => Err(why.into_iter().chain(note).collect::<Vec<_>>().join("; ")),
         }
     }
+
+    /// The hosts of the current table's routes with no instance ready since the wicket's start,
+    /// held routes aside.
+    pub fn never_ready(&self) -> Vec<String> {
+        let none = self.unready().none.into_iter();
+        none.filter(|(_, was)| !was).map(|(host, _)| host).collect()
+    }
+
+    /// The current table's routes not ready, in its order; notes those ready.
+    fn unready(&self) -> Unready {
+        let table = self.current();
+        let mut were_ready = self.were_ready.lock().unwrap();
+        let mut unready = Unready::default();
+        for route in table.advertised() {
+            let host = route.host.clone();
+            if table.held(route) {
+                unready.held.push(host);
+            } else if table.ready(route) {
+                were_ready.insert(host);
+            } else {
+                let was = were_ready.contains(&host);
+                unready.none.push((host, was));
+            }
+        }
+        unready
+    }
+}
+
+/// The hosts of a table's routes not ready ([`Routes::readiness`]).
+#[derive(Default)]
+struct Unready {
+    /// Held ([`Table::held`]).
+    held: Vec<String>,
+    /// With no instance ready, each with whether it had one since the wicket's start.
+    none: Vec<(String, bool)>,
 }
 
 /// Whether `a` and `b` advertise the same routes, in the same order, whatever their weights.

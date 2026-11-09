@@ -193,9 +193,9 @@ impl<T> Shared<T> {
 impl<T: Table> Shared<T> {
     /// Whether the wicket serves through the server, as a readiness probe asks: not from the drain
     /// on; else once every node of the membership has a stream up that took the current routes'
-    /// generation, and every route has an instance ready and is held for no controller
-    /// ([`Routes::readiness`]). Err says why not.
-    pub fn readiness(&self) -> Result<(), String> {
+    /// generation, and the routes are as [`Routes::readiness`] asks, `waiting` or not. Ok names
+    /// the routes with no instance ready, if any; Err says why not.
+    pub fn readiness(&self, waiting: bool) -> Result<Option<String>, String> {
         if self.drain.begin.is_cancelled() {
             return Err("draining".into());
         }
@@ -227,7 +227,7 @@ impl<T: Table> Shared<T> {
                 behind.join(", ")
             ));
         }
-        self.routes.readiness()
+        self.routes.readiness(waiting)
     }
 }
 

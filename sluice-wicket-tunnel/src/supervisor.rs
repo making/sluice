@@ -177,17 +177,26 @@ mod tests {
         n0.ack(false);
         n1.advertise().await;
         // ready once every node took the routes
-        let behind = until(|| shared.readiness().is_err_and(|why| why.ends_with(" to n1"))).await;
-        assert!(behind, "{:?}", shared.readiness());
+        let behind = until(|| {
+            shared
+                .readiness(false)
+                .is_err_and(|why| why.ends_with(" to n1"))
+        })
+        .await;
+        assert!(behind, "{:?}", shared.readiness(false));
         n1.ack(false);
-        assert!(until(|| shared.readiness().is_ok()).await);
+        assert!(until(|| shared.readiness(false).is_ok()).await);
         // n1 leaves: its stream ends (within the hang guard)
         n0.send(Body::MembershipUpdate(proto::MembershipUpdate {
             nodes: vec![node("n0", &url0)],
             membership_version: 2,
         }));
         n1.ended().await;
-        assert_eq!(shared.readiness(), Ok(()), "n0 alone is the membership");
+        assert_eq!(
+            shared.readiness(false),
+            Ok(None),
+            "n0 alone is the membership"
+        );
 
         assert!(
             bootstrap_streams.try_recv().is_err(),

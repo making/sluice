@@ -940,8 +940,10 @@ evacuated): local mode stays one wicket.
   evacuation of 60s, 20s more for a Firecracker wicket's disks), and update the next wicket once
   the first serves again: its readiness probe (`--health`, see the wicket's [Readiness
   probe](../sluice-wicket-runtime-wasi/README.md#readiness-probe)) says so once every node of the
-  server took its routes, each with an instance ready and none held. A route that does not start
-  ends the wicket's start. On Kubernetes the cf-api reaches a wicket leaving (a pod terminating, no
+  server took its routes, none held, each with an instance ready since its start or a Firecracker
+  wicket's `--ready-grace` (60s) passed: an app failing its readiness check on every wicket holds
+  the update a minute per wicket, not for good. A route that does not start ends the wicket's
+  start. On Kubernetes the cf-api reaches a wicket leaving (a pod terminating, no
   endpoint), or one not ready that holds its apps, by its name in the StatefulSet's headless
   Service with `publishNotReadyAddresses: true`
   alone

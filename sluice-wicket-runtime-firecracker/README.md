@@ -243,8 +243,9 @@ another variable of that prefix but the two below, a misspelled one, is refused 
 [findings](../.kb/wicket-firecracker-findings.md#relay-workers)). `--health <host:port>` serves the
 wicket's readiness probe, `GET /ready`, as sluice-wicket-runtime-wasi's ([Readiness
 probe](../sluice-wicket-runtime-wasi/README.md#readiness-probe)): ready once the routes started,
-each with a VM [ready](#readiness), and with `--server` every node took them; not from the drain on.
-`--probe <host:port>` asks it (exit 0 when ready, 1 when not).
+each with a VM [ready](#readiness) since or `--ready-grace` (60s) passed, and with `--server`
+every node took them; not from the drain on. `--probe <host:port>` asks it (exit 0 when ready, 1
+when not).
 
 `SLUICE_WICKET_RUNTIME_FIRECRACKER_SERIAL_CONSOLE=1` gives the VMs a serial console, the kernel's and
 `/init`'s own output into each VM's `firecracker.log` (the processes' reaches the wicket
@@ -269,6 +270,7 @@ workers: 4                      # threads relaying the connections
 watch-interval: 1s              # 0 = SIGHUP only
 drain-grace: 20s
 evacuation-grace: 0             # 60s: on SIGTERM, serves on while the apps move elsewhere
+ready-grace: 60s                # the readiness probe waits this long for each route's first VM
 # flume: grpc://127.0.0.1:8002  # see Output and the live access log
 # flume-token: ${FLUME_TOKEN}
 # jail-ids: 900000-900127       # see Jail mode
@@ -421,7 +423,12 @@ has it serve once its readiness check passed as well, as a CF app's readiness he
   Its target stays bound: a connection the server routed before fails. `--listen` routes its host
   as ever, its connections failing alike
 - **per connection, reused**: refused, a connection's VM being its own, restored as it comes
-- **the wicket's probe** (`--health`) is not ready while a route has no VM ready
+- **the wicket's probe** (`--health`) waits for each route's first VM ready since the wicket's
+  start (`not ready: no instance ready yet for app.local`), up to `--ready-grace` (60s, 0: not at
+  all) from the routes' start, when it logs those still without one. A route's readiness after
+  that is its app's: one with none ready leaves the wicket ready, named
+  (`ready; no instance ready for app.local`), so an app failing its check holds no update of the
+  wickets (`docker compose up --wait`, a StatefulSet's rolling update)
 - **told**: the log says each change (`route app.local: VM 1 not ready: GET /ready: HTTP/1.1 503
   Service Unavailable`, `route app.local: VM 1 ready`); the console's listing a route's `ready`
   (advertised) and `instances.ready` (its VMs taking connections), an app's `alive` each VM's `ready`

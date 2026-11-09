@@ -1,5 +1,6 @@
-//! A wicket's readiness probe (`--health`): `GET /ready` answers 200 while the wicket serves, 503
-//! saying why while it does not; no credentials asked, nothing else served. [`probe`] asks it,
+//! A wicket's readiness probe (`--health`): `GET /ready` answers 200 while the wicket serves,
+//! with what it notes if anything, 503 saying why while it does not; no credentials asked, nothing
+//! else served. [`probe`] asks it,
 //! where no HTTP client is at hand (a distroless image's healthcheck).
 
 use std::io::{Read as _, Write as _};
@@ -14,11 +15,11 @@ use crate::accept;
 /// Connections open at once: probes, one at a time each.
 const MAX_CONNECTIONS: usize = 16;
 
-/// Serves the probe on `listener` for good, `ready` telling whether the wicket serves (Err: why
-/// not).
+/// Serves the probe on `listener` for good, `ready` telling whether the wicket serves (Ok: what it
+/// notes, if anything; Err: why not).
 pub async fn run<F>(listener: TcpListener, ready: F)
 where
-    F: Fn() -> Result<(), String> + Send + Sync + 'static,
+    F: Fn() -> Result<Option<String>, String> + Send + Sync + 'static,
 {
     let ready = Arc::new(ready);
     accept::run(
@@ -72,11 +73,12 @@ pub fn probe(address: &str) -> Result<String, String> {
 fn answer(
     method: &hyper::Method,
     path: &str,
-    ready: &impl Fn() -> Result<(), String>,
+    ready: &impl Fn() -> Result<Option<String>, String>,
 ) -> hyper::Response<String> {
     let (status, body) = match (path, method) {
         ("/ready", &hyper::Method::GET | &hyper::Method::HEAD) => match ready() {
-            Ok(()) => (200, "ready\n".to_string()),
+            Ok(None) => (200, "ready\n".to_string()),
+            Ok(Some(note)) => (200, format!("ready; {note}\n")),
             Err(why) => (503, format!("not ready: {why}\n")),
         },
         ("/ready", _) => (405, "GET /ready\n".to_string()),
@@ -108,12 +110,14 @@ mod tests {
         answer
     }
 
-    /// `/ready` says what the wicket says, 200 or 503 and why; no other path is served.
+    /// `/ready` says what the wicket says, 200 and what it notes or 503 and why; no other path is
+    /// served.
     #[tokio::test]
     async fn ready_answers_as_the_wicket_says() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
-        let said: Arc<Mutex<Result<(), String>>> = Arc::new(Mutex::new(Err("starting".into())));
+        let said: Arc<Mutex<Result<Option<String>, String>>> =
+            Arc::new(Mutex::new(Err("starting".into())));
         let says = said.clone();
         tokio::spawn(run(listener, move || says.lock().unwrap().clone()));
 
@@ -126,13 +130,20 @@ mod tests {
         let asking = address.to_string();
         let probed = tokio::task::spawn_blocking(move || probe(&asking));
         assert_eq!(probed.await.unwrap(), Err("not ready: starting\n".into()));
-        *said.lock().unwrap() = Ok(());
+        *said.lock().unwrap() = Ok(None);
         let answer = asked(address, "GET /ready").await;
         assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
         assert!(answer.ends_with("\r\n\r\nready\n"), "{answer}");
         let asking = address.to_string();
         let probed = tokio::task::spawn_blocking(move || probe(&asking));
         assert_eq!(probed.await.unwrap(), Ok("ready\n".into()));
+        *said.lock().unwrap() = Ok(Some("no instance ready for a.local".into()));
+        let answer = asked(address, "GET /ready").await;
+        assert!(answer.starts_with("HTTP/1.1 200 "), "{answer}");
+        assert!(
+            answer.ends_with("\r\n\r\nready; no instance ready for a.local\n"),
+            "{answer}"
+        );
         assert!(
             asked(address, "HEAD /ready")
                 .await

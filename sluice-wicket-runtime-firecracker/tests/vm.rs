@@ -796,7 +796,8 @@ async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> 
 /// check, listed so; a VM failing it takes no connection, and with none ready the route leaves the
 /// advertisement until one answers again, its connections failing meanwhile, on the tunnel and on
 /// `--listen`; a process ending likewise, until the VM in its place is ready. The wicket's
-/// readiness probe says ready only while the route has a VM ready.
+/// readiness probe waits for the route's first VM ready, then says ready whatever the route's,
+/// naming it while it has none.
 async fn readiness(scratch: &Path, rootfs: &Path, start: impl Fn(&str, &[String]) -> Wicket) {
     const READY: &str = "ready.local";
     let config = scratch.join("readiness.yaml");
@@ -839,8 +840,18 @@ async fn readiness(scratch: &Path, rootfs: &Path, start: impl Fn(&str, &[String]
     };
     assert_eq!(hosts(&first), Vec::<String>::new(), "{}", wicket.log());
     said(wicket, "VM 0 not ready: GET /ready?after=20: HTTP/1.1 503").await;
-    let probe = probed(wicket.health()).await;
-    assert!(probe.starts_with("HTTP/1.1 503 "), "{probe}");
+    // the first VM ready waited for, once the server's ack of the first advertise is in (racing
+    // the VMs' first checks)
+    let deadline = Instant::now() + HANG;
+    loop {
+        let probe = probed(wicket.health()).await;
+        assert!(probe.starts_with("HTTP/1.1 503 "), "{probe}");
+        if probe.ends_with("\r\n\r\nnot ready: no instance ready yet for ready.local\n") {
+            break;
+        }
+        assert!(Instant::now() < deadline, "{probe}; {}", wicket.log());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let advertised = tunnel.advertise().await;
     assert_eq!(hosts(&advertised), [READY], "{}", wicket.log());
     // the server's ack on its way
@@ -889,8 +900,8 @@ async fn readiness(scratch: &Path, rootfs: &Path, start: impl Fn(&str, &[String]
     assert_eq!(hosts(&withdrawn), Vec::<String>::new(), "{}", wicket.log());
     let probe = probed(wicket.health()).await;
     assert!(
-        probe.starts_with("HTTP/1.1 503 ")
-            && probe.ends_with("\r\n\r\nnot ready: no instance ready for ready.local\n"),
+        probe.starts_with("HTTP/1.1 200 ")
+            && probe.ends_with("\r\n\r\nready; no instance ready for ready.local\n"),
         "{probe}"
     );
     let none = listed(wicket, READY).await;

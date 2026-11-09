@@ -73,6 +73,7 @@ use sluice_wicket_console::identity::Identity;
 use sluice_wicket_console::leaving;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use sluice_wicket_tunnel::flume::{self, Tap};
 use sluice_wicket_tunnel::ready::Readiness;
@@ -162,8 +163,9 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         routes.deploy(deployed);
     }
 
-    // probed from now on: not ready while the routes start
-    let readiness = Readiness::starting();
+    // probed from now on: not ready while the routes start; a wasm route has an instance ready
+    // as it starts, nothing to wait for
+    let readiness = Readiness::starting(Duration::ZERO);
     if let Some(address) = health {
         serve_health(&address, readiness.clone()).await?;
     }

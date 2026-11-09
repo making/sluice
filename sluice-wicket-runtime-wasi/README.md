@@ -904,11 +904,15 @@ credentials: `200 ready` while the wicket serves, else `503 not ready: <why>`:
 - with `--server`, until every node of the membership has a stream up that took the current
   routes (`no stream up that took the routes of generation N to <node>`), a reload's as well;
   from the drain on (`draining`), not during an [evacuation](#shutdown-drain) before it
-- while a route has no instance ready (`no instance ready for <host>`; a wasm route always has
-  one, a Firecracker wicket's VMs may not)
 - while an app is [held](#apps) until its owner confirms it (`held until their owners confirm
   them: <host>`): its controller reaches the console of a wicket not ready
 - without `--server`, ready once the routes started
+
+A route's instances are its app's, not the wicket's: one with none ready leaves the wicket ready,
+named in the body (`200 ready; no instance ready for <host>`) while the server sends its host to
+another wicket. A wasm route has one as it starts; a [Firecracker
+wicket](../sluice-wicket-runtime-firecracker/README.md#readiness) waits for each route's first VM
+ready (`no instance ready yet for <host>`), up to its `--ready-grace`.
 
 `sluice-wicket-runtime-wasi --probe <host:port>` asks it and exits 0 when ready, 1 when not: the
 image is distroless, with no HTTP client for a healthcheck. On Kubernetes a `readinessProbe`'s

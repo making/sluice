@@ -143,6 +143,7 @@ async fn serving(
         stall_timeout,
         drain_grace,
         evacuation_grace,
+        ready_grace,
         max_instances,
         max_memory_mib,
         workers: _,
@@ -193,7 +194,7 @@ async fn serving(
         routes.deploy(deployed);
     }
     // probed from now on: not ready while the routes start
-    let readiness = Readiness::starting();
+    let readiness = Readiness::starting(ready_grace);
     if let Some(address) = health {
         serve_health(&address, readiness.clone()).await?;
     }
