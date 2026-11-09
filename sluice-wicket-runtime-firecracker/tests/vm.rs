@@ -1190,6 +1190,26 @@ async fn deploy(
     assert_eq!(status, 200, "{apps}");
     let listed = &apps["apps"][0];
     assert_eq!(apps["runtime"], "firecracker");
+    // the wicket, by the id its directory keeps, and its flume node; its budget, as the routes'
+    // listing has it, and an app needing more refused for room
+    let id = std::fs::read_to_string(dir.join("wicket-id")).unwrap();
+    assert_eq!(
+        (&apps["wicket"]["id"], &apps["wicket"]["node"]),
+        (&id.trim().into(), &"wicket:vm-test".into())
+    );
+    assert_eq!(apps["budget"]["max_instances"], 64);
+    assert!(apps["budget"]["instances"].as_u64() >= Some(2), "{apps}");
+    let greedy = app_body(
+        "greedy.local",
+        &sha256,
+        serde_json::json!({"mode": "boot", "instances": 64}),
+    );
+    let (status, refused) = console(at, "PUT", "/api/apps/greedy", true, greedy).await;
+    assert_eq!(
+        (status, &refused["no_room"]),
+        (422, &true.into()),
+        "{refused}"
+    );
     assert_eq!(
         (&listed["name"], &listed["owner"], &listed["tag"]),
         (&"shop".into(), &"cf".into(), &"t1".into())

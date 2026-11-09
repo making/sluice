@@ -127,6 +127,17 @@ pub struct Table {
 }
 
 impl Table {
+    /// The instance slots the advertised routes' pools hold for good: what an edit's routes
+    /// may not need more of than `--max-instances`.
+    pub fn pooled(&self) -> usize {
+        let targets: HashSet<&String> = self.advertised.iter().map(|up| &up.target_url).collect();
+        targets
+            .into_iter()
+            .filter_map(|target| self.handler(target))
+            .map(|handler| handler.sandbox().warm)
+            .sum()
+    }
+
     /// The handler serving `target`.
     pub fn handler(&self, target: &str) -> Option<&Arc<Handler>> {
         self.entries.get(target).map(|entry| &entry.handler)
@@ -298,11 +309,17 @@ impl std::fmt::Display for Change {
 pub struct Unloaded {
     pub host: Option<String>,
     pub error: String,
+    /// The routes' pools need more than `--max-instances`.
+    pub no_room: bool,
 }
 
 impl Unloaded {
     fn of(error: String) -> Unloaded {
-        Unloaded { host: None, error }
+        Unloaded {
+            host: None,
+            error,
+            no_room: false,
+        }
     }
 }
 
@@ -746,6 +763,7 @@ impl Reloader {
             let failed = |e: String| Unloaded {
                 host: Some(spec.host.clone()),
                 error: format!("wasm route '{}': {e}", spec.host),
+                no_room: false,
             };
             spec.sandbox.check().map_err(failed)?;
             if let Some(files) = &spec.sandbox.files
@@ -815,10 +833,13 @@ impl Reloader {
             .map(|(_, sandbox, _)| sandbox.warm)
             .sum();
         if pooled > self.instances.max() {
-            return Err(Unloaded::of(format!(
-                "the routes' pools need {pooled} instance slots, more than --max-instances {}",
-                self.instances.max()
-            )));
+            return Err(Unloaded {
+                no_room: true,
+                ..Unloaded::of(format!(
+                    "the routes' pools need {pooled} instance slots, more than --max-instances {}",
+                    self.instances.max()
+                ))
+            });
         }
         Ok(plan)
     }
@@ -1951,6 +1972,7 @@ pub(crate) mod tests {
             Refused::Rejected(Unloaded {
                 host: Some(host), ..
             }) => format!("rejected at {host}"),
+            Refused::Rejected(Unloaded { no_room: true, .. }) => "no room".into(),
             Refused::Rejected(_) => "rejected".into(),
             Refused::Failed(_) => "failed".into(),
         };
@@ -1999,7 +2021,7 @@ pub(crate) mod tests {
             ),
             (
                 deploy("c.local", &hello, "warm=5"),
-                "rejected",
+                "no room",
                 "more than --max-instances 4".into(),
             ),
             (

@@ -1256,12 +1256,14 @@ impl Api {
         change: &(dyn Fn(&mut State) -> Result<(), ApiError> + Sync),
     ) -> Result<(), ApiError> {
         let _apps = self.controller.hold_all(guids).await;
-        let trial = self.store.read(|state| {
-            let mut trial = state.clone();
-            change(&mut trial)?;
-            Ok::<_, ApiError>(self.shares(&trial, guids))
-        })?;
-        let tried = self.try_shares(&trial).await?;
+        let trial = || {
+            self.store.read(|state| {
+                let mut trial = state.clone();
+                change(&mut trial)?;
+                Ok::<_, ApiError>(self.shares(&trial, guids))
+            })
+        };
+        let tried = self.try_placed(trial).await?;
         let committed = self.store.update(|state| change(state));
         if committed.is_err() {
             self.go_back(&tried).await;
@@ -1281,6 +1283,23 @@ impl Api {
             .iter()
             .map(|guid| (guid.clone(), shares(guid)))
             .collect()
+    }
+
+    /// [`Api::try_shares`] of the shares `trial` makes, made again while a wicket refusing one for
+    /// room comes to have none: its indices go to a wicket with room (`crate::placement`).
+    async fn try_placed(
+        &self,
+        trial: impl Fn() -> Result<Vec<(String, BTreeMap<String, AppBody>)>, ApiError>,
+    ) -> Result<Tried, ApiError> {
+        let full = || self.store.read(|state| state.wickets.full.len());
+        for _ in 0..self.controller.wickets.len() {
+            let before = full();
+            match self.try_shares(&trial()?).await {
+                Err(_) if full() > before => continue,
+                tried => return tried,
+            }
+        }
+        self.try_shares(&trial()?).await
     }
 
     /// Puts each app's shares as `trial` has them, on every wicket whose share it changes, a
@@ -1329,7 +1348,8 @@ impl Api {
 
     /// Puts an app's share on `wicket` as an edit would leave it, the share held. One the wicket
     /// is not known to serve (it refused it) has nothing to break: refused it goes through, or
-    /// what would fix the app (a push of another image, more memory) could not be made.
+    /// what would fix the app (a push of another image, more memory) could not be made; but for
+    /// room, which another wicket may have.
     async fn trial_put(
         &self,
         wicket: &Wicket,
@@ -1340,7 +1360,7 @@ impl Api {
             .store
             .read(|state| matches!(state.outcome(guid, &wicket.name), Some(Outcome::Running)));
         match self.controller.apply(wicket, guid, desired).await {
-            Err(Failure::Refused { .. }) if !serving => Ok(()),
+            Err(Failure::Refused { no_room: false, .. }) if !serving => Ok(()),
             put => put,
         }
     }
@@ -1374,10 +1394,10 @@ impl Api {
                 .collect()
         });
         let _apps = self.controller.hold_all(&named).await;
-        let (trial, guids) = {
+        let guids = {
             let mut trial = self.store.read(State::clone);
             match manifest::apply(&mut trial, space, &manifest, runtime) {
-                Ok(guids) => (trial, guids),
+                Ok(guids) => guids,
                 Err(e) => {
                     return self.job(
                         req,
@@ -1389,7 +1409,14 @@ impl Api {
             }
         };
         // the routes apply at once: a started app is put as it would be
-        let tried = match self.try_shares(&self.shares(&trial, &guids)).await {
+        let trial = || {
+            // of the state as it is: a wicket refusing a share for room fills
+            let mut trial = self.store.read(State::clone);
+            manifest::apply(&mut trial, space, &manifest, runtime)
+                .map_err(ApiError::unprocessable)?;
+            Ok(self.shares(&trial, &guids))
+        };
+        let tried = match self.try_placed(trial).await {
             Ok(tried) => tried,
             Err(refused) => {
                 return self.job(req, "space.apply_manifest", vec![refused.job_error()], None);

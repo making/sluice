@@ -32,6 +32,7 @@ impl Refusal {
                 host: None,
                 missing: Vec::new(),
                 did_not_start: false,
+                no_room: false,
             },
         }
     }
@@ -56,6 +57,10 @@ pub struct ErrorView {
     /// until something it asks changes.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub did_not_start: bool,
+    /// The routes would need more than the wicket's budget (422): a controller places the app
+    /// elsewhere.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub no_room: bool,
 }
 
 /// An edit the routes took: the generation serving it, and what changed.

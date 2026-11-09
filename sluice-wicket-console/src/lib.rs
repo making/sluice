@@ -11,6 +11,8 @@
 //! - [`serve`]: the console's HTTP/1.1 server, the page's shared files (its
 //!   style, fonts and script helpers) and its headers
 //! - [`http`]: the answers, the bodies read in memory or streamed to a file
+//! - [`identity`]: what an apps' listing says of the wicket: its id, its flume node, its build,
+//!   its budget
 //! - [`store`]: the console's directory (files kept under their sha256, never
 //!   rewritten, written by a rename), the names and hosts it takes
 //! - [`status`]: what the page shows of the reloads, and its long poll
@@ -19,6 +21,7 @@
 pub mod env;
 pub mod gate;
 pub mod http;
+pub mod identity;
 pub mod serve;
 pub mod settings;
 pub mod status;

@@ -151,6 +151,30 @@ pub fn check_data_dir(dir: &std::path::Path) -> Result<(), String> {
         .map_err(|e| format!("--data-dir {}: {e}", dir.display()))
 }
 
+/// The wickets `settings` name.
+fn wickets(settings: &Settings) -> Vec<Arc<wicket::Wicket>> {
+    let of = settings.wickets.len();
+    (settings.wickets.iter())
+        .map(|wicket| {
+            let token = settings.wicket_token.clone();
+            Arc::new(wicket::Wicket::new(
+                &wicket.name,
+                of,
+                &wicket.url,
+                token,
+                OWNER,
+            ))
+        })
+        .collect()
+}
+
+/// Refuses two `--wicket`s naming one wicket, of those answering now.
+pub async fn check_wickets(settings: &Settings) -> Result<(), String> {
+    // reqwest brings no crypto provider of its own
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    controller::distinct(&wickets(settings)).await
+}
+
 /// Binds `listen`; `loopback_only` (`--any-credentials`) refuses any other address.
 pub async fn bind(listen: &str, loopback_only: bool) -> Result<TcpListener, String> {
     let failed = |e: std::io::Error| format!("--listen {listen}: {e}");
@@ -223,22 +247,9 @@ pub async fn serve(
         None => None,
     };
     let logs = Arc::new(logs::Logs::default());
-    let of = settings.wickets.len();
-    let wickets = (settings.wickets.iter())
-        .map(|wicket| {
-            let token = settings.wicket_token.clone();
-            Arc::new(wicket::Wicket::new(
-                &wicket.name,
-                of,
-                &wicket.url,
-                token,
-                OWNER,
-            ))
-        })
-        .collect();
     let controller = Arc::new(controller::Controller::new(
         store.clone(),
-        wickets,
+        wickets(&settings),
         logs.clone(),
     ));
     let flume = settings

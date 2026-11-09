@@ -64,6 +64,7 @@ mod routes;
 mod wasm_host;
 
 use sluice_wicket_console::env;
+use sluice_wicket_console::identity::Identity;
 
 use std::sync::Arc;
 
@@ -190,6 +191,12 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
                 stores: reloader.stores().clone(),
                 server: server.clone(),
                 listen: listening,
+                identity: Identity::open(
+                    &console.dir,
+                    flume.as_ref().map(|_| format!("wicket:{client_id}")),
+                    describe_build(),
+                )?,
+                max_instances,
                 dir: console.dir.clone(),
             }),
         ));

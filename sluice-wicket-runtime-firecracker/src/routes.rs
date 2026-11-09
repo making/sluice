@@ -46,7 +46,7 @@
 //! change of the files from a reload of them; an edit, on a disk, from a reload, which is made
 //! again after it.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -88,6 +88,17 @@ pub struct Table {
 }
 
 impl Table {
+    /// The VMs the advertised routes keep for good (their booted VMs, their pools' warm), and
+    /// their guest memory: what an edit's routes may not need more of than the budget.
+    pub fn resident(&self) -> (usize, u64) {
+        let targets: HashSet<&String> = self.advertised.iter().map(|up| &up.target_url).collect();
+        let specs: Vec<RouteSpec> = targets
+            .into_iter()
+            .filter_map(|target| Some(self.routes.get(target)?.spec()))
+            .collect();
+        resident(specs.iter())
+    }
+
     /// The advertised routes in their order, each with where it comes from
     /// and its target's route.
     pub fn served(&self) -> impl Iterator<Item = (&Upstream, &Origin, &Arc<Route>)> {
@@ -429,6 +440,8 @@ pub enum Refused {
     Rejected(String),
     /// Its VMs did not start, of what they are: another try, nothing else changed, fails alike.
     DidNotStart(String),
+    /// The routes need more than the VMs' budget (`--max-instances`, `--max-memory-mib`).
+    NoRoom(String),
     /// The console's directory failed.
     Failed(String),
 }
@@ -441,6 +454,7 @@ impl std::fmt::Display for Refused {
             | Refused::Taken(message)
             | Refused::Rejected(message)
             | Refused::DidNotStart(message)
+            | Refused::NoRoom(message)
             | Refused::Failed(message) => f.write_str(message),
             Refused::Missing(sha256) => {
                 write!(f, "no image of the digest {sha256} kept: upload it first")
@@ -463,9 +477,12 @@ impl std::error::Error for DidNotStart {}
 
 /// What a reload failing refuses an edit with.
 fn refused(e: &BoxError) -> Refused {
-    match e.is::<DidNotStart>() {
-        true => Refused::DidNotStart(e.to_string()),
-        false => Refused::Rejected(e.to_string()),
+    if e.is::<DidNotStart>() {
+        Refused::DidNotStart(e.to_string())
+    } else if e.is::<Full>() {
+        Refused::NoRoom(e.to_string())
+    } else {
+        Refused::Rejected(e.to_string())
     }
 }
 
@@ -1599,8 +1616,7 @@ fn fits(specs: &[(RouteSpec, Origin)], capacity: &Capacity) -> Result<(), BoxErr
         }
     }
     let kept = |spec: &RouteSpec| spec.resident() as u64 * u64::from(spec.vm.memory_mib);
-    let resident: usize = targets.iter().map(|(_, spec)| spec.resident()).sum();
-    let in_memory: u64 = targets.iter().map(|(_, spec)| kept(spec)).sum();
+    let (resident, in_memory) = resident(targets.iter().map(|(_, spec)| *spec));
     let cloned = || targets.iter().filter(|(_, spec)| spec.mode.cloned());
     let vms = cloned()
         .map(|(_, spec)| resident - spec.resident() + 1)
@@ -1609,7 +1625,7 @@ fn fits(specs: &[(RouteSpec, Origin)], capacity: &Capacity) -> Result<(), BoxErr
         .map(|(_, spec)| in_memory - kept(spec) + u64::from(spec.vm.memory_mib))
         .fold(in_memory, u64::max);
     if vms > capacity.max_instances() || capacity.max_memory_mib().is_some_and(|max| memory > max) {
-        return Err(format!(
+        return Err(Full::over(format!(
             "the routes need {vms} VM(s) and {memory} MiB of guest memory to start (their booted \
              VMs, their pools' warm VMs, and a template at a time beside the other routes'): over \
              --max-instances {} / --max-memory-mib {}",
@@ -1617,10 +1633,19 @@ fn fits(specs: &[(RouteSpec, Origin)], capacity: &Capacity) -> Result<(), BoxErr
             capacity
                 .max_memory_mib()
                 .map_or("-".to_string(), |mib| mib.to_string())
-        )
+        ))
         .into());
     }
     Ok(())
+}
+
+/// The VMs the routes of `specs`, one of each target, keep for good, and their guest memory.
+fn resident<'a>(specs: impl Iterator<Item = &'a RouteSpec>) -> (usize, u64) {
+    specs.fold((0, 0), |(vms, memory), spec| {
+        let resident = spec.resident();
+        let mib = resident as u64 * u64::from(spec.vm.memory_mib);
+        (vms + resident, memory + mib)
+    })
 }
 
 #[cfg(test)]

@@ -688,6 +688,25 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         serde_json::json!([&capabilities[..], &["keyvalue"]].concat())
     );
     assert_eq!(apps["keyvalue_stores"], listing["keyvalue_stores"]);
+    // the wicket, by the id its directory keeps across the restart, of no flume node; its
+    // budget, of which the app's warm unit is kept, and an app needing more refused for room
+    let id = std::fs::read_to_string(kept.join("wicket-id")).unwrap();
+    assert_eq!(
+        (&apps["wicket"]["id"], &apps["wicket"]["node"]),
+        (&id.trim().into(), &serde_json::Value::Null)
+    );
+    assert!(apps["wicket"]["build"].is_string(), "{apps}");
+    assert_eq!(
+        apps["budget"],
+        serde_json::json!({"max_instances": 64, "instances": 1})
+    );
+    let mut greedy: serde_json::Value =
+        serde_json::from_slice(&app(&["g.localhost"], &hello)).unwrap();
+    greedy["sandbox"]["warm"] = 64.into();
+    let greedy = greedy.to_string().into_bytes();
+    let (status, _, body) = console(&at, "PUT /api/apps/greedy", &[bearer], &greedy).await;
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!((status, &body["no_room"]), (422, &true.into()), "{body}");
     let mut listed = apps["apps"][0].clone();
     assert_eq!(
         listed["hosts"],

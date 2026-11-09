@@ -26,6 +26,16 @@
 //! The wickets run apps one way, the first listed's: one listing another is logged, and none
 //! placed or put on it. What they offer is what every one of them does.
 //!
+//! A wicket lists which it is: its id, made at its first start and kept in its console's
+//! directory, its flume node and its build. Two names of one id are refused at the start
+//! ([`distinct`]); one coming to another's id later is logged and placed on no more, as a wicket
+//! of another runtime. An id changed behind a name, kept with the state, is logged and its apps
+//! put again, as on a lost directory. A wicket listing no id (one predating it) is taken as it
+//! is: logged once, its lines' instances told as of one wicket's. Its budget leaves the apps placed
+//! on it what the routes that are not theirs do not keep (`crate::placement`): those beyond what
+//! its apps of the owner list. A share it refuses for room has an index passed to a wicket with
+//! room, the wicket taking none until its revision moves.
+//!
 //! The data of a deleted keyvalue instance is deleted through every wicket once no app maps its
 //! namespace, a wicket's draining routes included: tried at the deletion and again after each
 //! listing.
@@ -37,6 +47,7 @@ use std::time::Duration;
 use futures_util::future::join_all;
 
 use crate::logs::Logs;
+use crate::placement::Budget;
 use crate::services::Offer;
 use crate::store::{App, Lifetime, Outcome, Purge, Removal, State, Store};
 use crate::wicket::{
@@ -46,6 +57,15 @@ use crate::wicket::{
 
 /// A lock of each key: what is done one at a time.
 type Locks<K> = Mutex<HashMap<K, Arc<tokio::sync::Mutex<()>>>>;
+
+/// What a wicket listed of itself.
+struct Noted {
+    offer: Offer,
+    runtime: Runtime,
+    /// None from a wicket predating it.
+    id: Option<String>,
+    revision: u64,
+}
 
 pub struct Controller {
     pub store: Arc<Store>,
@@ -59,8 +79,8 @@ pub struct Controller {
     shares: Locks<(String, String)>,
     /// The shares whose VMs did not start, as they were put, by wicket name and guid.
     did_not_start: Mutex<BTreeMap<(String, String), AppBody>>,
-    /// What each wicket offers and runs apps as, as it last listed it, by name.
-    listed: Mutex<BTreeMap<String, (Offer, Runtime)>>,
+    /// What each wicket last listed of itself, by name.
+    listed: Mutex<BTreeMap<String, Noted>>,
     /// The apps of the owner the state does not know, by wicket name and app name, as logged:
     /// once each.
     strangers: Mutex<BTreeSet<(String, String)>>,
@@ -270,12 +290,27 @@ impl Controller {
     fn runtimes(&self) -> (Option<Runtime>, BTreeSet<String>) {
         let listed = self.listed.lock().expect("no panic under the lock");
         let noted = self.wickets.iter().filter_map(|wicket| {
-            let (_, runtime) = listed.get(&wicket.name)?;
-            Some((&wicket.name, *runtime))
+            let noted = listed.get(&wicket.name)?;
+            Some((&wicket.name, noted.runtime))
         });
         let runtime = noted.clone().next().map(|(_, runtime)| runtime);
         let odd = noted.filter(|(_, its)| Some(*its) != runtime);
         (runtime, odd.map(|(name, _)| name.clone()).collect())
+    }
+
+    /// The wicket configured before `wicket` that listed the id it lists: it is a second name.
+    fn first_of(&self, wicket: &Wicket) -> Option<(&Wicket, String)> {
+        let listed = self.listed.lock().expect("no panic under the lock");
+        let id = |wicket: &Wicket| listed.get(&wicket.name)?.id.clone();
+        let its = id(wicket)?;
+        let before = self
+            .wickets
+            .iter()
+            .take_while(|other| other.name != wicket.name);
+        let first = before
+            .into_iter()
+            .find(|other| id(other).as_ref() == Some(&its))?;
+        Some((first, its))
     }
 
     /// What every wicket listed of the wickets' runtime offers.
@@ -284,43 +319,123 @@ impl Controller {
         let listed = self.listed.lock().expect("no panic under the lock");
         let offers: Vec<&Offer> = (self.wickets.iter())
             .filter_map(|wicket| listed.get(&wicket.name))
-            .filter(|(_, its)| Some(*its) == runtime)
-            .map(|(offer, _)| offer)
+            .filter(|noted| Some(noted.runtime) == runtime)
+            .map(|noted| &noted.offer)
             .collect();
         Offer::common(&offers)
     }
 
-    /// Notes what `wicket` listed: what it offers and runs apps as. A wicket of another runtime
-    /// than the wickets' is logged, and none placed or put on it.
-    fn note(&self, wicket: &Wicket, listing: &Listing) {
-        let offer = Offer::new(&listing.capabilities, &listing.keyvalue_stores);
-        let noted = (offer, listing.runtime());
-        (self.listed.lock().expect("no panic under the lock")).insert(wicket.name.clone(), noted);
-        let (runtime, odd) = self.runtimes();
+    /// Notes what `wicket` listed: what it offers and runs apps as, which wicket it is, its
+    /// budget. One placed on no more (of another runtime than the wickets', a second name of
+    /// one) or again is logged. Whether it is another wicket than the name had: its apps are put
+    /// again.
+    fn note(&self, wicket: &Wicket, listing: &Listing) -> bool {
+        let id = listing.wicket.as_ref().map(|listed| listed.id.clone());
+        let noted = Noted {
+            offer: Offer::new(&listing.capabilities, &listing.keyvalue_stores),
+            runtime: listing.runtime(),
+            id: id.clone(),
+            revision: listing.revision,
+        };
+        let before = (self.listed.lock().expect("no panic under the lock"))
+            .insert(wicket.name.clone(), noted);
+        if id.is_none() && before.is_none_or(|before| before.id.is_some()) {
+            println!(
+                "CELL: {} lists no id nor budget (a wicket predating them): placed on with room \
+                 enough, a second name of it not told apart, its lines' instances as one wicket's",
+                wicket.label
+            );
+        }
+        let barred: BTreeMap<&String, String> = (self.wickets.iter())
+            .filter_map(|wicket| Some((&wicket.name, self.odd(wicket)?)))
+            .collect();
+        let odd: BTreeSet<String> = barred.keys().map(|name| name.to_string()).collect();
         let was = self
             .store
             .note(|state| std::mem::replace(&mut state.wickets.odd, odd.clone()));
         for wicket in &self.wickets {
-            match (was.contains(&wicket.name), odd.contains(&wicket.name)) {
-                (false, true) => println!(
-                    "CELL: {} is put on no more: {}",
-                    wicket.label,
-                    self.odd(wicket).unwrap_or_default()
-                ),
-                (true, false) => println!(
-                    "CELL: {} runs the stack {} again, as the wickets: placed on as the others",
-                    wicket.label,
-                    runtime.map_or("", Runtime::stack)
-                ),
+            match (was.contains(&wicket.name), barred.get(&wicket.name)) {
+                (false, Some(why)) => println!("CELL: {} is put on no more: {why}", wicket.label),
+                (true, None) => {
+                    println!("CELL: {} is placed on again, as the others", wicket.label)
+                }
                 _ => {}
             }
         }
+        let budget = listing.budget.as_ref().map(|budget| {
+            // what its routes keep beyond its apps of the owner's is not theirs
+            let ours = (listing.apps.iter()).filter(|app| app.app.owner == wicket.owner);
+            let (instances, memory) = ours
+                .map(|app| match &app.app.sandbox {
+                    Sandbox::Wasm(sandbox) => (sandbox.instances.unwrap_or(0), 0),
+                    Sandbox::Vm(sandbox) => {
+                        let booted = sandbox.mode.as_deref() == Some("boot");
+                        let instances = sandbox.instances.unwrap_or(u64::from(booted));
+                        (instances, instances * sandbox.memory_mib.unwrap_or(0))
+                    }
+                })
+                .fold((0, 0), |(i, m), (instances, mib)| (i + instances, m + mib));
+            let others = budget.instances.saturating_sub(instances);
+            let others_memory = budget.memory_mib.unwrap_or(0).saturating_sub(memory);
+            Budget {
+                instances: budget.max_instances.saturating_sub(others),
+                memory_mib: (budget.max_memory_mib).map(|max| max.saturating_sub(others_memory)),
+            }
+        });
+        let node = listing
+            .wicket
+            .as_ref()
+            .and_then(|listed| listed.node.clone());
+        self.store.note(|state| {
+            let wickets = &mut state.wickets;
+            match budget {
+                Some(budget) => wickets.budgets.insert(wicket.name.clone(), budget),
+                None => wickets.budgets.remove(&wicket.name),
+            };
+            wickets.nodes.retain(|_, of| *of != wicket.name);
+            if let Some(node) = node {
+                wickets.nodes.insert(node, wicket.name.clone());
+            }
+            // its revision moved since it refused a share for room: it may have some
+            let full = wickets.full.get(&wicket.name);
+            if full.is_some_and(|revision| *revision != listing.revision) {
+                wickets.full.remove(&wicket.name);
+            }
+        });
+        let Some(id) = id else {
+            return false;
+        };
+        let was = self
+            .store
+            .read(|state| state.wicket_ids.get(&wicket.name).cloned());
+        if was.as_ref() == Some(&id) {
+            return false;
+        }
+        self.store
+            .update(|state| state.wicket_ids.insert(wicket.name.clone(), id.clone()));
+        let Some(was) = was else {
+            return false;
+        };
+        println!(
+            "CELL: {} is another wicket (id {id}, was {was}): its apps are put again",
+            wicket.label
+        );
+        (self.did_not_start.lock().expect("no panic under the lock"))
+            .retain(|(at, _), _| *at != wicket.name);
+        true
     }
 
-    /// Why nothing is put on `wicket`: it runs apps another way than the wickets.
+    /// Why nothing is put on `wicket`: it is a second name of a wicket, or runs apps another way
+    /// than the wickets.
     fn odd(&self, wicket: &Wicket) -> Option<String> {
+        if let Some((first, id)) = self.first_of(wicket) {
+            return Some(format!(
+                "{} lists the id {id} of {}: a second name of one wicket",
+                wicket.label, first.label
+            ));
+        }
         let listed = self.listed.lock().expect("no panic under the lock");
-        let runtime = |wicket: &Wicket| listed.get(&wicket.name).map(|(_, runtime)| *runtime);
+        let runtime = |wicket: &Wicket| listed.get(&wicket.name).map(|noted| noted.runtime);
         let its = runtime(wicket)?;
         let first = self.wickets.iter().find(|first| runtime(first).is_some())?;
         let theirs = runtime(first)?;
@@ -460,13 +575,7 @@ impl Controller {
         if let Some(why) = self.odd(wicket) {
             let line = format!("{} took none of the app: {why}", wicket.sentence());
             self.record(wicket, guid, Outcome::Refused(why.clone()), &line);
-            return Err(Failure::Refused {
-                status: 409,
-                error: why,
-                host: None,
-                missing: Vec::new(),
-                did_not_start: false,
-            });
+            return Err(Failure::refused(409, why));
         }
         let mut app = app.clone();
         let mut put = wicket.put(guid, &app).await;
@@ -522,7 +631,25 @@ impl Controller {
             ),
         };
         self.record(wicket, guid, outcome, &line);
+        if put.as_ref().is_err_and(Failure::no_room) {
+            // no room there until its revision moves
+            let revision = (self.listed.lock().expect("no panic under the lock"))
+                .get(&wicket.name)
+                .map_or(0, |noted| noted.revision);
+            self.store
+                .note(|state| state.wickets.full.insert(wicket.name.clone(), revision));
+        }
         put.map(|_| ())
+    }
+
+    /// Passes an index of the app `guid` from `wicket`, which refused its share for room, to a
+    /// wicket with room, logged: whether one had.
+    pub fn pass(&self, guid: &str, wicket: &str) -> bool {
+        let Some(line) = self.store.update(|state| state.pass(guid, wicket)) else {
+            return false;
+        };
+        self.logs.add(guid, "CELL", line);
+        true
     }
 
     /// Has `wicket` hold the droplet `sha256` of `app`: uploaded when the cf-api has its bytes,
@@ -648,13 +775,25 @@ impl Controller {
     }
 
     /// The shares of `guid` now, applied on every wicket at once: none on a wicket removes the
-    /// app from it.
+    /// app from it. A share refused for room has an index passed to a wicket with room, and the
+    /// shares applied again.
     pub async fn sync(&self, guid: &str) {
-        join_all(self.wickets.iter().map(|wicket| async move {
-            let _share = self.hold_share(guid, &wicket.name).await;
-            let _ = self.sync_held(wicket, guid).await;
-        }))
-        .await;
+        // each pass fills a wicket: as many as there are
+        for _ in 0..=self.wickets.len() {
+            let full = join_all(self.wickets.iter().map(|wicket| async move {
+                let _share = self.hold_share(guid, &wicket.name).await;
+                let synced = self.sync_held(wicket, guid).await;
+                synced.is_err_and(|e| e.no_room()).then_some(&wicket.name)
+            }))
+            .await;
+            let passed = full
+                .into_iter()
+                .flatten()
+                .any(|wicket| self.pass(guid, wicket));
+            if !passed {
+                return;
+            }
+        }
     }
 
     /// Puts / deletes, each in a task, the difference between the apps `wicket` listed and the
@@ -689,8 +828,15 @@ impl Controller {
                     };
                     let (controller, wicket, guid) = (self.clone(), wicket.clone(), guid.clone());
                     tokio::spawn(async move {
-                        let _held = held;
-                        let _ = controller.sync_held(&wicket, &guid).await;
+                        let synced = {
+                            let _held = held;
+                            controller.sync_held(&wicket, &guid).await
+                        };
+                        if synced.is_err_and(|e| e.no_room())
+                            && controller.pass(&guid, &wicket.name)
+                        {
+                            controller.sync(&guid).await;
+                        }
                     });
                 }
             }
@@ -759,8 +905,8 @@ impl Controller {
                 }
             };
             pause = Duration::from_secs(1);
-            self.note(&wicket, &listing);
-            let moved = after != Some(listing.revision);
+            let another = self.note(&wicket, &listing);
+            let moved = another || after != Some(listing.revision);
             after = Some(listing.revision);
             let pending = self.store.read(|state| {
                 (state.purges.iter()).any(|purge| !purge.purged.contains(&wicket.name))
@@ -794,6 +940,25 @@ impl Controller {
             self.record(wicket, &guid, Outcome::Unreachable, &line);
         }
     }
+}
+
+/// Refuses two names of one wicket among `wickets`: those answering now, by the id they list.
+pub async fn distinct(wickets: &[Arc<Wicket>]) -> Result<(), String> {
+    let listed = join_all(wickets.iter().map(|wicket| wicket.list(None))).await;
+    let mut named: BTreeMap<String, &Wicket> = BTreeMap::new();
+    for (wicket, listing) in wickets.iter().zip(listed) {
+        let Some(id) = listing.ok().and_then(|listing| Some(listing.wicket?.id)) else {
+            continue;
+        };
+        if let Some(first) = named.get(&id) {
+            return Err(format!(
+                "--wicket {} and --wicket {} name one wicket (id {id}): name each once",
+                first.name, wicket.name
+            ));
+        }
+        named.insert(id, wicket);
+    }
+    Ok(())
 }
 
 /// The lock of `key` among `locks`, made if missing.
@@ -862,13 +1027,10 @@ fn vm_sandbox(
 
 /// The droplet `sha256` is neither where it was kept nor to be made again.
 fn gone(sha256: &str, path: &std::path::Path, e: std::io::Error) -> Failure {
-    Failure::Refused {
-        status: 409,
-        error: format!("the droplet {sha256} is gone from {}: {e}", path.display()),
-        host: None,
-        missing: Vec::new(),
-        did_not_start: false,
-    }
+    Failure::refused(
+        409,
+        format!("the droplet {sha256} is gone from {}: {e}", path.display()),
+    )
 }
 
 /// Whether the wicket serves `desired` as listed: the capabilities and the egress in any order;
@@ -1292,13 +1454,7 @@ mod tests {
         assert!(!same(&body(told), &body(booted(2))));
         assert!(same(&body(booted(2)), &body(booted(2))));
         // a removal the wicket did not take is tried again, but for another owner's app
-        let refused = |status| Failure::Refused {
-            status,
-            error: String::new(),
-            host: None,
-            missing: Vec::new(),
-            did_not_start: false,
-        };
+        let refused = |status| Failure::refused(status, String::new());
         assert!(refused(422).retried());
         assert!(Failure::Unreachable(String::new()).retried());
         assert!(!refused(409).retried());

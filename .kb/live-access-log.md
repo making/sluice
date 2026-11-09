@@ -137,7 +137,7 @@ The cf-api (`sluice-wicket-cf-api --flume URL --flume-token TOKEN`) watches the 
 its apps' routes with the kinds `response`, `stdout` and `stderr`, and adds each line to
 the log of the app holding its host, which `cf logs` shows as Cloud Foundry does, the
 `instance` as the output's instance (`APP/PROC/WEB/1`) and the request's `app_index`
-(`-` for none; `RTR/0` is the router, the wicket):
+(`-` for none; `RTR/<n>` is the router, the wicket, `n` its place among the `--wicket`s):
 
 ```text
 [APP/PROC/WEB/1] OUT hello stdout: Method::Get /log body_bytes=0
@@ -151,9 +151,12 @@ the log of the app holding its host, which `cf logs` shows as Cloud Foundry does
   after another rotate over instances 0 to 2; one arriving while all three are busy runs on
   an instance of its own, the wicket's index 3 or above, named as one of 0 to 2 (the requests
   an instance takes at once). On a Firecracker wicket it is its VMs: a pool of
-  `cf scale -i 3` names 0 to 2 and nothing above, as they are. Over several wickets each
-  wicket's `instance` is its own, the line's `WatchRecord.node_id` unread: each wicket's
-  first is `0` (`cf app` maps a wicket's index to the app's, through the indices it holds).
+  `cf scale -i 3` names 0 to 2 and nothing above, as they are. Over several wickets a line's
+  wicket is the one whose apps listing (`GET /api/apps`: `wicket.node`) names the line's
+  `WatchRecord.node_id`, and its `instance` the app's index of that wicket's share, as `cf app`
+  maps it: the share's `k`th instance its `k`th index, those past it the remainder's. A node no
+  wicket listed (one predating it, or not listed yet) is taken as the one wicket holding the
+  app's indices, else as one wicket's.
 - The watch resumes past its cursor (kept in `state.json`) when the hosts change or the
   stream drops. Without a host it holds no watch: an empty filter passes every line.
 - Its startup line names the flume (`flume none` without `--flume`); a watch opened for
@@ -161,8 +164,9 @@ the log of the app holding its host, which `cf logs` shows as Cloud Foundry does
   of the flume ... ended`), logs `cf logs: watching the flume <url> for <hosts>`. The hosts
   are matched exactly: a line whose route key is none of them reaches no app.
 - Lines lost become an `LGR` ERR line in the log of every app watched, as they may be any
-  app's: a wicket's drops, `Up to N lines missed` when the watch fell behind, a flume
-  restart. A node's drops are never an app's lines and are left out.
+  app's: `Up to N lines missed` when the watch fell behind, a flume restart. A wicket's drops
+  go to the apps it holds indices of (`the wicket b's queue to the flume was full`), every
+  app's of a node no wicket listed. A node's drops are never an app's lines and are left out.
 - The lines are kept in memory, 1000 per app, stamped when they reach the cf-api: the
   order `cf logs` streams them in. While the cf-api watches, the nodes and the wicket keep
   feeding, and `cf logs --recent` shows what arrived since.

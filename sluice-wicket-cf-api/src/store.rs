@@ -93,6 +93,10 @@ pub struct State {
     /// (`flume`); None before one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flume: Option<FlumeCursor>,
+    /// The id each wicket last listed, by name: another behind a name is another wicket
+    /// (`crate::controller`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub wicket_ids: BTreeMap<String, String>,
     /// What each wicket answered of each app, by guid, then by wicket; not kept: a start
     /// lists the wickets.
     #[serde(skip)]
@@ -269,7 +273,7 @@ pub struct Lifetime {
 }
 
 /// The droplet and the sandbox the wicket got at the last start.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub struct Running {
     pub droplet: String,
     pub sha256: String,

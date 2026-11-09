@@ -32,7 +32,10 @@
 //! sandbox is the same in JSON, with its env (its process's environment
 //! variables, which may hold secrets: the listings name them, never their
 //! values; an app's `tag`, opaque to the console, tells its owner what it put),
-//! and its `disk` (`disk`).
+//! and its `disk` (`disk`). The apps' listing names the wicket too -- its id, kept in the
+//! console's directory, its flume node, its build -- and its budget: `--max-instances`,
+//! `--max-memory-mib` and what the routes keep of them for good; an edit needing more is
+//! refused `no_room`.
 //!
 //! The credentials, the page's shared files and the directory's layout are
 //! `sluice-wicket-console`'s.
@@ -50,6 +53,7 @@ use sluice_wicket_console::env::Env;
 use sluice_wicket_console::http::{
     Body, Edited, Intake, Received, Refusal, Response, error, json, pairs, read, receive,
 };
+use sluice_wicket_console::identity::{Budget, Identity};
 use sluice_wicket_console::serve::{self, Service};
 use sluice_wicket_console::status::{
     Alive, Crashed, FailureView, Shortage, Status, alive, crashed, settled,
@@ -104,6 +108,8 @@ pub struct Console {
     /// What the page shows besides the routes.
     pub server: Option<String>,
     pub listen: Option<SocketAddr>,
+    /// Which wicket this is, as the apps' listing says.
+    pub identity: Identity,
 }
 
 impl Service for Console {
@@ -299,9 +305,17 @@ impl Console {
                 down: route.down(),
             });
         }
+        let (instances, memory_mib) = table.resident();
         AppsView {
             revision: status.revision,
             generation: table.generation(),
+            wicket: self.identity.clone(),
+            budget: Budget {
+                max_instances: self.capacity.max_instances(),
+                max_memory_mib: self.capacity.max_memory_mib(),
+                instances,
+                memory_mib: self.capacity.max_memory_mib().map(|_| memory_mib),
+            },
             runtime: RUNTIME,
             capabilities: [],
             keyvalue_stores: [],
@@ -555,7 +569,7 @@ impl Console {
                     Refused::Invalid(_) => StatusCode::BAD_REQUEST,
                     Refused::Unknown(_) => StatusCode::NOT_FOUND,
                     Refused::Taken(_) | Refused::Missing(_) => StatusCode::CONFLICT,
-                    Refused::Rejected(_) | Refused::DidNotStart(_) => {
+                    Refused::Rejected(_) | Refused::DidNotStart(_) | Refused::NoRoom(_) => {
                         StatusCode::UNPROCESSABLE_ENTITY
                     }
                     Refused::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -564,6 +578,7 @@ impl Console {
                 match refused {
                     Refused::Missing(sha256) => refusal.view.missing = vec![sha256],
                     Refused::DidNotStart(_) => refusal.view.did_not_start = true,
+                    Refused::NoRoom(_) => refusal.view.no_room = true,
                     _ => {}
                 }
                 Err(refusal)
@@ -698,12 +713,14 @@ struct Uploaded {
     bytes: u64,
 }
 
-/// The apps. No capability or keyvalue store to grant: what a wasm wicket's
-/// listing offers its apps.
+/// The apps, the wicket and its budget: the VMs the routes keep for good and their memory. No
+/// capability or keyvalue store to grant: what a wasm wicket's listing offers its apps.
 #[derive(Serialize)]
 struct AppsView {
     revision: u64,
     generation: u64,
+    wicket: Identity,
+    budget: Budget,
     runtime: &'static str,
     capabilities: [&'static str; 0],
     keyvalue_stores: [&'static str; 0],

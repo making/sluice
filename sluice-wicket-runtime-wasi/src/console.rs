@@ -30,7 +30,9 @@
 //! console, tells its owner what it put); the apps' listing names what a
 //! sandbox may hold (the capabilities and the keyvalue stores), as the
 //! routes' does. An app's files, a tar uploaded by digest too, are its
-//! instances' read-only at `/` (`files`).
+//! instances' read-only at `/` (`files`). The apps' listing names the wicket too -- its id, kept
+//! in the console's directory, its flume node, its build -- and its budget: `--max-instances` and
+//! the slots the routes' pools hold for good; an edit needing more is refused `no_room`.
 //!
 //! The credentials, the page's shared files and the persistence layout are
 //! `sluice-wicket-console`'s.
@@ -48,6 +50,7 @@ use serde::{Deserialize, Serialize};
 use sluice_wicket_console::http::{
     Body, Edited, Intake, Refusal, Response, error, json, pairs, read, receive,
 };
+use sluice_wicket_console::identity::{Budget, Identity};
 use sluice_wicket_console::serve::{self, Service};
 use sluice_wicket_console::status::{Alive, Status, alive, settled};
 use sluice_wicket_console::store;
@@ -83,6 +86,10 @@ pub struct Console {
     pub listen: Option<SocketAddr>,
     /// The console's directory, the apps' files below it.
     pub dir: PathBuf,
+    /// Which wicket this is, as the apps' listing says.
+    pub identity: Identity,
+    /// `--max-instances`, which the apps' listing names as the budget.
+    pub max_instances: usize,
 }
 
 impl Service for Console {
@@ -266,6 +273,13 @@ impl Console {
         AppsView {
             revision: status.revision,
             generation: table.generation,
+            wicket: self.identity.clone(),
+            budget: Budget {
+                max_instances: self.max_instances,
+                max_memory_mib: None,
+                instances: table.pooled(),
+                memory_mib: None,
+            },
             capabilities: &Caps::NAMES,
             keyvalue_stores: self.store_views(),
             apps,
@@ -552,7 +566,10 @@ impl Console {
                 };
                 let mut refusal = Refusal::new(status, refused.to_string());
                 match refused {
-                    Refused::Rejected(unloaded) => refusal.view.host = unloaded.host,
+                    Refused::Rejected(unloaded) => {
+                        refusal.view.host = unloaded.host;
+                        refusal.view.no_room = unloaded.no_room;
+                    }
                     Refused::Missing(missing) => refusal.view.missing = missing,
                     _ => {}
                 }
@@ -717,11 +734,13 @@ struct BucketView {
     namespace: String,
 }
 
-/// The apps, and what their sandboxes may hold.
+/// The apps, the wicket and its budget, and what their sandboxes may hold.
 #[derive(Serialize)]
 struct AppsView {
     revision: u64,
     generation: u64,
+    wicket: Identity,
+    budget: Budget,
     capabilities: &'static [&'static str],
     keyvalue_stores: Vec<StoreView>,
     apps: Vec<AppView>,

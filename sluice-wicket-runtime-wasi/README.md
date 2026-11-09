@@ -497,7 +497,7 @@ removed by its owner: the API of a controller keeping the desired state of its a
 |---|---|
 | `PUT /api/components/<sha256>` | keeps the body, a component of 128MiB at most, under its digest (400 when the body has another): `{"sha256": .., "bytes": ..}` |
 | `PUT /api/files/<sha256>` | unpacks the body, a tar of an app's files (1GiB at most), under its digest, as the component's: `{"sha256": .., "bytes": ..}`; 400 naming what of the tar is refused |
-| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "capabilities", "keyvalue_stores", "apps": [..]}`; `capabilities` and `keyvalue_stores` name what a sandbox may hold |
+| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "wicket", "budget", "capabilities", "keyvalue_stores", "apps": [..]}`; `capabilities` and `keyvalue_stores` name what a sandbox may hold; `wicket` which wicket this is: `id`, made at its first start and kept in the console directory (`wicket-id`), `node`, its flume node (`wicket:<client-id>`, null without `--flume`), `build`; `budget` `max_instances` (`--max-instances`) and `instances`, the slots the routes' pools hold for good. An app needing more is refused 422 with `"no_room": true` |
 | `PUT /api/apps/<name>` | serves the app of the body (JSON, below) |
 | `DELETE /api/apps/<name>?owner=<owner>` | removes the app of `owner` |
 | `DELETE /api/keyvalue/<store>/<namespace>` | deletes the namespace's keys (its usage too): `{"store", "namespace", "keys": <deleted>}`. Refused (409) while a route maps it, one being drained included; 404 for an unknown store. The namespace may hold `/` (percent-encoded or not) |

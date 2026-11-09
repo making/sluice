@@ -394,13 +394,10 @@ struct Entry {
 /// an entry `STARTING` beside it would keep the CLI's wait going where all that it lists has
 /// failed.
 fn alive(listed: &ListedApp, wicket: &str, indices: &[u64], instances: u64) -> Vec<Entry> {
-    let Some(count) = std::num::NonZeroU64::new(indices.len() as u64) else {
+    if indices.is_empty() {
         return Vec::new();
-    };
-    let named = |index: u64| {
-        let index = indices[(index % count) as usize];
-        crate::flume::listed(index, instances)
-    };
+    }
+    let named = |index: u64| crate::placement::app_index(indices, index, instances);
     let entry = |index, state, details, since| Entry {
         index,
         host: wicket.to_string(),

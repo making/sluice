@@ -105,6 +105,11 @@ impl Drop for Slot {
 pub struct Full(String);
 
 impl Full {
+    /// The routes need more than the budget: `why`.
+    pub fn over(why: String) -> Full {
+        Full(why)
+    }
+
     /// Named after the route that asked.
     pub fn of(self, label: &str) -> Full {
         Full(format!("route {label}: {}", self.0))

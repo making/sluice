@@ -576,34 +576,36 @@ fn the_cf_cli_deploys_to_the_wicket() {
     );
     let flume_url = flume.logged("listening on ");
     // a wicket on the flume, its console at `console`, of a console directory and a keyvalue
-    // file of its own (`deployed<suffix>`, `kv<suffix>.db`): its listener and its console
-    let start_wicket = |console: &str, suffix: &str| {
-        let wicket = Process::spawn(
-            &wicket_binary,
-            &[
-                "--flume",
-                &flume_url,
-                "--flume-token",
-                FLUME_TOKEN,
-                "--listen",
-                "127.0.0.1:0",
-                "--console",
-                console,
-                "--console-token",
-                TOKEN,
-                "--console-dir",
-                dir.join(format!("deployed{suffix}")).to_str().unwrap(),
-                "--keyvalue-file",
-                dir.join(format!("kv{suffix}.db")).to_str().unwrap(),
-                "--watch-interval",
-                "0",
-            ],
-        );
+    // file of its own (`deployed<suffix>`, `kv<suffix>.db`), and `more`: its listener and its
+    // console
+    let start_wicket = |console: &str, suffix: &str, more: &[&str]| {
+        let console_dir = dir.join(format!("deployed{suffix}"));
+        let kv_file = dir.join(format!("kv{suffix}.db"));
+        let mut args = vec![
+            "--flume",
+            &flume_url,
+            "--flume-token",
+            FLUME_TOKEN,
+            "--listen",
+            "127.0.0.1:0",
+            "--console",
+            console,
+            "--console-token",
+            TOKEN,
+            "--console-dir",
+            console_dir.to_str().unwrap(),
+            "--keyvalue-file",
+            kv_file.to_str().unwrap(),
+            "--watch-interval",
+            "0",
+        ];
+        args.extend_from_slice(more);
+        let wicket = Process::spawn(&wicket_binary, &args);
         let listen = wicket.logged("listening on ");
         let console = wicket.logged("console on http://");
         (wicket, listen, console)
     };
-    let (wicket, listen, console) = start_wicket("127.0.0.1:0", "");
+    let (wicket, listen, console) = start_wicket("127.0.0.1:0", "", &[]);
     // ports of its own, kept across the restarts (the CLI targets it; the cf-api names the
     // second wicket's console)
     let free = || {
@@ -1401,11 +1403,27 @@ fn the_cf_cli_deploys_to_the_wicket() {
     // indices are placed again at the restart, its name no --wicket's: hello's second goes to
     // the second wicket
     let console_b = free();
-    let (mut wicket_b, mut listen_b, _) = start_wicket(&console_b, "-b");
+    let (mut wicket_b, mut listen_b, _) = start_wicket(&console_b, "-b", &[]);
     let two_wickets = [
         format!("a=http://{console}"),
         format!("b=http://{console_b}"),
     ];
+    // one wicket named twice, by two URLs: refused at the start, by the id its listing names
+    let port = console.rsplit(':').next().unwrap();
+    let twice = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-cf-api"))
+        .args(["--wicket", &two_wickets[0], "--wicket"])
+        .arg(format!("c=http://localhost:{port}"))
+        .args(["--wicket-token", TOKEN, "--listen", "127.0.0.1:0"])
+        .args(["--any-credentials", "--data-dir"])
+        .arg(dir.join("twice"))
+        .output()
+        .unwrap();
+    assert!(!twice.status.success());
+    let why = String::from_utf8_lossy(&twice.stderr);
+    assert!(
+        why.contains("--wicket a and --wicket c name one wicket (id "),
+        "{why}"
+    );
     drop(api);
     let (api, _) = with_rules(&two_wickets, &["email=*@example.com", "groups=devs"]);
     let guid_of = |app: &str| cf.ok(&["app", app, "--guid"]).trim().to_string();
@@ -1425,7 +1443,8 @@ fn the_cf_cli_deploys_to_the_wicket() {
     });
 
     // pushed at -i 2: an instance on each wicket, each listing the app at 1 and answering it on
-    // its listener; `cf app` the two running, each on its wicket
+    // its listener; `cf app` the two running, each on its wicket, index 0 on the second: the
+    // first, holding the apps pushed before, has less room
     let app = dir.join("app");
     cf.ok(&["push", "spread", "-p", app.to_str().unwrap(), "-i", "2"]);
     for (console, listen) in [(&console, &listen), (&console_b, &listen_b)] {
@@ -1447,13 +1466,31 @@ fn the_cf_cli_deploys_to_the_wicket() {
         entries.iter().map(entry).collect::<Vec<_>>()
     };
     let at = |index, state: &str, host: &str| (index, state.to_string(), host.to_string());
-    let both = [at(0, "RUNNING", "a"), at(1, "RUNNING", "b")];
+    let both = [at(0, "RUNNING", "b"), at(1, "RUNNING", "a")];
     eventually("an instance running on each wicket", || hosted() == both);
     let shown = cf.ok(&["app", "spread"]);
     for index in ["#0", "#1"] {
         let running = |line: &&str| line.starts_with(index) && line.contains("running");
         assert!(shown.lines().any(|line| running(&line)), "{shown}");
     }
+    // `cf logs` names each line by the wicket that wrote it: its output #0 and #1, its requests
+    // by the router of each, the wicket's place
+    for listen in [&listen, &listen_b] {
+        assert_eq!(get(listen, "spread.localhost", "/log", None).0, 200);
+    }
+    eventually("spread's lines of each wicket", || {
+        let recent = cf.ok(&["logs", "spread", "--recent"]);
+        let routed = |router: u64, index: u64| {
+            recent.lines().any(|line| {
+                line.contains(&format!("[RTR/{router}] OUT spread.localhost"))
+                    && line.ends_with(&format!("app_index:\"{index}\""))
+            })
+        };
+        [(1, 0), (0, 1)].into_iter().all(|(router, index)| {
+            let out = format!("[APP/PROC/WEB/{index}] OUT hello stdout: Method::Get /log");
+            recent.contains(&out) && routed(router, index)
+        })
+    });
 
     // the second wicket stopped: its index starting. Back, it serves what it kept, as the
     // cf-api finds it, putting nothing again
@@ -1466,12 +1503,13 @@ fn the_cf_cli_deploys_to_the_wicket() {
     };
     let kept = deployed(&console_b);
     wicket_b.kill();
-    let away = [at(0, "RUNNING", "a"), at(1, "STARTING", "b")];
+    let away = [at(0, "STARTING", "b"), at(1, "RUNNING", "a")];
     eventually("the second wicket's index starting", || hosted() == away);
     let shown = cf.ok(&["app", "spread"]);
-    let starting = |line: &&str| line.starts_with("#1") && line.contains("starting");
+    let starting = |line: &&str| line.starts_with("#0") && line.contains("starting");
     assert!(shown.lines().any(|line| starting(&line)), "{shown}");
-    (wicket_b, listen_b, _) = start_wicket(&console_b, "-b");
+    // back with room for 3 instances: hello's, spread's and one more
+    (wicket_b, listen_b, _) = start_wicket(&console_b, "-b", &["--max-instances", "3"]);
     let spread = guid_of("spread");
     api.line(&format!("[{spread}] CELL: Found in the wicket b as wanted"));
     assert_eq!(deployed(&console_b), kept);
@@ -1480,22 +1518,53 @@ fn the_cf_cli_deploys_to_the_wicket() {
         hosted() == both
     });
 
-    // `cf scale -i 3` gives one wicket two, `-i 1` removes the app from the other
-    let instances = |console: &str| {
-        share(console, "spread.localhost").map(|sandbox| sandbox["instances"].clone())
+    // `cf scale -i 3` gives the wicket of the most room two, `-i 1` keeps index 0 alone, the
+    // app removed from the other
+    let instances = |console: &str, host: &str| {
+        share(console, host).map(|sandbox| sandbox["instances"].clone())
     };
+    let spread_on = |console: &str| instances(console, "spread.localhost");
     cf.ok(&["scale", "spread", "-i", "3"]);
     assert_eq!(
-        (instances(&console), instances(&console_b)),
+        (spread_on(&console), spread_on(&console_b)),
         (Some(json!(2)), Some(json!(1)))
     );
     cf.ok(&["scale", "spread", "-i", "1"]);
     assert_eq!(
-        (instances(&console), instances(&console_b)),
-        (Some(json!(1)), None)
+        (spread_on(&console), spread_on(&console_b)),
+        (None, Some(json!(1)))
     );
-    assert_eq!(get(&listen_b, "spread.localhost", "/", None).0, 404);
+    assert_eq!(get(&listen, "spread.localhost", "/", None).0, 404);
     cf.ok(&["delete", "spread", "-r", "-f"]);
+
+    // the second wicket's budget taken but for hello's (a route of its console keeping 2 warm):
+    // a new app's indices go to the first
+    let console_route = format!("http://{console_b}/api/routes/full.localhost");
+    let http_b = reqwest::blocking::Client::new();
+    let deployed = http_b
+        .put(format!("{console_route}?name=hello.wasm&warm=2"))
+        .bearer_auth(TOKEN)
+        .body(std::fs::read(app.join("hello.wasm")).unwrap())
+        .send()
+        .unwrap();
+    assert_eq!(deployed.status(), 200, "{:?}", deployed.text());
+    // the cf-api lists the second wicket's change at once
+    std::thread::sleep(Duration::from_secs(1));
+    cf.ok(&["push", "crowded", "-p", app.to_str().unwrap(), "-i", "2"]);
+    assert_eq!(
+        (
+            instances(&console, "crowded.localhost"),
+            instances(&console_b, "crowded.localhost")
+        ),
+        (Some(json!(2)), None)
+    );
+    cf.ok(&["delete", "crowded", "-r", "-f"]);
+    let removed = http_b
+        .delete(&console_route)
+        .bearer_auth(TOKEN)
+        .send()
+        .unwrap();
+    assert_eq!(removed.status(), 200);
 
     // a component the wicket refuses: its reason reaches the user
     let output = cf.fails(&[

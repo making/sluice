@@ -1,10 +1,13 @@
 //! The apps' own logs from the live access log: a watch of the sluice-flume
-//! (`--flume`) for what the wicket feeds of the apps' hosts -- the guests'
+//! (`--flume`) for what the wickets feed of the apps' hosts -- the guests'
 //! output (`stdout`, `stderr`) and the requests answered (`response`) -- each
 //! line added to the log of the app holding its host, as Cloud Foundry has
 //! it: the output as `APP/PROC/WEB` OUT / ERR of the instance writing it, a
 //! request as `RTR` in the gorouter's access log format, naming the instance
-//! that served it (`app_index`).
+//! that served it (`app_index`). A line's wicket is the one listing its flume
+//! node, its instance the app's index of that wicket's share
+//! (`State::instance_of`); a request's `RTR` index is the wicket's place among
+//! the wickets, each a router of its share.
 //!
 //! ```text
 //! wicket --Feed--> sluice-flume <--Watch-- cf-api --log-cache read API--> cf logs
@@ -14,7 +17,8 @@
 //! state) when the apps' hosts change or the stream drops. The lines lost on
 //! the way -- dropped by the wicket, passed while the watch fell behind, or
 //! gone with a restart of the flume -- become a line saying so (`LGR`) in
-//! every app's log, as they may be any app's. Without a host there is no
+//! every app's log, as they may be any app's; those a wicket dropped, in the
+//! logs of the apps it holds indices of. Without a host there is no
 //! watch: the flume passes every line to an empty filter.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -228,17 +232,23 @@ impl Taker<'_> {
                 let Some(app) = self.hosts.get(&event.route_key) else {
                     return;
                 };
-                let instances = self
-                    .store
-                    .read(|state| state.app(app).map_or(0, |app| app.process.instances));
-                let served = instance(&event).map(|index| listed(index, instances));
+                let (served, router) = self.store.read(|state| {
+                    let wicket = state.wickets.nodes.get(&record.node_id);
+                    let served = instance(&event).map(|index| match state.app(app) {
+                        Some(app) => state.instance_of(app, wicket.map(String::as_str), index),
+                        None => index,
+                    });
+                    let mut configured = state.wickets.configured.iter();
+                    let router = wicket.and_then(|wicket| configured.position(|at| at == wicket));
+                    (served, router.unwrap_or(0) as u64)
+                });
                 // a wicket predating the instance index names none: 0, as before
                 let index = served.unwrap_or(0);
                 let (source, index, stream, text) = match event.kind.as_str() {
                     "stdout" => ("APP/PROC/WEB", index, Stream::Out, field(&event, "line")),
                     "stderr" => ("APP/PROC/WEB", index, Stream::Err, field(&event, "line")),
-                    // the router's index: the wicket is the one router
-                    "response" => ("RTR", 0, Stream::Out, router_line(&event, app, served)),
+                    // each wicket is a router of its share: its place among the wickets
+                    "response" => ("RTR", router, Stream::Out, router_line(&event, app, served)),
                     _ => return,
                 };
                 self.logs.push(app, source, index, stream, text);
@@ -250,9 +260,7 @@ impl Taker<'_> {
                 let dropped = gap.dropped;
                 match gap.cause() {
                     watch_gap::Cause::NodeDropped if !gap.node_id.starts_with(WICKET_NODE) => {}
-                    watch_gap::Cause::NodeDropped => self.lost(format!(
-                        "Up to {dropped} lines missed: the wicket's queue to the flume was full"
-                    )),
+                    watch_gap::Cause::NodeDropped => self.dropped(&gap.node_id, dropped),
                     _ => self.lost(format!(
                         "Up to {dropped} lines missed: the cf-api fell behind the flume"
                     )),
@@ -283,6 +291,32 @@ impl Taker<'_> {
     /// were is unknown.
     fn lost(&self, text: String) {
         let apps: BTreeSet<&String> = self.hosts.values().collect();
+        self.lost_to(apps, text);
+    }
+
+    /// Tells the apps watched that the wicket of the flume node `node` holds some of that its
+    /// lines were dropped; every app watched, of a node no wicket listed.
+    fn dropped(&self, node: &str, dropped: u64) {
+        let (apps, who) = self.store.read(|state| {
+            let wicket = state.wickets.nodes.get(node);
+            let who = match (state.wickets.configured.len(), wicket) {
+                (1, _) => "the wicket".to_string(),
+                (_, Some(wicket)) => format!("the wicket {wicket}"),
+                (_, None) => format!("the flume node {node}"),
+            };
+            let holds = |app: &&String| {
+                wicket.is_none_or(|wicket| {
+                    (state.app(app)).is_some_and(|app| state.indices(app).contains_key(wicket))
+                })
+            };
+            let apps: BTreeSet<&String> = self.hosts.values().filter(holds).collect();
+            (apps, who)
+        });
+        let text = format!("Up to {dropped} lines missed: {who}'s queue to the flume was full");
+        self.lost_to(apps, text);
+    }
+
+    fn lost_to<'a>(&self, apps: impl IntoIterator<Item = &'a String>, text: String) {
         for app in apps {
             self.logs.push(app, "LGR", 0, Stream::Err, text.clone());
         }
@@ -307,13 +341,6 @@ fn instance(event: &AccessEvent) -> Option<u64> {
         .iter()
         .find(|field| field.name == "instance")
         .and_then(|field| field.value.parse().ok())
-}
-
-/// The wicket's instance `index` as `cf app` lists an app of `instances`: only the cf-api knows
-/// them, and a wasm wicket's route runs more at once, the requests of an instance. Of an app at
-/// 0, which lists none, or gone, as it came.
-pub(crate) fn listed(index: u64, instances: u64) -> u64 {
-    index.checked_rem(instances).unwrap_or(index)
 }
 
 /// A response as the gorouter's access log has it: the host, when the
@@ -376,10 +403,11 @@ mod tests {
     use crate::proto::access_event::Field;
     use crate::proto::{WatchGap, WatchHello, WatchRecord};
 
+    /// A line the wicket `a` fed.
     fn event(seq: u64, kind: &str, host: &str, fields: &[(&str, &str)]) -> watch_event::Body {
         watch_event::Body::Record(WatchRecord {
             seq,
-            node_id: "wicket:w".into(),
+            node_id: "wicket:a".into(),
             event: Some(AccessEvent {
                 node_seq: 1,
                 // 2026-10-30T01:17:47.500Z
@@ -395,6 +423,14 @@ mod tests {
                     .collect(),
             }),
         })
+    }
+
+    /// `line` as the flume node `node` fed it.
+    fn of(node: &str, mut line: watch_event::Body) -> watch_event::Body {
+        if let watch_event::Body::Record(record) = &mut line {
+            record.node_id = node.into();
+        }
+        line
     }
 
     fn gap(node_id: &str, cause: watch_gap::Cause) -> watch_event::Body {
@@ -417,23 +453,34 @@ mod tests {
     /// Each line goes to the app holding its host, as cf has it: the output
     /// `APP/PROC/WEB` OUT / ERR of its instance (0 from a wicket naming
     /// none), a response `RTR` in the gorouter's format, naming the instance
-    /// that served it (`-` for none). The lines lost reach every app watched
-    /// -- a sluice node's drops none of them -- and the cursor follows the
-    /// lines taken, of the flume's run at hand.
+    /// that served it (`-` for none); an instance is the app's index of the
+    /// share of the wicket listing the line's node, a response's `RTR` that
+    /// wicket's place. The lines lost reach every app watched -- a sluice
+    /// node's drops none of them, a wicket's those it holds indices of -- and
+    /// the cursor follows the lines taken, of the flume's run at hand.
     #[test]
     fn lines_reach_the_app_of_their_host_and_losses_every_app() {
         let dir = std::env::temp_dir().join(format!("sluice-cf-api-flume-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let localhost = ["localhost".to_string()];
-        let store = Store::open(&dir, "o", "s", &localhost, &["wicket".to_string()]).unwrap();
+        let wickets = ["a".to_string(), "b".to_string()];
+        let store = Store::open(&dir, "o", "s", &localhost, &wickets).unwrap();
         store.update(|state| {
             state.flume = Some(FlumeCursor { epoch: 1, seq: 9 });
         });
+        // its index 0 on a, 1 on b
         let scaled = store.update(|state| {
             let space = state.spaces[0].guid.clone();
             let app = state.create_app("scaled", crate::store::STACK, &space);
             app.process.instances = 2;
             app.guid.clone()
+        });
+        store.note(|state| {
+            state.wickets.nodes = [
+                ("wicket:a".to_string(), "a".to_string()),
+                ("wicket:b".to_string(), "b".to_string()),
+            ]
+            .into()
         });
         let logs = Logs::default();
         let mut taker = Taker {
@@ -461,7 +508,7 @@ mod tests {
             &[("instance", "1"), ("line", "out")],
         ));
         taker.take(event(2, "stderr", "hi.localhost", &[("line", "err")]));
-        let response = |seq: u64, status: &str, instance: Option<&str>| {
+        let response = |seq: u64, host: &str, status: &str, instance: Option<&str>| {
             let mut fields = vec![
                 ("method", "GET"),
                 ("path", "/x?y=1"),
@@ -473,10 +520,10 @@ mod tests {
                 ("userAgent", "curl/8"),
             ];
             fields.extend(instance.map(|instance| ("instance", instance)));
-            event(seq, "response", "b.localhost", &fields)
+            event(seq, "response", host, &fields)
         };
-        taker.take(response(3, "200", Some("1")));
-        taker.take(response(4, "503", None));
+        taker.take(response(3, "b.localhost", "200", Some("1")));
+        taker.take(response(4, "b.localhost", "503", None));
         taker.take(event(
             5,
             "stdout",
@@ -484,27 +531,15 @@ mod tests {
             &[("line", "not watched")],
         ));
         taker.take(gap("node-0", watch_gap::Cause::NodeDropped));
-        taker.take(gap("wicket:w", watch_gap::Cause::NodeDropped));
+        taker.take(gap("wicket:x", watch_gap::Cause::NodeDropped));
+        taker.take(gap("wicket:b", watch_gap::Cause::NodeDropped));
         taker.take(gap("", watch_gap::Cause::Behind));
 
-        let restarted = (
-            "LGR",
-            0,
-            Stream::Err,
-            "Lines may be missing: the flume restarted".to_string(),
-        );
-        let dropped = (
-            "LGR",
-            0,
-            Stream::Err,
-            "Up to 3 lines missed: the wicket's queue to the flume was full".to_string(),
-        );
-        let behind = (
-            "LGR",
-            0,
-            Stream::Err,
-            "Up to 3 lines missed: the cf-api fell behind the flume".to_string(),
-        );
+        let lost = |text: &str| ("LGR", 0, Stream::Err, text.to_string());
+        let restarted = lost("Lines may be missing: the flume restarted");
+        let dropped =
+            lost("Up to 3 lines missed: the flume node wicket:x's queue to the flume was full");
+        let behind = lost("Up to 3 lines missed: the cf-api fell behind the flume");
         assert_eq!(
             lines(&logs, "app-a"),
             [
@@ -530,11 +565,11 @@ mod tests {
         assert_eq!(
             lines(&logs, "app-b"),
             [
-                restarted,
+                restarted.clone(),
                 router("200", "1"),
                 router("503", "-"),
-                dropped,
-                behind,
+                dropped.clone(),
+                behind.clone(),
             ]
         );
         assert_eq!(
@@ -542,20 +577,42 @@ mod tests {
             Some(FlumeCursor { epoch: 2, seq: 5 }),
             "the last line taken"
         );
-        // an instance past the app's, the requests of one, named as `cf app` lists it
-        for (seq, kind, index) in [(6, "stdout", "3"), (7, "response", "5")] {
-            taker.take(event(
-                seq,
-                kind,
+        // b's instance past its share, a's request of one past it, b's request: named as
+        // `cf app` lists them, each request by its wicket's router
+        taker.take(of(
+            "wicket:b",
+            event(
+                6,
+                "stdout",
                 "scaled.localhost",
-                &[("instance", index), ("line", "past")],
-            ));
-        }
+                &[("instance", "3"), ("line", "past")],
+            ),
+        ));
+        taker.take(response(7, "scaled.localhost", "200", Some("5")));
+        taker.take(of(
+            "wicket:b",
+            response(8, "scaled.localhost", "200", Some("0")),
+        ));
         let of_scaled = lines(&logs, &scaled);
-        let (out, router) = (&of_scaled[of_scaled.len() - 2], of_scaled.last().unwrap());
-        assert_eq!((out.0, out.1, out.3.as_str()), ("APP/PROC/WEB", 1, "past"));
-        assert!(router.3.ends_with("app_index:\"1\""), "{router:?}");
-        assert_eq!(listed(3, 0), 3, "at 0 it lists none");
+        let shown: Vec<_> = (of_scaled.iter())
+            .map(|(source, index, _, text)| (*source, *index, text.rsplit(' ').next().unwrap()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("LGR", 0, "restarted"),
+                ("LGR", 0, "full"),
+                ("LGR", 0, "full"),
+                ("LGR", 0, "flume"),
+                ("APP/PROC/WEB", 1, "past"),
+                ("RTR", 0, "app_index:\"0\""),
+                ("RTR", 1, "app_index:\"1\""),
+            ]
+        );
+        assert_eq!(
+            of_scaled[2].3,
+            "Up to 3 lines missed: the wicket b's queue to the flume was full"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

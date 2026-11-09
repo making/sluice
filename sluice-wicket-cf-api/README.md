@@ -818,21 +818,37 @@ wicket's `--listen` serves its own apps only and drains nothing (a signal ends i
 mode stays one wicket.
 
 - **Placement.** Each index of an app's web process is on a wicket, kept in the state: a new
-  index goes to a wicket holding none of the app's while there is one, else to one holding the
-  fewest, the first named of them, so every app of `-i 1` is on the first wicket. A scale down
-  drops the highest indices, as on CF, and removes the app from a wicket left with none. A wicket
-  runs an app of its indices: their count is its `instances`, those below the app's `warm` (the
-  lowest are the warm ones) its `warm`. Nothing else moves an index: a wicket added takes new
-  ones. A state of one wicket has its indices on the first wicket named, and the indices of a
-  wicket no name gives any more are placed again at the start (logged): a wicket keeps its apps
-  while it keeps its name, and the one wicket of `--wicket <url>` is `wicket`
-  (`--wicket wicket=<url>`)
+  index goes to a wicket with room for it holding none of the app's while there is one, else to
+  one holding the fewest, of them the one with the most room, the first named of those. A
+  wicket's room is its budget (`--max-instances`, a Firecracker wicket's `--max-memory-mib`) less
+  what its routes not of the cf-api's apps keep and the indices of the started apps placed on it,
+  each an instance (a VM's memory too). A scale down drops the highest indices, as on CF, and
+  removes the app from a wicket left with none. A wicket runs an app of its indices: their count
+  is its `instances`, those below the app's `warm` (the lowest are the warm ones) its `warm`. A
+  wicket refusing a share for room has none until its apps change: an edit (`cf scale -i`) is
+  placed again without it, a start passes the share's highest index to a wicket with room
+  (`CELL: Index 2 placed on the wicket b: the wicket a has no room for it`). No wicket has room:
+  an edit is refused with the wicket's reason, a start shows the indices `CRASHED` with it. Nothing
+  else moves an index: a wicket added takes new ones. A state of one wicket has its indices on the
+  first wicket named, and the indices of a wicket no name gives any more are placed again at the
+  start (logged): a wicket keeps its apps while it keeps its name, and the one wicket of
+  `--wicket <url>` is `wicket` (`--wicket wicket=<url>`)
+- **Which wicket.** A wicket's apps listing names it: an id made at its first start and kept in
+  its console directory (`wicket-id`), its flume node, its build, and its budget. Two names of one
+  id (two URLs reaching one console) are refused at the start; one coming to another's id later
+  is logged and placed on no more. An id changed behind a name (another console directory) is
+  logged, kept in `state.json`, and the apps placed there are put again. A wicket listing none (one
+  predating them) is logged once and taken as it is: room enough, its lines' instances as one
+  wicket's
 - **`cf app`** lists each wicket's instances at their indices, the wicket's name as their `host`
   (`cf curl /v3/apps/<guid>/processes/web/stats`): a wicket away shows its indices `STARTING`, one
   refusing its share `CRASHED` with its reason. An edit applying at once (`cf scale -i`, routes,
   annotations) is put on each wicket whose share it changes, and a refusal by one changes nothing;
   a start, restart or restage puts every share at once, each wicket's outcome its own. `cf logs`
-  names an instance by its wicket's own index: each wicket's first is `0`
+  names a line's instance as `cf app` does, by the wicket whose flume node fed it: `[APP/PROC/WEB/1]`
+  for the second wicket's first instance of an app of `-i 2`. A request's `RTR` index is its
+  wicket's place among the `--wicket`s (each a router of its share), its `app_index` the instance.
+  The lines a wicket dropped (`LGR`) are in the logs of the apps it holds indices of
 - **What they share.** The wickets run apps one way: one listing another runtime than the first
   is logged, and none placed or put on it. They share one `--wicket-token`, not a console
   directory (a volume each; a StatefulSet on Kubernetes). The marketplace is what every wicket

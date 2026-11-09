@@ -479,7 +479,7 @@ digest, or made of an OCI image, first; the app names it:
 |---|---|
 | `PUT /api/components/<sha256>` | keeps the body, an ext4 image of 4 GiB at most, under its digest (400 when the body has another): `{"sha256": .., "bytes": ..}` |
 | `PUT /api/images` | makes an ext4 image of the OCI image the body names (below), kept under its digest as an upload: `{"image": <the reference pinned to its digest>, "name": .., "sha256": .., "bytes": ..}` |
-| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "runtime": "firecracker", "capabilities": [], "keyvalue_stores": [], "apps": [..]}` |
+| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "wicket", "budget", "runtime": "firecracker", "capabilities": [], "keyvalue_stores": [], "apps": [..]}`; `wicket` which wicket this is: `id`, made at its first start and kept in the console directory (`wicket-id`), `node`, its flume node (`wicket:<client-id>`, null without `--flume`), `build`; `budget` `max_instances`, `max_memory_mib` (with `--max-memory-mib`) and what the routes keep of them for good (their booted and warm VMs): `instances`, `memory_mib`. An app needing more is refused 422 with `"no_room": true` |
 | `PUT /api/apps/<name>` | serves the app of the body (JSON, below) |
 | `DELETE /api/apps/<name>?owner=<owner>` | removes the app of `owner` |
 

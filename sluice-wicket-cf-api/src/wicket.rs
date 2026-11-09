@@ -232,6 +232,12 @@ pub struct MadeImage {
 pub struct Listing<S = Sandbox> {
     pub revision: u64,
     pub generation: u64,
+    /// Which wicket it is: none from a wicket predating it.
+    #[serde(default)]
+    pub wicket: Option<ListedWicket>,
+    /// Its budget: none from a wicket predating it.
+    #[serde(default)]
+    pub budget: Option<ListedBudget>,
     /// `firecracker`, or none from a wasm wicket.
     #[serde(default)]
     pub runtime: Option<String>,
@@ -264,12 +270,37 @@ impl Listing<serde_json::Value> {
         Ok(Listing {
             revision: self.revision,
             generation: self.generation,
+            wicket: self.wicket,
+            budget: self.budget,
             runtime: self.runtime,
             capabilities: self.capabilities,
             keyvalue_stores: self.keyvalue_stores,
             apps,
         })
     }
+}
+
+/// Which wicket answers.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct ListedWicket {
+    /// Made at its first start, kept in its console's directory.
+    pub id: String,
+    /// Its node among the flume's (`wicket:<client-id>`): none without a flume.
+    #[serde(default)]
+    pub node: Option<String>,
+    pub build: String,
+}
+
+/// The instances a wicket keeps at once at most, and what its routes keep of them for good: a
+/// Firecracker wicket's guest memory too.
+#[derive(Deserialize, Clone, Debug, PartialEq)]
+pub struct ListedBudget {
+    pub max_instances: u64,
+    #[serde(default)]
+    pub max_memory_mib: Option<u64>,
+    pub instances: u64,
+    #[serde(default)]
+    pub memory_mib: Option<u64>,
 }
 
 #[derive(Deserialize, Clone, Debug, PartialEq)]
@@ -346,19 +377,38 @@ pub struct Edited {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Failure {
     /// The wicket answered no (4xx): its reason, the host of the route that
-    /// did not load, the components it has no upload of, whether the app's VMs did not start.
+    /// did not load, the components it has no upload of, whether the app's VMs did not start,
+    /// whether its routes would need more than its budget.
     Refused {
         status: u16,
         error: String,
         host: Option<String>,
         missing: Vec<String>,
         did_not_start: bool,
+        no_room: bool,
     },
     /// No answer, or none to act on (5xx).
     Unreachable(String),
 }
 
 impl Failure {
+    /// The wicket refused it with `error` alone.
+    pub fn refused(status: u16, error: String) -> Failure {
+        Failure::Refused {
+            status,
+            error,
+            host: None,
+            missing: Vec::new(),
+            did_not_start: false,
+            no_room: false,
+        }
+    }
+
+    /// Whether the wicket refused it for room.
+    pub fn no_room(&self) -> bool {
+        matches!(self, Failure::Refused { no_room: true, .. })
+    }
+
     /// Whether a removal the wicket answered so is to be tried again: anything but another
     /// owner's app, which stays that way.
     pub fn retried(&self) -> bool {
@@ -383,6 +433,8 @@ struct ErrorBody {
     missing: Vec<String>,
     #[serde(default)]
     did_not_start: bool,
+    #[serde(default)]
+    no_room: bool,
 }
 
 impl Wicket {
@@ -587,14 +639,12 @@ fn refused(status: reqwest::StatusCode, body: &[u8]) -> Failure {
             host: error.host,
             missing: error.missing,
             did_not_start: error.did_not_start,
+            no_room: error.no_room,
         },
-        Err(_) => Failure::Refused {
-            status: status.as_u16(),
-            error: format!("{status}: {}", String::from_utf8_lossy(body)),
-            host: None,
-            missing: Vec::new(),
-            did_not_start: false,
-        },
+        Err(_) => Failure::refused(
+            status.as_u16(),
+            format!("{status}: {}", String::from_utf8_lossy(body)),
+        ),
     }
 }
 

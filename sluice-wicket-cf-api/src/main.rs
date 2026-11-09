@@ -28,6 +28,10 @@ async fn main() -> ExitCode {
         eprintln!("{e}");
         return ExitCode::FAILURE;
     }
+    if let Err(e) = sluice_wicket_cf_api::check_wickets(&config.settings).await {
+        eprintln!("{e}");
+        return ExitCode::FAILURE;
+    }
     let listener =
         match sluice_wicket_cf_api::bind(&config.listen, config.settings.oidc.is_none()).await {
             Ok(listener) => listener,

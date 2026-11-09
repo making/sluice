@@ -63,6 +63,7 @@ pub mod wire;
 
 use std::sync::Arc;
 
+use sluice_wicket_console::identity::Identity;
 use sluice_wicket_tunnel::flume::{self, Tap};
 use sluice_wicket_tunnel::proto::PeerBuild;
 use sluice_wicket_tunnel::session::{self, Shared};
@@ -190,6 +191,7 @@ async fn serving(
     )
     .await?;
     let routes = reloader.routes().clone();
+    let node = flume.as_ref().map(|_| format!("wicket:{client_id}"));
     if let Some(flume) = flume {
         flume::start(flume, tap, &client_id)?;
     }
@@ -218,6 +220,7 @@ async fn serving(
     let (requests, requests_received) = mpsc::channel(8);
     match console.zip(intake) {
         Some((console, intake)) => {
+            let identity = Identity::open(&console.dir, node, describe_build())?;
             let listener = console.bind().await?;
             println!(
                 "console on http://{} ({}); its routes kept in {}",
@@ -239,6 +242,7 @@ async fn serving(
                     jailed: jail.is_some(),
                     server: server.clone(),
                     listen: listening,
+                    identity,
                 }),
             ));
         }
