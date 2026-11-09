@@ -362,7 +362,9 @@ class ConsoleView {
 				role = "Serving";
 			}
 			else if (weighted) {
-				role = weightRole(group.weights().get(index), group.totalWeight());
+				long inFlight = group.inFlight().get(index);
+				role = weightRole(group.weights().get(index), group.totalWeight())
+						+ (inFlight > 0 ? ", " + inFlight + " in flight" : "");
 			}
 			else if (group.preferred() != null) {
 				role = "Standby";
@@ -431,7 +433,7 @@ class ConsoleView {
 		}
 		String role = candidates.get(candidates.size() - 1).role();
 		if (role.startsWith(WEIGHT_ROLE)) {
-			return "Requests rotate across these clients by their weights";
+			return "Requests go to the client with the fewest in flight for its weight";
 		}
 		return switch (role) {
 			case "In rotation" -> "Requests rotate across these clients";

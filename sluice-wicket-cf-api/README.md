@@ -826,8 +826,10 @@ them, so one wicket can stop while the apps serve on -- those of `-i 2` or more 
 instances, all of them once moved off a wicket told to stop, or gone -- and the wickets be
 updated one at a time. Clients reach them through a [sluice server](../README.md), each wicket
 advertising the hosts of the apps it runs, the app's instances on it their weight, and the server
-spreading a host's requests over the wickets serving it by them (its
-[Scale-out](../README.md#scale-out)): `-i 3` over two wickets, 2 of every 3 to the wicket of two.
+sending each of a host's requests to the wicket serving it with the fewest in flight for its
+weight (its [Scale-out](../README.md#scale-out)): `-i 3` over two wickets, 2 of every 3 to the
+wicket of two while each ends before the next, and the next to the other while a wicket's
+instances are busy.
 A wicket's `--listen` serves its own apps only and drains nothing (a signal ends it once
 evacuated): local mode stays one wicket.
 

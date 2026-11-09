@@ -27,6 +27,7 @@ import ch.qos.logback.core.read.ListAppender;
 import io.micrometer.core.instrument.simple.SimpleMeterRegistry;
 
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance;
@@ -47,7 +48,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * an HTTP/1.1 keep-alive connection whose Host resolves to another client's upstream must
  * be answered by that upstream (and, with {@code rewrite-host}, by the host of its own
  * route), with a {@code type=req} access log line per request head; the virtual
- * connection switched from leaves its tunnel session at once.
+ * connection switched from leaves its tunnel session at once. Each route carries a
+ * weight, so its requests count in flight: each from its pick to its response's end, none
+ * left once a test's connections ended, whichever way they did.
  */
 // the relay logs why it ended and the client why a dial failed at debug, should a
 // rerouting fail on CI again (a logging level must be set before the context starts: a
@@ -131,6 +134,7 @@ class KeepAliveReroutingE2ETest {
 					.host(h)
 					.target("http://127.0.0.1:" + upstream.getAddress().getPort())
 					.rewriteHost(rewriteHost)
+					.weight(1)
 					.build())
 				.token("it-token")
 				.build();
@@ -172,6 +176,11 @@ class KeepAliveReroutingE2ETest {
 			.map(e -> e.getFormattedMessage())
 			.filter(m -> m.startsWith("type=req") && m.contains("route=" + route + " "))
 			.toList();
+	}
+
+	@AfterEach
+	void noneLeftInFlight() {
+		InFlight.awaitNone(Objects.requireNonNull(this.router));
 	}
 
 	@AfterAll
@@ -216,6 +225,9 @@ class KeepAliveReroutingE2ETest {
 		try (Socket socket = new Socket("127.0.0.1", dataPort)) {
 			socket.setSoTimeout(10_000);
 			assertThat(exchange(socket, "same.a.test", "/x")).startsWith("HTTP/1.1 200 OK|alpha:");
+			// in flight to its response's end, not for its connection's life
+			Router routes = Objects.requireNonNull(this.router);
+			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> InFlight.of(routes, "same.a.test") == 0);
 			assertThat(exchange(socket, "same.a.test", "/x")).startsWith("HTTP/1.1 200 OK|alpha:");
 		}
 	}

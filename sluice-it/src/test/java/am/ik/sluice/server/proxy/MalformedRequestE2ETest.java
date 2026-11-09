@@ -33,6 +33,7 @@ import javax.net.ssl.TrustManagerFactory;
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -44,6 +45,7 @@ import org.junit.jupiter.params.provider.ValueSource;
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
+import am.ik.sluice.it.InFlight;
 import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.it.TestSockets;
 import am.ik.sluice.server.SluiceServerApplication;
@@ -63,8 +65,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * UTF-8 header value) is routed and tracked like any other, so the connection keeps its
  * deadlines and its rerouting; a malformed request is answered 400 at a request boundary
  * and the connection closed, nothing of it reaching an upstream; and a response the relay
- * cannot frame is relayed until its upstream closes. In the relay's package for the
- * deadline queue of {@link ConnectionLimits}.
+ * cannot frame is relayed until its upstream closes. Each route carries a weight, so its
+ * requests count in flight until their responses end, are lost or their client goes: none
+ * is left once a test's connections ended. In the relay's package for the deadline queue
+ * of {@link ConnectionLimits}.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -174,15 +178,27 @@ class MalformedRequestE2ETest {
 		TunnelClient started = TunnelClient.builder()
 			.properties(SluiceClientProperties.builder()
 				.serverUrl("grpc://127.0.0.1:" + grpcPort)
-				.upstream(Upstream.builder().host(ECHO_HOST).target("http://127.0.0.1:" + echo.getLocalPort()).build())
-				.upstream(
-						Upstream.builder().host(OTHER_HOST).target("http://127.0.0.1:" + other.getLocalPort()).build())
+				.upstream(Upstream.builder()
+					.host(ECHO_HOST)
+					.target("http://127.0.0.1:" + echo.getLocalPort())
+					.weight(1)
+					.build())
+				.upstream(Upstream.builder()
+					.host(OTHER_HOST)
+					.target("http://127.0.0.1:" + other.getLocalPort())
+					.weight(1)
+					.build())
 				.upstream(Upstream.builder()
 					.host(REWRITE_HOST)
 					.target("http://127.0.0.1:" + rewritePort)
 					.rewriteHost(true)
+					.weight(1)
 					.build())
-				.upstream(Upstream.builder().host(ODD_HOST).target("http://127.0.0.1:" + odd.getLocalPort()).build())
+				.upstream(Upstream.builder()
+					.host(ODD_HOST)
+					.target("http://127.0.0.1:" + odd.getLocalPort())
+					.weight(1)
+					.build())
 				.token("it-token")
 				.build())
 			.taskExecutor(task -> Thread.ofVirtual().name("e2e-malformed-worker").start(task))
@@ -204,6 +220,11 @@ class MalformedRequestE2ETest {
 		Awaitility.await().atMost(Duration.ofSeconds(3)).until(() -> connectionLimits().scheduledDeadlines() == 0);
 		this.received.clear();
 		this.ended.clear();
+	}
+
+	@AfterEach
+	void noneLeftInFlight() {
+		InFlight.awaitNone(router());
 	}
 
 	@AfterAll
@@ -381,6 +402,7 @@ class MalformedRequestE2ETest {
 			write(socket, concat(slow, malformed));
 			Awaitility.await().atMost(Duration.ofSeconds(3)).until(() -> this.received.size() == 1);
 			assertThat(admitted()).isEqualTo(1);
+			assertThat(InFlight.of(router(), ECHO_HOST)).as("the slow request; the malformed one is none").isOne();
 		}
 		// the relay waits for the slow response, fails to write it to the gone client
 		awaitAdmitted(0);

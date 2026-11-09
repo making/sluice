@@ -25,6 +25,7 @@ import javax.net.ssl.TrustManagerFactory;
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -34,6 +35,7 @@ import org.junit.jupiter.api.TestInstance.Lifecycle;
 import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
+import am.ik.sluice.it.InFlight;
 import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.it.TestSockets;
 import am.ik.sluice.server.SluiceServerApplication;
@@ -54,8 +56,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * connection (plaintext or TLS-terminated), an upgraded HTTP/1.1 connection -- that
  * relays no byte in either direction for the timeout is closed and its slot released,
  * also while the relay is blocked writing to a client that stopped reading; bytes flowing
- * in either direction keep it open; a route without one keeps its connections open. In
- * the relay's package for the deadline queue of {@link ConnectionLimits}.
+ * in either direction keep it open; a route without one keeps its connections open. Each
+ * route carries a weight: a connection relayed verbatim counts in flight for its life, an
+ * upgraded one from its request on, none once a test's connections ended. In the relay's
+ * package for the deadline queue of {@link ConnectionLimits}.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -135,19 +139,37 @@ class VerbatimIdleTimeoutE2ETest {
 					.target(target)
 					.listenPort(timedPort)
 					.verbatimIdleTimeout(TIMEOUT)
+					.weight(1)
 					.build())
-				.upstream(Upstream.builder().host("untimed.tcp").target(target).listenPort(untimedPort).build())
+				.upstream(
+						Upstream.builder().host("untimed.tcp").target(target).listenPort(untimedPort).weight(1).build())
 				.upstream(Upstream.builder()
 					.host(PASSTHROUGH_HOST)
 					.target(target)
 					.tlsPassthrough(true)
 					.verbatimIdleTimeout(TIMEOUT)
+					.weight(1)
 					.build())
-				.upstream(Upstream.builder().host(PASSTHROUGH_OFF_HOST).target(target).tlsPassthrough(true).build())
-				.upstream(Upstream.builder().host(TERMINATED_HOST).target(target).verbatimIdleTimeout(TIMEOUT).build())
-				.upstream(Upstream.builder().host(UPGRADE_HOST).target(target).verbatimIdleTimeout(TIMEOUT).build())
+				.upstream(Upstream.builder()
+					.host(PASSTHROUGH_OFF_HOST)
+					.target(target)
+					.tlsPassthrough(true)
+					.weight(1)
+					.build())
+				.upstream(Upstream.builder()
+					.host(TERMINATED_HOST)
+					.target(target)
+					.verbatimIdleTimeout(TIMEOUT)
+					.weight(1)
+					.build())
+				.upstream(Upstream.builder()
+					.host(UPGRADE_HOST)
+					.target(target)
+					.verbatimIdleTimeout(TIMEOUT)
+					.weight(1)
+					.build())
 				// the catch-all route: reached by hostless plaintext heads
-				.upstream(Upstream.builder().host("").target(target).verbatimIdleTimeout(TIMEOUT).build())
+				.upstream(Upstream.builder().host("").target(target).verbatimIdleTimeout(TIMEOUT).weight(1).build())
 				.token("it-token")
 				.build())
 			.taskExecutor(task -> Thread.ofVirtual().name("e2e-verbatim-idle-worker").start(task))
@@ -169,6 +191,11 @@ class VerbatimIdleTimeoutE2ETest {
 		// every connection of the previous test is gone, and so are its deadlines
 		Awaitility.await().atMost(Duration.ofSeconds(10)).until(() -> admitted() == 0);
 		awaitNoDeadline();
+	}
+
+	@AfterEach
+	void noneLeftInFlight() {
+		InFlight.awaitNone(router());
 	}
 
 	@AfterAll
@@ -295,6 +322,7 @@ class VerbatimIdleTimeoutE2ETest {
 			send(socket, "echo\r\n");
 			exchange(socket, "ping");
 			assertThat(connectionLimits().scheduledDeadlines()).isEqualTo(1);
+			assertThat(InFlight.of(router())).as("the connection, for its life").isOne();
 		}
 		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> admitted() == 0);
 		awaitNoDeadline();
@@ -372,6 +400,7 @@ class VerbatimIdleTimeoutE2ETest {
 			send(socket, "echo\r\n");
 			exchange(socket, "ping");
 			assertThat(connectionLimits().scheduledDeadlines()).isEqualTo(1);
+			assertThat(InFlight.of(router(), PASSTHROUGH_HOST)).as("the connection, for its life").isOne();
 		}
 		Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> admitted() == 0);
 		awaitNoDeadline();
@@ -435,6 +464,7 @@ class VerbatimIdleTimeoutE2ETest {
 			// client
 			// reads the 101: the queue is read without the deadline's lock
 			Awaitility.await().atMost(Duration.ofSeconds(1)).until(() -> connectionLimits().scheduledDeadlines() == 1);
+			assertThat(InFlight.of(router(), UPGRADE_HOST)).as("the upgrade, for the connection's life").isOne();
 			TestSockets.awaitClosed(socket, WITHIN);
 			assertThat(since(start)).isGreaterThanOrEqualTo(TIMEOUT);
 			awaitReleased(closed);

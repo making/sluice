@@ -404,7 +404,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			SniHeadParser.Head hello = new SniHeadParser(HEAD_LIMIT).parse(pushback)
 				.orElseThrow(() -> new IllegalArgumentException("unrecognized tls handshake"));
 			// an unresolved route keeps the legacy behavior: terminate when a bundle is
-			// configured, passthrough otherwise
+			// configured, passthrough otherwise. Looked up, not picked: the connection's
+			// head is picked once, as it is relayed
 			Optional<Router.Route> resolved = this.router.lookup(hello.sni());
 			boolean passthrough = resolved.map(Router.Route::tlsPassthrough).orElseGet(() -> this.tlsFactory() == null);
 			if (passthrough) {
@@ -512,11 +513,12 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 	 * with an error response and closed. Plaintext and TLS-terminated HTTP relays drive
 	 * {@code deadline} between their requests; a verbatim relay puts it under the
 	 * verbatim idle timeout of its route. An h2 connection is relayed only once the bytes
-	 * of its relay are reserved.
+	 * of its relay are reserved. The pick of the connection's route is closed here unless
+	 * a relay took it: the relay closes it once the connection's first request ended, or
+	 * a connection relayed verbatim once it closed.
 	 */
 	private boolean relay(Connection conn, AccessLogger.Connection access, ConnectionLimits.KeepAliveDeadline deadline,
 			ConnectionLimits.Admission admission) {
-		Runnable release = admission::release;
 		if (conn.head().undecodable()) {
 			// a connection error before any stream: nothing of it may be routed
 			access.request(null, "-", "-", "2", null);
@@ -527,7 +529,28 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			this.reject(conn, this.errorResponse.badRequest());
 			return false;
 		}
-		Optional<Router.Route> route = this.router.lookup(conn.head().host());
+		Optional<Router.Pick> pick = this.router.pick(conn.head().host());
+		boolean relaying = false;
+		try {
+			relaying = this.relayPicked(conn, access, deadline, admission, pick.orElse(null));
+			return relaying;
+		}
+		finally {
+			if (!relaying) {
+				pick.ifPresent(Router.Pick::close);
+			}
+		}
+	}
+
+	/**
+	 * Relays the connection to the route picked for it ({@link #relay}); null when none
+	 * was.
+	 */
+	private boolean relayPicked(Connection conn, AccessLogger.Connection access,
+			ConnectionLimits.KeepAliveDeadline deadline, ConnectionLimits.Admission admission,
+			Router.@Nullable Pick pick) {
+		Runnable release = admission::release;
+		Optional<Router.Route> route = Optional.ofNullable(pick).map(Router.Pick::route);
 		InetAddress peer = conn.peer() != null ? conn.peer() : peerOf(conn.socket());
 		// a trusted proxy's forwarded-for entry replaces the peer as the judged address
 		if (!this.accessControl.allowed(route.orElse(null), peer, conn.head().forwardedFor(),
@@ -536,11 +559,11 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			return false;
 		}
 		TunnelSession session = route.map(r -> this.sessions.find(r.clientId()).orElse(null)).orElse(null);
-		if (session == null) {
+		if (pick == null || session == null) {
 			this.reject(conn, this.errorResponse.noRoute(conn.head()));
 			return false;
 		}
-		Router.Route route0 = route.get();
+		Router.Route route0 = pick.route();
 		access.route(route0);
 		ConnectionHeadParser.Head.Request request = conn.head().request();
 		boolean http2 = conn.head().http2Connection();
@@ -568,7 +591,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 					.errorResponse(this.errorResponse)
 					.access(access)
 					.meters(this.h2DemuxMeters)
-					.initialRoute(route0, session)
+					.initialRoute(pick, session)
 					.handshake(conn.handshake())
 					.peer(peer)
 					.forwarding(forwarding)
@@ -593,7 +616,7 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			}
 			ReroutingRelay rerouting = new ReroutingRelay(this.clientPipeSeam.apply(conn.pipe()), conn.head(),
 					this.router, this.sessions, this.accessControl, this.routeAuth, this.errorResponse, access,
-					this.meterRegistry, route0, session, peer, forwarding, deadline,
+					this.meterRegistry, pick, session, peer, forwarding, deadline,
 					this.properties.limits().halfCloseProbeInterval(), this.probeSeam, this.headSeam, relayed, release);
 			this.activeConnections.incrementAndGet();
 			try {
@@ -624,6 +647,8 @@ public class DataProxyServer implements SmartLifecycle, Drainable {
 			.onComplete(() -> {
 				deadline.disarm();
 				this.activeConnections.decrementAndGet();
+				// in flight for the connection's life
+				pick.close();
 				access.close();
 				session.remove(connection.connectionId());
 				// the slot covers what the connection still queues for the tunnel

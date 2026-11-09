@@ -15,6 +15,7 @@ import java.util.stream.IntStream;
 import org.awaitility.Awaitility;
 import org.jspecify.annotations.Nullable;
 import org.junit.jupiter.api.AfterAll;
+import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.TestInstance.Lifecycle;
 import org.junit.jupiter.api.TestInstance;
@@ -23,6 +24,7 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.it.H2TestClient;
+import am.ik.sluice.it.InFlight;
 import am.ik.sluice.it.ScriptedH2Upstream;
 import am.ik.sluice.it.TestH2;
 import am.ik.sluice.it.TestPorts;
@@ -49,7 +51,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * the streams of other legs. A stream lost before a response frame was relayed on it is
  * answered with the bad-gateway page ({@code 502}) by the relay, one lost after with
  * RST_STREAM {@code INTERNAL_ERROR}, and a stream the upstream never saw is refused
- * ({@code REFUSED_STREAM}). In the relay's package for the meters.
+ * ({@code REFUSED_STREAM}). Each route carries a weight, so its streams count in flight
+ * until they close, however they end: none is left once a test's connections ended. In
+ * the relay's package for the meters.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -119,6 +123,11 @@ class H2DemuxUpstreamErrorE2ETest {
 		registry.add("server.port", () -> String.valueOf(TestPorts.freePort()));
 	}
 
+	@AfterEach
+	void noneLeftInFlight() {
+		InFlight.awaitNone(Objects.requireNonNull(this.router));
+	}
+
 	@AfterAll
 	void tearDown() {
 		this.clients.forEach(TunnelClient::stop);
@@ -164,6 +173,9 @@ class H2DemuxUpstreamErrorE2ETest {
 			assertThat(client.awaitEnd(lastStream, WITHIN)).isTrue();
 			assertThat(TestH2.bodyOf(client.frames(lastStream))).isEqualTo("after");
 			assertThat(client.goAwayCode()).isEqualTo(-1);
+			assertThat(InFlight.of(Objects.requireNonNull(this.router), route))
+				.as("each stream in flight until it closed, not for the connection's life")
+				.isZero();
 			assertThat(upstream.connections()).as("the leg went on").hasSize(1);
 			assertThat(upstream.awaitConnection(0, WITHIN).frames()).noneMatch(frame -> frame.type() == TestH2.GOAWAY);
 		}
@@ -942,7 +954,7 @@ class H2DemuxUpstreamErrorE2ETest {
 		TunnelClient client = TunnelClient.builder()
 			.properties(SluiceClientProperties.builder()
 				.serverUrl("grpc://127.0.0.1:" + grpcPort)
-				.upstream(Upstream.builder().host(host).target("tcp://127.0.0.1:" + upstream.port()).build())
+				.upstream(Upstream.builder().host(host).target("tcp://127.0.0.1:" + upstream.port()).weight(1).build())
 				.token("it-token")
 				.build())
 			.taskExecutor(task -> Thread.ofVirtual().name("e2e-ue").start(task))

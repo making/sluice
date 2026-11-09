@@ -288,10 +288,10 @@ class RouterTest {
 		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3000")));
 		router.register("c2", List.of(upstream("demo.local", "http://127.0.0.2:3000")));
 		router.register("c3", List.of(upstream("demo.local", "http://127.0.0.3:3000")));
+		assertThat(picks(router, "demo.local", 4)).containsExactly("c1", "c2", "c3", "c1");
+		// a lookup moves the rotation no further
 		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c1");
-		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c2");
-		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c3");
-		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c1");
+		assertThat(picks(router, "demo.local", 1)).containsExactly("c2");
 	}
 
 	@Test
@@ -301,10 +301,10 @@ class RouterTest {
 		router.register("c2", List.of(upstream("a.local", "http://127.0.0.2:3000")));
 		router.register("c3", List.of(upstream("b.local", "http://127.0.0.3:3001")));
 		router.register("c4", List.of(upstream("b.local", "http://127.0.0.4:3001")));
-		assertThat(router.lookup("a.local").orElseThrow().clientId()).isEqualTo("c1");
-		assertThat(router.lookup("b.local").orElseThrow().clientId()).isEqualTo("c3");
-		assertThat(router.lookup("a.local").orElseThrow().clientId()).isEqualTo("c2");
-		assertThat(router.lookup("b.local").orElseThrow().clientId()).isEqualTo("c4");
+		assertThat(picks(router, "a.local", 1)).containsExactly("c1");
+		assertThat(picks(router, "b.local", 1)).containsExactly("c3");
+		assertThat(picks(router, "a.local", 1)).containsExactly("c2");
+		assertThat(picks(router, "b.local", 1)).containsExactly("c4");
 	}
 
 	@Test
@@ -312,9 +312,7 @@ class RouterTest {
 		Router router = new Router(LoadBalance.ROUND_ROBIN, LoadBalance.ROUND_ROBIN);
 		router.register("c1", List.of(portUpstream(16379, "tcp://10.0.0.1:7001")));
 		router.register("c2", List.of(portUpstream(16379, "tcp://10.0.0.2:7002")));
-		assertThat(router.lookupByPort(16379).orElseThrow().address()).isEqualTo("10.0.0.1:7001");
-		assertThat(router.lookupByPort(16379).orElseThrow().address()).isEqualTo("10.0.0.2:7002");
-		assertThat(router.lookupByPort(16379).orElseThrow().address()).isEqualTo("10.0.0.1:7001");
+		assertThat(portPicks(router, 16379, 3)).containsExactly("c1", "c2", "c1");
 	}
 
 	@Test
@@ -322,9 +320,8 @@ class RouterTest {
 		Router router = new Router(LoadBalance.RANDOM, LoadBalance.RANDOM);
 		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3000")));
 		router.register("c2", List.of(upstream("demo.local", "http://127.0.0.2:3000")));
-		for (int i = 0; i < 10; i++) {
-			assertThat(router.lookup("demo.local").orElseThrow().clientId()).isIn("c1", "c2");
-		}
+		assertThat(picks(router, "demo.local", 10))
+			.allMatch(clientId -> clientId.equals("c1") || clientId.equals("c2"));
 	}
 
 	@Test
@@ -334,10 +331,8 @@ class RouterTest {
 				List.of(upstream("demo.local", "http://127.0.0.1:3000"), portUpstream(16379, "tcp://127.0.0.1:7001")));
 		router.register("c2",
 				List.of(upstream("demo.local", "http://127.0.0.2:3000"), portUpstream(16379, "tcp://127.0.0.2:7002")));
-		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c1");
-		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c1");
-		assertThat(router.lookupByPort(16379).orElseThrow().clientId()).isEqualTo("c1");
-		assertThat(router.lookupByPort(16379).orElseThrow().clientId()).isEqualTo("c2");
+		assertThat(picks(router, "demo.local", 2)).containsExactly("c1", "c1");
+		assertThat(portPicks(router, 16379, 2)).containsExactly("c1", "c2");
 	}
 
 	@Test
@@ -345,30 +340,43 @@ class RouterTest {
 		Router router = new Router(LoadBalance.ROUND_ROBIN, LoadBalance.ROUND_ROBIN);
 		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3000")));
 		router.register("c2", List.of(upstream("demo.local", "http://127.0.0.2:3000")));
-		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c1");
+		assertThat(picks(router, "demo.local", 1)).containsExactly("c1");
 		router.remove("c1");
-		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c2");
-		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c2");
+		assertThat(picks(router, "demo.local", 2)).containsExactly("c2", "c2");
 		// a key left without a target starts its rotation afresh
 		router.remove("c2");
 		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3000")));
 		router.register("c2", List.of(upstream("demo.local", "http://127.0.0.2:3000")));
-		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c1");
+		assertThat(picks(router, "demo.local", 1)).containsExactly("c1");
 	}
 
 	private static Upstream weighted(Upstream upstream, int weight) {
 		return upstream.toBuilder().setWeight(weight).build();
 	}
 
+	/** The clients of {@code times} picks for the host, each request ending at once. */
 	private static List<String> picks(Router router, String host, int times) {
-		return IntStream.range(0, times).mapToObj(i -> router.lookup(host).orElseThrow().clientId()).toList();
+		return IntStream.range(0, times).mapToObj(i -> ended(router.pick(host).orElseThrow())).toList();
 	}
 
 	/**
-	 * Targets each carrying a weight share their key by it, whatever the strategy: smooth
-	 * weighted round robin, each its weight in every round of their sum, interleaved,
-	 * http and tcp routes alike. A weight changed by a re-registration goes on from where
-	 * the rotation is; a key left without a target starts afresh.
+	 * The clients of {@code times} picks for the port, each connection ending at once.
+	 */
+	private static List<String> portPicks(Router router, int port, int times) {
+		return IntStream.range(0, times).mapToObj(i -> ended(router.pickByPort(port).orElseThrow())).toList();
+	}
+
+	private static String ended(Router.Pick pick) {
+		pick.close();
+		return pick.route().clientId();
+	}
+
+	/**
+	 * Targets each carrying a weight share their key by it, whatever the strategy: each
+	 * request ending before the next, smooth weighted round robin, each its weight in
+	 * every round of their sum, interleaved, http and tcp routes alike. A weight changed
+	 * by a re-registration goes on from where the rotation is; a key left without a
+	 * target starts afresh.
 	 */
 	@ParameterizedTest
 	@EnumSource(LoadBalance.class)
@@ -379,8 +387,7 @@ class RouterTest {
 		router.register("c1", List.of(weighted(one, 2), weighted(portUpstream(16379, "tcp://127.0.0.1:7001"), 2)));
 		router.register("c2", List.of(weighted(two, 1), weighted(portUpstream(16379, "tcp://127.0.0.2:7002"), 1)));
 		assertThat(picks(router, "demo.local", 6)).containsExactly("c1", "c2", "c1", "c1", "c2", "c1");
-		assertThat(IntStream.range(0, 3).mapToObj(i -> router.lookupByPort(16379).orElseThrow().clientId()))
-			.containsExactly("c1", "c2", "c1");
+		assertThat(portPicks(router, 16379, 3)).containsExactly("c1", "c2", "c1");
 
 		router.register("c2", List.of(weighted(two, 2)));
 		assertThat(picks(router, "demo.local", 5)).containsExactly("c1", "c2", "c1", "c2", "c1");
@@ -393,20 +400,66 @@ class RouterTest {
 	}
 
 	/**
+	 * A request goes to the candidate with the fewest in flight for its weight: one whose
+	 * request has not ended passes its turn while the other's end, and gets it back once
+	 * it ended, the rotation going on from where it was. A pick counts once however often
+	 * closed. A candidate keeps its count over a re-registration, a sole one's included,
+	 * and over leaving and coming back; the route table tells the counts.
+	 */
+	@Test
+	void aCandidateWithMoreInFlightForItsWeightPassesItsTurnUntilTheyEnd() {
+		Router router = new Router();
+		Upstream one = upstream("demo.local", "http://127.0.0.1:3001");
+		Upstream two = upstream("demo.local", "http://127.0.0.2:3002");
+		router.register("c1", List.of(weighted(one, 2)));
+		router.register("c2", List.of(weighted(two, 1)));
+		Router.Pick slow = router.pick("demo.local").orElseThrow();
+		assertThat(slow.route().clientId()).isEqualTo("c1");
+		// 1 in flight for 2 against none: c1's turns pass to c2, whose requests end
+		assertThat(picks(router, "demo.local", 3)).containsExactly("c2", "c2", "c2");
+		assertThat(router.resolve("demo.local").orElseThrow().inFlight()).containsExactly(1L, 0L);
+		slow.close();
+		slow.close();
+		assertThat(router.resolve("demo.local").orElseThrow().inFlight()).containsExactly(0L, 0L);
+		assertThat(picks(router, "demo.local", 3)).containsExactly("c2", "c1", "c1");
+
+		Router.Pick held = router.pick("demo.local").orElseThrow();
+		assertThat(held.route().clientId()).isEqualTo("c2");
+		router.register("c2", List.of(weighted(two, 3)));
+		assertThat(router.resolve("demo.local").orElseThrow().inFlight()).containsExactly(0L, 1L);
+		router.remove("c2");
+		assertThat(picks(router, "demo.local", 1)).containsExactly("c1");
+		router.register("c2", List.of(weighted(two, 1)));
+		assertThat(picks(router, "demo.local", 2)).containsExactly("c1", "c1");
+		assertThat(router.resolve("demo.local").orElseThrow().inFlight()).containsExactly(0L, 1L);
+		held.close();
+		router.remove("c2");
+		Router.Pick sole = router.pick("demo.local").orElseThrow();
+		router.register("c1", List.of(weighted(one, 4)));
+		assertThat(router.resolve("demo.local").orElseThrow().inFlight()).containsExactly(1L);
+		sole.close();
+		assertThat(router.resolve("demo.local").orElseThrow().inFlight()).containsExactly(0L);
+	}
+
+	/**
 	 * A key not every target of which carries a weight goes by the strategy, the weights
-	 * aside: a client predating them among wickets carrying theirs. The route table tells
-	 * the weights, and no winner of a key shared by them; a weight is unsigned.
+	 * aside: a client predating them among wickets carrying theirs, its requests counted
+	 * nowhere. The route table tells the weights, and no winner of a key shared by them;
+	 * a weight is unsigned.
 	 */
 	@Test
 	void aKeyWithATargetCarryingNoWeightGoesByTheStrategy() {
 		Router router = new Router();
 		router.register("c5", List.of(weighted(upstream("demo.local", "http://127.0.0.5:3005"), 3)));
 		router.register("c2", List.of(upstream("demo.local", "http://127.0.0.2:3002")));
+		Router.Pick open = router.pick("demo.local").orElseThrow();
 		assertThat(picks(router, "demo.local", 3)).containsExactly("c2", "c2", "c2");
 		Router.RouteGroup mixed = router.resolve("demo.local").orElseThrow();
 		assertThat(mixed.weights()).containsExactly(3L, 0L);
+		assertThat(mixed.inFlight()).containsExactly(0L, 0L);
 		assertThat(mixed.weighted()).isFalse();
 		assertThat(mixed.preferred()).extracting(Router.Route::clientId).isEqualTo("c2");
+		open.close();
 
 		router.register("c2", List.of(weighted(upstream("demo.local", "http://127.0.0.2:3002"), 1)));
 		Router.RouteGroup shared = router.httpRoutes().get(0);
@@ -438,12 +491,12 @@ class RouterTest {
 		Router router = new Router(LoadBalance.ROUND_ROBIN, LoadBalance.ROUND_ROBIN);
 		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3001")));
 		router.register("c2", List.of(upstream("demo.local", "http://127.0.0.1:3002")));
-		String first = router.lookup("demo.local").orElseThrow().clientId();
+		String first = picks(router, "demo.local", 1).get(0);
 		Router.RouteGroup resolved = router.resolve("demo.local").orElseThrow();
 		assertThat(resolved.preferred()).isNull();
 		assertThat(resolved.candidates()).hasSize(2);
-		// resolve() leaves the rotation where lookup() left it
-		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isNotEqualTo(first);
+		// resolve() leaves the rotation where pick() left it
+		assertThat(picks(router, "demo.local", 1).get(0)).isNotEqualTo(first);
 	}
 
 	@Test

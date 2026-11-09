@@ -892,8 +892,8 @@ bootstrap may be a load balancer over any node, but each public url must
 reach its own node (the wicket warns when a stream reaches another one). A
 dropped stream reconnects with jittered exponential backoff (ceiling
 1s..30s, each wait drawn from its upper half). A route advertises its
-`instances` as its weight (none without): the server spreads a host several
-wickets serve by them.
+`instances` as its weight (none without): the server sends each request of a
+host several wickets serve to the one with the fewest in flight for its weight.
 
 ## Readiness probe
 

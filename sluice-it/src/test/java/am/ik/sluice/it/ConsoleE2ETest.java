@@ -343,11 +343,13 @@ class ConsoleE2ETest {
 				console-client 127.0.0.1:%d Serving
 				console-z 127.0.0.1:%d Standby
 				""".formatted(httpPort, httpPort));
-		assertThat(page.locator("tbody[data-route='h1only.local']").innerText()).isEqualToNormalizingWhitespace("""
-				h1only.local Requests rotate across these clients by their weights Open Auth: bearer Log: off Shut
-				console-client 127.0.0.1:%d Weight 2 of 3 HTTP/1.1 only
-				console-z 127.0.0.1:%d Weight 1 of 3 HTTP/1.1 only
-				""".formatted(httpPort, httpPort));
+		assertThat(page.locator("tbody[data-route='h1only.local']").innerText()).isEqualToNormalizingWhitespace(
+				"""
+						h1only.local Requests go to the client with the fewest in flight for its weight Open Auth: bearer Log: off Shut
+						console-client 127.0.0.1:%d Weight 2 of 3 HTTP/1.1 only
+						console-z 127.0.0.1:%d Weight 1 of 3 HTTP/1.1 only
+						"""
+					.formatted(httpPort, httpPort));
 		assertThat(page.locator("tbody[data-route='h1only.local'] [data-testid=route-auth]").innerText())
 			.isEqualTo("Auth: bearer");
 		assertThat(page.locator("tbody[data-route='h1only.local'] [data-testid=route-access-log]").innerText())

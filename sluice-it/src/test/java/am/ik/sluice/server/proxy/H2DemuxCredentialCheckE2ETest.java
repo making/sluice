@@ -49,6 +49,7 @@ import am.ik.sluice.client.config.SluiceClientProperties;
 import am.ik.sluice.client.config.Upstream;
 import am.ik.sluice.client.tunnel.TunnelClient;
 import am.ik.sluice.it.H2TestClient;
+import am.ik.sluice.it.InFlight;
 import am.ik.sluice.it.TestH2;
 import am.ik.sluice.it.TestPorts;
 import am.ik.sluice.it.WindowedH2Upstream;
@@ -84,7 +85,9 @@ import static org.assertj.core.api.Assertions.assertThat;
  * then the leg closes, ending the client's drain. The checks are held by the server's
  * password encoder, replaced here by one holding a credential's check until the test lets
  * it go. The relay's exception sink stays silent but for the check that throws, and with
- * netty's paranoid leak detection on no buffer leaks.
+ * netty's paranoid leak detection on no buffer leaks. Each route carries a weight, so its
+ * streams count in flight: none is left once a relay ended, whether its streams were
+ * relayed, answered, refused, reset or dropped.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -242,8 +245,16 @@ class H2DemuxCredentialCheckE2ETest {
 			.properties(SluiceClientProperties.builder()
 				.serverUrl("grpc://127.0.0.1:" + grpcPort)
 				.token("it-token")
-				.upstream(Upstream.builder().host(GATED).target("tcp://127.0.0.1:" + server.getLocalPort()).build())
-				.upstream(Upstream.builder().host(OPEN).target("tcp://127.0.0.1:" + server.getLocalPort()).build())
+				.upstream(Upstream.builder()
+					.host(GATED)
+					.target("tcp://127.0.0.1:" + server.getLocalPort())
+					.weight(1)
+					.build())
+				.upstream(Upstream.builder()
+					.host(OPEN)
+					.target("tcp://127.0.0.1:" + server.getLocalPort())
+					.weight(1)
+					.build())
 				.build())
 			.taskExecutor(task -> Thread.ofVirtual().name("e2e-check-worker").start(task))
 			.meterRegistry(new SimpleMeterRegistry())
@@ -268,6 +279,7 @@ class H2DemuxCredentialCheckE2ETest {
 			.atMost(TIMEOUT)
 			.until(() -> admitted() == 0 && server().activeConnections() == 0 && hopThreads().isEmpty());
 		assertThat(held()).as("nothing held by any relay").isZero();
+		assertThat(InFlight.of(router())).as("no stream in flight").isZero();
 	}
 
 	@AfterAll
@@ -354,8 +366,11 @@ class H2DemuxCredentialCheckE2ETest {
 				.clientId(clientId)
 				.token("it-token")
 				.drainGrace(Duration.ofMinutes(1))
-				.upstream(
-						Upstream.builder().host(WITHDRAWING).target("tcp://127.0.0.1:" + server.getLocalPort()).build())
+				.upstream(Upstream.builder()
+					.host(WITHDRAWING)
+					.target("tcp://127.0.0.1:" + server.getLocalPort())
+					.weight(1)
+					.build())
 				.build())
 			.taskExecutor(task -> Thread.ofVirtual().name("e2e-check-withdrawing").start(task))
 			.meterRegistry(new SimpleMeterRegistry())

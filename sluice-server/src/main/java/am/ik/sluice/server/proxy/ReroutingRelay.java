@@ -7,11 +7,11 @@ import java.net.InetAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.util.ArrayDeque;
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
@@ -58,6 +58,13 @@ import io.micrometer.core.instrument.MeterRegistry;
  * would see the upstream's, and may retry the request. Each leg pumps its inbound side on
  * its own virtual thread for the lifetime of its virtual connection; a leg closed by the
  * relay leaves its tunnel session at once.
+ * <p>
+ * Every request head's route is picked ({@link Router#pick}), the connection head's with
+ * the connection: a request relayed hands its pick to its leg, which closes it once the
+ * response completed -- or keeps it for good when the response switched the connection to
+ * verbatim -- and closes those left as it ends; a request refused closes its pick at
+ * once. So a route shared by weights counts each request in flight from its pick to its
+ * response's end.
  * <p>
  * A leg in charge whose client withdrew ({@link TunnelSession#withdrawn()}) is retired at
  * the first request boundary -- no response owed, nothing of a next request read, the
@@ -163,6 +170,9 @@ final class ReroutingRelay {
 
 	private final Router.Route initialRoute;
 
+	/** The pick of the connection's first request, which the connection head is. */
+	private final Router.Pick initialPick;
+
 	private final TunnelSession initialSession;
 
 	private final @Nullable InetAddress peer;
@@ -255,7 +265,7 @@ final class ReroutingRelay {
 
 	ReroutingRelay(DuplexPipe pipe, ConnectionHeadParser.Head head, Router router, SessionRegistry sessions,
 			AccessControl accessControl, RouteAuthenticator routeAuth, ErrorResponse errorResponse,
-			AccessLogger.Connection access, MeterRegistry meterRegistry, Router.Route initialRoute,
+			AccessLogger.Connection access, MeterRegistry meterRegistry, Router.Pick initialPick,
 			TunnelSession initialSession, @Nullable InetAddress peer, Forwarding forwarding,
 			ConnectionLimits.KeepAliveDeadline deadline, Duration probeInterval, ProbeSeam probeSeam, HeadSeam headSeam,
 			Runnable onFinish, Runnable release) {
@@ -268,7 +278,8 @@ final class ReroutingRelay {
 		this.errorResponse = errorResponse;
 		this.access = access;
 		this.meterRegistry = meterRegistry;
-		this.initialRoute = initialRoute;
+		this.initialRoute = initialPick.route();
+		this.initialPick = initialPick;
 		this.initialSession = initialSession;
 		this.peer = peer;
 		this.forwarding = forwarding;
@@ -664,10 +675,10 @@ final class ReroutingRelay {
 		}
 		Resolved resolved;
 		if (this.firstHead) {
-			// resolved with the connection; the lookup must not run twice (it advances
-			// the load balancing state)
+			// picked with the connection; the pick must not run twice (it advances the
+			// load balancing state)
 			this.firstHead = false;
-			resolved = new Resolved(this.initialRoute, this.initialSession);
+			resolved = new Resolved(this.initialPick, this.initialSession);
 		}
 		else {
 			resolved = resolveOrRespond(head, host);
@@ -675,77 +686,91 @@ final class ReroutingRelay {
 				return; // refused: the answer waits for the request boundary
 			}
 		}
-		Router.Route route = resolved.route();
-		Origin origin = this.forwarding.origin(ConnectionHeadParser.http1Headers(head),
-				ConnectionHeadParser.http1HostOf(head));
-		Verdict verdict = this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head), origin);
-		if (!(verdict instanceof Verdict.Pass pass)) {
-			this.access.refused(route, ConnectionHeadParser.http1RequestOf(head), verdict);
-			this.refusal = this.errorResponse.refusal(ConnectionHeadParser.Head.http1(head, host), verdict);
-			return;
-		}
-		Leg old = this.current;
-		Leg leg;
-		if (old != null && !old.ended && old.route.equals(route)) {
-			leg = old;
-		}
-		else {
-			if (old != null && !old.ended) {
-				old.replaced = true; // its EOF from now on is the switch, not the end
-				this.awaitDrained(old);
-				if (this.rejected) {
-					return; // it lost a request, answered 502: the connection ends
-				}
-				if (resolved.session().withdrawn()) {
-					// its client began shutting down while the old leg finished: the
-					// request goes to a client staying
-					resolved = resolveOrRespond(head, host);
-					if (resolved == null) {
-						return;
+		// the request's pick: its leg's once sent, closed here on every other way out
+		Router.Pick pick = resolved.pick();
+		boolean sent = false;
+		try {
+			Router.Route route = pick.route();
+			Origin origin = this.forwarding.origin(ConnectionHeadParser.http1Headers(head),
+					ConnectionHeadParser.http1HostOf(head));
+			Verdict verdict = this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head), origin);
+			if (!(verdict instanceof Verdict.Pass pass)) {
+				this.access.refused(route, ConnectionHeadParser.http1RequestOf(head), verdict);
+				this.refusal = this.errorResponse.refusal(ConnectionHeadParser.Head.http1(head, host), verdict);
+				return;
+			}
+			Leg old = this.current;
+			Leg leg;
+			if (old != null && !old.ended && old.route.equals(route)) {
+				leg = old;
+			}
+			else {
+				if (old != null && !old.ended) {
+					old.replaced = true; // its EOF from now on is the switch, not the end
+					this.awaitDrained(old);
+					if (this.rejected) {
+						return; // it lost a request, answered 502: the connection ends
 					}
-					route = resolved.route();
-					verdict = this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head), origin);
-					if (!(verdict instanceof Verdict.Pass passed)) {
-						this.access.refused(route, ConnectionHeadParser.http1RequestOf(head), verdict);
-						this.refusal = this.errorResponse.refusal(ConnectionHeadParser.Head.http1(head, host), verdict);
-						return;
+					if (resolved.session().withdrawn()) {
+						// its client began shutting down while the old leg finished: the
+						// request goes to a client staying
+						pick.close();
+						resolved = resolveOrRespond(head, host);
+						if (resolved == null) {
+							return;
+						}
+						pick = resolved.pick();
+						route = pick.route();
+						verdict = this.routeAuth.verify(route, ConnectionHeadParser.http1Headers(head), origin);
+						if (!(verdict instanceof Verdict.Pass passed)) {
+							this.access.refused(route, ConnectionHeadParser.http1RequestOf(head), verdict);
+							this.refusal = this.errorResponse.refusal(ConnectionHeadParser.Head.http1(head, host),
+									verdict);
+							return;
+						}
+						pass = passed;
 					}
-					pass = passed;
+				}
+				leg = new Leg(route, resolved.session());
+				this.legs.add(leg);
+				if (this.legs.size() == 1) {
+					this.access.connectionId(leg.connection.connectionId());
+				}
+				this.current = leg; // visible to the old pump before its close below
+				if (old != null && !old.ended) {
+					old.retire(); // the switch ends the previous conversation
+					old.awaitQueued();
 				}
 			}
-			leg = new Leg(route, resolved.session());
-			this.legs.add(leg);
-			if (this.legs.size() == 1) {
-				this.access.connectionId(leg.connection.connectionId());
+			this.headSeam.routed(this);
+			ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser.http1RequestOf(head);
+			String expect = ConnectionHeadParser.http1HeaderOf(head, "expect");
+			this.continueAwaited = expect != null && expect.toLowerCase(java.util.Locale.ROOT).contains("100-continue");
+			this.clientWaits.update();
+			if (closesConnection(head)) {
+				leg.closing = true;
 			}
-			this.current = leg; // visible to the old pump before its close below
-			if (old != null && !old.ended) {
-				old.retire(); // the switch ends the previous conversation
-				old.awaitQueued();
+			leg.requestSent(host, request, Http1Heads.isUpgrade(head), pick);
+			sent = true;
+			this.lastRequest = System.nanoTime();
+			Forwarding.Headers forwarded = this.forwarding.headers(ConnectionHeadParser.http1Headers(head),
+					ConnectionHeadParser.http1HostOf(head));
+			Set<String> removed = new HashSet<>(pass.strip());
+			removed.addAll(forwarded.removed());
+			Map<String, String> added = new LinkedHashMap<>(pass.add());
+			added.putAll(forwarded.added());
+			byte[] stripped = ConnectionHeadRewriter.withHeaders(head, removed, added);
+			byte[] relayed = route.rewriteHost() ? ConnectionHeadRewriter.rewriteHttp1(stripped, route.address())
+					: stripped;
+			leg.toUpstream(relayed, 0, relayed.length);
+			if (request != null) {
+				this.access.request(route, request);
 			}
 		}
-		this.headSeam.routed(this);
-		ConnectionHeadParser.Head.@Nullable Request request = ConnectionHeadParser.http1RequestOf(head);
-		String expect = ConnectionHeadParser.http1HeaderOf(head, "expect");
-		this.continueAwaited = expect != null && expect.toLowerCase(java.util.Locale.ROOT).contains("100-continue");
-		this.clientWaits.update();
-		if (closesConnection(head)) {
-			leg.closing = true;
-		}
-		leg.requestSent(host, request, Http1Heads.isUpgrade(head));
-		this.lastRequest = System.nanoTime();
-		Forwarding.Headers forwarded = this.forwarding.headers(ConnectionHeadParser.http1Headers(head),
-				ConnectionHeadParser.http1HostOf(head));
-		Set<String> removed = new HashSet<>(pass.strip());
-		removed.addAll(forwarded.removed());
-		Map<String, String> added = new LinkedHashMap<>(pass.add());
-		added.putAll(forwarded.added());
-		byte[] stripped = ConnectionHeadRewriter.withHeaders(head, removed, added);
-		byte[] relayed = route.rewriteHost() ? ConnectionHeadRewriter.rewriteHttp1(stripped, route.address())
-				: stripped;
-		leg.toUpstream(relayed, 0, relayed.length);
-		if (request != null) {
-			this.access.request(route, request);
+		finally {
+			if (!sent) {
+				pick.close();
+			}
 		}
 	}
 
@@ -763,31 +788,31 @@ final class ReroutingRelay {
 	}
 
 	/**
-	 * The route of a request head and the session serving it.
+	 * The pick of a request head's route and the session serving it.
 	 */
-	private record Resolved(Router.Route route, TunnelSession session) {
+	private record Resolved(Router.Pick pick, TunnelSession session) {
 	}
 
 	/**
-	 * Resolves the route of a later request head; on any refusal the error response is
-	 * kept for the request boundary ({@link #refusal}), mirroring the connection-level
-	 * refusals.
+	 * Picks the route of a later request head; on any refusal the pick is closed and the
+	 * error response kept for the request boundary ({@link #refusal}), mirroring the
+	 * connection-level refusals.
 	 */
 	private @Nullable Resolved resolveOrRespond(byte[] head, @Nullable String host) {
-		Optional<Router.Route> route = this.router.lookup(host);
-		if (route.isEmpty()) {
+		Router.Pick pick = this.router.pick(host).orElse(null);
+		if (pick == null) {
 			return refuse(head, host, this.errorResponse.noRoute(ConnectionHeadParser.Head.http1(head, host)));
 		}
-		TunnelSession session = this.sessions.find(route.get().clientId()).orElse(null);
-		if (session == null) {
-			return refuse(head, host, this.errorResponse.noRoute(ConnectionHeadParser.Head.http1(head, host)));
-		}
+		TunnelSession session = this.sessions.find(pick.route().clientId()).orElse(null);
 		String forwardedFor = ConnectionHeadParser.http1HeaderOf(head, ConnectionHeadParser.Head.FORWARDED_FOR);
 		String forwarded = ConnectionHeadParser.http1HeaderOf(head, ConnectionHeadParser.Head.FORWARDED);
-		if (!this.accessControl.allowed(route.get(), this.peer, forwardedFor, forwarded)) {
-			return refuse(head, host, this.errorResponse.forbidden(ConnectionHeadParser.Head.http1(head, host)));
+		if (session == null || !this.accessControl.allowed(pick.route(), this.peer, forwardedFor, forwarded)) {
+			pick.close();
+			return refuse(head, host,
+					session == null ? this.errorResponse.noRoute(ConnectionHeadParser.Head.http1(head, host))
+							: this.errorResponse.forbidden(ConnectionHeadParser.Head.http1(head, host)));
 		}
-		return new Resolved(route.get(), session);
+		return new Resolved(pick, session);
 	}
 
 	private @Nullable Resolved refuse(byte[] head, @Nullable String host, byte[] response) {
@@ -878,6 +903,18 @@ final class ReroutingRelay {
 		/** The requests whose final response has not begun, in order. */
 		private final ArrayDeque<Sent> unanswered = new ArrayDeque<>();
 
+		/**
+		 * The picks of the requests whose response has not completed, in order: each is
+		 * closed as its response completes, those left as the leg ends.
+		 */
+		private final ArrayDeque<Router.Pick> picks = new ArrayDeque<>();
+
+		/**
+		 * The pick of the request whose response switched the leg to verbatim: in flight
+		 * until the leg ends.
+		 */
+		private Router.@Nullable Pick switched;
+
 		/** A request asking for an upgrade waits for its answer. */
 		private boolean upgradeAwaited;
 
@@ -965,7 +1002,13 @@ final class ReroutingRelay {
 			}
 		}
 
-		void requestSent(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request, boolean upgrade) {
+		/**
+		 * A request is relayed on the leg: its pick is the leg's from now on, closed at
+		 * once when the leg ended already.
+		 */
+		void requestSent(@Nullable String host, ConnectionHeadParser.Head.@Nullable Request request, boolean upgrade,
+				Router.Pick pick) {
+			boolean ended;
 			synchronized (this) {
 				this.sent++;
 				this.unanswered.addLast(new Sent(host, request, upgrade));
@@ -973,6 +1016,13 @@ final class ReroutingRelay {
 					this.upgradeAwaited = true;
 					this.upgradeAnswer = null;
 				}
+				ended = this.ended;
+				if (!ended) {
+					this.picks.addLast(pick);
+				}
+			}
+			if (ended) {
+				pick.close();
 			}
 			owedChanged(1);
 		}
@@ -1071,30 +1121,56 @@ final class ReroutingRelay {
 			}
 		}
 
-		/** A response completed; one the upstream sent unasked counts for nothing. */
-		void responseCompleted() {
+		/**
+		 * A response completed, its request's pick closed -- or kept until the leg ends
+		 * when the response {@code switched} it to verbatim; one the upstream sent
+		 * unasked counts for nothing.
+		 */
+		void responseCompleted(boolean switched) {
 			boolean counted;
+			Router.@Nullable Pick done = null;
 			synchronized (this) {
 				counted = this.completed < this.sent;
 				if (counted) {
 					this.completed++;
+					Router.Pick pick = this.picks.pollFirst();
+					if (switched && this.switched == null) {
+						this.switched = pick;
+					}
+					else {
+						done = pick;
+					}
 				}
 				this.notifyAll();
+			}
+			if (done != null) {
+				done.close();
 			}
 			if (counted) {
 				owedChanged(-1);
 			}
 		}
 
-		/** The leg ended: the responses it still owed never come. */
+		/**
+		 * The leg ended: the responses it still owed never come, and the picks of their
+		 * requests are closed.
+		 */
 		void markEnded() {
 			int lost;
+			List<Router.Pick> left;
 			synchronized (this) {
 				this.ended = true;
 				lost = this.sent - this.completed;
 				this.completed = this.sent;
+				left = new ArrayList<>(this.picks);
+				this.picks.clear();
+				if (this.switched != null) {
+					left.add(this.switched);
+					this.switched = null;
+				}
 				this.notifyAll();
 			}
+			left.forEach(Router.Pick::close);
 			owedChanged(-lost);
 		}
 
@@ -1306,6 +1382,8 @@ final class ReroutingRelay {
 			return;
 		}
 		this.deadline.disarm();
+		// a first head never relayed (malformed) left its pick to here; a leg's closed it
+		this.initialPick.close();
 		for (Leg leg : this.legs) {
 			leg.close();
 			leg.session.remove(leg.connection.connectionId());
@@ -1344,6 +1422,9 @@ final class ReroutingRelay {
 		private final Leg leg;
 
 		private final Http1ResponseParser parser = new Http1ResponseParser(this);
+
+		/** The final head read last switched the leg to verbatim. */
+		private boolean switched;
 
 		ResponseTracker(Leg leg) {
 			this.leg = leg;
@@ -1390,6 +1471,7 @@ final class ReroutingRelay {
 			Sent request = this.leg.nextRequest();
 			@Nullable String method = request == null ? null : request.method();
 			boolean switched = status == 101 || "CONNECT".equals(method) && status >= 200 && status < 300;
+			this.switched = switched;
 			if (request != null && request.upgrade()) {
 				this.leg.upgradeAnswered(switched);
 			}
@@ -1404,7 +1486,9 @@ final class ReroutingRelay {
 
 		@Override
 		public void completed() {
-			this.leg.responseCompleted();
+			// a switch completes its response at once: its request stays in flight for
+			// the leg's life
+			this.leg.responseCompleted(this.switched);
 		}
 
 		@Override
@@ -1415,7 +1499,7 @@ final class ReroutingRelay {
 
 		@Override
 		public void cut() {
-			this.leg.responseCompleted();
+			this.leg.responseCompleted(false);
 		}
 
 	}

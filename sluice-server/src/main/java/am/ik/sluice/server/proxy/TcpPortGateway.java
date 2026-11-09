@@ -10,7 +10,6 @@ import java.net.Socket;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.TreeSet;
 import java.util.Set;
 import java.util.SortedMap;
@@ -348,6 +347,7 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 	 */
 	private void relay(Socket socket, int port, AccessLogger.Connection access, ConnectionLimits.Admission admission) {
 		boolean relaying = false;
+		Router.@Nullable Pick pick = null;
 		try {
 			InputStream source = socket.getInputStream();
 			InetAddress peer = peerOf(socket);
@@ -373,19 +373,20 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 				return;
 			}
 			access.accept();
-			Optional<Router.Route> route = this.router.lookupByPort(port);
-			if (!this.accessControl.allowed(route.orElse(null), peer)) {
+			pick = this.router.pickByPort(port).orElse(null);
+			if (!this.accessControl.allowed(pick == null ? null : pick.route(), peer)) {
 				this.close(socket);
 				access.close();
 				return;
 			}
-			TunnelSession session = route.map(r -> this.sessions.find(r.clientId()).orElse(null)).orElse(null);
-			if (session == null) {
+			TunnelSession session = pick == null ? null : this.sessions.find(pick.route().clientId()).orElse(null);
+			if (pick == null || session == null) {
 				this.close(socket);
 				access.close();
 				return;
 			}
-			Router.Route route0 = route.get();
+			Router.Pick picked = pick;
+			Router.Route route0 = picked.route();
 			VirtualConnection connection = session.open(route0, "", peer);
 			access.route(route0).connectionId(connection.connectionId());
 			AtomicInteger active = this.activeConnections.computeIfAbsent(port, p -> new AtomicInteger());
@@ -399,6 +400,8 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 				.onComplete(() -> {
 					deadline.disarm();
 					active.decrementAndGet();
+					// in flight for the connection's life
+					picked.close();
 					access.close();
 					session.remove(connection.connectionId());
 					// the slot covers what the connection still queues for the tunnel
@@ -426,6 +429,9 @@ public class TcpPortGateway implements TcpRouteListener, SmartLifecycle, AutoClo
 		}
 		finally {
 			if (!relaying) {
+				if (pick != null) {
+					pick.close();
+				}
 				admission.release();
 			}
 		}

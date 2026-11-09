@@ -16,7 +16,6 @@ import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
-import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.CompletableFuture;
@@ -71,12 +70,16 @@ import io.netty.util.AsciiString;
  * The connection head {@link DataProxyServer} read (the preface up to the first header
  * block) is fed to the client endpoint first, the socket after it, so netty's codec
  * validates the first stream like any other; the first stream takes the route
- * {@code DataProxyServer} resolved for the connection without a second lookup (a lookup
+ * {@code DataProxyServer} picked for the connection without a second pick (a pick
  * advances the load balancing state). Every later request head is routed by its
- * {@code :authority} (else {@code host}) and access-checked on its own: a refused stream
- * gets the no-route ({@code 503}) or forbidden ({@code 403}) page written through the
- * client endpoint's flow controller, and the connection goes on. Every stream, the first
- * one included, is then checked against its route's credentials
+ * {@code :authority} (else {@code host}), picked ({@link Router#pick}), and
+ * access-checked on its own. A stream's pick is closed once the stream closed -- its
+ * response relayed to the end, or the stream reset either way -- or once the relay
+ * answered it itself, so a route shared by weights counts each stream in flight from its
+ * pick to its end; those of streams left open are closed as the relay finishes. A refused
+ * stream gets the no-route ({@code 503}) or forbidden ({@code 403}) page written through
+ * the client endpoint's flow controller, and the connection goes on. Every stream, the
+ * first one included, is then checked against its route's credentials
  * ({@link RouteAuthenticator}): a refused one gets the unauthorized ({@code 401}) or, its
  * credential not checked for the checks in flight, the busy ({@code 503}) page the same
  * way; the headers of the route's credentials are removed from a head that passes unless
@@ -496,6 +499,13 @@ final class NettyHttp2DemuxRelay {
 	 */
 	private final Map<Integer, Exchange> exchanges = new HashMap<>();
 
+	/**
+	 * The picks of the client's routed streams, by id, each closed once its stream closed
+	 * or the relay answered it itself; those left as the relay finishes. With the loop's
+	 * lock.
+	 */
+	private final Map<Integer, Router.Pick> picks = new HashMap<>();
+
 	/** The highest stream id the client opened; with the loop's lock. */
 	private int highestStreamId;
 
@@ -523,8 +533,15 @@ final class NettyHttp2DemuxRelay {
 		this.errorResponse = Objects.requireNonNull(builder.errorResponse, "errorResponse is required");
 		this.access = Objects.requireNonNull(builder.access, "access is required");
 		this.meters = Objects.requireNonNull(builder.meters, "meters is required");
-		this.initialRoute = Objects.requireNonNull(builder.initialRoute, "initialRoute is required");
+		Router.Pick initialPick = Objects.requireNonNull(builder.initialPick, "initialPick is required");
+		this.initialRoute = initialPick.route();
 		this.initialSession = Objects.requireNonNull(builder.initialSession, "initialSession is required");
+		if (this.seedStreamId < 0) {
+			initialPick.close(); // no stream takes it
+		}
+		else {
+			this.picks.put(this.seedStreamId, initialPick);
+		}
 		this.peer = builder.peer;
 		this.handshake = builder.handshake;
 		this.forwarding = Objects.requireNonNull(builder.forwarding, "forwarding is required");
@@ -688,19 +705,24 @@ final class NettyHttp2DemuxRelay {
 			session = this.initialSession;
 		}
 		else {
-			Optional<Router.Route> found = this.router.lookup(host);
-			TunnelSession serving = found.flatMap(candidate -> this.sessions.find(candidate.clientId())).orElse(null);
-			if (found.isEmpty() || serving == null) {
+			Router.Pick pick = this.router.pick(host).orElse(null);
+			TunnelSession serving = pick == null ? null : this.sessions.find(pick.route().clientId()).orElse(null);
+			if (pick == null || serving == null) {
+				if (pick != null) {
+					pick.close();
+				}
 				refuseLocked(streamId, request, this.errorResponse.noRoutePage(host, request));
 				return;
 			}
-			if (!this.accessControl.allowed(found.get(), this.peer,
+			if (!this.accessControl.allowed(pick.route(), this.peer,
 					headerOf(headers, ConnectionHeadParser.Head.FORWARDED_FOR),
 					headerOf(headers, ConnectionHeadParser.Head.FORWARDED))) {
+				pick.close();
 				refuseLocked(streamId, request, this.errorResponse.forbiddenPage(host, request));
 				return;
 			}
-			route = found.get();
+			this.picks.put(streamId, pick);
+			route = pick.route();
 			session = serving;
 		}
 		NewStream stream = new NewStream(streamId, route, session, host, request, headers, endStream);
@@ -721,9 +743,25 @@ final class NettyHttp2DemuxRelay {
 	 * {@code 302}), one that passes loses the headers of its route's credentials, gets
 	 * those its verdict adds and goes to its route's leg -- with what the client sent
 	 * while it was parked --, or is answered {@code 421} for a {@code force-http1} route;
-	 * a check that failed resets it ({@code INTERNAL_ERROR}). With the loop's lock.
+	 * a check that failed resets it ({@code INTERNAL_ERROR}). A stream that does not go
+	 * to its leg is in flight no longer: its pick is closed. With the loop's lock.
 	 */
 	private void verifiedLocked(NewStream stream, CompletableFuture<Verdict> checked) {
+		boolean relayed = false;
+		try {
+			relayed = relayVerifiedLocked(stream, checked);
+		}
+		finally {
+			if (!relayed) {
+				closePickLocked(stream.id);
+			}
+		}
+	}
+
+	/**
+	 * {@link #verifiedLocked}: whether the stream went to its leg. With the loop's lock.
+	 */
+	private boolean relayVerifiedLocked(NewStream stream, CompletableFuture<Verdict> checked) {
 		int streamId = stream.id;
 		Router.Route route = stream.route;
 		ConnectionHeadParser.Head.Request request = stream.request;
@@ -738,7 +776,7 @@ final class NettyHttp2DemuxRelay {
 					cause.toString(), cause);
 			releaseParkedDataLocked(stream);
 			resetClientLocked(streamId, Http2Error.INTERNAL_ERROR);
-			return;
+			return false;
 		}
 		if (!(verdict instanceof Verdict.Pass pass)) {
 			this.access.refused(route, request, verdict);
@@ -748,7 +786,7 @@ final class NettyHttp2DemuxRelay {
 			if (shortfall != null) {
 				refuseForBudgetLocked(streamId, shortfall);
 			}
-			return;
+			return false;
 		}
 		for (String name : pass.strip()) {
 			headers.remove(AsciiString.of(name));
@@ -757,7 +795,7 @@ final class NettyHttp2DemuxRelay {
 		if (route.forceHttp1()) {
 			releaseParkedDataLocked(stream);
 			misdirectLocked(streamId, stream.host, route, request, stream.requestEnded);
-			return;
+			return false;
 		}
 		CharSequence authority = headers.authority() != null ? headers.authority() : headers.get(HOST);
 		Forwarding.Headers forwarded = this.forwarding.headers(ConnectionHeadParser.http2Headers(headers),
@@ -771,13 +809,13 @@ final class NettyHttp2DemuxRelay {
 		if (shortfall != null) {
 			releaseParkedDataLocked(stream);
 			refuseForBudgetLocked(streamId, shortfall);
-			return;
+			return false;
 		}
 		Leg leg = legLocked(route, stream.session, streamId);
 		if (leg == null) {
 			releaseParkedDataLocked(stream);
 			resetClientLocked(streamId, Http2Error.REFUSED_STREAM);
-			return;
+			return false;
 		}
 		if (route.rewriteHost()) {
 			headers.authority(AsciiString.of(route.address()));
@@ -831,6 +869,18 @@ final class NettyHttp2DemuxRelay {
 			}
 		}
 		this.access.request(route, request);
+		return true;
+	}
+
+	/**
+	 * The stream's request is in flight no longer: its pick, if it has one, is closed.
+	 * With the loop's lock.
+	 */
+	private void closePickLocked(int streamId) {
+		Router.Pick pick = this.picks.remove(streamId);
+		if (pick != null) {
+			pick.close();
+		}
 	}
 
 	/**
@@ -849,6 +899,7 @@ final class NettyHttp2DemuxRelay {
 		Shortfall shortfall = admitLocked(stream.headBytes);
 		if (shortfall != null) {
 			verdict.cancel(false);
+			closePickLocked(stream.id);
 			refuseForBudgetLocked(stream.id, shortfall);
 			return;
 		}
@@ -2049,6 +2100,12 @@ final class NettyHttp2DemuxRelay {
 	 */
 	private void closeAccountsLocked() {
 		this.accountsClosed = true;
+		// a stream the codec never closed, the connection head's never read: none in
+		// flight after the relay
+		for (Router.Pick pick : this.picks.values()) {
+			pick.close();
+		}
+		this.picks.clear();
 		this.meters.held(-this.queued);
 		this.queued = 0;
 		this.meters.credit(-this.credit);
@@ -2697,6 +2754,8 @@ final class NettyHttp2DemuxRelay {
 			if (resetByCodecLocked(stream)) {
 				NettyHttp2DemuxRelay.this.meters.resetForProtocol();
 			}
+			// answered, reset, or relayed to the end: the request is in flight no longer
+			closePickLocked(stream.id());
 			NewStream parked = NettyHttp2DemuxRelay.this.parked.get(stream.id());
 			if (parked != null) {
 				dropParkedLocked(parked);
@@ -2967,7 +3026,7 @@ final class NettyHttp2DemuxRelay {
 
 		private @Nullable H2DemuxMeters meters;
 
-		private Router.@Nullable Route initialRoute;
+		private Router.@Nullable Pick initialPick;
 
 		private @Nullable TunnelSession initialSession;
 
@@ -3043,9 +3102,12 @@ final class NettyHttp2DemuxRelay {
 			return this;
 		}
 
-		/** The route and session resolved for the connection head's stream. */
-		Builder initialRoute(Router.Route initialRoute, TunnelSession initialSession) {
-			this.initialRoute = initialRoute;
+		/**
+		 * The pick of the connection head's stream's route, the relay's to close, and the
+		 * session serving it.
+		 */
+		Builder initialRoute(Router.Pick initialPick, TunnelSession initialSession) {
+			this.initialPick = initialPick;
 			this.initialSession = initialSession;
 			return this;
 		}
