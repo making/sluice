@@ -40,14 +40,12 @@ executable), the OSS `cf` 8.19.0.
    ```text
    cf create-service wasi inherit-network shiori-network
    cf create-service wasi allow-ip-name-lookup shiori-dns
-   cd shiori && cf push --no-start
-   cf set-env shiori DATABASE_URL "postgresql://postgres:<POSTGRES_PASSWORD>@postgres:5432/postgres"
-   cf start shiori
+   cd shiori && cf push
    open http://shiori.localhost:28000/
    ```
 
-   `DATABASE_URL` is set apart from the manifest so the password is in no file pushed; the app reads that
-   variable alone, not `VCAP_SERVICES`, so a user-provided service does not reach it.
+   `DATABASE_URL` is the manifest's `env`, its password `.env`'s `POSTGRES_PASSWORD`: change both together.
+   The app reads that variable alone, not `VCAP_SERVICES`, so a user-provided service does not reach it.
 
 The first request took 15.6s (the schema and eighteen sample books), the other instance's first 1.8s (the
 schema statements again), then 0.49s a page (see [Latency](#latency)). On the README's
@@ -239,6 +237,8 @@ applications:
   metadata:
     annotations:
       wicket.sluice.ik.am/budget-ms: "60000"   # the first start: see The first start
+  env:
+    DATABASE_URL: postgresql://postgres:5f0c1d2e3a4b5c6d7e8f90a1b2c3d4e5@postgres:5432/postgres   # .env's POSTGRES_PASSWORD
   services:
   - shiori-network
   - shiori-dns
