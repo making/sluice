@@ -277,7 +277,7 @@ mod tests {
 
     /// Made once, as an ext4 file system of its size for its owner alone, its room taken on
     /// the host; grown, what it held stays; asked for less, as it is. A lock held refuses
-    /// another.
+    /// another, and is given back as its holder goes.
     #[tokio::test]
     async fn a_disk_is_made_once_grows_and_takes_one_holder() {
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
@@ -309,9 +309,11 @@ mod tests {
         disk.ready().await.unwrap();
         assert_eq!(disk.file_bytes(), Ok(128 << 20));
 
-        assert!(!held(&disk.file).unwrap());
+        // free: taken. A lock given back is free only once no process another test forks
+        // shares its file any more (until its exec or exit), so it is taken as `hold` takes
+        // it, never asserted free at once (`held`)
         let holder = std::fs::File::open(&disk.file).unwrap();
-        assert!(lock(holder.as_raw_fd()).unwrap());
+        assert!(take(holder.as_raw_fd()).unwrap());
         assert!(held(&disk.file).unwrap());
         // a holder going at once is waited for
         let taker = std::fs::File::open(&disk.file).unwrap();
@@ -323,7 +325,9 @@ mod tests {
         going.join().unwrap();
         assert!(held(&disk.file).unwrap());
         drop(taker);
-        assert!(!held(&disk.file).unwrap());
+        // given back as its holder went
+        let next = std::fs::File::open(&disk.file).unwrap();
+        assert!(take(next.as_raw_fd()).unwrap());
         assert!(!held(&dir.join("none")).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
     }
