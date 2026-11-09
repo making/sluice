@@ -1,9 +1,10 @@
 name: Rust
 # The Rust crates' own gates, apart from CI: a Java-only change runs none of them, and
-# each crate's job runs only when its paths changed. CI still builds sluice-flume for the
-# sluice-it tests. A run with the sluice-flume / sluice-wicket-runtime-wasi / sluice-wicket-cf-api /
-# sluice-wicket-runtime-firecracker job passed deploys its image (deploy-flume.yaml /
-# deploy-wicket-runtime-wasi.yaml / deploy-cf-api.yaml / deploy-wicket-runtime-firecracker.yaml).
+# each crate's job runs only when its paths changed since the last run that passed. CI still
+# builds sluice-flume for the sluice-it tests. A run with the sluice-flume /
+# sluice-wicket-runtime-wasi / sluice-wicket-cf-api / sluice-wicket-runtime-firecracker job
+# passed deploys its image (deploy-flume.yaml / deploy-wicket-runtime-wasi.yaml /
+# deploy-cf-api.yaml / deploy-wicket-runtime-firecracker.yaml).
 on:
   push:
     branches:
@@ -41,6 +42,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
+      actions: read
       contents: read
       pull-requests: read
     outputs:
@@ -58,9 +60,22 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
+    # A push is compared with the commit of the last run that passed, not with the commit before
+    # it: a crate changed by a push whose run failed runs again (and its image deploys) with the
+    # next push, whatever that one changes. None passed yet: the commit before the push.
+    - name: The last passing run's commit
+      id: base
+      if: github.event_name == 'push'
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        PASSED=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows/rust.yaml/runs?branch=main&event=push&status=success&per_page=1" --jq '.workflow_runs[0].head_sha // empty')
+        echo "last passing run's commit: ${PASSED:-none}" | tee -a "${GITHUB_STEP_SUMMARY}"
+        echo "sha=${PASSED}" >> "${GITHUB_OUTPUT}"
     - uses: dorny/paths-filter@v3
       id: filter
       with:
+        base: ${{ steps.base.outputs.sha || github.event.before }}
         filters: |
           client-wasm:
           - 'sluice-client-wasm/**'
