@@ -994,7 +994,8 @@ impl Keeper {
         };
         let route = self.routes.get(&request.route).expect("checked");
         // the disk: the VM's id's to write, the wicket's group keeping its way to it; and the
-        // VM's lock, on an open file of its own going with it
+        // VM's lock, on an open file of its own going with it (a holder going at once waited
+        // for, a second at most: the wicket waited for the VM on it before)
         let locked = match &route.disk {
             Some(disk) => {
                 std::os::unix::fs::fchown(disk, Some(id), Some(self.group))?;
@@ -1005,7 +1006,7 @@ impl Keeper {
                     .write(true)
                     .custom_flags(libc::O_CLOEXEC)
                     .open(format!("/proc/self/fd/{}", disk.as_raw_fd()))?;
-                if !crate::disk::lock(locked.as_raw_fd())? {
+                if !crate::disk::take(locked.as_raw_fd())? {
                     return Err(io::Error::other("the disk is in use by another VM"));
                 }
                 Some((locked, fstat(disk)?.st_size as u64))

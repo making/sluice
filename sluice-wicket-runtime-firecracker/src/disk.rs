@@ -8,7 +8,8 @@
 //! file its `firecracker` inherits ([`hold`]; the keeper's own in jail mode, `keeper`): the
 //! kernel lets it go when that process is gone, a crash of the wicket included. A reload
 //! stops the VM holding a disk before it starts the next (`routes`), and a start waits for
-//! the lock ([`Disk::ready`]): a killed VM's process takes tens of milliseconds to end.
+//! the lock ([`Disk::ready`]): a killed VM's process takes tens of milliseconds to end. Taking
+//! it waits a moment too ([`take`]), for a holder going at once.
 
 use std::io;
 use std::os::fd::{AsRawFd as _, IntoRawFd as _};
@@ -38,6 +39,11 @@ pub const STOP_MOST: Duration =
 /// dial holding on to it (`vm::Vm::dial`, 10s at most), then its teardown.
 const FREE_WAIT: Duration = Duration::from_secs(40);
 const _: () = assert!(FREE_WAIT.as_secs() > STOP_MOST.as_secs());
+
+/// How long taking a disk's lock waits for a holder going at once: [`held`]'s, its file
+/// shared with a process the wicket spawns at that moment until that one's exec, or a backup's
+/// `flock -n`. A VM on the disk is waited for before ([`Disk::ready`]).
+const TAKE_WAIT: Duration = Duration::from_secs(1);
 
 /// A VM's disk.
 #[derive(Clone, Debug, PartialEq)]
@@ -204,7 +210,7 @@ fn allocate(file: &std::fs::File, bytes: u64) -> io::Result<()> {
 }
 
 /// Takes the exclusive lock of `fd`: false when another holds it.
-pub fn lock(fd: std::os::fd::RawFd) -> io::Result<bool> {
+fn lock(fd: std::os::fd::RawFd) -> io::Result<bool> {
     // SAFETY: flock of an open file, not blocking
     if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0 {
         return Ok(true);
@@ -213,6 +219,21 @@ pub fn lock(fd: std::os::fd::RawFd) -> io::Result<bool> {
     match e.raw_os_error() {
         Some(libc::EWOULDBLOCK) => Ok(false),
         _ => Err(e),
+    }
+}
+
+/// Takes the exclusive lock of `fd`, waiting [`TAKE_WAIT`] at most for another to let it go:
+/// false when another holds it still.
+pub fn take(fd: std::os::fd::RawFd) -> io::Result<bool> {
+    let deadline = Instant::now() + TAKE_WAIT;
+    loop {
+        if lock(fd)? {
+            return Ok(true);
+        }
+        if Instant::now() >= deadline {
+            return Ok(false);
+        }
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -236,7 +257,7 @@ pub fn hold(file: &Path) -> io::Result<()> {
         .write(true)
         .open(file)
         .map_err(failed)?;
-    if !lock(open.as_raw_fd()).map_err(failed)? {
+    if !take(open.as_raw_fd()).map_err(failed)? {
         return Err(io::Error::other(format!(
             "{}: in use by another VM",
             file.display()
@@ -292,7 +313,16 @@ mod tests {
         let holder = std::fs::File::open(&disk.file).unwrap();
         assert!(lock(holder.as_raw_fd()).unwrap());
         assert!(held(&disk.file).unwrap());
-        drop(holder);
+        // a holder going at once is waited for
+        let taker = std::fs::File::open(&disk.file).unwrap();
+        let going = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(holder);
+        });
+        assert!(take(taker.as_raw_fd()).unwrap());
+        going.join().unwrap();
+        assert!(held(&disk.file).unwrap());
+        drop(taker);
         assert!(!held(&disk.file).unwrap());
         assert!(!held(&dir.join("none")).unwrap());
         std::fs::remove_dir_all(&dir).unwrap();
