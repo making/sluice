@@ -15,6 +15,8 @@
 //! DELETE /api/keyvalue/<store>/<namespace>     deletes the data of a namespace no route maps
 //! PUT    /api/evacuated/<owner>                a wicket leaving: the owner moved what of its
 //!                                              apps it could, the rest staying until it drains
+//! PUT    /api/confirmed/<owner>                the owner's apps the body names are as it wants
+//!                                              them: those a start of the wicket holds served
 //! ```
 
 use std::collections::BTreeMap;
@@ -59,6 +61,10 @@ pub struct AppBody<S = Sandbox> {
     /// (`crate::env::tag`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    /// How long a start of the wicket holds the app at most, until its owner confirms it: put
+    /// to a wicket listing its start alone (`crate::controller`).
+    #[serde(default, rename = "held-ms", skip_serializing_if = "Option::is_none")]
+    pub held_ms: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -174,6 +180,7 @@ impl AppBody<serde_json::Value> {
                 Runtime::Firecracker => Sandbox::Vm(serde_json::from_value(self.sandbox)?),
             },
             tag: self.tag,
+            held_ms: self.held_ms,
         })
     }
 }
@@ -322,6 +329,10 @@ pub struct ListedWicket {
     #[serde(default)]
     pub node: Option<String>,
     pub build: String,
+    /// Its start, in seconds since the epoch: from then on it holds an app put with `held-ms`
+    /// until its owner confirms it. None from a wicket predating it, which takes no `held-ms`.
+    #[serde(default)]
+    pub since: Option<u64>,
 }
 
 /// The instances a wicket keeps at once at most, and what its routes keep of them for good: a
@@ -378,6 +389,10 @@ pub struct ListedApp<S = Sandbox> {
     /// sends them connections. None from a wicket predating it.
     #[serde(default)]
     pub advertised: Option<bool>,
+    /// Whether the wicket holds it since its start until its owner confirms it: it serves it
+    /// not.
+    #[serde(default)]
+    pub held: bool,
 }
 
 impl ListedApp<serde_json::Value> {
@@ -391,6 +406,7 @@ impl ListedApp<serde_json::Value> {
             crashed: self.crashed,
             down: self.down,
             advertised: self.advertised,
+            held: self.held,
         })
     }
 }
@@ -625,6 +641,22 @@ impl Wicket {
             .client
             .put(format!("{}/api/evacuated/{owner}", self.base))
             .timeout(READ_TIMEOUT);
+        let (status, body) = self.send(request).await?;
+        if !status.is_success() {
+            return Err(refused(status, &body));
+        }
+        Ok(())
+    }
+
+    /// Tells the wicket the owner's apps `names` are as it wants them: those a start of it holds
+    /// are served.
+    pub async fn confirmed(&self, names: &[String]) -> Result<(), Failure> {
+        let owner: String = form_urlencoded::byte_serialize(self.owner.as_bytes()).collect();
+        let request = self
+            .client
+            .put(format!("{}/api/confirmed/{owner}", self.base))
+            .timeout(READ_TIMEOUT)
+            .json(&serde_json::json!({ "apps": names }));
         let (status, body) = self.send(request).await?;
         if !status.is_success() {
             return Err(refused(status, &body));

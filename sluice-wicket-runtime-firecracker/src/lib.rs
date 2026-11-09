@@ -270,6 +270,7 @@ async fn serving(
                     server: server.clone(),
                     listen: listening,
                     identity,
+                    held: reloader.held(),
                 }),
             ));
         }

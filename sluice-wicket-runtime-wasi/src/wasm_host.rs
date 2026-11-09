@@ -3271,8 +3271,8 @@ pub async fn serve(mut io: TunnelIo, binding: Binding) {
 }
 
 /// Serves the requests of one connection, h2 when `h2` (sniffed by the
-/// caller) else http/1.1, each by the handler `route` finds for it (404 with
-/// its message when none), until the connection ends; once `gone` is
+/// caller) else http/1.1, each by the handler `route` finds for it (the status
+/// and message it gives when none), until the connection ends; once `gone` is
 /// cancelled it shuts down gracefully. `label` names the connection in the
 /// log; `accepted` is its client, None for a tunnel connection (whose client
 /// is the last entry of each request's `X-Forwarded-For`, and which the
@@ -3289,7 +3289,7 @@ pub(crate) async fn serve_http<I, R>(
     accepted: Option<Accepted>,
 ) where
     I: tokio::io::AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    R: Fn(&hyper::Request<hyper::body::Incoming>) -> Result<Arc<Handler>, String>
+    R: Fn(&hyper::Request<hyper::body::Incoming>) -> Result<Arc<Handler>, (u16, String)>
         + Send
         + Sync
         + 'static,
@@ -3319,7 +3319,7 @@ pub(crate) async fn serve_http<I, R>(
                     };
                     respond(&handler, &share, req, admitted).await
                 }
-                Err(message) => plain_response(404, message),
+                Err((status, message)) => plain_response(status, message),
             };
             let response = match answered {
                 Some(answered) => answered.counting(response),

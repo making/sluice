@@ -49,6 +49,11 @@ The PoC was verified by hand only; nothing runs it in `./mvnw verify`.
   `-i 1` on the one told to stop (SIGTERM) moves to the other with no request failing
   through the server, the stopped one exiting before its bound; checked by hand only
   (`.kb/wicket-cf-api-findings.md`, Evacuation), `tests/cli.rs` asks each listener directly
+- a wicket gone (258): the same with `--wicket-away-grace`, an app of `-i 1` on the one killed
+  (SIGKILL) served by the other after the bound; started again, the killed one serves neither an
+  app changed meanwhile nor one deleted, holding them until the cf-api removes them; checked by
+  hand only (`.kb/wicket-cf-api-findings.md`, A wicket gone), `tests/cli.rs` asks each listener
+  directly
 
 Acceptance: `./mvnw verify` covers the wasm path; CI without rust still passes
 (skipped, not failed).

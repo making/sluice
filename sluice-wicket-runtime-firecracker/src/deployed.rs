@@ -22,14 +22,16 @@
 //! removed after every edit and at startup, an upload once `UPLOAD_GRACE`
 //! passed: an app naming it links it below `rootfs/` before. A disk stays as the
 //! app goes, its next one of that name and owner finding it, until it is removed
-//! ([`Deployed::remove_disk`]).
+//! ([`Deployed::remove_disk`]). An app put with `held-ms` is held at each start
+//! until its owner confirms it (`sluice_wicket_console::held`, [`Deployed::held`]).
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
 use sluice_wicket_console::env::Env;
+use sluice_wicket_console::held::check_held_ms;
 use sluice_wicket_console::http::Received;
 use sluice_wicket_console::store::{
     Blobs, UPLOADS, check_digest, check_file, check_host, check_hosts, check_kept, check_name,
@@ -87,6 +89,8 @@ pub struct App {
     pub env: Env,
     /// The owner's, kept and listed as given ([`check_tag`]).
     pub tag: Option<String>,
+    /// How long a start of the wicket holds it at most, until its owner confirms it.
+    pub held_ms: Option<u64>,
     /// When it took this image, these options and this env, RFC 3339.
     pub deployed: String,
 }
@@ -121,6 +125,7 @@ pub struct AppSpec {
     pub options: Options,
     pub env: Env,
     pub tag: Option<String>,
+    pub held_ms: Option<u64>,
 }
 
 /// The console's routes in the order deployed, its apps in the order put, and
@@ -158,6 +163,15 @@ impl Deployed {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The apps a start holds until their owners confirm them: each one's owner, name and
+    /// `held-ms`.
+    pub fn held(&self) -> impl Iterator<Item = (String, String, Duration)> + '_ {
+        self.apps.iter().filter_map(|app| {
+            let held = Duration::from_millis(app.held_ms?);
+            Some((app.owner.clone(), app.name.clone(), held))
+        })
     }
 
     pub fn routes(&self) -> &[Route] {
@@ -214,6 +228,7 @@ impl Deployed {
                     name: app.name.clone(),
                     owner: app.owner.clone(),
                     tag: app.tag.clone(),
+                    held_ms: app.held_ms,
                     deployed: app.deployed.clone(),
                 };
                 specs.push((spec, origin));
@@ -328,8 +343,8 @@ impl Deployed {
     /// The apps with the app `name` as `app` has it since `now`: its image made
     /// from an upload or another file of its digest, in place of the app of
     /// that name -- which keeps its time when its image, options and env stay,
-    /// its hosts and tag changing or not -- or added last. Another owner's app
-    /// is refused, and so is an image of a digest not kept.
+    /// its hosts, tag and `held-ms` changing or not -- or added last. Another
+    /// owner's app is refused, and so is an image of a digest not kept.
     pub fn with_app(&self, name: &str, app: AppSpec, now: SystemTime) -> Result<Deployed, Refused> {
         check_name("app", name).map_err(Refused::Invalid)?;
         check_name("owner", &app.owner).map_err(Refused::Invalid)?;
@@ -374,6 +389,7 @@ impl Deployed {
             options: app.options,
             env: app.env,
             tag: app.tag,
+            held_ms: app.held_ms,
             deployed: rfc3339(now),
         };
         let mut deployed = self.clone();
@@ -385,6 +401,7 @@ impl Deployed {
             {
                 kept.hosts = app.hosts;
                 kept.tag = app.tag;
+                kept.held_ms = app.held_ms;
             }
             Some(kept) => *kept = app,
             None => deployed.apps.push(app),
@@ -575,6 +592,8 @@ struct ManifestApp {
     rootfs: String,
     deployed: String,
     tag: Option<String>,
+    #[serde(rename = "held-ms")]
+    held_ms: Option<u64>,
     /// As a `--vm` flag's query has them.
     #[serde(default)]
     options: BTreeMap<String, String>,
@@ -635,6 +654,9 @@ fn read(text: &str) -> Result<(Vec<Route>, Vec<App>), String> {
         if let Some(tag) = &app.tag {
             check_tag(tag).map_err(failed)?;
         }
+        if let Some(held_ms) = app.held_ms {
+            check_held_ms(held_ms).map_err(failed)?;
+        }
         let pairs: Vec<(String, String)> = app.options.into_iter().collect();
         let options = options(&hosts[0], &pairs).map_err(failed)?;
         let env = Env::new(app.env).map_err(|e| failed(format!("env: {e}")))?;
@@ -646,6 +668,7 @@ fn read(text: &str) -> Result<(Vec<Route>, Vec<App>), String> {
             options,
             env,
             tag: app.tag,
+            held_ms: app.held_ms,
             deployed: app.deployed,
         });
     }
@@ -704,6 +727,9 @@ fn write(routes: &[Route], apps: &[App]) -> String {
         if let Some(tag) = &app.tag {
             yaml.push_str(&format!("    tag: {}\n", quote(tag)));
         }
+        if let Some(held_ms) = app.held_ms {
+            yaml.push_str(&format!("    held-ms: {held_ms}\n"));
+        }
         if !app.options.is_empty() {
             let options = app
                 .options
@@ -737,7 +763,8 @@ mod tests {
 
     /// The options are the `--vm` flag's, checked as a route takes them, kept in
     /// one order; the routes file reads back as written, routes and apps, an app's
-    /// env and tag included, and what the console never writes -- an image not its
+    /// env, tag and `held-ms` included (the apps a start holds those of `held-ms`), and
+    /// what the console never writes -- an image not its
     /// own, a host or an app twice, an option a route refuses, no time -- fails,
     /// naming the route or the app, never a value. A move keeps a route as it is, in
     /// its place, and replaces none.
@@ -852,6 +879,7 @@ mod tests {
                 ]))
                 .unwrap(),
                 tag: Some("0123456789abcdef:\"#{}".into()),
+                held_ms: Some(15_000),
                 deployed: rfc3339(UNIX_EPOCH),
             },
             App {
@@ -862,6 +890,7 @@ mod tests {
                 options: Vec::new(),
                 env: Env::default(),
                 tag: None,
+                held_ms: None,
                 deployed: rfc3339(UNIX_EPOCH),
             },
             App {
@@ -872,10 +901,26 @@ mod tests {
                 options: pairs("disk=/var/lib/app&disk-mib=64"),
                 env: Env::default(),
                 tag: None,
+                held_ms: None,
                 deployed: rfc3339(UNIX_EPOCH),
             },
         ];
         let text = write(&routes, &apps);
+        let held: Vec<_> = Deployed {
+            dir: PathBuf::new(),
+            routes: Vec::new(),
+            apps: apps.clone(),
+        }
+        .held()
+        .collect();
+        assert_eq!(
+            held,
+            [(
+                "cf".to_string(),
+                "0b9e2c6a".to_string(),
+                Duration::from_secs(15)
+            )]
+        );
         assert_eq!(read(&text), Ok((routes.clone(), apps)), "{text}");
         assert!(
             text.contains("egress: [\"db.internal:5432\", \"10.0.0.0/24:6379\"]"),
@@ -948,6 +993,7 @@ mod tests {
                 "apps[0]: rootfs: '../a.ext4' is not one of the console's",
             ),
             (apps(", tag: 'a b'"), "apps[0]: tag: 'a b' is no tag"),
+            (apps(", held-ms: 0"), "apps[0]: held-ms: must be at least 1"),
             (
                 apps(", options: {mode: pool}"),
                 "apps[0]: the route: mode=pool needs instances",

@@ -558,11 +558,13 @@ pub enum Origin {
     /// The console, which deployed it at `deployed` (RFC 3339).
     Console { deployed: String },
     /// An app of the console's API, `name` of `owner` (its `tag` opaque to the
-    /// console), which took its rootfs and options at `deployed` (RFC 3339).
+    /// console, its `held-ms`), which took its rootfs and options at `deployed`
+    /// (RFC 3339).
     Api {
         name: String,
         owner: String,
         tag: Option<String>,
+        held_ms: Option<u64>,
         deployed: String,
     },
 }

@@ -11,7 +11,9 @@
 //! instance to serve it leaves the advertisement, so the server sends its
 //! host to another client serving it, or falls through as for a host no client
 //! advertises, until it is ready again ([`Routes::readiness_changed`]). It is
-//! still bound: the server may have routed a connection to it before.
+//! still bound: the server may have routed a connection to it before. So is a
+//! route held ([`Table::held`]): an app a wicket serves once its controller
+//! confirmed it since the wicket's start.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,10 +42,21 @@ pub trait Table: Send + Sync + Sized + 'static {
         true
     }
 
-    /// What a stream advertises: [`Table::advertised`], those [`Table::ready`].
+    /// Whether `route` is held: an app of a controller's, which the wicket serves once the
+    /// controller confirmed it since its start, or a bound passed. The wicket tells a change
+    /// ([`Routes::readiness_changed`]).
+    fn held(&self, _route: &Upstream) -> bool {
+        false
+    }
+
+    /// What a stream advertises: [`Table::advertised`], those [`Table::ready`] and not
+    /// [`Table::held`].
     fn offered(&self) -> Vec<Upstream> {
         let advertised = self.advertised().iter();
-        advertised.filter(|up| self.ready(up)).cloned().collect()
+        advertised
+            .filter(|up| !self.held(up) && self.ready(up))
+            .cloned()
+            .collect()
     }
 
     /// Whether `route`, advertised alone, takes any host on a wicket's listener:
@@ -173,19 +186,32 @@ impl<T: Table> Routes<T> {
         T::bind(self, address)
     }
 
-    /// Whether every route of the current table has an instance ready ([`Table::ready`]); Err
-    /// names the hosts of those without.
+    /// Whether every route of the current table has an instance ready ([`Table::ready`]) and
+    /// none is held ([`Table::held`]); Err names the hosts of those that are not.
     pub fn readiness(&self) -> Result<(), String> {
         let table = self.current();
-        let unready: Vec<&str> = table
-            .advertised()
-            .iter()
-            .filter(|route| !table.ready(route))
-            .map(|route| route.host.as_str())
-            .collect();
-        match unready.is_empty() {
+        let hosts = |unready: &dyn Fn(&Upstream) -> bool| -> Vec<&str> {
+            let routes = table.advertised().iter();
+            routes
+                .filter(|route| unready(route))
+                .map(|route| route.host.as_str())
+                .collect()
+        };
+        let held = hosts(&|route| table.held(route));
+        let unready = hosts(&|route| !table.held(route) && !table.ready(route));
+        let mut why = Vec::new();
+        if !held.is_empty() {
+            why.push(format!(
+                "held until their owners confirm them: {}",
+                held.join(", ")
+            ));
+        }
+        if !unready.is_empty() {
+            why.push(format!("no instance ready for {}", unready.join(", ")));
+        }
+        match why.is_empty() {
             true => Ok(()),
-            false => Err(format!("no instance ready for {}", unready.join(", "))),
+            false => Err(why.join("; ")),
         }
     }
 }
@@ -234,6 +260,8 @@ pub(crate) mod testing {
         pub(crate) takes_any_host: bool,
         /// The hosts with no instance ready, as they are now ([`Table::ready`]).
         pub(crate) unready: Arc<std::sync::Mutex<Vec<String>>>,
+        /// The hosts held, as they are now ([`Table::held`]).
+        pub(crate) held: Arc<std::sync::Mutex<Vec<String>>>,
     }
 
     impl Fixed {
@@ -251,6 +279,7 @@ pub(crate) mod testing {
                     .collect(),
                 takes_any_host: false,
                 unready: Arc::default(),
+                held: Arc::default(),
             }
         }
     }
@@ -268,6 +297,10 @@ pub(crate) mod testing {
 
         fn ready(&self, route: &Upstream) -> bool {
             !self.unready.lock().unwrap().contains(&route.host)
+        }
+
+        fn held(&self, route: &Upstream) -> bool {
+            self.held.lock().unwrap().contains(&route.host)
         }
 
         fn takes_any_host(&self, _route: &Upstream) -> bool {

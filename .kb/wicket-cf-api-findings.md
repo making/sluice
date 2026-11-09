@@ -103,6 +103,21 @@ server, a connection each, both hosts in turn. The wicket holding both told to s
   advertise behind the data it sends, which the wait covers
 - back, the `-i 2` app's second index moved back to it
 
+## A wicket gone
+
+The same setup (`--wicket-away-grace 5`, a request every ~5ms through the server, a connection
+each), an app of `-i 1` on the first wicket, killed (SIGKILL):
+
+- the requests failed from the kill until the app answered on the other wicket 5.47s on (992 of
+  2141): the bound, the first failed listing seen at once (the long poll's connection reset), the
+  move a put and the servers' acknowledgement
+- changed meanwhile (`cf set-env`, `cf restart`: its new env on the other wicket), the killed
+  wicket started again: 0 of 1027 requests answered by its old version. It held the app until
+  the cf-api, listing it at once, removed it
+- an app deleted with its wicket killed, the wicket started again 0.5s on: 0 of 1688 requests
+  answered. Without the hold (seen through a server the same day): the deleted app served 8s,
+  until the cf-api's next listing, whose pause grew to 30s then
+
 ## The demo's GIF
 
 2.5MB ([demo/README.md](../sluice-wicket-cf-api/demo/README.md)).

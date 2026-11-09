@@ -477,8 +477,9 @@ routes:
 /// edit from another origin and a body that is no wasm. A controller's app,
 /// its component uploaded by digest, serves its hosts at once -- its guest
 /// seeing its env -- listed as it was put but the env's values, never shown,
-/// the page's endpoints refusing them, until its owner removes it; the data
-/// of its keyvalue namespace is deleted only then.
+/// the page's endpoints refusing them, held at the next start until its owner
+/// confirms it (`held-ms`), until its owner removes it; the data of its
+/// keyvalue namespace is deleted only then.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_console_deploys_an_uploaded_component_as_a_route() {
     let hello = std::fs::read(guests().join("hello.wasm")).unwrap();
@@ -635,7 +636,11 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
                                      "sandbox": sandbox, "tag": "v1"});
         app.to_string().into_bytes()
     };
-    let shop = app(&["b.localhost", "a.localhost"], &hello);
+    // held at the wicket's starts until its owner confirms it
+    let mut shop: serde_json::Value =
+        serde_json::from_slice(&app(&["b.localhost", "a.localhost"], &hello)).unwrap();
+    shop["held-ms"] = 60_000.into();
+    let shop = shop.to_string().into_bytes();
     let (status, _, body) = console(&at, "PUT /api/apps/shop", &[bearer], &shop).await;
     assert_eq!(
         (status, body.as_str()),
@@ -730,12 +735,44 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         Some(true.into()),
         "no server"
     );
+    assert_eq!(listed_app.remove("held"), Some(false.into()), "put since");
     let again = listed.to_string().into_bytes();
     let (status, _, body) = console(&at, "PUT /api/apps/shop", &[bearer], &again).await;
     assert_eq!(
         (status, body.as_str()),
         (200, r#"{"generation":3,"message":"no change"}"#)
     );
+    // at the next start it waits for its owner's word, neither served nor advertised: another
+    // owner's changes nothing, its owner's serves it
+    drop(wicket);
+    wicket = Wicket::start(&args);
+    let (address, at) = (wicket.address(), wicket.console());
+    assert_eq!(
+        get(&address, "a.localhost", "/").await,
+        (
+            503,
+            "the app 'shop' of cf is held until its owner confirms it".into()
+        )
+    );
+    let (_, _, apps) = console(&at, "GET /api/apps", &[bearer], b"").await;
+    let apps: serde_json::Value = serde_json::from_str(&apps).unwrap();
+    assert_eq!(
+        (&apps["apps"][0]["held"], &apps["apps"][0]["held-ms"]),
+        (&true.into(), &60_000.into())
+    );
+    let names = br#"{"apps": ["shop"]}"#;
+    let (status, _, body) = console(&at, "PUT /api/confirmed/ops", &[bearer], names).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (200, r#"{"released":[],"held":[]}"#)
+    );
+    assert_eq!(get(&address, "b.localhost", "/").await.0, 503);
+    let (status, _, body) = console(&at, "PUT /api/confirmed/cf", &[bearer], names).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (200, r#"{"released":["shop"],"held":[]}"#)
+    );
+    assert_eq!(get(&address, "b.localhost", "/").await.0, 200);
     // the page's endpoints refuse its hosts
     let taken = r#"{"error":"a.localhost is routed by the app 'shop' of cf, not by the console"}"#;
     let page_deploy = "PUT /api/routes/a.localhost?name=hello.wasm";
@@ -916,7 +953,7 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         (status, body.as_str()),
         (
             200,
-            r#"{"generation":6,"message":"removed a.localhost, b.localhost"}"#
+            r#"{"generation":4,"message":"removed a.localhost, b.localhost"}"#
         )
     );
     assert_eq!(get(&address, "a.localhost", "/").await.0, 404);

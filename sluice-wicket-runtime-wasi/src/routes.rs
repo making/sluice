@@ -21,12 +21,17 @@
 //! The console changes its own routes and its API's apps through the same
 //! reload ([`Reloader::apply`]): the routes as they would be are reloaded
 //! first, and kept only when they loaded.
+//!
+//! The apps put with `held-ms` are held from the start, neither advertised nor served on
+//! `--listen` ([`Table::held_app`]), until their owners confirm them
+//! (`sluice_wicket_console::held`).
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use sluice_wicket_console::held::Held;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -59,12 +64,14 @@ pub enum Origin {
     Flag,
     /// The console's page, which deployed it at `deployed` (RFC 3339).
     Console { deployed: String },
-    /// The app `name` of the console's API, put by `owner` with its `tag`;
-    /// it took its component and sandbox at `deployed` (RFC 3339).
+    /// The app `name` of the console's API, put by `owner` with its `tag`
+    /// and its `held-ms`; it took its component and sandbox at `deployed`
+    /// (RFC 3339).
     Api {
         name: String,
         owner: String,
         tag: Option<String>,
+        held_ms: Option<u64>,
         deployed: String,
     },
 }
@@ -124,6 +131,8 @@ pub struct Table {
     entries: HashMap<String, Entry>,
     /// The wicket has a console, editing its routes.
     console: bool,
+    /// The apps held until their owners confirm them.
+    held: Arc<Held>,
 }
 
 impl Table {
@@ -182,6 +191,25 @@ impl Table {
         let target = &sluice_wicket_tunnel::routes::Table::host_route(self, host)?.target_url;
         self.entries.get(target).map(|entry| entry.handler.clone())
     }
+
+    /// The app of `host`'s route, by its name and owner, while it is held.
+    pub fn held_app(&self, host: &str) -> Option<(&str, &str)> {
+        match self.origins.get(host)? {
+            Origin::Api { name, owner, .. } if self.held.holds(name) => Some((name, owner)),
+            _ => None,
+        }
+    }
+
+    /// [`Table::held_app`] of the route a request for `host` (no port) takes on the listener.
+    pub fn held_at(&self, host: &str) -> Option<(&str, &str)> {
+        let route = sluice_wicket_tunnel::routes::Table::host_route(self, host)?;
+        self.held_app(&route.host)
+    }
+
+    /// Whether the app `name` is held.
+    pub fn holds(&self, name: &str) -> bool {
+        self.held.holds(name)
+    }
 }
 
 impl sluice_wicket_tunnel::routes::Table for Table {
@@ -193,6 +221,11 @@ impl sluice_wicket_tunnel::routes::Table for Table {
 
     fn advertised(&self) -> &[Upstream] {
         &self.advertised
+    }
+
+    /// An app's, until its owner confirmed it ([`Table::held_app`]).
+    fn held(&self, route: &Upstream) -> bool {
+        self.held_app(&route.host).is_some()
     }
 
     /// A `--wasm` route, on a wicket without a console: not a config file's, whose
@@ -267,6 +300,7 @@ fn fixed_advertising(
             })
             .collect(),
         console: false,
+        held: Held::new([]),
     })
 }
 
@@ -491,10 +525,13 @@ pub struct Reloader {
     pending: Option<Stamps>,
     /// Removed targets still in the table -> the generation that removed them.
     lingering: HashMap<String, u64>,
+    /// The apps held until their owners confirm them, from the startup table on.
+    held: Arc<Held>,
 }
 
 impl Reloader {
-    /// Reads the routes and builds the startup table; an error is fatal.
+    /// Reads the routes and builds the startup table, holding the apps put with `held-ms` from
+    /// then on; an error is fatal.
     pub async fn start(source: RouteSource, instances: Arc<Instances>) -> Result<Reloader, String> {
         let mut watched = Stamps::new();
         let specs = read(&source, &mut watched).await.map_err(|e| e.error)?;
@@ -505,6 +542,7 @@ impl Reloader {
                 origins: HashMap::new(),
                 entries: HashMap::new(),
                 console: source.deployed().is_some(),
+                held: Held::new([]),
             }),
             status: watch::Sender::new(Status::default()),
             instances,
@@ -513,11 +551,20 @@ impl Reloader {
             watched: Stamps::new(),
             pending: None,
             lingering: HashMap::new(),
+            held: Held::new([]),
         };
         let planned = reloader
             .plan(&specs, true, &mut watched)
             .await
             .map_err(|e| e.error)?;
+        // from the start on, the components loaded
+        let deployed = reloader.source.deployed();
+        reloader.held = Held::new(deployed.into_iter().flat_map(|deployed| deployed.held()));
+        let (status, routes) = (reloader.status.clone(), reloader.routes.clone());
+        tokio::spawn(reloader.held.clone().follow(move || {
+            status.send_modify(|status| status.revision += 1);
+            routes.readiness_changed();
+        }));
         reloader.commit(planned);
         reloader.watched = watched;
         Ok(reloader)
@@ -536,6 +583,11 @@ impl Reloader {
     /// leaving (`sluice_wicket_console::leaving`).
     pub fn status(&self) -> watch::Sender<Status> {
         self.status.clone()
+    }
+
+    /// The apps held until their owners confirm them, which the console releases.
+    pub fn held(&self) -> Arc<Held> {
+        self.held.clone()
     }
 
     /// Reloads until `stop`: polls the watched files every `interval` (zero:
@@ -922,6 +974,7 @@ impl Reloader {
                     origins: plan.origins,
                     entries: current.entries.clone(),
                     console: current.console,
+                    held: self.held.clone(),
                 });
             }
             if moved_on || !adjusted.is_empty() {
@@ -990,6 +1043,7 @@ impl Reloader {
             origins: plan.origins,
             entries,
             console: current.console,
+            held: self.held.clone(),
         });
         self.status.send_modify(|status| status.revision += 1);
         for handler in replaced {
@@ -1022,6 +1076,7 @@ impl Reloader {
             origins: current.origins.clone(),
             entries,
             console: current.console,
+            held: self.held.clone(),
         });
         for token in tokens {
             token.cancel();
@@ -1385,6 +1440,7 @@ pub(crate) mod tests {
                 entries: HashMap::new(),
                 origins: HashMap::from([("a.local".to_string(), origin.clone())]),
                 console: on_console,
+                held: Held::new([]),
             };
             let routed = sluice_wicket_tunnel::routes::Table::host_route(&table, "b.local");
             assert_eq!(routed.is_some(), takes, "{origin:?}, console {on_console}");
@@ -1694,6 +1750,7 @@ pub(crate) mod tests {
                         files: None,
                         sandbox,
                         tag: None,
+                        held_ms: None,
                     },
                 }
             };

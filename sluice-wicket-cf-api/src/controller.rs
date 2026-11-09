@@ -53,6 +53,20 @@
 //! indices with nowhere to go staying until it stops. A wicket back, or new, takes the indices
 //! that spread an app again the same way round, one at a time ([`Controller::respread`]). A
 //! restart of the cf-api takes up the moves under way ([`Controller::resume_moves`]).
+//!
+//! A wicket that has not answered for `--wicket-away-grace` is gone, as Diego takes a cell whose
+//! presence expired: placed on no more, the indices of the started apps on it move to the
+//! wickets with room as off a wicket leaving ([`Away::Gone`]), removing nothing from it, which
+//! answers nothing, as long as it does not answer. Back, its listing removes what moved, and it
+//! is placed on again once it has answered for as long, taking the indices that spread an app
+//! again: a wicket going and coming moves no app back and forth.
+//!
+//! A share is put with `held-ms` ([`HELD`]) to a wicket listing its start: started again, the
+//! wicket holds it, serving it not, until the cf-api confirms it as wanted
+//! ([`Controller::confirm`]) or puts it again, and removes what it holds that is not wanted: back
+//! from a crash, a wicket serves no app deleted, stopped, moved or changed meanwhile. It is
+//! listed again [`MAX_PAUSE`] at most after it answers again; the cf-api down, the wicket
+//! serves what it holds once `held-ms` passed.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -77,15 +91,48 @@ type Locks<K> = Mutex<HashMap<K, Arc<tokio::sync::Mutex<()>>>>;
 /// comes within a round trip.
 const LOOK: Duration = Duration::from_millis(100);
 
-/// A wicket's leaving, as the cf-api goes through it while it lists itself so.
-#[derive(Default)]
+/// How long a start of a wicket holds a share at most, until the cf-api confirms it (`held-ms`):
+/// the cf-api lists a wicket back within [`MAX_PAUSE`].
+pub const HELD: Duration = Duration::from_secs(15);
+
+/// The first pause between two listings of a wicket that does not answer, and the longest: one
+/// back is listed that soon, what it holds confirmed.
+const MIN_PAUSE: Duration = Duration::from_secs(1);
+const MAX_PAUSE: Duration = Duration::from_secs(2);
+
+/// Why the indices on a wicket move off it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Away {
+    /// It lists itself leaving: told to stop, it serves on until its apps are elsewhere.
+    Leaving,
+    /// It has not answered for `--wicket-away-grace`: what is on it is removed once it answers.
+    Gone,
+}
+
+/// A wicket's evacuation, as the cf-api goes through it while the wicket lists itself leaving or
+/// is gone.
 struct Evacuation {
+    away: Away,
     /// Its task runs ([`Controller::evacuate`]).
     running: bool,
-    /// The apps of which an index stays on it: not tried again.
+    /// The apps of which an index stays on it, for room or its data: said once, tried again.
     stayed: BTreeSet<String>,
+    /// The apps whose moves were refused or not served: not tried again.
+    undone: BTreeSet<String>,
     /// It was told the owner moved what it could.
     told: bool,
+}
+
+impl Evacuation {
+    fn new(away: Away) -> Evacuation {
+        Evacuation {
+            away,
+            running: false,
+            stayed: BTreeSet::new(),
+            undone: BTreeSet::new(),
+            told: false,
+        }
+    }
 }
 
 /// What became of an app's moves ([`Controller::relocate`]).
@@ -106,6 +153,8 @@ struct Noted {
     /// None from a wicket predating it.
     id: Option<String>,
     revision: u64,
+    /// It lists its start: it holds a share put with `held-ms` from then on.
+    holds: bool,
 }
 
 pub struct Controller {
@@ -132,14 +181,27 @@ pub struct Controller {
     /// The wickets whose apps' spread the indices moving to them restore, by name, while they do
     /// ([`Controller::respread`]).
     respreading: Mutex<BTreeSet<String>>,
+    /// How long a wicket may not answer before it is gone: 0, never.
+    away_grace: Duration,
+    /// The wickets whose last listing failed, by name.
+    down: Mutex<BTreeSet<String>>,
 }
 
 impl Controller {
-    pub fn new(store: Arc<Store>, wickets: Vec<Arc<Wicket>>, logs: Arc<Logs>) -> Controller {
+    /// The controller of `wickets`, of which one not answering for `away_grace` is gone (0:
+    /// never).
+    pub fn new(
+        store: Arc<Store>,
+        wickets: Vec<Arc<Wicket>>,
+        logs: Arc<Logs>,
+        away_grace: Duration,
+    ) -> Controller {
         Controller {
             store,
             wickets,
             logs,
+            away_grace,
+            down: Mutex::default(),
             held: Mutex::default(),
             shares: Mutex::default(),
             did_not_start: Mutex::default(),
@@ -288,6 +350,8 @@ impl Controller {
                 files: running.files.clone().map(|sha256| FilesRef { sha256 }),
                 sandbox,
                 tag: running.tag.clone(),
+                // as the wicket takes it (`Controller::apply`)
+                held_ms: None,
             })
         };
         let indices = state.indices(app).into_iter();
@@ -395,6 +459,7 @@ impl Controller {
             runtime: listing.runtime(),
             id: id.clone(),
             revision: listing.revision,
+            holds: (listing.wicket.as_ref()).is_some_and(|listed| listed.since.is_some()),
         };
         let before = (self.listed.lock().expect("no panic under the lock"))
             .insert(wicket.name.clone(), noted);
@@ -690,6 +755,7 @@ impl Controller {
             return Err(Failure::refused(409, why));
         }
         let mut app = app.clone();
+        app.held_ms = self.held_ms(wicket);
         let mut put = wicket.put(guid, &app).await;
         if let Err(Failure::Refused { missing, .. }) = &put
             && !missing.is_empty()
@@ -944,17 +1010,23 @@ impl Controller {
     /// Puts / deletes, each in a task, the difference between the apps `wicket` listed and the
     /// shares the state places on it, and logs the apps of the owner the state does not know. A
     /// share under a put or an edit is theirs, one whose VMs did not start as it is wanted is not
-    /// tried again.
-    fn fix(self: &Arc<Self>, wicket: &Arc<Wicket>, listed: &[ListedApp]) {
+    /// tried again. The apps of the owner it holds that are as wanted, or the state does not
+    /// know (left as they are), are to be confirmed to it ([`Controller::confirm`]): their names.
+    fn fix(self: &Arc<Self>, wicket: &Arc<Wicket>, listed: &[ListedApp]) -> Vec<String> {
         let owner = &wicket.owner;
+        let held_ms = self.held_ms(wicket);
         let wanted: Vec<(String, Option<AppBody>)> = self.store.read(|state| {
             let apps = state.apps.iter();
             apps.map(|app| {
                 let mut shares = Controller::desired(state, app, owner);
-                (app.guid.clone(), shares.remove(&wicket.name))
+                let share = shares.remove(&wicket.name);
+                // as it is put there
+                let share = share.map(|share| AppBody { held_ms, ..share });
+                (app.guid.clone(), share)
             })
             .collect()
         });
+        let mut confirmed = Vec::new();
         for (guid, desired) in &wanted {
             let listed = listed
                 .iter()
@@ -963,6 +1035,9 @@ impl Controller {
                 (Some(desired), Some(listed)) if same(&listed.app, desired) => {
                     let line = format!("Found in {} as wanted", wicket.label);
                     self.record(wicket, guid, Outcome::Running, &line);
+                    if listed.held {
+                        confirmed.push(guid.clone());
+                    }
                 }
                 (None, None) => {}
                 _ if self.refused_as(wicket, guid, desired.as_ref()) => {}
@@ -1000,6 +1075,10 @@ impl Controller {
             .filter(|name| !wanted.iter().any(|(guid, _)| guid == name))
             .filter(|name| !removing.iter().any(|guid| guid == name))
             .collect();
+        // left as they are: served as they were
+        let held = |name: &str| listed.iter().any(|app| app.name == name && app.held);
+        let left = strangers.iter().filter(|name| held(name));
+        confirmed.extend(left.map(|name| name.to_string()));
         let mut logged = self.strangers.lock().expect("no panic under the lock");
         logged.retain(|(at, name)| *at != wicket.name || strangers.contains(name.as_str()));
         for name in strangers {
@@ -1010,6 +1089,40 @@ impl Controller {
                      {label} removes it",
                     label = wicket.label
                 );
+            }
+        }
+        confirmed
+    }
+
+    /// The `held-ms` of a share put to `wicket`: [`HELD`] of one listing its start, none of one
+    /// predating it, which takes none.
+    fn held_ms(&self, wicket: &Wicket) -> Option<u64> {
+        let listed = self.listed.lock().expect("no panic under the lock");
+        let holds = listed.get(&wicket.name).is_some_and(|noted| noted.holds);
+        holds.then_some(HELD.as_millis() as u64)
+    }
+
+    /// Tells `wicket` its apps of the owner `names` are as wanted: a start of it held them, it
+    /// serves them now. Whether to tell it again: it did not answer.
+    async fn confirm(&self, wicket: &Wicket, names: &[String]) -> bool {
+        if names.is_empty() {
+            return false;
+        }
+        match wicket.confirmed(names).await {
+            Ok(()) => {
+                println!(
+                    "CELL: {} serves the {} app(s) it held since its start: as wanted",
+                    wicket.sentence(),
+                    names.len()
+                );
+                false
+            }
+            Err(e) => {
+                println!(
+                    "CELL: {} not told its apps are as wanted: {e}",
+                    wicket.label
+                );
+                matches!(e, Failure::Unreachable(_))
             }
         }
     }
@@ -1028,34 +1141,70 @@ impl Controller {
     }
 
     /// Lists `wicket`'s apps and fixes the difference at startup, whenever its revision moves and
-    /// when it answers again, then tries its pending removals and purges (after a hold too: a
-    /// drained route's end moves no revision); while it is unreachable, every share placed on it
-    /// is `STARTING`, and it is tried again with a growing pause. Listing itself leaving, the
-    /// apps' indices on it move elsewhere ([`Controller::start_evacuation`]); serving at startup,
-    /// or again after it left or was unreachable, it takes those that spread an app again
-    /// ([`Controller::start_respread`]).
+    /// when it answers again, confirming what it holds as wanted, then tries its pending removals
+    /// and purges (after a hold too: a drained route's end moves no revision); while it is
+    /// unreachable, every share placed on it is `STARTING`, and it is tried again with a growing
+    /// pause, [`MAX_PAUSE`] at most. Listing itself leaving, the apps' indices on it move
+    /// elsewhere ([`Controller::start_evacuation`]), as they do once it has not answered for
+    /// `--wicket-away-grace`: gone, it is placed on again once it has answered for as long.
+    /// Serving at startup, or again after it left, was unreachable or gone, it takes those that
+    /// spread an app again ([`Controller::start_respread`]).
     async fn watch_one(self: Arc<Self>, wicket: Arc<Wicket>) {
         let mut after: Option<u64> = None;
-        let mut pause = Duration::from_secs(1);
+        let mut pause = MIN_PAUSE;
         // not seen serving since the start, or since it left or was unreachable
         let mut away = true;
+        // since when it has not answered
+        let mut unanswered: Option<Instant> = None;
+        // gone and answering again: when it is placed on again
+        let mut steady: Option<Instant> = None;
         loop {
-            let listing = match wicket.list(after).await {
+            let listed = match steady {
+                Some(at) => tokio::select! {
+                    listed = wicket.list(after) => Some(listed),
+                    () = tokio::time::sleep_until(at) => None,
+                },
+                None => Some(wicket.list(after).await),
+            };
+            let Some(listed) = listed else {
+                steady = None;
+                self.placed_on_again(&wicket);
+                if std::mem::take(&mut away) {
+                    self.start_respread(&wicket);
+                }
+                continue;
+            };
+            let listing = match listed {
                 Ok(listing) => listing,
                 Err(e) => {
                     self.unreachable(&wicket, &e);
                     away = true;
+                    steady = None;
+                    let since = *unanswered.get_or_insert_with(Instant::now);
+                    if self.gone(&wicket, since) {
+                        self.start_evacuation(&wicket, Away::Gone, false);
+                    }
                     // back, it is looked at whatever its revision: a wicket restarted
                     // may have come to the one it had
                     after = None;
                     (self.did_not_start.lock().expect("no panic under the lock"))
                         .retain(|(at, _), _| *at != wicket.name);
                     tokio::time::sleep(pause).await;
-                    pause = (pause * 2).min(Duration::from_secs(30));
+                    pause = (pause * 2).min(MAX_PAUSE);
                     continue;
                 }
             };
-            pause = Duration::from_secs(1);
+            self.answered(&wicket);
+            unanswered = None;
+            pause = MIN_PAUSE;
+            if steady.is_none() && self.is_gone(&wicket.name) {
+                steady = Some(Instant::now() + self.away_grace);
+                println!(
+                    "CELL: {} answers again: placed on again once it has answered for {}s",
+                    wicket.sentence(),
+                    self.away_grace.as_secs()
+                );
+            }
             let another = self.note(&wicket, &listing);
             let moved = another || after != Some(listing.revision);
             after = Some(listing.revision);
@@ -1067,17 +1216,27 @@ impl Controller {
                 continue;
             }
             if moved {
-                self.fix(&wicket, &listing.apps);
+                let held = self.fix(&wicket, &listing.apps);
+                if self.confirm(&wicket, &held).await {
+                    // listed again at once, what it holds confirmed then
+                    after = None;
+                }
                 match &listing.leaving {
                     Some(leaving) => {
                         away = true;
                         let told = leaving.evacuated.contains(&wicket.owner);
-                        self.start_evacuation(&wicket, told);
+                        self.start_evacuation(&wicket, Away::Leaving, told);
                     }
                     None => {
-                        (self.evacuations.lock().expect("no panic under the lock"))
-                            .remove(&wicket.name);
-                        if std::mem::take(&mut away) {
+                        let mut evacuations =
+                            self.evacuations.lock().expect("no panic under the lock");
+                        if (evacuations.get(&wicket.name))
+                            .is_some_and(|evacuation| evacuation.away == Away::Leaving)
+                        {
+                            evacuations.remove(&wicket.name);
+                        }
+                        drop(evacuations);
+                        if steady.is_none() && std::mem::take(&mut away) {
                             self.start_respread(&wicket);
                         }
                     }
@@ -1088,18 +1247,28 @@ impl Controller {
         }
     }
 
-    /// Moves the apps' indices off `wicket`, leaving ([`Controller::evacuate`]), unless that runs;
-    /// `told`: it lists the owner as having moved what it could (before a restart of the cf-api).
-    fn start_evacuation(self: &Arc<Self>, wicket: &Arc<Wicket>, told: bool) {
+    /// Moves the apps' indices off `wicket`, leaving or gone ([`Controller::evacuate`]), unless
+    /// that runs; `told`: it lists the owner as having moved what it could (before a restart of
+    /// the cf-api).
+    fn start_evacuation(self: &Arc<Self>, wicket: &Arc<Wicket>, away: Away, told: bool) {
         {
             let mut evacuations = self.evacuations.lock().expect("no panic under the lock");
-            let evacuation = evacuations.entry(wicket.name.clone()).or_insert_with(|| {
-                println!(
-                    "CELL: {} is leaving: the apps' indices on it move to the other wickets",
-                    wicket.label
-                );
-                Evacuation::default()
-            });
+            let fresh = (evacuations.get(&wicket.name))
+                .is_none_or(|evacuation| evacuation.away != away && !evacuation.running);
+            if fresh {
+                if away == Away::Leaving {
+                    println!(
+                        "CELL: {} is leaving: the apps' indices on it move to the other wickets",
+                        wicket.label
+                    );
+                }
+                evacuations.insert(wicket.name.clone(), Evacuation::new(away));
+            }
+            let evacuation = evacuations.get_mut(&wicket.name).expect("just kept");
+            // the other's runs: tried again at the next listing
+            if evacuation.away != away {
+                return;
+            }
             evacuation.told |= told;
             if std::mem::replace(&mut evacuation.running, true) {
                 return;
@@ -1107,7 +1276,7 @@ impl Controller {
         }
         let (controller, wicket) = (self.clone(), wicket.clone());
         tokio::spawn(async move {
-            controller.evacuate(&wicket).await;
+            controller.evacuate(&wicket, away).await;
             let mut evacuations = controller
                 .evacuations
                 .lock()
@@ -1118,52 +1287,79 @@ impl Controller {
         });
     }
 
-    /// What `f` makes of the evacuation of the wicket `name`, if it is leaving.
+    /// What `f` makes of the evacuation of the wicket `name`, if it is leaving or gone.
     fn evacuation<R>(&self, name: &str, f: impl FnOnce(&mut Evacuation) -> R) -> Option<R> {
         let mut evacuations = self.evacuations.lock().expect("no panic under the lock");
         evacuations.get_mut(name).map(f)
     }
 
-    /// Moves the indices of the started apps off `wicket`, leaving, to the wickets with room
-    /// ([`State::evacuate`]), every app's at once ([`Controller::relocate`]), as long as some are
-    /// left to try: an index with nowhere to go, or not taken elsewhere for another reason than
-    /// room, stays until the wicket stops. Then, once no index moves off it any more (or it
+    /// Moves the indices of the started apps off `wicket`, leaving or gone, to the wickets with
+    /// room ([`State::evacuate`]), every app's at once ([`Controller::relocate`]), as long as
+    /// some are left to try (gone, as long as it does not answer): an index with nowhere to go
+    /// stays until the wicket stops (is back), tried again, one not taken elsewhere for another
+    /// reason than room for good. Then, leaving, once no index moves off it any more (or it
     /// drains), tells it the owner moved what it could.
-    async fn evacuate(&self, wicket: &Wicket) {
+    async fn evacuate(&self, wicket: &Wicket, away: Away) {
         let name = &wicket.name;
+        let (why, until) = match away {
+            Away::Leaving => (format!("{} is leaving", wicket.label), "until it stops"),
+            Away::Gone => (
+                format!(
+                    "{} has not answered for {}s",
+                    wicket.label,
+                    self.away_grace.as_secs()
+                ),
+                "until it is back",
+            ),
+        };
+        let on = || away == Away::Leaving || self.is_down(name);
         // a refusal for room has the wicket hold none until its revision moves: each pass
         // tries the indices on another, as many as there are
         for _ in 0..=self.wickets.len() {
-            let stayed = self.evacuation(name, |evacuation| evacuation.stayed.clone());
+            if !on() {
+                return;
+            }
+            let undone = self.evacuation(name, |evacuation| evacuation.undone.clone());
             let guids: Vec<String> = self.store.read(|state| {
                 (state.apps.iter())
                     .filter(|app| {
-                        !stayed
+                        undone
                             .as_ref()
-                            .is_some_and(|stayed| stayed.contains(&app.guid))
+                            .is_none_or(|undone| !undone.contains(&app.guid))
                     })
                     .filter(|app| state.placement(app).contains(name))
                     .map(|app| app.guid.clone())
                     .collect()
             });
+            let (why, on) = (&why, &on);
             // each app apart: one under a long edit holds no other's move
             let moved = join_all(guids.into_iter().map(|guid| async move {
                 let moves = {
                     let _app = self.hold(&guid).await;
-                    let Evacuated { moves, stay, why } =
-                        self.store.update(|state| state.evacuate(&guid, name));
+                    if !on() {
+                        return false;
+                    }
+                    let Evacuated {
+                        moves,
+                        stay,
+                        why: nowhere,
+                    } = self.store.note(|state| state.evacuate(&guid, name));
+                    if !moves.is_empty() {
+                        // kept: a restart takes them up
+                        self.store.update(|_| ());
+                    }
                     for (index, to) in &moves {
-                        let line = format!(
-                            "Index {index} moves to the wicket {to}: {} is leaving",
-                            wicket.label
-                        );
+                        let line = format!("Index {index} moves to the wicket {to}: {why}");
                         self.logs.add(&guid, "CELL", line);
                     }
-                    if !stay.is_empty() {
-                        let line =
-                            format!("{} on {} until it stops: {why}", stays(&stay), wicket.label);
+                    let first = !stay.is_empty()
+                        && self
+                            .evacuation(name, |evacuation| evacuation.stayed.insert(guid.clone()))
+                            == Some(true);
+                    if first {
+                        let stay = stays(&stay);
+                        let line = format!("{stay} on {} {until}: {nowhere}", wicket.label);
                         self.logs.add(&guid, "CELL", line);
-                        self.evacuation(name, |evacuation| evacuation.stayed.insert(guid.clone()));
                     }
                     moves
                 };
@@ -1171,7 +1367,7 @@ impl Controller {
                     return false;
                 }
                 if self.relocate(&guid, moves).await == Relocated::Undone {
-                    self.evacuation(name, |evacuation| evacuation.stayed.insert(guid));
+                    self.evacuation(name, |evacuation| evacuation.undone.insert(guid));
                 }
                 true
             }))
@@ -1179,6 +1375,9 @@ impl Controller {
             if !moved.contains(&true) {
                 break;
             }
+        }
+        if away == Away::Gone {
+            return;
         }
         // the moves off it others started (a wicket back taking indices, the cf-api's restart)
         let until = self
@@ -1348,6 +1547,8 @@ impl Controller {
                 changed.insert(to.clone());
             }
         }
+        // one not answering (gone) has its shares fixed once it does: its listing
+        changed.retain(|name| !self.is_down(name));
         if !changed.is_empty() {
             let changed: Vec<String> = changed.into_iter().collect();
             self.sync_on(guid, Some(&changed)).await;
@@ -1431,8 +1632,9 @@ impl Controller {
         listed.is_some_and(|listed| listed.advertised != Some(false))
     }
 
-    /// Every share placed on `wicket` is `STARTING` until it answers.
+    /// Every share placed on `wicket` is `STARTING` until it answers ([`Controller::answered`]).
     fn unreachable(&self, wicket: &Wicket, e: &Failure) {
+        (self.down.lock().expect("no panic under the lock")).insert(wicket.name.clone());
         let owner = self.owner();
         let guids: Vec<String> = self.store.read(|state| {
             let apps = state.apps.iter();
@@ -1446,6 +1648,63 @@ impl Controller {
         );
         for guid in guids {
             self.record(wicket, &guid, Outcome::Unreachable, &line);
+        }
+    }
+
+    /// `wicket` answers again: an evacuation of it, gone, ends, what stayed tried again the next
+    /// time it is.
+    fn answered(&self, wicket: &Wicket) {
+        (self.down.lock().expect("no panic under the lock")).remove(&wicket.name);
+        self.evacuation(&wicket.name, |evacuation| {
+            if evacuation.away == Away::Gone {
+                evacuation.stayed.clear();
+                evacuation.undone.clear();
+            }
+        });
+    }
+
+    /// Whether the last listing of the wicket `name` failed.
+    fn is_down(&self, name: &str) -> bool {
+        (self.down.lock().expect("no panic under the lock")).contains(name)
+    }
+
+    /// Whether the wicket `name` is gone: placed on no more.
+    fn is_gone(&self, name: &str) -> bool {
+        self.store.read(|state| state.wickets.gone.contains(name))
+    }
+
+    /// Whether `wicket`, not answering since `since`, is gone: `--wicket-away-grace` passed, and
+    /// another wicket is configured. Placed on no more from then on, logged once.
+    fn gone(&self, wicket: &Wicket, since: Instant) -> bool {
+        if self.away_grace.is_zero() || self.wickets.len() < 2 || since.elapsed() < self.away_grace
+        {
+            return false;
+        }
+        let gone = self
+            .store
+            .note(|state| state.wickets.gone.insert(wicket.name.clone()));
+        if gone {
+            println!(
+                "CELL: {} has not answered for {}s: placed on no more, the apps' indices on it \
+                 move to the other wickets",
+                wicket.sentence(),
+                self.away_grace.as_secs()
+            );
+        }
+        true
+    }
+
+    /// `wicket`, gone, has answered for `--wicket-away-grace`: placed on again.
+    fn placed_on_again(&self, wicket: &Wicket) {
+        let gone = self
+            .store
+            .note(|state| state.wickets.gone.remove(&wicket.name));
+        if gone {
+            println!(
+                "CELL: {} has answered for {}s: placed on again",
+                wicket.sentence(),
+                self.away_grace.as_secs()
+            );
         }
     }
 }
@@ -1575,6 +1834,7 @@ fn same(listed: &AppBody, desired: &AppBody) -> bool {
         && listed.component == desired.component
         && listed.files == desired.files
         && listed.tag == desired.tag
+        && listed.held_ms == desired.held_ms
         && match (&listed.sandbox, &desired.sandbox) {
             (Sandbox::Wasm(listed), Sandbox::Wasm(desired)) => same_wasm(listed, desired),
             (Sandbox::Vm(listed), Sandbox::Vm(desired)) => same_vm(listed, desired),

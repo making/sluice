@@ -533,10 +533,11 @@ digest, or made of an OCI image, first; the app names it:
 |---|---|
 | `PUT /api/components/<sha256>` | keeps the body, an ext4 image of 4 GiB at most, under its digest (400 when the body has another): `{"sha256": .., "bytes": ..}` |
 | `PUT /api/images` | makes an ext4 image of the OCI image the body names (below), kept under its digest as an upload: `{"image": <the reference pinned to its digest>, "name": .., "sha256": .., "bytes": ..}` |
-| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "wicket", "budget", "runtime": "firecracker", "capabilities": [], "keyvalue_stores": [], "apps": [..]}`; `wicket` which wicket this is: `id`, made at its first start and kept in the console directory (`wicket-id`), `node`, its flume node (`wicket:<client-id>`, null without `--flume`), `build`; `budget` `max_instances`, `max_memory_mib` (with `--max-memory-mib`) and what the routes keep of them for good (their booted and warm VMs): `instances`, `memory_mib`. An app needing more is refused 422 with `"no_room": true` |
+| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "wicket", "budget", "runtime": "firecracker", "capabilities": [], "keyvalue_stores": [], "apps": [..]}`; `wicket` which wicket this is: `id`, made at its first start and kept in the console directory (`wicket-id`), `node`, its flume node (`wicket:<client-id>`, null without `--flume`), `build`, `since` (its start, in seconds since the epoch); `budget` `max_instances`, `max_memory_mib` (with `--max-memory-mib`) and what the routes keep of them for good (their booted and warm VMs): `instances`, `memory_mib`. An app needing more is refused 422 with `"no_room": true` |
 | `PUT /api/apps/<name>` | serves the app of the body (JSON, below) |
 | `DELETE /api/apps/<name>?owner=<owner>` | removes the app of `owner` |
 | `PUT /api/evacuated/<owner>` | a wicket leaving (`"leaving"` in both listings, `--evacuation-grace`): `owner` moved what of its apps it could, those left staying until the drain; 409 unless leaving |
+| `PUT /api/confirmed/<owner>` | the apps of `owner` the body names (`{"apps": ["<name>", ..]}`) are as it wants them: those held are served from now on (`held-ms` below). `{"released": [..], "held": [..]}` |
 
 ```json
 {
@@ -545,7 +546,8 @@ digest, or made of an OCI image, first; the app names it:
   "component": {"sha256": "0954dc11…e8", "name": "shop.ext4"},
   "sandbox": {"mode": "pool", "instances": 2, "memory-mib": 256, "egress": ["db.internal:5432"],
               "env": {"GREETING": "hello"}},
-  "tag": "3f1c…9a"
+  "tag": "3f1c…9a",
+  "held-ms": 15000
 }
 ```
 
@@ -554,6 +556,11 @@ digest, or made of an OCI image, first; the app names it:
   listings name the variables only (`"env": ["GREETING"]`), never a value
 - `tag` (optional) is opaque to the wicket, kept and listed as given: a controller tells by it
   what it put, an env it cannot read back included. A tag or hosts alone start no VM
+- `held-ms` (optional; 1 to 3600000) holds the app at each start of the wicket, as the wasm
+  wicket's ([Apps](../sluice-wicket-runtime-wasi/README.md#apps)): its VMs start, but it is
+  neither advertised nor served on `--listen` (503), listed `"held": true`, the wicket not ready,
+  until its owner confirms it (`PUT /api/confirmed/<owner>`), puts it again or removes it, or
+  `held-ms` passed. It alone starts no VM
 - `alive` in a listing: its VMs alive, lowest first, `{"index": 0, "since": 1793000000, "ready":
   true}`: the `instance` index, its start in seconds since the epoch, its guest accepting, and whether
   it takes connections ([Readiness](#readiness)); `crashed`, those it

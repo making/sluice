@@ -239,6 +239,7 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
                 )?,
                 max_instances,
                 dir: console.dir.clone(),
+                held: reloader.held(),
             }),
         ));
     } else {

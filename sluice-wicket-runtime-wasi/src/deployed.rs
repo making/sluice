@@ -21,13 +21,15 @@
 //! the apps' env, so only its owner reads it (0600). A component file
 //! nothing names is removed after every edit and at startup, an upload once
 //! `UPLOAD_GRACE` passed: an app naming it links it below `components/`
-//! before.
+//! before. An app put with `held-ms` is held at each start until its owner
+//! confirms it (`sluice_wicket_console::held`, [`Deployed::held`]).
 
 use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use serde::Deserialize;
+use sluice_wicket_console::held::check_held_ms;
 use sluice_wicket_console::store::{
     Blobs, UPLOADS, check_digest, check_file, check_host, check_hosts, check_kept, check_name,
     check_tag, collect_uploads, digest, file_name, rfc3339, write_by_rename,
@@ -77,6 +79,8 @@ pub struct App {
     pub sandbox: Sandbox,
     /// The owner's, kept and listed as given ([`check_tag`]).
     pub tag: Option<String>,
+    /// How long a start of the wicket holds it at most, until its owner confirms it.
+    pub held_ms: Option<u64>,
     /// When it took this component and sandbox, RFC 3339.
     pub deployed: String,
 }
@@ -95,6 +99,7 @@ pub struct AppSpec {
     /// With its keyvalue map ([`app_map`]).
     pub sandbox: Sandbox,
     pub tag: Option<String>,
+    pub held_ms: Option<u64>,
 }
 
 /// The console's routes in the order deployed, its apps in the order put,
@@ -126,6 +131,15 @@ impl Deployed {
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// The apps a start holds until their owners confirm them: each one's owner, name and
+    /// `held-ms`.
+    pub fn held(&self) -> impl Iterator<Item = (String, String, Duration)> + '_ {
+        self.apps.iter().filter_map(|app| {
+            let held = Duration::from_millis(app.held_ms?);
+            Some((app.owner.clone(), app.name.clone(), held))
+        })
     }
 
     /// The routes, then the apps' (one per host), as specs; a keyvalue route
@@ -161,6 +175,7 @@ impl Deployed {
                     name: app.name.clone(),
                     owner: app.owner.clone(),
                     tag: app.tag.clone(),
+                    held_ms: app.held_ms,
                     deployed: app.deployed.clone(),
                 },
             })
@@ -276,7 +291,8 @@ impl Deployed {
     /// The apps with the app `name` as `app` has it since `now`: its
     /// component made from an upload or another file of its digest, in place
     /// of the app of that name -- which keeps its time when its component,
-    /// files and sandbox stay, its tag changing or not -- or added last.
+    /// files and sandbox stay, its tag and `held-ms` changing or not -- or
+    /// added last.
     /// Another owner's app is refused, and so are a component and files of a
     /// digest not kept (all of them named).
     pub fn with_app(&self, name: &str, app: AppSpec, now: SystemTime) -> Result<Deployed, Refused> {
@@ -335,6 +351,7 @@ impl Deployed {
             files,
             sandbox: app.sandbox,
             tag: app.tag,
+            held_ms: app.held_ms,
             deployed: rfc3339(now),
         };
         let mut deployed = self.clone();
@@ -346,6 +363,7 @@ impl Deployed {
             {
                 kept.hosts = app.hosts;
                 kept.tag = app.tag;
+                kept.held_ms = app.held_ms;
             }
             Some(kept) => *kept = app,
             None => deployed.apps.push(app),
@@ -510,6 +528,8 @@ struct ManifestApp {
     files: Option<String>,
     deployed: String,
     tag: Option<String>,
+    #[serde(rename = "held-ms")]
+    held_ms: Option<u64>,
     #[serde(default)]
     sandbox: SandboxFile,
 }
@@ -570,6 +590,9 @@ fn read(text: &str) -> Result<(Vec<Route>, Vec<App>), String> {
         if let Some(tag) = &app.tag {
             check_tag(tag).map_err(failed)?;
         }
+        if let Some(held_ms) = app.held_ms {
+            check_held_ms(held_ms).map_err(failed)?;
+        }
         let (mut sandbox, map) = app.sandbox.split().map_err(failed)?;
         sandbox.keyvalue = app_map(sandbox.caps, map.unwrap_or_default()).map_err(failed)?;
         apps.push(App {
@@ -580,6 +603,7 @@ fn read(text: &str) -> Result<(Vec<Route>, Vec<App>), String> {
             files,
             sandbox,
             tag: app.tag,
+            held_ms: app.held_ms,
             deployed: app.deployed,
         });
     }
@@ -640,6 +664,9 @@ fn write(routes: &[Route], apps: &[App]) -> String {
         if let Some(tag) = &app.tag {
             yaml.push_str(&format!("    tag: {}\n", quote(tag)));
         }
+        if let Some(held_ms) = app.held_ms {
+            yaml.push_str(&format!("    held-ms: {held_ms}\n"));
+        }
         if let Some(sandbox) = sandbox_yaml(&app.sandbox, true) {
             yaml.push_str(&format!("    sandbox: {sandbox}\n"));
         }
@@ -653,8 +680,9 @@ mod tests {
 
     use super::*;
 
-    /// The routes file reads back as written, routes and apps, an app's env
-    /// and tag included; what the console never writes -- a component not
+    /// The routes file reads back as written, routes and apps, an app's env,
+    /// tag and `held-ms` included, the apps a start holds those of `held-ms`;
+    /// what the console never writes -- a component not
     /// its own, a keyvalue map or an env of a route, an app's map without a
     /// namespace, a host or an app twice -- fails, naming the route or the
     /// app, never a value. A move keeps a route as it is, in its place, and
@@ -707,6 +735,7 @@ mod tests {
                 files: Some(format!("files/{}", "f".repeat(64))),
                 sandbox,
                 tag: Some("0123456789abcdef:\"#{}".into()),
+                held_ms: Some(15_000),
                 deployed: rfc3339(UNIX_EPOCH),
             },
             App {
@@ -717,6 +746,7 @@ mod tests {
                 files: None,
                 sandbox: Sandbox::default(),
                 tag: None,
+                held_ms: None,
                 deployed: rfc3339(UNIX_EPOCH),
             },
         ];
@@ -753,6 +783,21 @@ mod tests {
         ));
 
         let text = write(&routes, &apps);
+        let held: Vec<_> = Deployed {
+            dir: PathBuf::new(),
+            routes: Vec::new(),
+            apps: apps.clone(),
+        }
+        .held()
+        .collect();
+        assert_eq!(
+            held,
+            [(
+                "cf-api".to_string(),
+                "0b9e2c6a".to_string(),
+                Duration::from_secs(15)
+            )]
+        );
         assert_eq!(read(&text), Ok((routes.clone(), apps)));
         assert!(
             text.contains("deployed: \"1970-01-01T00:00:00Z\""),
@@ -857,6 +902,10 @@ mod tests {
                 "routes[0]: sandbox.env: the console's routes take none".into(),
             ),
             (apps(", tag: 'a b'"), "apps[0]: tag: 'a b' is no tag".into()),
+            (
+                apps(", held-ms: 0"),
+                "apps[0]: held-ms: must be at least 1".into(),
+            ),
             (
                 apps(", files: files/../etc"),
                 "apps[0]: files: 'files/../etc' is no files/<sha256>".into(),

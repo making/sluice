@@ -1159,7 +1159,8 @@ function hostCell(route) {
     ? h("span", { class: "route__host catch-all" }, "any host")
     : h("span", { class: "route__host mono" }, route.host);
   const app = route.origin === "api"
-    ? h("span", { class: "route__app" }, "app ", h("span", { class: "mono" }, route.app), " of ", route.owner)
+    ? h("span", { class: "route__app" }, "app ", h("span", { class: "mono" }, route.app), " of ", route.owner,
+      route.held ? ", held until its owner confirms it" : null)
     : null;
   return [name, app, reachView(route.host, state.listing?.listen)];
 }

@@ -3,7 +3,8 @@
 //! (`wasm_host::serve_http`: http/1.1 or h2c sniffed, the same handlers,
 //! sandbox, pools and budgets), but each request finds its route by its
 //! host: the route of that host, or the sole route whatever the host
-//! (`sluice_wicket_tunnel::routes::Table::sole`).
+//! (`sluice_wicket_tunnel::routes::Table::sole`). An app held until its owner
+//! confirms it is answered 503, as it is advertised to no server.
 //!
 //! A client's leaving is watched here as the server does for a tunnel
 //! connection ([`client_gone`]): hyper's `half_close` does not read between a
@@ -147,16 +148,21 @@ async fn serve<S>(
     }
 }
 
-/// The handler of `request`'s host (`wasm_host::request_host`).
+/// The handler of `request`'s host (`wasm_host::request_host`): Err with the status and why of
+/// an unknown host (404) and of an app held until its owner confirms it (503).
 fn route(
     routes: &Routes,
     request: &hyper::Request<hyper::body::Incoming>,
-) -> Result<Arc<Handler>, String> {
+) -> Result<Arc<Handler>, (u16, String)> {
     let host = wasm_host::request_host(request);
-    routes
-        .current()
+    let table = routes.current();
+    if let Some((name, owner)) = table.held_at(&host) {
+        let held = format!("the app '{name}' of {owner} is held until its owner confirms it");
+        return Err((503, held));
+    }
+    table
         .by_host(&host)
-        .ok_or_else(|| format!("no wasm route for host '{host}'"))
+        .ok_or_else(|| (404, format!("no wasm route for host '{host}'")))
 }
 
 /// Resolves once the client of a connection is known to be gone while hyper

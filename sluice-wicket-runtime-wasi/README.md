@@ -503,12 +503,13 @@ removed by its owner: the API of a controller keeping the desired state of its a
 |---|---|
 | `PUT /api/components/<sha256>` | keeps the body, a component of 128MiB at most, under its digest (400 when the body has another): `{"sha256": .., "bytes": ..}` |
 | `PUT /api/files/<sha256>` | unpacks the body, a tar of an app's files (1GiB at most), under its digest, as the component's: `{"sha256": .., "bytes": ..}`; 400 naming what of the tar is refused |
-| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "wicket", "budget", "capabilities", "keyvalue_stores", "apps": [..]}`; `capabilities` and `keyvalue_stores` name what a sandbox may hold; `wicket` which wicket this is: `id`, made at its first start and kept in the console directory (`wicket-id`), `node`, its flume node (`wicket:<client-id>`, null without `--flume`), `build`; `budget` `max_instances` (`--max-instances`) and `instances`, the slots the routes' pools hold for good. An app needing more is refused 422 with `"no_room": true`. Told to stop with an evacuation bound, `"leaving": {"since", "until", "evacuated": [<owner>, ..]}` too (both listings; see [Shutdown](#shutdown-drain)) |
+| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "wicket", "budget", "capabilities", "keyvalue_stores", "apps": [..]}`; `capabilities` and `keyvalue_stores` name what a sandbox may hold; `wicket` which wicket this is: `id`, made at its first start and kept in the console directory (`wicket-id`), `node`, its flume node (`wicket:<client-id>`, null without `--flume`), `build`, `since` (its start, in seconds since the epoch); `budget` `max_instances` (`--max-instances`) and `instances`, the slots the routes' pools hold for good. An app needing more is refused 422 with `"no_room": true`. Told to stop with an evacuation bound, `"leaving": {"since", "until", "evacuated": [<owner>, ..]}` too (both listings; see [Shutdown](#shutdown-drain)) |
 | `PUT /api/apps/<name>` | serves the app of the body (JSON, below) |
 | `DELETE /api/apps/<name>?owner=<owner>` | removes the app of `owner` |
 | `GET /api/keyvalue/<store>/<namespace>` | the routes mapping the namespace, one being drained included (`"a route being drained"`): `{"store", "namespace", "mapped_by": [..]}`; 404 for an unknown store. What a controller asks every wicket before it deletes a shared store's namespace through one |
 | `DELETE /api/keyvalue/<store>/<namespace>` | deletes the namespace's keys (its usage too): `{"store", "namespace", "keys": <deleted>}`. Refused (409) while a route maps it, one being drained included; 404 for an unknown store. The namespace may hold `/` (percent-encoded or not) |
 | `PUT /api/evacuated/<owner>` | a wicket leaving: `owner` moved what of its apps it could, those left staying until the drain, no longer waited for: the `leaving` of the listing; 409 unless leaving |
+| `PUT /api/confirmed/<owner>` | the apps of `owner` the body names (`{"apps": ["<name>", ..]}`) are as it wants them: those [held](#apps) are served from now on. `{"released": [..], "held": [..]}`: the apps it released, and those of `owner` held still |
 
 ```json
 {
@@ -520,7 +521,8 @@ removed by its owner: the API of a controller keeping the desired state of its a
               "instances": null, "keep-ms": null, "concurrency": 1,
               "keyvalue": {"": "local/cf/5d2f-guid"},
               "env": {"GREETING": "hello"}},
-  "tag": "3f1c…9a"
+  "tag": "3f1c…9a",
+  "held-ms": 15000
 }
 ```
 
@@ -549,10 +551,18 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
   kept and listed as given, so a controller tells what it put, an env it cannot read back
   included (`sluice-wicket-cf-api` tags each start's snapshot with a random tag). A tag alone
   changes no route
+- `held-ms` (optional; 1 to 3600000) holds the app at each start of the wicket -- neither
+  advertised nor served on `--listen` (503), listed `"held": true`, the wicket not
+  [ready](#readiness-probe) -- until its owner says it is as it wants it (`PUT
+  /api/confirmed/<owner>`), puts it again or removes it, or `held-ms` passed: its controller,
+  which may have moved, changed or removed it while the wicket was away (killed, its host
+  down), says so before a request reaches what it no longer wants, and a controller that is
+  down keeps it from serving that long at most. Changing it alone changes no route
 - a PUT is one reload, as a deploy: every host of the app or none, kept only when the routes
   load; the same app again changes nothing, and an app keeps its `deployed` time while its
   component and sandbox stay. An app listed by `GET /api/apps` is a body its PUT takes (less
-  `name`, `deployed`, `alive` and `advertised`, and the env's values); a PUT is 1MiB at most
+  `name`, `deployed`, `alive`, `advertised` and `held`, and the env's values); a PUT is 1MiB at
+  most
 - `alive` in a listing: its instances alive, lowest first, a warm one's, a spare one's and a
   request's own while it runs, `{"index": 0, "since": 1793000000}`: the [index](#live-access-log) and its start in seconds
   since the epoch, a replacement's its own
@@ -567,8 +577,8 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
   routes, for another owner's app, and for a component or files no upload kept (`"missing":
   ["<sha256>", ..]`, every digest missing); a 422 names the host whose route did not load
   (`"host"`; none when no one route failed, e.g. pools past `--max-instances`)
-- the page lists an app's routes read-only (`origin: "api"`, with `app` and `owner`), and its
-  per-host endpoints refuse their hosts (409)
+- the page lists an app's routes read-only (`origin: "api"`, with `app` and `owner`, `held`
+  while held), and its per-host endpoints refuse their hosts (409)
 - an app and an owner are named by 1 to 100 of `A-Z`, `a-z`, `0-9`, `.`, `_` and `-`, starting
   with a letter or a digit; a component's file name by those, ending in `.wasm`
 - the data of a namespace no app maps any more stays until deleted (`DELETE
@@ -893,6 +903,8 @@ credentials: `200 ready` while the wicket serves, else `503 not ready: <why>`:
   from the drain on (`draining`), not during an [evacuation](#shutdown-drain) before it
 - while a route has no instance ready (`no instance ready for <host>`; a wasm route always has
   one, a Firecracker wicket's VMs may not)
+- while an app is [held](#apps) until its owner confirms it (`held until their owners confirm
+  them: <host>`): its controller reaches the console of a wicket not ready
 - without `--server`, ready once the routes started
 
 `sluice-wicket-runtime-wasi --probe <host:port>` asks it and exits 0 when ready, 1 when not: the

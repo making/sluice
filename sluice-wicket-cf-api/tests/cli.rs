@@ -13,7 +13,8 @@
 //! wicket -- the one wicket's indices placed again, an app's instances spread over both,
 //! one stopped and back, a rolling push a wicket at a time, one refused, taken up by a restart
 //! of the cf-api and canceled, a canary continued, a scale, one told to stop moving its apps to
-//! the other first and back taking an app's spread again --, a component the wicket refuses
+//! the other first and back taking an app's spread again, one killed and gone, its apps started on
+//! the other, back holding them until removed --, a component the wicket refuses
 //! until a service binding grants what it needs, the services' lifecycle -- a store of each
 //! wicket's host keeping its apps on one wicket, one they share (Redis) counting once over
 //! both --, a service broker
@@ -680,7 +681,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
         let console = wicket.logged("console on http://");
         (wicket, listen, console)
     };
-    let (wicket, listen, console) = start_wicket("127.0.0.1:0", "", &[]);
+    let (mut wicket, listen, console) = start_wicket("127.0.0.1:0", "", &[]);
     // ports of its own, kept across the restarts (the CLI targets it; the cf-api names the
     // second wicket's console)
     let free = || {
@@ -1547,8 +1548,8 @@ fn the_cf_cli_deploys_to_the_wicket() {
         })
     });
 
-    // the second wicket stopped: its index starting. Back, it serves what it kept, as the
-    // cf-api finds it, putting nothing again
+    // the second wicket stopped: its index starting. Back, it serves what it kept once the
+    // cf-api, finding it as wanted, says so, putting nothing again
     let deployed = |console: &str| {
         let apps = listing(console)["apps"].as_array().unwrap().clone();
         let app = apps
@@ -1570,7 +1571,9 @@ fn the_cf_cli_deploys_to_the_wicket() {
     let spread = guid_of("spread");
     api.line(&format!("[{spread}] CELL: Found in the wicket b as wanted"));
     assert_eq!(deployed(&console_b), kept);
-    assert_eq!(get(&listen_b, "spread.localhost", "/", None).0, 200);
+    eventually("spread served by the second wicket again", || {
+        get(&listen_b, "spread.localhost", "/", None).0 == 200
+    });
     eventually("an instance running on each wicket again", || {
         hosted() == both
     });
@@ -1760,6 +1763,59 @@ fn the_cf_cli_deploys_to_the_wicket() {
         .send()
         .unwrap();
     assert_eq!(removed.status(), 200);
+
+    // the first wicket killed: gone once it has not answered for --wicket-away-grace, the indices
+    // on it -- img's one, hello's first -- start on the second, which then has no room left.
+    // Started again, it holds them until the cf-api removed them, serving neither, and takes
+    // hello's second index once it has answered for as long
+    assert_eq!(
+        (
+            instances(&console, "img.localhost"),
+            instances(&console_b, "img.localhost")
+        ),
+        (Some(json!(1)), None)
+    );
+    drop(api);
+    let mut args: Vec<&str> = oidc.to_vec();
+    for rule in ["email=*@example.com", "groups=devs"] {
+        args.extend_from_slice(&["--oidc-claim", rule]);
+    }
+    args.extend_from_slice(&["--wicket-away-grace", "2"]);
+    let (api, _) = start_api(
+        &api_listen,
+        &two_wickets,
+        &flume_url,
+        &dir.join("cf"),
+        &args,
+    );
+    let img = guid_of("img");
+    api.line(&format!("[{img}] CELL: Found in the wicket a as wanted"));
+    wicket.kill();
+    api.line("CELL: The wicket a has not answered for 2s: placed on no more");
+    for step in [
+        "moves to the wicket b: the wicket a has not answered for 2s",
+        "runs on the wicket b: out of the wicket a's share",
+    ] {
+        api.line(&format!("[{img}] CELL: Index 0 {step}"));
+    }
+    assert_eq!(get(&listen_b, "img.localhost", "/", None).0, 200);
+    eventually("hello's first index on the second wicket", || {
+        instances(&console_b, "hello.localhost") == Some(json!(2))
+    });
+    (wicket, _, _) = start_wicket(&console, "", &["--listen", &listen]);
+    assert_ne!(get(&listen, "img.localhost", "/", None).0, 200, "held");
+    eventually("img and hello removed from the first wicket", || {
+        listing(&console)["apps"].as_array().unwrap().is_empty()
+    });
+    api.line(&format!(
+        "[{hello}] CELL: Index 1 moves to the wicket a: the app's instances spread over the \
+         wickets again"
+    ));
+    eventually("hello spread over both wickets again", || {
+        let hello_on = |console: &str| instances(console, "hello.localhost");
+        (hello_on(&console), hello_on(&console_b)) == (Some(json!(1)), Some(json!(1)))
+    });
+    assert_eq!(instances(&console_b, "img.localhost"), Some(json!(1)));
 
     // a component the wicket refuses: its reason reaches the user
     let output = cf.fails(&[

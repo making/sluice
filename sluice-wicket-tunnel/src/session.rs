@@ -193,7 +193,8 @@ impl<T> Shared<T> {
 impl<T: Table> Shared<T> {
     /// Whether the wicket serves through the server, as a readiness probe asks: not from the drain
     /// on; else once every node of the membership has a stream up that took the current routes'
-    /// generation, and every route has an instance ready ([`Routes::readiness`]). Err says why not.
+    /// generation, and every route has an instance ready and is held for no controller
+    /// ([`Routes::readiness`]). Err says why not.
     pub fn readiness(&self) -> Result<(), String> {
         if self.drain.begin.is_cancelled() {
             return Err("draining".into());
@@ -953,6 +954,16 @@ mod tests {
         assert_eq!(hosts(&stream.advertise().await), ["a.local"]);
         stream.ack(false);
         unready.lock().unwrap().clear();
+        routes.readiness_changed();
+        assert_eq!(hosts(&stream.advertise().await), ["a.local", "b.local"]);
+        stream.ack(false);
+        // held, as with none ready
+        let held = routes.current().held.clone();
+        held.lock().unwrap().push("a.local".into());
+        routes.readiness_changed();
+        assert_eq!(hosts(&stream.advertise().await), ["b.local"]);
+        stream.ack(false);
+        held.lock().unwrap().clear();
         routes.readiness_changed();
         assert_eq!(hosts(&stream.advertise().await), ["a.local", "b.local"]);
     }

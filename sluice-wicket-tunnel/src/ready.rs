@@ -1,7 +1,8 @@
 //! A wicket's readiness, as its probe asks it (`--health`): whether it serves. Not while its routes
 //! start; then, through a server, once every node of the membership took its routes and every
-//! route has an instance ready ([`Shared::readiness`]), not from the drain on; in local mode
-//! alone, once every route has an instance ready ([`Routes::readiness`]).
+//! route has an instance ready and is held for no controller ([`Shared::readiness`]), not from
+//! the drain on; in local mode alone, once every route has an instance ready and is held for
+//! none ([`Routes::readiness`]).
 
 use std::sync::{Arc, OnceLock};
 
@@ -66,8 +67,8 @@ mod tests {
     }
 
     /// Through a server: not ready while starting, nor before the server took the routes; ready
-    /// after, not while a route has no instance ready or a reload is not taken yet, nor from the
-    /// drain on. In local mode alone, ready as the routes are.
+    /// after, not while a route has no instance ready or is held, or a reload is not taken yet, nor
+    /// from the drain on. In local mode alone, ready as the routes are.
     #[tokio::test]
     async fn ready_once_the_server_took_the_routes_and_not_from_the_drain_on() {
         let (shared, _, _) = hello_shared(Duration::ZERO);
@@ -92,6 +93,13 @@ mod tests {
             readiness.check(),
             Err("no instance ready for hello.local".into())
         );
+        let held = shared.routes.current().held.clone();
+        held.lock().unwrap().push("hello.local".into());
+        assert_eq!(
+            readiness.check(),
+            Err("held until their owners confirm them: hello.local".into())
+        );
+        held.lock().unwrap().clear();
         unready.lock().unwrap().clear();
         shared
             .routes

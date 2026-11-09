@@ -30,7 +30,8 @@
 //! Every node stream advertises the routes whose next connection finds a VM ([`Route::ready`]):
 //! one with none, every VM down or failing its readiness check, leaves the advertisement until it
 //! has one, a route starting with the wicket included, and is still bound (the server may have
-//! routed a connection to it before).
+//! routed a connection to it before). So does an app put with `held-ms` from the start until its
+//! owner confirms it ([`Table::held_app`], `sluice_wicket_console::held`).
 //!
 //! A VM that goes down is the route's to replace (`route::VmPool`), its start not the reloads':
 //! one route failing holds no other's edit, and no reload fails for it. A change of the target
@@ -56,6 +57,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
+use sluice_wicket_console::held::Held;
 use sluice_wicket_console::http::Received;
 use sluice_wicket_console::status::Status;
 use sluice_wicket_tunnel::listener::Replay;
@@ -90,6 +92,8 @@ pub struct Table {
     origins: HashMap<String, Origin>,
     /// The wicket has a console, editing its routes.
     console: bool,
+    /// The apps held until their owners confirm them.
+    held: Arc<Held>,
 }
 
 impl Table {
@@ -162,6 +166,25 @@ impl Table {
         self.routes.get(target).cloned()
     }
 
+    /// The app of `host`'s route, by its name and owner, while it is held.
+    pub fn held_app(&self, host: &str) -> Option<(&str, &str)> {
+        match self.origins.get(host)? {
+            Origin::Api { name, owner, .. } if self.held.holds(name) => Some((name, owner)),
+            _ => None,
+        }
+    }
+
+    /// [`Table::held_app`] of the route a connection to `host` (no port) takes on `--listen`.
+    pub fn held_at(&self, host: &str) -> Option<(&str, &str)> {
+        let route = sluice_wicket_tunnel::routes::Table::host_route(self, host)?;
+        self.held_app(&route.host)
+    }
+
+    /// Whether the app `name` is held.
+    pub fn holds(&self, name: &str) -> bool {
+        self.held.holds(name)
+    }
+
     /// Stops the VMs holding a disk, each given its time, and waits for a stop under way: the
     /// wicket is ending, and what they wrote goes to their disks first.
     pub async fn stop_disks(&self) {
@@ -193,6 +216,11 @@ impl sluice_wicket_tunnel::routes::Table for Table {
     fn ready(&self, route: &Upstream) -> bool {
         let route = self.routes.get(&route.target_url);
         route.is_none_or(|route| route.ready())
+    }
+
+    /// An app's, until its owner confirmed it ([`Table::held_app`]).
+    fn held(&self, route: &Upstream) -> bool {
+        self.held_app(&route.host).is_some()
     }
 
     /// A `--vm` route, on a wicket without a console: not a config file's, whose
@@ -651,12 +679,15 @@ pub struct Reloader {
     next_ahead: u64,
     started_ahead: mpsc::UnboundedReceiver<StartedAhead>,
     tell_started_ahead: mpsc::UnboundedSender<StartedAhead>,
+    /// The apps held until their owners confirm them, from the startup table on.
+    held: Arc<Held>,
 }
 
 impl Reloader {
     /// Starts the VMs of every route of `source` within `capacity`, each target
     /// in a place of its own of `places`, their output to `sink`; the first
     /// failure ends them all. The stops of VMs on a disk that no route waits for go to `stops`.
+    /// The apps put with `held-ms` are held from then on.
     pub async fn start(
         source: RouteSource,
         capacity: Arc<Capacity>,
@@ -673,6 +704,7 @@ impl Reloader {
                 routes: HashMap::new(),
                 origins: HashMap::new(),
                 console: source.deployed().is_some(),
+                held: Held::new([]),
             }),
             status: watch::Sender::new(Status::default()),
             source,
@@ -691,6 +723,7 @@ impl Reloader {
             next_ahead: 0,
             started_ahead,
             tell_started_ahead,
+            held: Held::new([]),
         };
         // read before it: a change while it starts is a change for the next poll
         reloader.read = stamps(reloader.source.config());
@@ -703,6 +736,14 @@ impl Reloader {
             .map(|start| (start.target.clone(), reloader.starter(start)))
             .collect();
         let started = all_started(starting).await?;
+        // from the start on, the VMs up
+        let deployed = reloader.source.deployed();
+        reloader.held = Held::new(deployed.into_iter().flat_map(|deployed| deployed.held()));
+        let (status, routes) = (reloader.status.clone(), reloader.routes.clone());
+        tokio::spawn(reloader.held.clone().follow(move || {
+            status.send_modify(|status| status.revision += 1);
+            routes.readiness_changed();
+        }));
         reloader.publish(specs, started, Moved::new());
         Ok(reloader)
     }
@@ -715,6 +756,11 @@ impl Reloader {
     /// leaving (`sluice_wicket_console::leaving`).
     pub fn status(&self) -> watch::Sender<Status> {
         self.status.clone()
+    }
+
+    /// The apps held until their owners confirm them, which the console releases.
+    pub fn held(&self) -> Arc<Held> {
+        self.held.clone()
     }
 
     /// Reloads on SIGHUP (`hangups`) and on a change of the routes' files,
@@ -1351,6 +1397,7 @@ impl Reloader {
                     routes: current.routes.clone(),
                     origins,
                     console: current.console,
+                    held: self.held.clone(),
                 });
             }
             if moved_on || !change.adjusted.is_empty() {
@@ -1390,6 +1437,7 @@ impl Reloader {
             routes,
             origins,
             console: current.console,
+            held: self.held.clone(),
         });
         self.status.send_modify(|status| status.revision += 1);
         change
@@ -1469,6 +1517,7 @@ impl Reloader {
                 .collect(),
             origins: current.origins.clone(),
             console: current.console,
+            held: self.held.clone(),
         });
     }
 }
@@ -1760,6 +1809,7 @@ mod tests {
                 routes: HashMap::new(),
                 origins: HashMap::from([("a.local".to_string(), origin.clone())]),
                 console: on_console,
+                held: Held::new([]),
             };
             let routed = sluice_wicket_tunnel::routes::Table::host_route(&table, "b.local");
             assert_eq!(routed.is_some(), takes, "{origin:?}, console {on_console}");

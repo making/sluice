@@ -25,6 +25,8 @@
 //! DELETE /api/disks/<name>?owner=<owner>        removes the disk of an app that was
 //! PUT    /api/evacuated/<owner>                 a wicket leaving: the owner moved what of its
 //!                                               apps it could (`sluice_wicket_console::leaving`)
+//! PUT    /api/confirmed/<owner>                 the owner's apps the body names are as it wants
+//!                                               them: held, served (`sluice_wicket_console::held`)
 //! ```
 //!
 //! The options are the `--vm` route's (`mode`, `vcpus`, `memory-mib`, `warm`, `instances`,
@@ -38,7 +40,10 @@
 //! console's directory, its flume node, its build -- and its budget: `--max-instances`,
 //! `--max-memory-mib` and what the routes keep of them for good; an edit needing more is
 //! refused `no_room`. Both listings say when the wicket is leaving: told to stop, it waits for
-//! the apps of the API but those with a disk to be moved elsewhere (`--evacuation-grace`).
+//! the apps of the API but those with a disk to be moved elsewhere (`--evacuation-grace`). An app
+//! put with `held-ms` is held at each start of the wicket, listed so, until its owner confirms it,
+//! puts it again or removes it, or `held-ms` passed: its owner may have moved, changed or removed
+//! it while the wicket was away.
 //!
 //! The credentials, the page's shared files and the directory's layout are
 //! `sluice-wicket-console`'s.
@@ -53,6 +58,7 @@ use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sluice_wicket_console::env::Env;
+use sluice_wicket_console::held::{self, Held};
 use sluice_wicket_console::http::{
     Body, Edited, Intake, Received, Refusal, Response, error, json, pairs, read, receive,
 };
@@ -115,6 +121,8 @@ pub struct Console {
     pub listen: Option<SocketAddr>,
     /// Which wicket this is, as the apps' listing says.
     pub identity: Identity,
+    /// The apps held until their owners confirm them.
+    pub held: Arc<Held>,
 }
 
 impl Service for Console {
@@ -182,6 +190,12 @@ impl Service for Console {
                 _ => error(StatusCode::METHOD_NOT_ALLOWED, "an owner's word takes PUT"),
             };
         }
+        if let Some(owner) = path.strip_prefix("/api/confirmed/") {
+            return match *method {
+                Method::PUT => held::confirmed(&self.held, owner, parts, take()).await,
+                _ => error(StatusCode::METHOD_NOT_ALLOWED, "an owner's word takes PUT"),
+            };
+        }
         error(StatusCode::NOT_FOUND, format!("nothing at {path}"))
     }
 }
@@ -204,6 +218,7 @@ impl Console {
                 };
                 let vms = route.vms();
                 RouteView {
+                    held: table.held_app(&up.host).is_some(),
                     host: up.host.clone(),
                     origin: origin.name(),
                     deployed: match origin {
@@ -289,6 +304,7 @@ impl Console {
                 name,
                 owner,
                 tag,
+                held_ms,
                 deployed,
             } = origin
             else {
@@ -315,11 +331,13 @@ impl Console {
                 },
                 sandbox: sandbox_view(&route.spec()),
                 tag: tag.clone(),
+                held_ms: *held_ms,
                 deployed: deployed.clone(),
                 alive: alive_ready(route.alive()),
                 crashed: crashed(route.crashed()),
                 down: route.down(),
                 advertised: taken,
+                held: table.holds(name),
             });
         }
         let (instances, memory_mib) = table.resident();
@@ -428,7 +446,12 @@ impl Console {
         match app {
             Ok(app) => {
                 let name = name.to_string();
-                self.edit(Edit::PutApp { name, app }).await
+                let put = self.request(Edit::PutApp {
+                    name: name.clone(),
+                    app,
+                });
+                // as its owner wants it
+                edited(put.await.inspect(|_| self.held.release(&name)))
             }
             Err(e) => error(StatusCode::BAD_REQUEST, e),
         }
@@ -438,7 +461,11 @@ impl Console {
         match owner_of(name, query) {
             Ok(owner) => {
                 let name = name.to_string();
-                self.edit(Edit::DeleteApp { name, owner }).await
+                let removal = self.request(Edit::DeleteApp {
+                    name: name.clone(),
+                    owner,
+                });
+                edited(removal.await.inspect(|_| self.held.release(&name)))
             }
             Err(e) => error(StatusCode::BAD_REQUEST, e),
         }
@@ -556,16 +583,7 @@ impl Console {
 
     /// Has the reloader apply `edit`, and answers its outcome.
     async fn edit(&self, edit: Edit) -> Response {
-        match self.request(edit).await {
-            Ok(Outcome { generation, change }) => json(
-                StatusCode::OK,
-                &Edited {
-                    generation,
-                    message: change.map_or_else(|| "no change".into(), |change| change.to_string()),
-                },
-            ),
-            Err(refused) => refused.into(),
-        }
+        edited(self.request(edit).await)
     }
 
     /// Has the reloader apply `edit`: its outcome, or the answer refusing it.
@@ -606,6 +624,20 @@ impl Console {
     }
 }
 
+/// The answer of an edit's outcome.
+fn edited(outcome: Result<Outcome, Refusal>) -> Response {
+    match outcome {
+        Ok(Outcome { generation, change }) => json(
+            StatusCode::OK,
+            &Edited {
+                generation,
+                message: change.map_or_else(|| "no change".into(), |change| change.to_string()),
+            },
+        ),
+        Err(refused) => refused.into(),
+    }
+}
+
 /// The owner `query` names of the app `name`, both checked.
 fn owner_of(name: &str, query: Option<&str>) -> Result<String, String> {
     let owner = pairs(query)
@@ -634,6 +666,9 @@ fn app_spec(name: &str, body: AppBody) -> Result<AppSpec, String> {
         check_digest(&body.component.sha256).map_err(|e| format!("component.sha256: {e}"))?;
     if let Some(tag) = &body.tag {
         check_tag(tag)?;
+    }
+    if let Some(held_ms) = body.held_ms {
+        held::check_held_ms(held_ms)?;
     }
     let hosts = check_hosts(&body.hosts)?;
     let mut sandbox = body.sandbox;
@@ -669,6 +704,7 @@ fn app_spec(name: &str, body: AppBody) -> Result<AppSpec, String> {
         options,
         env,
         tag: body.tag,
+        held_ms: body.held_ms,
     })
 }
 
@@ -759,6 +795,8 @@ struct AppView {
     sandbox: Map<String, Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tag: Option<String>,
+    #[serde(rename = "held-ms", skip_serializing_if = "Option::is_none")]
+    held_ms: Option<u64>,
     deployed: String,
     /// Its VMs alive, lowest index first.
     alive: Vec<Alive>,
@@ -771,6 +809,8 @@ struct AppView {
     /// Whether the server of every tunnel stream took its routes as they are, a VM of them
     /// ready: it sends them connections. So in local mode.
     advertised: bool,
+    /// Whether it is held until its owner confirms it: neither advertised nor served.
+    held: bool,
 }
 
 /// The body of an app's PUT.
@@ -786,6 +826,9 @@ struct AppBody {
     sandbox: Map<String, Value>,
     /// Opaque to the console, kept and listed as given ([`check_tag`]).
     tag: Option<String>,
+    /// How long a start of the wicket holds it at most, until its owner confirms it.
+    #[serde(rename = "held-ms")]
+    held_ms: Option<u64>,
 }
 
 /// An image uploaded by digest, and the file name it is kept as.
@@ -831,6 +874,8 @@ struct BudgetView {
 
 #[derive(Serialize)]
 struct RouteView {
+    /// An app's route held until its owner confirms it: neither advertised nor served.
+    held: bool,
     host: String,
     origin: &'static str,
     deployed: Option<String>,

@@ -21,6 +21,9 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
                               <url> names the one wicket 'wicket'
   --wicket-token <token>      their --console-token, one for all
   --wicket-token-file <path>  read the token from a file instead
+  --wicket-away-grace <secs>  of several wickets, one not answering that long is gone: placed
+                              on no more, the apps' indices on it start on the others, until it
+                              has answered as long again (default 30, 0 = never)
   --domain <name>             a shared domain; repeatable (or comma-separated): the first
                               takes the default and random routes (default localhost)
   --data-dir <path>           the state, the packages and the droplets (default cf-api)
@@ -107,6 +110,7 @@ const VALUED: &[&str] = &[
     "wicket",
     "wicket-token",
     "wicket-token-file",
+    "wicket-away-grace",
     "domain",
     "data-dir",
     "org",
@@ -236,6 +240,12 @@ pub fn parse(
         }
     };
     let wicket_token = secret("wicket-token")?;
+    let wicket_away_grace = match value("wicket-away-grace") {
+        Some(seconds) => seconds.trim().parse::<u64>().map_err(|_| {
+            format!("--wicket-away-grace: a number of seconds (0 = never), not '{seconds}'")
+        })?,
+        None => DEFAULT_WICKET_AWAY_GRACE,
+    };
     let flume = match value("flume") {
         Some(url) => {
             if !url.starts_with("grpc://") && !url.starts_with("grpcs://") {
@@ -408,6 +418,7 @@ pub fn parse(
         settings: Settings {
             wickets,
             wicket_token,
+            wicket_away_grace: std::time::Duration::from_secs(wicket_away_grace),
             domains,
             data_dir: PathBuf::from(value("data-dir").unwrap_or_else(|| "cf-api".to_string())),
             org: value("org").unwrap_or_else(|| "sluice".to_string()),
@@ -425,6 +436,10 @@ pub fn parse(
 
 /// The name of the one wicket `--wicket <url>` gives.
 pub const ONE_WICKET: &str = "wicket";
+
+/// Default of `--wicket-away-grace`, in seconds: a wicket restarting, its apps' VMs booting,
+/// is back well within it.
+const DEFAULT_WICKET_AWAY_GRACE: u64 = 30;
 
 /// The wickets `--wicket` names, each `<name>=<url>` (or comma-separated), or one `<url>`, named
 /// [`ONE_WICKET`]: distinct names of distinct consoles.
@@ -533,6 +548,10 @@ mod tests {
             [wicket("wicket", "http://wicket:9090")]
         );
         assert_eq!(config.settings.wicket_token.as_deref(), Some("from-env"));
+        assert_eq!(
+            config.settings.wicket_away_grace,
+            std::time::Duration::from_secs(30)
+        );
         assert_eq!(config.settings.domains, ["c.example"]);
         assert_eq!(config.settings.data_dir, PathBuf::from("cf-api"));
         assert_eq!(config.settings.org, "sluice");
@@ -600,10 +619,14 @@ mod tests {
         );
         assert!(config.settings.tls.is_none());
         let config = serve(parse(
-            args("--wicket http://w:1 --any-credentials --domain x.io --domain y.io,Z.io."),
+            args(
+                "--wicket http://w:1 --any-credentials --domain x.io --domain y.io,Z.io. \
+                 --wicket-away-grace 0",
+            ),
             |_| None,
         ));
         assert_eq!(config.settings.domains, ["x.io", "y.io", "z.io"]);
+        assert!(config.settings.wicket_away_grace.is_zero());
         // several wickets, each named, in the order given: of the options, else the environment
         let config = serve(parse(
             args("--wicket a=http://a:9090/ --wicket b-1=https://b:9090,c.2=http://c:9090"),
@@ -688,6 +711,10 @@ mod tests {
             assert!(error(line).contains(refusal), "{line}: {}", error(line));
         }
         assert!(error("--wicket http://w:1 --domain a_b").contains("--domain"));
+        assert!(
+            error("--wicket http://w:1 --wicket-away-grace 30s")
+                .contains("--wicket-away-grace: a number of seconds")
+        );
         assert!(error("--wicket http://w:1 --colour").contains("--colour"));
         assert!(error("--wicket").contains("needs a value"));
         assert!(

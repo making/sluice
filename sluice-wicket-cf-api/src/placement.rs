@@ -29,7 +29,9 @@
 //! ([`State::evacuate`]); with none, or its keyvalue data there, it stays until the wicket stops.
 //! A wicket back, or a new one, takes the indices that spread an app again, one at a time
 //! ([`State::respread`]): from the wicket holding the most of the app's, while that one holds two
-//! more than it.
+//! more than it. A wicket gone ([`Wickets::gone`]: it has not answered for a bound, or answered
+//! again for less) has no room either, and the indices on it move the same way, as long as it
+//! does not answer: nothing is removed from it, which answers nothing.
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
@@ -70,6 +72,9 @@ pub struct Wickets {
     /// Those leaving, told to stop: when each drains at the latest, in seconds since the epoch,
     /// as it last listed it. No room there.
     pub leaving: BTreeMap<String, u64>,
+    /// Those gone: they have not answered for `--wicket-away-grace`, or answered again for less
+    /// (`crate::controller`). No room there.
+    pub gone: BTreeSet<String>,
     /// Each keyvalue store the wickets list, by name: whether it is one store of them all, else
     /// each wicket's host's own (`crate::services::Offer::stores`).
     pub stores: BTreeMap<String, bool>,
@@ -272,12 +277,13 @@ impl State {
 
     /// The room for the indices of `app` on each wicket of a known budget: the indices of its
     /// that fit beside those of the other started apps placed there or moving there (as kept), 0
-    /// at most on one that refused a share for room or is leaving.
+    /// at most on one that refused a share for room, is leaving or is gone.
     pub fn rooms(&self, app: &App) -> BTreeMap<String, i64> {
         let mut rooms = BTreeMap::new();
         for wicket in &self.wickets.configured {
-            let full =
-                self.wickets.full.contains_key(wicket) || self.wickets.leaving.contains_key(wicket);
+            let full = self.wickets.full.contains_key(wicket)
+                || self.wickets.leaving.contains_key(wicket)
+                || self.wickets.gone.contains(wicket);
             let mut room = match self.wickets.budgets.get(wicket) {
                 Some(budget) => {
                     let (instances, memory) = (self.apps.iter())
@@ -365,11 +371,11 @@ impl State {
         indices
     }
 
-    /// Moves the indices of the app `guid` placed on `from`, a wicket leaving, each to a wicket
-    /// with room for it, not leaving, holding the fewest of the app's, of them the one with the
-    /// most room, the first configured of those ([`App::moving`]): those with nowhere to go
-    /// stay, as they all do with its keyvalue data there. Of a started app only, its indices
-    /// moving already moving on.
+    /// Moves the indices of the app `guid` placed on `from`, a wicket leaving or gone, each to a
+    /// wicket with room for it, neither leaving nor gone, holding the fewest of the app's, of them
+    /// the one with the most room, the first configured of those ([`App::moving`]): those with
+    /// nowhere to go stay, as they all do with its keyvalue data there. Of a started app only, its
+    /// indices moving already moving on.
     pub fn evacuate(&mut self, guid: &str, from: &str) -> Evacuated {
         let Some(app) = self.app(guid).filter(|app| takes_room(app)) else {
             return Evacuated::default();
@@ -419,8 +425,8 @@ impl State {
     /// The next index to move to `to`, a wicket back or new, for an app's spread
     /// ([`App::moving`]): of a started app but those `skipped`, not pinned to a keyvalue home,
     /// none of its indices moving, `to` with room for one more of it and holding two fewer of
-    /// its indices than the wicket holding the most (not leaving, the first configured of
-    /// those), the highest index there. None: no spread is better for one.
+    /// its indices than the wicket holding the most (neither leaving nor gone, the first
+    /// configured of those), the highest index there. None: no spread is better for one.
     pub fn respread(&mut self, to: &str, skipped: &BTreeSet<String>) -> Option<(String, Move)> {
         if !self.wickets.configured.iter().any(|wicket| wicket == to) || !self.takes_more(to) {
             return None;
@@ -437,8 +443,11 @@ impl State {
                 return None;
             }
             // of the wickets holding the most, the first configured
+            let away = |wicket: &String| {
+                self.wickets.leaving.contains_key(wicket) || self.wickets.gone.contains(wicket)
+            };
             let from = (self.wickets.configured.iter())
-                .filter(|wicket| *wicket != to && !self.wickets.leaving.contains_key(*wicket))
+                .filter(|wicket| *wicket != to && !away(wicket))
                 .rev()
                 .max_by_key(|wicket| on(wicket))?;
             if on(from) < here + 2 {
@@ -481,10 +490,12 @@ impl State {
         self.placement(app).get(index as usize).cloned()
     }
 
-    /// Whether `wicket` takes indices: of the wickets' runtime, a second name of none, not
-    /// leaving.
+    /// Whether `wicket` takes indices: of the wickets' runtime, a second name of none, neither
+    /// leaving nor gone.
     fn takes_more(&self, wicket: &str) -> bool {
-        !self.wickets.odd.contains(wicket) && !self.wickets.leaving.contains_key(wicket)
+        !self.wickets.odd.contains(wicket)
+            && !self.wickets.leaving.contains_key(wicket)
+            && !self.wickets.gone.contains(wicket)
     }
 
     /// Keeps the placement of every app as [`State::placement`] has it, in turn: at every
@@ -669,10 +680,11 @@ mod tests {
     }
 
     /// A wicket's room is its budget less the indices of the other started apps placed there or
-    /// moving there, a VM's memory too, none on a wicket that refused a share for room or is
-    /// leaving; such a refusal passes the app's highest index there to a wicket with room. A
-    /// wicket leaving has its indices moved to wickets with room, as new ones go, a wicket back
-    /// those that spread an app again. A wicket's instance is the app's index of its share.
+    /// moving there, a VM's memory too, none on a wicket that refused a share for room, is
+    /// leaving or is gone; such a refusal passes the app's highest index there to a wicket with
+    /// room. A wicket leaving or gone has its indices moved to wickets with room, as new ones go,
+    /// a wicket back those that spread an app again. A wicket's instance is the app's index of
+    /// its share.
     #[test]
     fn the_room_is_what_the_budget_leaves_and_a_refusal_passes_an_index() {
         let mut state = State::new("o", "s", &["localhost".into()]);
@@ -872,5 +884,20 @@ mod tests {
         );
         state.wickets.leaving.insert("b".into(), 60);
         assert_eq!(state.respread("b", &none), None, "leaving");
+
+        // b gone (it has not answered for the bound): no room there, its indices moving as off a
+        // wicket leaving (three's 1 to a: c has no room left), none spread to it; a gone, none
+        // spread from it
+        state.wickets.leaving.clear();
+        state.wickets.gone.insert("b".into());
+        assert_eq!(state.rooms(state.app(&two).unwrap())["b"], 0, "gone");
+        assert_eq!(state.respread("b", &none), None, "gone");
+        state.app_mut(&three).unwrap().placement = names(&["a", "b", "c"]);
+        assert_eq!(state.evacuate(&three, "b"), moved(&[(1, "a")], &[]));
+        assert_eq!(state.moved(&three, 1, "a").as_deref(), Some("b"));
+        state.wickets.gone = ["a".to_string()].into();
+        assert_eq!(state.respread("b", &none), None, "from a wicket gone");
+        state.wickets.gone.clear();
+        assert!(state.respread("b", &none).is_some());
     }
 }

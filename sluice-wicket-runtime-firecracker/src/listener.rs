@@ -7,8 +7,9 @@
 //! nothing first: its guest may speak first. What was read is relayed
 //! verbatim, as the rest: a later request of the connection, an h2 stream or a
 //! keep-alive request, stays on that route whatever its host, and no
-//! `X-Forwarded-*` header is added. An unknown host is answered 404, a request
-//! finding no room for its VM 502 ([`bad_gateway`]); a connection that is not
+//! `X-Forwarded-*` header is added. An unknown host is answered 404, an app held
+//! until its owner confirms it 503, a request finding no room for its VM 502
+//! ([`bad_gateway`]); a connection that is not
 //! HTTP, or whose head runs past `head::MAX_HEAD` or takes longer than
 //! [`HEAD_TIMEOUT`], is closed.
 //!
@@ -150,7 +151,13 @@ where
             return None;
         }
     };
-    let route = routes.current().by_host(host_of(head.host()));
+    let table = routes.current();
+    if let Some((name, owner)) = table.held_at(host_of(head.host())) {
+        let held = format!("the app '{name}' of {owner} is held until its owner confirms it");
+        answer(client, &head, "503 Service Unavailable", &held).await;
+        return None;
+    }
+    let route = table.by_host(host_of(head.host()));
     if route.is_none() {
         let message = format!("no firecracker route for host '{}'", head.host());
         answer(client, &head, "404 Not Found", &message).await;

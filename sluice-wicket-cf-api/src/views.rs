@@ -311,7 +311,8 @@ pub fn process(base: &str, app: &App) -> Value {
 /// Each index is on a wicket (`crate::placement`), whose name an entry has as its `host`: one
 /// moving to another, the one it is on until the other serves it. `DOWN`
 /// for a stopped app and, of a wicket's indices too, `CRASHED` with its refusal as `details` and
-/// `STARTING` until it serves its share (`listed`, by wicket, as each answers now). Serving it, an
+/// `STARTING` until it serves its share (`listed`, by wicket, as each answers now), held by its
+/// start until the cf-api confirms it included. Serving it, an
 /// entry `RUNNING` per instance alive, by the index `cf logs` names, up since its own start,
 /// `CRASHED` for what it says is down, since then, and `STARTING` for a VM it keeps and has not up
 /// yet: none is a limit not reached, no failure, as is an app the wickets have no reason to serve
@@ -346,8 +347,8 @@ pub fn stats(state: &State, app: &App, owner: &str, listed: &BTreeMap<String, Li
                 entries.extend(match state.outcome(&app.guid, &wicket) {
                     Some(Outcome::Refused(detail)) => all("CRASHED", Some(detail)),
                     Some(Outcome::Running) => match listed.get(&wicket) {
-                        Some(listed) => alive(listed, &wicket, &indices, instances),
-                        None => all("STARTING", None),
+                        Some(listed) if !listed.held => alive(listed, &wicket, &indices, instances),
+                        _ => all("STARTING", None),
                     },
                     Some(Outcome::Unreachable) | None => all("STARTING", None),
                 });
@@ -1064,9 +1065,12 @@ mod tests {
         let crashed = |index| (index, "CRASHED".to_string(), Some("no".to_string()));
         assert_eq!(entries(&state, None), [crashed(0), crashed(1)]);
 
-        // taken, and gone from its listing or the listing not read
+        // taken, and gone from its listing or the listing not read, or held since its start
         outcome(&mut state, "w", Outcome::Running);
         assert_eq!(entries(&state, None), starting);
+        let mut held = listed(json!([0, 1]), Value::Null);
+        held.held = true;
+        assert_eq!(entries(&state, Some(&held)), starting);
 
         // what is alive, by the index `cf logs` names, one index one entry; none is no failure
         for (alive, listed_as) in [

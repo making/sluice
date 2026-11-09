@@ -4,7 +4,7 @@
 //! log-cache's read API it uses -- keeping the desired state of its apps and
 //! having its wickets serve them through each wicket's app API, an app's
 //! instances spread over them (`placement`, `controller`) and moved off a wicket
-//! told to stop, a deployment put a wicket's share at a time (`deployments`); a
+//! told to stop or gone, a deployment put a wicket's share at a time (`deployments`); a
 //! component comes
 //! in a zip or from an OCI registry (`registry`), a rootfs in a zip or made by
 //! a wicket of an OCI image, and what every wicket offers of its keyvalue stores
@@ -105,6 +105,9 @@ pub struct Settings {
     pub wickets: Vec<WicketSettings>,
     /// Their `--console-token`, one for all.
     pub wicket_token: Option<String>,
+    /// How long one of several wickets may not answer before it is gone (`crate::controller`):
+    /// zero, never.
+    pub wicket_away_grace: std::time::Duration,
     /// The shared domains; the first takes the default and random routes.
     pub domains: Vec<String>,
     /// The state, the packages and the droplets.
@@ -254,6 +257,7 @@ pub async fn serve(
         store.clone(),
         wickets(&settings),
         logs.clone(),
+        settings.wicket_away_grace,
     ));
     let flume = settings
         .flume
@@ -314,6 +318,7 @@ mod tests {
                 url: "http://127.0.0.1:1".into(),
             }],
             wicket_token: None,
+            wicket_away_grace: std::time::Duration::ZERO,
             domains: vec!["apps.test".into()],
             data_dir,
             org: "org".into(),

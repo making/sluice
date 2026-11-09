@@ -15,7 +15,8 @@
 //! the older registration when a client id re-registers.
 //!
 //! Every stream advertises the wicket's [`routes::Routes`] that have an
-//! instance ready, again on each change of them or of which are ready, and
+//! instance ready and are held for no controller, again on each change of them
+//! or of which are ready, and
 //! serves the virtual connections the server opens on it
 //! ([`tunnel`]: per-connection flow control, the connection limit, the
 //! outbound scheduling): a CONNECT is bound to a route of the wicket's

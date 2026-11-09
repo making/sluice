@@ -12,15 +12,17 @@
 //!   style, fonts and script helpers) and its headers
 //! - [`http`]: the answers, the bodies read in memory or streamed to a file
 //! - [`identity`]: what an apps' listing says of the wicket: its id, its flume node, its build,
-//!   its budget
+//!   its start, its budget
 //! - [`store`]: the console's directory (files kept under their sha256, never
 //!   rewritten, written by a rename), the names and hosts it takes
 //! - [`status`]: what the page shows of the reloads, and its long poll
 //! - [`leaving`]: a wicket told to stop serving on while its apps' controllers move them
+//! - [`held`]: the apps a wicket holds at its start until their controllers confirm them
 //! - [`settings`]: the console's options, as both wickets take them
 
 pub mod env;
 pub mod gate;
+pub mod held;
 pub mod http;
 pub mod identity;
 pub mod leaving;
