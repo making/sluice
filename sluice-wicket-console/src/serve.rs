@@ -115,6 +115,7 @@ mod tests {
     use sluice_wicket_server::http::QUIET;
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
     use tokio::net::TcpStream;
+    use tokio::sync::Notify;
     use tokio::time::{Duration, Instant, sleep};
 
     use super::*;
@@ -122,7 +123,11 @@ mod tests {
     /// How long the [`Page`]'s API takes to answer: past [`QUIET`].
     const HOLD: Duration = Duration::from_secs(90);
 
-    struct Page;
+    /// Its API tells when a request reached it.
+    #[derive(Default)]
+    struct Page {
+        reached: Notify,
+    }
 
     impl Service for Page {
         const INDEX: &'static str = "page";
@@ -130,9 +135,19 @@ mod tests {
         const DRAIN_LIMIT: u64 = 1 << 20;
 
         async fn handle(&self, _: Request<'_>) -> Response {
+            self.reached.notify_one();
             sleep(HOLD).await;
             error(StatusCode::NOT_FOUND, "nothing")
         }
+    }
+
+    /// Keeps the paused clock still until dropped: a blocking task running stops its
+    /// auto-advance, which otherwise leaps to the next timer whenever the runtime waits on a
+    /// socket, past [`QUIET`] before the sockets' bytes arrive.
+    fn hold_clock() -> std::sync::mpsc::Sender<()> {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        tokio::task::spawn_blocking(move || released.recv());
+        release
     }
 
     /// Connections left open taking every slot stop no one: the next one is
@@ -148,20 +163,23 @@ mod tests {
             sign_in: None,
             realm: "test",
         };
-        tokio::spawn(run(listener, gate, Arc::new(Page)));
+        let page = Arc::new(Page::default());
+        tokio::spawn(run(listener, gate, page.clone()));
+        let held = hold_clock();
         let started = Instant::now();
-        let mut admitted = TcpStream::connect(address).await.unwrap();
-        admitted
-            .write_all(b"GET /api/hold HTTP/1.1\r\nhost: t\r\nauthorization: Bearer token\r\n\r\n")
-            .await
-            .unwrap();
         let mut refused = TcpStream::connect(address).await.unwrap();
         refused
             .write_all(b"POST /api/x HTTP/1.1\r\nhost: t\r\ncontent-length: 5\r\n\r\nab")
             .await
             .unwrap();
-        // both reach the gate
-        sleep(Duration::from_secs(1)).await;
+        let mut admitted = TcpStream::connect(address).await.unwrap();
+        admitted
+            .write_all(b"GET /api/hold HTTP/1.1\r\nhost: t\r\nauthorization: Bearer token\r\n\r\n")
+            .await
+            .unwrap();
+        // both reach the gate, refused's sent first, and are no longer fresh
+        page.reached.notified().await;
+        tokio::time::advance(Duration::from_secs(1)).await;
         let mut quiet = Vec::new();
         for _ in 2..MAX_CONNECTIONS {
             quiet.push(TcpStream::connect(address).await.unwrap());
@@ -176,6 +194,7 @@ mod tests {
         assert_eq!(&status, b"HTTP/1.1 200");
         assert_eq!(refused.read(&mut [0; 1]).await.unwrap(), 0);
         assert!(started.elapsed() < QUIET, "{:?}", started.elapsed());
+        drop(held);
 
         for mut client in quiet {
             assert_eq!(client.read(&mut [0; 1]).await.unwrap(), 0);

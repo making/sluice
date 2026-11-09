@@ -335,6 +335,15 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Keeps the paused clock still until dropped: a blocking task running stops its
+    /// auto-advance, which otherwise leaps to the next timer whenever the runtime waits on a
+    /// socket, past [`QUIET`] before the sockets' bytes arrive.
+    fn hold_clock() -> std::sync::mpsc::Sender<()> {
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        tokio::task::spawn_blocking(move || released.recv());
+        release
+    }
+
     /// All slots taken, a request with a token keeps its connection, one without
     /// gives way, each still sending its body.
     #[tokio::test(start_paused = true)]
@@ -348,6 +357,7 @@ mod tests {
                 .await
                 .unwrap()
         });
+        let _held = hold_clock();
         let grant = "grant_type=password&username=u";
         let mut signing_in = TcpStream::connect(address).await.unwrap();
         let request = format!(
@@ -362,19 +372,22 @@ mod tests {
         let tokens: serde_json::Value = serde_json::from_str(tokens).unwrap();
         let token = tokens["access_token"].as_str().unwrap();
 
-        let mut admitted = TcpStream::connect(address).await.unwrap();
-        let request = format!(
-            "POST /v3/x HTTP/1.1\r\nhost: t\r\nauthorization: bearer {token}\r\n\
-             content-length: 5\r\n\r\nab"
-        );
-        admitted.write_all(request.as_bytes()).await.unwrap();
-        let mut anyone = TcpStream::connect(address).await.unwrap();
-        anyone
-            .write_all(b"POST /v3/x HTTP/1.1\r\nhost: t\r\ncontent-length: 5\r\n\r\nab")
-            .await
-            .unwrap();
-        // both reach their handler
-        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        // each in its handler, reading its body: its client told to send it
+        let sending = async |head: String| {
+            let mut client = TcpStream::connect(address).await.unwrap();
+            client.write_all(head.as_bytes()).await.unwrap();
+            let mut continued = [0; 25];
+            client.read_exact(&mut continued).await.unwrap();
+            assert_eq!(&continued, b"HTTP/1.1 100 Continue\r\n\r\n");
+            client.write_all(b"ab").await.unwrap();
+            client
+        };
+        let head = "POST /v3/x HTTP/1.1\r\nhost: t\r\nexpect: 100-continue\r\n\
+                    content-length: 5\r\n";
+        let mut admitted = sending(format!("{head}authorization: bearer {token}\r\n\r\n")).await;
+        let mut anyone = sending(format!("{head}\r\n")).await;
+        // no longer fresh
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
 
         let mut quiet = Vec::new();
         for _ in 2..api::MAX_CONNECTIONS {
