@@ -1629,6 +1629,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "sluice-build-info",
+ "sluice-wicket-console",
  "sluice-wicket-oidc",
  "sluice-wicket-registry",
  "sluice-wicket-server",
@@ -1640,6 +1641,25 @@ dependencies = [
  "tonic-prost-build",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "sluice-wicket-console"
+version = "0.0.1-SNAPSHOT"
+dependencies = [
+ "base64 0.22.1",
+ "bytes",
+ "form_urlencoded",
+ "getrandom 0.4.3",
+ "http",
+ "http-body-util",
+ "hyper",
+ "serde",
+ "serde_json",
+ "sha2",
+ "sluice-wicket-oidc",
+ "sluice-wicket-server",
+ "tokio",
 ]
 
 [[package]]

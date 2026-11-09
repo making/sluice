@@ -20,10 +20,11 @@ use crate::http::{Body, Response, asset, drain, error, secure};
 /// admitted, or waits in the backlog for one.
 const MAX_CONNECTIONS: usize = 64;
 
-const CSS: &str = include_str!("assets/console.css");
+/// The pages' style, its fonts in `fonts/` next to it: sluice-wicket-cf-api's pages wear it too.
+pub const CSS: &str = include_str!("assets/console.css");
 const KIT: &str = include_str!("assets/kit.js");
-const OVERPASS: &[u8] = include_bytes!("assets/fonts/overpass.woff2");
-const OVERPASS_MONO: &[u8] = include_bytes!("assets/fonts/overpass-mono.woff2");
+pub const OVERPASS: &[u8] = include_bytes!("assets/fonts/overpass.woff2");
+pub const OVERPASS_MONO: &[u8] = include_bytes!("assets/fonts/overpass-mono.woff2");
 
 /// A request the gate admitted.
 pub struct Request<'a> {

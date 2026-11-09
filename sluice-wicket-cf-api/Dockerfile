@@ -1,8 +1,9 @@
 # sluice-wicket-cf-api as a static musl binary on distroless static. The flume proto lives
 # in sluice-proto, the build script dependency in sluice-build-info, the OpenID Provider
-# client in sluice-wicket-oidc, the connections in sluice-wicket-server, the image pulls in
-# sluice-wicket-registry and the component a static site is staged with in sluice-wicket-site
-# (on the WIT of sluice-wicket-runtime-wasi), so the build context is the repository root:
+# client in sluice-wicket-oidc, the connections in sluice-wicket-server, the pages' style in
+# sluice-wicket-console, the image pulls in sluice-wicket-registry and the component a static
+# site is staged with in sluice-wicket-site (on the WIT of sluice-wicket-runtime-wasi), so the
+# build context is the repository root:
 #   docker build -f sluice-wicket-cf-api/Dockerfile --build-arg GIT_COMMIT=$(git rev-parse HEAD) .
 
 # sluice-wicket-site, on the nightly toolchain it pins (wasm32-wasip3), on glibc: the
@@ -25,6 +26,8 @@ COPY sluice-wicket-oidc/Cargo.toml sluice-wicket-oidc/
 COPY sluice-wicket-oidc/src sluice-wicket-oidc/src
 COPY sluice-wicket-server/Cargo.toml sluice-wicket-server/
 COPY sluice-wicket-server/src sluice-wicket-server/src
+COPY sluice-wicket-console/Cargo.toml sluice-wicket-console/
+COPY sluice-wicket-console/src sluice-wicket-console/src
 COPY sluice-wicket-registry/Cargo.toml sluice-wicket-registry/
 COPY sluice-wicket-registry/src sluice-wicket-registry/src
 COPY sluice-wicket-cf-api/Cargo.toml sluice-wicket-cf-api/Cargo.lock sluice-wicket-cf-api/build.rs sluice-wicket-cf-api/

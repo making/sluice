@@ -531,9 +531,7 @@ fn passcode_page(http: &Http, api: &str) -> (u16, String) {
 fn passcode(http: &Http, api: &str) -> (String, String) {
     let (status, page) = passcode_page(http, api);
     assert_eq!(status, 200, "{page}");
-    let (_, rest) = page
-        .split_once("id=\"passcode\" class=\"big\">")
-        .expect("the code");
+    let (_, rest) = page.split_once("<code id=\"passcode\">").expect("the code");
     (rest.split_once("</code>").unwrap().0.to_string(), page)
 }
 
@@ -1277,6 +1275,11 @@ fn the_cf_cli_deploys_to_the_wicket() {
         ),
         "{page}"
     );
+    // its style, the wickets' consoles', with no token
+    for asset in ["console.css", "fonts/overpass.woff2"] {
+        let (status, _, _) = http.get(&format!("{url}/uaa/{asset}"), None);
+        assert_eq!(status, 200, "{asset}");
+    }
     let output = cf.ok_with_stdin(&["login", "--sso"], &format!("{code}\n"));
     assert!(output.contains("Authenticating...\nOK"), "{output}");
     assert!(cf.ok(&["target"]).contains("user:           alice"));

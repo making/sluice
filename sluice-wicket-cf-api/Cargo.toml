@@ -20,6 +20,8 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "str
 sluice-wicket-oidc = { path = "../sluice-wicket-oidc" }
 # its connections
 sluice-wicket-server = { path = "../sluice-wicket-server" }
+# the style of its pages (cf login --sso), the wickets' consoles'
+sluice-wicket-console = { path = "../sluice-wicket-console" }
 # the images cf push --docker-image names
 sluice-wicket-registry = { path = "../sluice-wicket-registry" }
 serde = { version = "1", features = ["derive"] }

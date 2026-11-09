@@ -22,6 +22,7 @@ use http::{Method, StatusCode, header};
 use http_body_util::{BodyExt as _, Full, Limited};
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
+use sluice_wicket_console::http::asset;
 use sluice_wicket_server::accept::{self, Slot};
 use sluice_wicket_server::http::{self as connection, Body};
 use tokio::net::TcpListener;
@@ -406,6 +407,18 @@ impl Api {
                 }
             }
             (&Method::GET, ["uaa", "token_keys"]) => Ok(json(StatusCode::OK, &json!({"keys": []}))),
+            // the pages' style, the wickets' consoles'
+            (&Method::GET, ["uaa", "console.css"]) => Ok(asset(
+                "text/css; charset=utf-8",
+                sluice_wicket_console::serve::CSS.as_bytes(),
+            )),
+            (&Method::GET, ["uaa", "fonts", "overpass.woff2"]) => {
+                Ok(asset("font/woff2", sluice_wicket_console::serve::OVERPASS))
+            }
+            (&Method::GET, ["uaa", "fonts", "overpass-mono.woff2"]) => Ok(asset(
+                "font/woff2",
+                sluice_wicket_console::serve::OVERPASS_MONO,
+            )),
             (&Method::GET, ["uaa", "passcode"]) => {
                 let Some(provider) = &self.provider else {
                     return Ok(page(
@@ -455,14 +468,14 @@ impl Api {
                         let groups = self
                             .store
                             .read(|state| self.policy.explain_groups(state, &identity.claims))
-                            .map(|groups| format!("<p>{}</p>", escape(&groups)))
+                            .map(|groups| format!("<p class=\"hint\">{}</p>", escape(&groups)))
                             .unwrap_or_default();
                         match self.uaa.passcode(identity) {
                             Ok(passcode) => Ok(page(
                                 StatusCode::OK,
                                 "Temporary Authentication Code",
                                 format!(
-                                    "<p>Signed in as <b>{}</b>. Paste this code into <code>cf login --sso</code> (or <code>cf login --sso-passcode {passcode}</code>) within {} minutes; it works once.</p><p><code id=\"passcode\" class=\"big\">{passcode}</code></p>{groups}",
+                                    "<p>Signed in as <b>{}</b>. Paste this code into <code>cf login --sso</code> (or <code>cf login --sso-passcode {passcode}</code>) within {} minutes; it works once.</p><p class=\"passcode\"><code id=\"passcode\">{passcode}</code> <button type=\"button\" id=\"copy\" class=\"button button--primary\">Copy</button></p>{groups}{COPY_SCRIPT}",
                                     escape(&user),
                                     uaa::PASSCODE_TTL.as_secs() / 60
                                 ),
@@ -2477,16 +2490,31 @@ pub(crate) fn no_content() -> Response {
         .expect("a plain response")
 }
 
-/// A page of the browser flow: `title` and the `body` fragment.
+/// The passcode page's copy button: the clipboard where the page is a secure context (HTTPS,
+/// loopback), else the selection copied.
+const COPY_SCRIPT: &str = "<script>document.getElementById('copy').addEventListener('click',async function(){const code=document.getElementById('passcode');try{await navigator.clipboard.writeText(code.textContent)}catch(e){const range=document.createRange();range.selectNodeContents(code);const selection=getSelection();selection.removeAllRanges();selection.addRange(range);document.execCommand('copy')}this.textContent='Copied'})</script>";
+
+/// A page of `cf login --sso` (the passcode, the callback's answers): `title` and the `body`
+/// fragment, drawn as the wickets' consoles are.
 fn page(status: StatusCode, title: &str, body: String) -> Response {
     text(
         status,
         "text/html; charset=utf-8",
         format!(
-            "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width\"><title>{title}</title><style>body{{font-family:system-ui,sans-serif;max-width:40em;margin:3em auto;padding:0 1em;line-height:1.5}}code{{background:#f2f2f2;padding:.1em .3em;border-radius:.2em}}code.big{{font-size:2em;letter-spacing:.1em;display:inline-block;padding:.3em .6em;user-select:all}}</style></head><body><h1>{title}</h1>{body}</body></html>"
+            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><meta name=\"color-scheme\" content=\"light dark\"><title>{title} - Sluice cf-api</title><link rel=\"icon\" type=\"image/svg+xml\" href=\"{ICON}\"><link rel=\"stylesheet\" href=\"console.css\"><style>{STYLE}</style></head><body><header class=\"masthead\"><span class=\"brand\">{BRAND}</span></header><main class=\"page\"><section class=\"panel\"><h1 class=\"rule-heading\">{title}</h1>{body}</section></main></body></html>"
         ),
     )
 }
+
+/// The brand of the wickets' consoles (their `index.html`), named cf-api.
+const BRAND: &str = "<svg class=\"brand__mark\" viewBox=\"0 0 32 32\" aria-hidden=\"true\"><path d=\"M3 9h9M3 23h9M20 9h9M20 23h9\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.5\"/><path d=\"M12 9l4 7M12 23l4-7\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"2.5\" stroke-linecap=\"round\"/><path d=\"M2 16h8M22 16h8\" fill=\"none\" stroke=\"var(--water)\" stroke-width=\"1.5\" stroke-dasharray=\"2 3\"/></svg><span class=\"brand__word\">sluice</span><span class=\"brand__sub\">cf-api</span>";
+
+/// Its mark as the favicon, the palette pinned to the light theme (a favicon cannot read CSS
+/// variables).
+const ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Cpath d='M3 9h9M3 23h9M20 9h9M20 23h9' fill='none' stroke='%23143b69' stroke-width='1.5'/%3E%3Cpath d='M12 9l4 7M12 23l4-7' fill='none' stroke='%23143b69' stroke-width='2.5' stroke-linecap='round'/%3E%3Cpath d='M2 16h8M22 16h8' fill='none' stroke='%231b86c2' stroke-width='1.5' stroke-dasharray='2 3'/%3E%3C/svg%3E";
+
+/// What the consoles' style has not: the passcode, a literal value large enough to read off.
+const STYLE: &str = ".panel{max-width:44rem}.passcode{display:flex;flex-wrap:wrap;align-items:center;gap:1rem;margin:1.5rem 0}.passcode code{padding:.4rem 1rem .25rem;border:1px solid var(--hair);background:var(--paper-raised);font-size:var(--step-4);letter-spacing:.12em;user-select:all}";
 
 fn redirect(location: &str) -> Response {
     hyper::Response::builder()
