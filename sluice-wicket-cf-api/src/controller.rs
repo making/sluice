@@ -251,20 +251,22 @@ impl Controller {
     }
 
     /// Deletes the app `guid` (`name`): gone from every wicket first; one not taking that
-    /// removes it when it does.
+    /// removes it when it does. Each share is held until the state no longer has the app: a
+    /// listing of a wicket that answered first does not put it back meanwhile.
     pub async fn remove(&self, guid: &str, name: &str) {
         let _app = self.hold(guid).await;
         let removed = join_all(self.wickets.iter().map(|wicket| async move {
-            let _share = self.hold_share(guid, &wicket.name).await;
-            (wicket.name.clone(), self.apply(wicket, guid, None).await)
+            let share = self.hold_share(guid, &wicket.name).await;
+            let removed = self.apply(wicket, guid, None).await;
+            (wicket.name.clone(), removed, share)
         }))
         .await;
         let blobs = self.store.update(|state| {
-            for (wicket, removed) in removed {
-                if removed.is_err_and(|e| e.retried()) {
+            for (wicket, removed, _) in &removed {
+                if removed.as_ref().is_err_and(Failure::retried) {
                     state.removals.push(Removal {
                         app: guid.to_string(),
-                        wicket,
+                        wicket: wicket.clone(),
                     });
                 }
             }
@@ -2455,5 +2457,166 @@ mod tests {
 
         state.app_mut(&guid).unwrap().started = false;
         assert!(Controller::desired(&state, state.app(&guid).unwrap(), "cf").is_empty());
+    }
+
+    /// A wicket's app API as the controller uses it: a listing held until its revision moves,
+    /// answered a little later, `PUT` and `DELETE` of an app, the latter answered after
+    /// `deleting`.
+    struct FakeWicket {
+        apps: Mutex<BTreeMap<String, serde_json::Value>>,
+        revision: tokio::sync::watch::Sender<u64>,
+        /// The revision of the listing held last: the watch listed it.
+        held: tokio::sync::watch::Sender<Option<u64>>,
+        deleting: Duration,
+    }
+
+    impl FakeWicket {
+        /// Serves it on a port of its own: its URL.
+        async fn start(deleting: Duration) -> (Arc<FakeWicket>, String) {
+            let fake = Arc::new(FakeWicket {
+                apps: Mutex::default(),
+                revision: tokio::sync::watch::Sender::new(0),
+                held: tokio::sync::watch::Sender::new(None),
+                deleting,
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let serving = fake.clone();
+            tokio::spawn(sluice_wicket_server::accept::run(
+                listener,
+                16,
+                "fake",
+                move |stream, _, slot| {
+                    let fake = serving.clone();
+                    tokio::spawn(sluice_wicket_server::http::serve(stream, slot, move |r| {
+                        fake.clone().answer(r)
+                    }));
+                },
+            ));
+            (fake, url)
+        }
+
+        fn names(&self) -> Vec<String> {
+            let apps = self.apps.lock().unwrap();
+            apps.keys().cloned().collect()
+        }
+
+        fn moved(&self) -> u64 {
+            self.revision.send_modify(|revision| *revision += 1);
+            *self.revision.borrow()
+        }
+
+        async fn answer(
+            self: Arc<Self>,
+            request: hyper::Request<sluice_wicket_server::http::Body>,
+        ) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+            use http_body_util::BodyExt as _;
+            let (head, body) = request.into_parts();
+            let name = head.uri.path().strip_prefix("/api/apps/");
+            let answer = match (head.method, name.map(str::to_string)) {
+                (http::Method::GET, None) => {
+                    let after = head
+                        .uri
+                        .query()
+                        .and_then(|query| query.strip_prefix("after="));
+                    if let Some(after) = after.map(|after| after.parse::<u64>().unwrap()) {
+                        self.held.send_replace(Some(after));
+                        let mut revision = self.revision.subscribe();
+                        revision
+                            .wait_for(|revision| *revision != after)
+                            .await
+                            .unwrap();
+                        // after the answer to the edit that moved it
+                        tokio::time::sleep(LOOK).await;
+                    }
+                    let apps: Vec<serde_json::Value> = (self.apps.lock().unwrap().iter())
+                        .map(|(name, app)| {
+                            let mut app = app.clone();
+                            app["name"] = name.as_str().into();
+                            app["deployed"] = "".into();
+                            app["alive"] = serde_json::json!([]);
+                            app
+                        })
+                        .collect();
+                    let revision = *self.revision.borrow();
+                    serde_json::json!({"revision": revision, "generation": revision, "apps": apps})
+                }
+                (http::Method::PUT, Some(name)) => {
+                    let body = body.collect().await.unwrap().to_bytes();
+                    let app = serde_json::from_slice(&body).unwrap();
+                    self.apps.lock().unwrap().insert(name, app);
+                    serde_json::json!({"generation": self.moved(), "message": "put"})
+                }
+                (http::Method::DELETE, Some(name)) => {
+                    tokio::time::sleep(self.deleting).await;
+                    if self.apps.lock().unwrap().remove(&name).is_none() {
+                        let mut gone = hyper::Response::new(http_body_util::Full::default());
+                        *gone.status_mut() = http::StatusCode::NOT_FOUND;
+                        return gone;
+                    }
+                    serde_json::json!({"generation": self.moved(), "message": "removed"})
+                }
+                (method, name) => panic!("{method} {name:?}"),
+            };
+            hyper::Response::new(answer.to_string().into())
+        }
+    }
+
+    /// An app removed from two wickets, the second answering late: the first, whose watch lists
+    /// it gone meanwhile, does not have it put back, the state wanting it still. Its share is
+    /// held until the state no longer has the app.
+    #[tokio::test]
+    async fn a_removal_is_not_undone_by_a_listing() {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("cf-api-removal-{}", crate::store::guid()));
+        let wickets = ["a".to_string(), "b".to_string()];
+        let store = Store::open(&dir, "o", "s", &["localhost".into()], &wickets).unwrap();
+        let guid = store.update(|state| {
+            let space = state.spaces[0].guid.clone();
+            let domain = state.domains[0].guid.clone();
+            let app = state.create_app("hello", crate::store::STACK, &space);
+            app.process.instances = 2;
+            app.started = true;
+            app.running = Some(Running {
+                sha256: "ab".repeat(32),
+                file: "hello.wasm".into(),
+                memory_mib: 64,
+                ..Running::default()
+            });
+            let guid = app.guid.clone();
+            let route = state.create_route("hello", &domain, &space).guid.clone();
+            state.map(&route, &guid);
+            guid
+        });
+        let shares =
+            store.read(|state| Controller::desired(state, state.app(&guid).unwrap(), crate::OWNER));
+        assert_eq!(shares.keys().collect::<Vec<_>>(), ["a", "b"]);
+        let (a, url_a) = FakeWicket::start(Duration::ZERO).await;
+        let (b, url_b) = FakeWicket::start(Duration::from_millis(500)).await;
+        let controller = Arc::new(Controller::new(
+            Arc::new(store),
+            vec![
+                Arc::new(Wicket::new("a", 2, &url_a, None, crate::OWNER)),
+                Arc::new(Wicket::new("b", 2, &url_b, None, crate::OWNER)),
+            ],
+            Arc::new(Logs::default()),
+            Duration::ZERO,
+        ));
+        tokio::spawn(controller.clone().watch());
+        let within = Duration::from_secs(10);
+        let put = async {
+            while a.names().is_empty() || b.names().is_empty() {
+                tokio::time::sleep(LOOK).await;
+            }
+        };
+        tokio::time::timeout(within, put).await.unwrap();
+
+        controller.remove(&guid, "hello").await;
+        let revision = *a.revision.borrow();
+        let mut held = a.held.subscribe();
+        let listed = held.wait_for(|held| *held == Some(revision));
+        tokio::time::timeout(within, listed).await.unwrap().unwrap();
+        assert_eq!((a.names(), b.names()), (vec![], vec![]));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
