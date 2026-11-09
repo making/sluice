@@ -10,24 +10,10 @@ executable), the OSS `cf` 8.19.0.
 
 ## Steps
 
-1. The README's four files, with PostgreSQL added to `compose.yaml` (its volume under `volumes:` too) and its
-   password to `.env`. It is reached on the Compose network alone, by its service name:
-
-   ```yaml
-     postgres:
-       image: postgres:18-alpine
-       pull_policy: always
-       environment:
-         POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD}
-         POSTGRES_INITDB_ARGS: -c password_encryption=md5
-       volumes:
-         - postgres:/var/lib/postgresql
-       restart: unless-stopped
-   ```
-
-   ```text
-   POSTGRES_PASSWORD=5f0c1d2e3a4b5c6d7e8f90a1b2c3d4e5     # openssl rand -hex 16
-   ```
+1. The files of the [appendix](#appendix-the-files), in a directory of their own:
+   the README's [Docker Compose](../sluice-wicket-cf-api/README.md#docker-compose) with PostgreSQL added, reached
+   on the Compose network alone by its service name, without Redis (the keyvalue store is the default
+   `local`; Shiori uses none), the wicket's and Dex's configuration inlined (`configs:`).
 
    - md5, not the default SCRAM-SHA-256: Shiori opens a connection per request, and a SCRAM login costs the
      guest 0.7s (`authentication=698.039 ms` in the server's log; 1.18s a page against 0.47s). PostgreSQL 18
@@ -42,26 +28,14 @@ executable), the OSS `cf` 8.19.0.
    cf login -a http://127.0.0.1:9091 --sso      # admin@example.com / secret at Dex
    ```
 
-2. The component, in a directory of its own (`cf push` takes a directory or a zip), from a rontolisp checkout:
+2. The component, beside the manifest in `shiori/` (`cf push` takes a directory or a zip), from a rontolisp
+   checkout:
 
    ```text
-   rontolisp examples/db/shiori/shiori.lisp -o shiori/shiori.wasm --component --optimize   # 7s
+   rontolisp examples/db/shiori/shiori.lisp -o <the directory>/shiori/shiori.wasm --component --optimize   # 7s
    ```
 
-3. `shiori/manifest.yml`, the services it names, the push:
-
-   ```yaml
-   applications:
-   - name: shiori
-     instances: 2
-     memory: 256M
-     metadata:
-       annotations:
-         wicket.sluice.ik.am/budget-ms: "60000"   # the first start: see below
-     services:
-     - shiori-network
-     - shiori-dns
-   ```
+3. The services `shiori/manifest.yml` names, the push:
 
    ```text
    cf create-service wasi inherit-network shiori-network
@@ -118,3 +92,154 @@ cl-postgres writes a statement's messages in more than one write: each waits on 
 A wrong `DATABASE_URL` fails the top level: every request, the static files included, answers `500` with
 `wasm handler failed: wasm trap: ...` and the backtrace as its body; `cf logs` has `Unhandled condition:
 Database error: tcp-connect: cannot connect to ...`, and `cf app` shows the instances running.
+
+## Appendix: the files
+
+Run as they are on 2026-11-09 (Docker Compose v5.5.0), from `docker compose up -d` to Shiori's first page.
+The wicket's and Dex's configuration are in `compose.yaml` (`configs:`); `shiori.wasm` is step 2's.
+
+```text
+compose.yaml
+.env
+shiori/
+  manifest.yml
+  shiori.wasm
+```
+
+`compose.yaml`:
+
+```yaml
+# compose.yaml: Shiori's stack, the wicket's and Dex's configuration inlined; .env holds the secrets
+services:
+  postgres:
+    image: postgres:18-alpine
+    pull_policy: always
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD}
+      POSTGRES_INITDB_ARGS: -c password_encryption=md5    # not SCRAM: see Steps
+    volumes:
+      - postgres:/var/lib/postgresql
+    restart: unless-stopped
+  flume:                            # the apps' output and requests in cf logs
+    image: ghcr.io/making/sluice/sluice-flume
+    pull_policy: always
+    environment:
+      SLUICE_FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
+    restart: unless-stopped
+  dex:                              # the OpenID Provider cf login --sso goes through
+    image: ghcr.io/dexidp/dex:v2.46.1
+    pull_policy: always
+    command: [dex, serve, /etc/dex/dex.yaml]
+    configs:
+      - source: dex
+        target: /etc/dex/dex.yaml
+    networks:
+      default:
+        aliases: [dex.localhost]    # the issuer's host, as the browser reaches it on the loopback
+    ports:
+      - "127.0.0.1:5556:5556"
+    restart: unless-stopped
+  wicket:
+    image: ghcr.io/making/sluice/sluice-wicket-runtime-wasi
+    pull_policy: always
+    command: [--config, /etc/sluice/wicket.yaml]
+    configs:
+      - source: wicket
+        target: /etc/sluice/wicket.yaml
+    ports:
+      - "28000:28000"               # the apps
+      - "127.0.0.1:9090:9090"       # the console, from this host only
+    volumes:
+      - wicket:/data
+    depends_on: [dex]
+    restart: unless-stopped
+  cf-api:
+    image: ghcr.io/making/sluice/sluice-wicket-cf-api
+    pull_policy: always
+    command: [--listen, 0.0.0.0:9091, --wicket, http://wicket:9090, --flume, grpc://flume:8002, --oidc-issuer, http://dex.localhost:5556/dex]
+    environment:
+      SLUICE_WICKET_CF_API_WICKET_TOKEN: ${CONSOLE_TOKEN:?CONSOLE_TOKEN}
+      SLUICE_WICKET_CF_API_FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
+      SLUICE_WICKET_CF_API_DOMAIN: ${APPS_DOMAIN:-localhost}
+      SLUICE_WICKET_CF_API_OIDC_CLIENT_ID: sluice
+      SLUICE_WICKET_CF_API_OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
+      SLUICE_WICKET_CF_API_OIDC_CLAIM: email=admin@example.com    # who may log in
+      SLUICE_WICKET_CF_API_ADMIN: email=admin@example.com    # who is an admin
+    ports:
+      - "127.0.0.1:9091:9091"       # the API, from this host only
+    volumes:
+      - cf-api:/data
+    depends_on: [wicket, dex]
+    restart: unless-stopped
+configs:
+  wicket:
+    content: |
+      listen: 0.0.0.0:28000
+      console: 0.0.0.0:9090
+      console-token: ${CONSOLE_TOKEN:?CONSOLE_TOKEN}
+      console-dir: /data/deployed
+      oidc-issuer: http://dex.localhost:5556/dex
+      oidc-client-id: sluice
+      oidc-client-secret: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
+      oidc-claim: email=admin@example.com
+      flume: grpc://flume:8002
+      flume-token: ${FLUME_TOKEN:?FLUME_TOKEN}
+  dex:
+    content: |
+      issuer: http://dex.localhost:5556/dex
+      storage:
+        type: memory
+      web:
+        http: 0.0.0.0:5556
+      oauth2:
+        skipApprovalScreen: true
+      staticClients:
+        - id: sluice
+          name: sluice
+          secret: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
+          redirectURIs:
+            - http://127.0.0.1:9091/uaa/callback
+            - http://127.0.0.1:9090/oauth2/callback
+      enablePasswordDB: true
+      staticPasswords:
+        - email: admin@example.com     # password "secret"
+          username: admin
+          preferredUsername: admin
+          userID: 1c2a0b3e-0000-4000-8000-000000000001
+          hash: "${ADMIN_PASSWORD_HASH:?ADMIN_PASSWORD_HASH}"
+volumes:
+  postgres:
+  wicket:
+  cf-api:
+```
+
+`.env`:
+
+```text
+# .env, next to compose.yaml: these values work as they are; change the secrets (openssl rand
+# -hex 16 each) and the password before anyone else can reach the host
+POSTGRES_PASSWORD=5f0c1d2e3a4b5c6d7e8f90a1b2c3d4e5
+FLUME_TOKEN=d6edd1ade98c42dd49b77a7ba4906881
+CONSOLE_TOKEN=92190bcaf0277ff738ee4162d89c9eeb
+OIDC_CLIENT_SECRET=13915f086b88d15379e27e6c3aa4a59f
+# admin@example.com's password, bcrypt: htpasswd -bnBC 10 "" <password> | tr -d ':\n'
+# (single-quoted: $ is Compose's otherwise); this one is "secret"
+ADMIN_PASSWORD_HASH='$2y$10$cYEVeVIzJX6QWDQcjRUaNe1RHrXamph8BdMRzlR/LS7msAe83oJOi'
+# a name whose wildcard DNS reaches the host (default localhost)
+# APPS_DOMAIN=apps.example.com
+```
+
+`shiori/manifest.yml`:
+
+```yaml
+applications:
+- name: shiori
+  instances: 2
+  memory: 256M
+  metadata:
+    annotations:
+      wicket.sluice.ik.am/budget-ms: "60000"   # the first start: see The first start
+  services:
+  - shiori-network
+  - shiori-dns
+```
