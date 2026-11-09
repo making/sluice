@@ -13,7 +13,11 @@ Diego places a lost cell's instances elsewhere once its presence expires.
 - Back, it serves its `routes.yaml` at once, through the server too, before the cf-api reaches it: an app moved
   away meanwhile, maybe of an older droplet or env, takes requests until the cf-api removes it. Weigh a wicket
   advertising an `api` app only once its controller listed or put it since its start, bounded so it still
-  serves with the cf-api down (README Behavior: "The wicket serves on while the cf-api is down")
+  serves with the cf-api down (README Behavior: "The wicket serves on while the cf-api is down").
+  Not moves alone: an app deleted, stopped or scaled off it while it was away is served the same way
+  (seen 2026-11-09 through a sluice server: `cf delete` with the wicket killed, the wicket restarted served
+  the deleted app 8s), bounded by the cf-api's next listing, whose pause after an unreachable wicket grows
+  to 30s (`watch_one`): the wicket telling the cf-api it is back, or a shorter pause, narrows it
 - Then the spread restored, as 257 does for a wicket back
 - A wicket flapping moves no app back and forth; a partition (the cf-api cut off from a wicket the server
   still reaches) runs the moved instances twice until it heals: say so

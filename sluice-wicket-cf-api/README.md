@@ -876,8 +876,8 @@ mode stays one wicket.
 - **Updating the wickets**, one at a time: a wicket stopping drains (`--drain-grace`, 20s), its
   routes withdrawn on every node, and the server sends their hosts to the other wicket; started
   again, it serves the apps of its console directory before it advertises them, and the cf-api
-  puts nothing again. An app of `-i 2` or more serves on; one of `-i 1` answers 503 until its
-  wicket is back. The server's default `sluice.http-load-balance`, `smallest-client-id`, sends
+  puts nothing again. An app of `-i 2` or more serves on; one of `-i 1`, or one mapping a store of
+  each wicket's host (all its instances on one wicket), answers 503 until its wicket is back. The server's default `sluice.http-load-balance`, `smallest-client-id`, sends
   every request to one wicket, the other standing by; `round-robin` shares them. Let a stop take
   longer than the drain (`stop_grace_period` / `terminationGracePeriodSeconds` 30s, a Firecracker
   wicket's 40s), and update the next wicket once the first serves again (`cf app` shows its
