@@ -512,25 +512,25 @@ async fn every_route_serves_http_through_the_tunnel() {
     // the console's route after a restart: started again from its directory alone
     if image.is_none() {
         // told to stop, it waits for shop's move alone: data and late are on a disk no other
-        // wicket has; once its owner said it moved what it could, it drains
-        let pid = match jailed {
-            true => wicket.keeper(),
-            false => wicket.child.id() as i32,
-        };
-        wicket.signal("TERM", pid);
-        said(
-            &wicket,
-            "leaving: serving on while the controllers move 1 app(s) elsewhere, 60s at most \
-             (--evacuation-grace): cf/shop",
-        )
-        .await;
-        let path = "/api/evacuated/cf";
-        let (status, leaving) = console(wicket.console(), "PUT", path, true, Bytes::new()).await;
-        assert_eq!(
-            (status, &leaving["evacuated"]),
-            (200, &serde_json::json!(["cf"]))
-        );
-        said(&wicket, "evacuated: no app left to wait for").await;
+        // wicket has; once its owner said it moved what it could, it drains. Jailed, the
+        // keeper is gone already (`jails` kills it)
+        if !jailed {
+            wicket.signal("TERM", wicket.child.id() as i32);
+            said(
+                &wicket,
+                "leaving: serving on while the controllers move 1 app(s) elsewhere, 60s at \
+                 most (--evacuation-grace): cf/shop",
+            )
+            .await;
+            let path = "/api/evacuated/cf";
+            let (status, leaving) =
+                console(wicket.console(), "PUT", path, true, Bytes::new()).await;
+            assert_eq!(
+                (status, &leaving["evacuated"]),
+                (200, &serde_json::json!(["cf"]))
+            );
+            said(&wicket, "evacuated: no app left to wait for").await;
+        }
         drop(wicket);
         if !jailed {
             let late = console_dir.join("disks/cf/late.ext4");
