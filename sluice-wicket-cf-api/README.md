@@ -247,6 +247,10 @@ SpaceDeveloper`, or a group's: `SLUICE_WICKET_CF_API_GROUP_ROLE:
 devs=space_developer@sluice/wicket`); a Dex [connector](https://dexidp.io/docs/connectors/)
 replaces the static users with GitHub, LDAP, another OpenID Provider and the like.
 
+An app with a database of its own in the same Compose, PostgreSQL beside the wicket: rontolisp's Shiori, with
+the capabilities it is bound, the `budget-ms` its first start needs and what a page takes, in
+[.kb/shiori-on-wasi-wicket.md](../.kb/shiori-on-wasi-wicket.md).
+
 ### Mapping to components
 
 | CF | wicket |
