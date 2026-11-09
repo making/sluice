@@ -273,6 +273,15 @@ impl State {
                 removal.wicket.clone_from(first);
             }
         }
+        // the rootfs a wicket no --wicket names made: none serves them
+        let unnamed = |made: &mut BTreeMap<String, String>| {
+            made.retain(|wicket, _| configured.contains(wicket))
+        };
+        self.droplets
+            .iter_mut()
+            .for_each(|droplet| unnamed(&mut droplet.made));
+        let running = self.apps.iter_mut().filter_map(|app| app.running.as_mut());
+        running.for_each(|running| unnamed(&mut running.made));
         let mut said = Vec::new();
         self.removals.retain(|removal| {
             let named = configured.contains(&removal.wicket);

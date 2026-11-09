@@ -958,6 +958,7 @@ mod tests {
         app.running = Some(crate::store::Running {
             droplet: "d".into(),
             sha256: "ab".repeat(32),
+            made: Default::default(),
             file: "a.wasm".into(),
             files: None,
             memory_mib: 64,

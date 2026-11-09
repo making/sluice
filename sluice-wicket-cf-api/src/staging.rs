@@ -162,6 +162,7 @@ pub async fn run(
                 file: staged.entry,
                 bytes: staged.size,
                 image: staged.image,
+                made: Default::default(),
                 files: staged.files,
                 created_at: at.clone(),
                 updated_at: at.clone(),

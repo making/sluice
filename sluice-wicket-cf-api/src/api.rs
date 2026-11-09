@@ -2411,6 +2411,7 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
     Ok(Running {
         droplet: droplet.guid.clone(),
         sha256: droplet.sha256.clone(),
+        made: droplet.made.clone(),
         file: droplet
             .file
             .rsplit('/')

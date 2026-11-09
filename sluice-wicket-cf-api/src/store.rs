@@ -277,6 +277,9 @@ pub struct Lifetime {
 pub struct Running {
     pub droplet: String,
     pub sha256: String,
+    /// The droplet's [`Droplet::made`] as started, kept as it is.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub made: BTreeMap<String, String>,
     /// The component's file name in the wicket (the droplet's web process,
     /// less its directories).
     pub file: String,
@@ -765,11 +768,54 @@ pub struct Droplet {
     /// for a zip's.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image: Option<String>,
+    /// An image's rootfs, which each Firecracker wicket makes itself, of its own guest: the
+    /// digest a wicket made where it is not `sha256` (the one staging made), by wicket name. A
+    /// wicket not named is asked for `sha256`: a state written before names none, its
+    /// `sha256` the one wicket's.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub made: BTreeMap<String, String>,
     /// A static site's files, the component serving them its `sha256`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<Files>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl Droplet {
+    /// What the wicket `wicket` serves it as ([`Droplet::made`]).
+    pub fn sha256_on(&self, wicket: &str) -> &str {
+        made_on(&self.sha256, &self.made, wicket)
+    }
+
+    /// The wicket `wicket` made it as `sha256`.
+    pub fn made_as(&mut self, wicket: &str, sha256: &str) {
+        note_made(&self.sha256, &mut self.made, wicket, sha256);
+    }
+}
+
+impl Running {
+    /// What the wicket `wicket` serves it as ([`Droplet::made`]).
+    pub fn sha256_on(&self, wicket: &str) -> &str {
+        made_on(&self.sha256, &self.made, wicket)
+    }
+
+    /// The wicket `wicket` made it as `sha256`.
+    pub fn made_as(&mut self, wicket: &str, sha256: &str) {
+        note_made(&self.sha256, &mut self.made, wicket, sha256);
+    }
+}
+
+/// The digest `wicket` serves a droplet of `sha256` as, `made` its own ([`Droplet::made`]).
+fn made_on<'a>(sha256: &'a str, made: &'a BTreeMap<String, String>, wicket: &str) -> &'a str {
+    made.get(wicket).map_or(sha256, String::as_str)
+}
+
+/// `wicket` made a droplet of `sha256` as `digest`: named in `made` when it is another.
+fn note_made(sha256: &str, made: &mut BTreeMap<String, String>, wicket: &str, digest: &str) {
+    match digest == sha256 {
+        true => made.remove(wicket),
+        false => made.insert(wicket.to_string(), digest.to_string()),
+    };
 }
 
 /// A tar of a static site's files (`droplets/<sha256>.tar`), the wicket's
@@ -1729,6 +1775,7 @@ mod tests {
             file: "hello.wasm".into(),
             bytes: 1,
             image: None,
+            made: BTreeMap::new(),
             files: None,
             created_at: now(),
             updated_at: now(),

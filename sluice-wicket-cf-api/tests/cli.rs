@@ -2082,7 +2082,9 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     let (listen, console, api_listen) = (free(), free(), free());
     // a state directory each: a killed wicket's stays, and is refused
     let starts = AtomicUsize::new(0);
-    let start_wicket = || {
+    // the wicket on `listen` of the console `console` and its directory `deployed`, its VMs'
+    // /init `guest`
+    let start_wicket_on = |listen: &str, console: &str, deployed: &str, guest: &Path| {
         let (firecracker, kernel, state) = (
             firecracker.to_str().unwrap(),
             kernel.to_str().unwrap(),
@@ -2102,13 +2104,13 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
                 "--flume-token",
                 FLUME_TOKEN,
                 "--listen",
-                &listen,
+                listen,
                 "--console",
-                &console,
+                console,
                 "--console-token",
                 TOKEN,
                 "--console-dir",
-                dir.join("deployed").to_str().unwrap(),
+                dir.join(deployed).to_str().unwrap(),
                 "--guest",
                 guest.to_str().unwrap(),
                 "--watch-interval",
@@ -2118,6 +2120,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         wicket.logged("console on http://");
         wicket
     };
+    let start_wicket = || start_wicket_on(&listen, &console, "deployed", &guest);
     let mut wicket = start_wicket();
     // an API taking any credentials names who edits the security groups by the name given
     let (api, url) = start_api(
@@ -2869,9 +2872,68 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         .find(|app| app["hosts"][0] == "fc.localhost");
     assert_eq!(fc.unwrap()["component"]["sha256"], sha256.as_str());
 
+    // a second wicket of another guest, as in a rolling upgrade of the wickets: it makes the
+    // image's rootfs of its own digest at its first put and serves it, the first wicket the one
+    // staged; neither makes it again, nor is put again once both listed it
+    let guest_b = dir.join("guest-b");
+    std::fs::copy(&guest, &guest_b).unwrap();
+    let mut bytes = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&guest_b)
+        .unwrap();
+    bytes.write_all(b"other bytes").unwrap();
+    drop(bytes);
+    let (listen_b, console_b) = (free(), free());
+    let wicket_b = start_wicket_on(&listen_b, &console_b, "deployed-b", &guest_b);
+    drop(api);
+    let (api, _) = start_api(
+        &api_listen,
+        &[
+            format!("wicket=http://{console}"),
+            format!("b=http://{console_b}"),
+        ],
+        &flume_url,
+        &dir.join("cf"),
+        &["--any-credentials"],
+    );
+    cf.ok(&["scale", "fc", "-i", "2"]);
+    let served_as = |console: &str| {
+        let listed = listing(console);
+        let apps = listed["apps"].as_array().unwrap();
+        let fc = apps.iter().find(|app| app["hosts"][0] == "fc.localhost");
+        let fc = fc.unwrap_or_else(|| panic!("no fc: {listed}"));
+        let revision = listed["revision"].as_u64().unwrap();
+        (
+            fc["component"]["sha256"].as_str().unwrap().to_string(),
+            revision,
+        )
+    };
+    let own = served_as(&console_b).0;
+    assert_ne!(own, sha256, "a guest of other bytes");
+    let made = api.line("made the rootfs of");
+    assert!(
+        made.contains(&format!("The wicket b made the rootfs of {image}@")),
+        "{made}"
+    );
+    // a restart puts both, each its own
+    cf.ok(&["restart", "fc"]);
+    let (on_a, on_b) = (served_as(&console), served_as(&console_b));
+    assert_eq!((&on_a.0, &on_b.0), (&sha256, &own));
+    for listen in [&listen, &listen_b] {
+        assert_eq!(get(listen, "fc.localhost", "/", None).0, 200);
+    }
+    instances_come_to(&cf, "fc", "2/2");
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!((served_as(&console), served_as(&console_b)), (on_a, on_b));
+    let made: Vec<String> = (api.lines.try_iter())
+        .filter(|line| line.contains("made the rootfs of"))
+        .collect();
+    assert_eq!(made, Vec::<String>::new(), "made again");
+
     for app in ["fc", "zipped"] {
         cf.ok(&["delete", app, "-r", "-f"]);
     }
+    drop(wicket_b);
     assert!(listing(&console)["apps"].as_array().unwrap().is_empty());
     assert_eq!(get(&listen, "fc.localhost", "/", None).0, 404);
     drop(api);

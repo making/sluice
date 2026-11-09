@@ -199,7 +199,7 @@ impl Controller {
             .health_check
             .timeout
             .unwrap_or(DEFAULT_HEALTH_CHECK_TIMEOUT);
-        let share = |indices: &[u64]| {
+        let share = |wicket: &str, indices: &[u64]| {
             let instances = indices.len() as u64;
             let warm =
                 warm.map(|warm| indices.iter().filter(|index| **index < warm).count() as u64);
@@ -231,7 +231,7 @@ impl Controller {
                 owner: owner.to_string(),
                 hosts: hosts.clone(),
                 component: ComponentRef {
-                    sha256: running.sha256.clone(),
+                    sha256: running.sha256_on(wicket).to_string(),
                     name: running.file.clone(),
                 },
                 files: running.files.clone().map(|sha256| FilesRef { sha256 }),
@@ -241,7 +241,10 @@ impl Controller {
         };
         let indices = state.indices(app).into_iter();
         indices
-            .map(|(wicket, indices)| (wicket, share(&indices)))
+            .map(|(wicket, indices)| {
+                let share = share(&wicket, &indices);
+                (wicket, share)
+            })
             .collect()
     }
 
@@ -584,7 +587,7 @@ impl Controller {
         {
             // the droplet is not uploaded (or no more): upload it and put again
             for sha256 in missing.clone() {
-                if let Err(e) = self.provide(wicket, &sha256, &mut app).await {
+                if let Err(e) = self.provide(wicket, guid, &sha256, &mut app).await {
                     put = Err(e);
                     break;
                 }
@@ -652,13 +655,15 @@ impl Controller {
         true
     }
 
-    /// Has `wicket` hold the droplet `sha256` of `app`: uploaded when the cf-api has its bytes,
-    /// else made again of the image it was pinned from (a wicket's own rootfs). A wicket of
-    /// another guest makes another digest: the droplet and the running app are that one's from
-    /// here on, a rebuild of the same image and guest the same.
+    /// Has `wicket` hold the droplet `sha256` of `app` (the app `guid`'s share): uploaded when the
+    /// cf-api has its bytes, else made again of the image it was pinned from (a wicket's own
+    /// rootfs), logged. A wicket of another guest makes another digest: the droplet and the
+    /// running apps are that one's on that wicket from here on ([`crate::store::Droplet::made`]),
+    /// on the others as they were; a rebuild of the same image and guest the same.
     async fn provide(
         &self,
         wicket: &Wicket,
+        guid: &str,
         sha256: &str,
         app: &mut AppBody,
     ) -> Result<(), Failure> {
@@ -688,7 +693,7 @@ impl Controller {
                 .droplets
                 .iter()
                 .rev()
-                .find(|kept| kept.sha256 == sha256)?;
+                .find(|kept| kept.sha256_on(&wicket.name) == sha256)?;
             let image = droplet.image.clone()?;
             let credentials = state
                 .packages
@@ -709,20 +714,23 @@ impl Controller {
             .as_ref()
             .map(|(username, password)| (username.as_str(), password.as_str()));
         let made = wicket.make_image(&image, credentials).await?;
+        let line = format!(
+            "{} made the rootfs of {image} (sha256 {})",
+            wicket.sentence(),
+            made.sha256.get(..12).unwrap_or(&made.sha256)
+        );
+        self.logs.add(guid, "CELL", line);
         if made.sha256 != sha256 {
+            let on = wicket.name.as_str();
             self.store.update(|state| {
                 for droplet in &mut state.droplets {
-                    if droplet.sha256 == sha256 {
-                        droplet.sha256 = made.sha256.clone();
-                        droplet.bytes = made.bytes;
+                    if droplet.sha256_on(on) == sha256 {
+                        droplet.made_as(on, &made.sha256);
                     }
                 }
-                for kept in &mut state.apps {
-                    if let Some(running) = &mut kept.running
-                        && running.sha256 == sha256
-                    {
-                        running.sha256 = made.sha256.clone();
-                    }
+                let running = state.apps.iter_mut().filter_map(|app| app.running.as_mut());
+                for running in running.filter(|running| running.sha256_on(on) == sha256) {
+                    running.made_as(on, &made.sha256);
                 }
             });
             app.component.sha256 = made.sha256;
@@ -1127,6 +1135,7 @@ mod tests {
         let running = Running {
             droplet: "d".into(),
             sha256: "ab".repeat(32),
+            made: BTreeMap::new(),
             file: "hello.wasm".into(),
             files: Some("cd".repeat(32)),
             memory_mib: 64,
@@ -1481,6 +1490,24 @@ mod tests {
             };
             assert_eq!((counts("w"), counts("v")), (on_w, on_v), "{file} {warm:?}");
         }
+        // an image's rootfs v made of its own guest: v's share names v's digest, w's the one
+        // staged; v listing it is as wanted, the staged one not
+        let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
+        let (staged, own) = (running.sha256.clone(), "ef".repeat(32));
+        running.made_as("v", &own);
+        let shares = Controller::desired(&state, state.app(&guid).unwrap(), "cf");
+        assert_eq!(
+            (&shares["w"].component.sha256, &shares["v"].component.sha256),
+            (&staged, &own)
+        );
+        let mut listed = shares["v"].clone();
+        assert!(same(&listed, &shares["v"]));
+        listed.component.sha256.clone_from(&staged);
+        assert!(!same(&listed, &shares["v"]), "the digest w made");
+        // v making the staged one again: named no more
+        let running = state.app_mut(&guid).unwrap().running.as_mut().unwrap();
+        running.made_as("v", &staged);
+        assert!(running.made.is_empty());
         // scaled down, the highest go, v's with them; not below what the start keeps warm
         let app = state.app_mut(&guid).unwrap();
         app.process.instances = 1;

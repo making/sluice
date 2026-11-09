@@ -707,7 +707,7 @@ The wicket's listing says `runtime: firecracker`.
 |---|---|
 | package (docker) | any container image, `--docker-username` with `CF_DOCKER_PASSWORD` its credentials: the build has the wicket make its rootfs (`PUT /api/images`), which pulls it. Listening on `PORT`, as on CF. Spring Boot reads `SERVER_PORT`, not `PORT`: its default fits, an app with another `server.port` takes `cf set-env <app> SERVER_PORT 8080` |
 | package (bits) | a zip holding the rootfs, `.ext4` as a component's `.wasm` is picked (160 MiB at most, unpacking to 4 GiB at most: an image is the way for more) |
-| droplet | the rootfs by sha256 (stack `firecracker`, buildpack `rootfs`; an image's has neither, as on CF): the wicket keeps an image's, the cf-api its reference pinned to the manifest's digest, and has it made again when the wicket lost it (the same digest, unless the wicket's guest changed) |
+| droplet | the rootfs by sha256 (stack `firecracker`, buildpack `rootfs`; an image's has neither, as on CF): the wicket keeps an image's, the cf-api its reference pinned to the manifest's digest and, per wicket, the digest it made, and has it made again when the wicket lost it (the same digest, unless the wicket's guest changed) |
 | web process `instances` | `instances`, [the limit](#instances) of the app's VMs: `mode=pool`, that many VMs cloned from a snapshot, one too; [annotated](#how-long-a-vm-lives), any mode. 0 is [as on CF](#mapping): no VM and no app in the wicket |
 | web process `memory` | `memory-mib`, 1G by default as on CF: less fails a CNB Java image's memory calculator at its start. The snapshot takes what its guest wrote of it on the host's memory (`--tmpfs /run/sluice`; [measured](../.kb/wicket-firecracker-findings.md#a-snapshots-memory)), and at most all of it |
 | web process `health_check` `timeout` (`cf push -t`) | `boot-ms`, 60s by default and 180s at most as on CF: how long the process may take to listen, in the request that starts it. A process exiting first is refused at once |
@@ -854,10 +854,10 @@ mode stays one wicket.
   directory (a volume each; a StatefulSet on Kubernetes). The marketplace is what every wicket
   offers. A `local` keyvalue store is a file of each wicket's host: an app over two
   wickets reads and writes two namespaces, so bind it a store they share (`redis`). Firecracker
-  wickets make an image's rootfs each, one at staging, the others at their first put of it:
-  wickets of two guests make two digests, so push no image while they run, as during an update of
-  the wickets changing the guest. The cf-api runs beside the wickets, not as an app of one, which
-  would stop with it
+  wickets make an image's rootfs each, one at staging, the others at their first put of it, the
+  cf-api keeping the digest each made: wickets of two guests, as during an update of the wickets
+  changing the guest, serve one image as two digests. The cf-api runs beside the wickets, not as
+  an app of one, which would stop with it
 - **Updating the wickets**, one at a time: a wicket stopping drains (`--drain-grace`, 20s), its
   routes withdrawn on every node, and the server sends their hosts to the other wicket; started
   again, it serves the apps of its console directory before it advertises them, and the cf-api
