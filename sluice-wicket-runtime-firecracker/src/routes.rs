@@ -16,9 +16,10 @@
 //! is named after them.
 //!
 //! How many VMs and how long (`route::Bounds`) is no change of them: the route running takes it
-//! as it is ([`Route::adjust`]). An app's target names none of it, so nothing is advertised; a
-//! route's does, so its VMs go on under the target of its new numbers, the old one served by them
-//! as a removed one is.
+//! as it is ([`Route::adjust`]). An app's target names none of it, so its routes stay, but for the
+//! weight its `instances` make ([`RouteSpec::weight`]), advertised in the generation it was; a
+//! route's target does, so its VMs go on under the target of its new numbers, the old one served
+//! by them as a removed one is.
 //!
 //! A disk has one writer (`disk`), so a route's VM on a disk is the exception to the
 //! order: once every other target started, the VM holding the disk is stopped, then
@@ -62,7 +63,7 @@ use sluice_wicket_console::http::Received;
 use sluice_wicket_console::status::Status;
 use sluice_wicket_tunnel::listener::Replay;
 use sluice_wicket_tunnel::proto::Upstream;
-use sluice_wicket_tunnel::routes::{Binding, Routes};
+use sluice_wicket_tunnel::routes::{Binding, Routes, same_routes};
 use sluice_wicket_tunnel::tunnel::TunnelIo;
 use sluice_wicket_tunnel::workers::Workers;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -1332,6 +1333,7 @@ impl Reloader {
             .map(|spec| Upstream {
                 host: spec.host.clone(),
                 target_url: spec.target(),
+                weight: spec.weight(),
                 ..Default::default()
             })
             .collect();
@@ -1379,21 +1381,22 @@ impl Reloader {
                 change.removed.push(up.host.clone());
             }
         }
-        let same_routes =
+        let unchanged =
             change.added.is_empty() && change.removed.is_empty() && change.restarted.is_empty();
-        if same_routes && advertised == current.advertised {
+        if unchanged && same_routes(&advertised, &current.advertised) {
             for (target, spec, _) in kept {
                 if let Some(started) = self.started.get_mut(&target) {
                     started.spec = spec;
                 }
             }
             // how many and how long, or where a route comes from (a console route's time),
-            // changed alone: in the generation it was, nothing to advertise
-            let moved_on = origins != current.origins;
+            // changed alone: in the generation it was, no route to acknowledge, an app's weight
+            // advertised all the same
+            let moved_on = origins != current.origins || advertised != current.advertised;
             if moved_on {
                 self.routes.publish(Table {
                     generation: current.generation,
-                    advertised: current.advertised.clone(),
+                    advertised,
                     routes: current.routes.clone(),
                     origins,
                     console: current.console,

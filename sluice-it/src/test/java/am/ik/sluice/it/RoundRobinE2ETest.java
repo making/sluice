@@ -38,13 +38,17 @@ import static org.assertj.core.api.Assertions.assertThat;
  * End to end verification of the round-robin load balancing
  * ({@code sluice.http-load-balance} / {@code sluice.tcp-load-balance}): two clients
  * serving the same domain or listen port alternate across successive connections instead
- * of pinning the route to the smallest client id.
+ * of pinning the route to the smallest client id; serving one with a weight each, they
+ * share it by their weights instead.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
 class RoundRobinE2ETest {
 
 	private static final String HOST = "rr.local";
+
+	/** Served by client-a with weight 2, by client-b with weight 1. */
+	private static final String WEIGHTED = "weighted.local";
 
 	private static final TaskExecutor TASK_EXECUTOR = task -> Thread.ofVirtual().name("e2e-round-robin").start(task);
 
@@ -160,14 +164,16 @@ class RoundRobinE2ETest {
 	 */
 	private void startClients() {
 		this.clients.computeIfAbsent("client-b", id -> {
-			TunnelClient client = startClient(id, httpUpstream(httpUpstreamB), tcpUpstream(tcpUpstreamB));
+			TunnelClient client = startClient(id, httpUpstream(httpUpstreamB), weightedUpstream(httpUpstreamB, 1),
+					tcpUpstream(tcpUpstreamB));
 			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> this.sessions.count() >= 1);
 			// its routes are registered once it handled the advertise acknowledgement
 			Awaitility.await().atMost(Duration.ofSeconds(5)).until(client::isConnected);
 			return client;
 		});
 		this.clients.computeIfAbsent("client-a", id -> {
-			TunnelClient client = startClient(id, httpUpstream(httpUpstreamA), tcpUpstream(tcpUpstreamA));
+			TunnelClient client = startClient(id, httpUpstream(httpUpstreamA), weightedUpstream(httpUpstreamA, 2),
+					tcpUpstream(tcpUpstreamA));
 			Awaitility.await().atMost(Duration.ofSeconds(5)).until(() -> this.sessions.count() >= 2);
 			Awaitility.await().atMost(Duration.ofSeconds(5)).until(client::isConnected);
 			return client;
@@ -179,6 +185,15 @@ class RoundRobinE2ETest {
 	private static Upstream httpUpstream(@Nullable HttpServer server) {
 		java.util.Objects.requireNonNull(server, "http upstream not started");
 		return Upstream.builder().host(HOST).target("http://127.0.0.1:" + server.getAddress().getPort()).build();
+	}
+
+	private static Upstream weightedUpstream(@Nullable HttpServer server, int weight) {
+		java.util.Objects.requireNonNull(server, "http upstream not started");
+		return Upstream.builder()
+			.host(WEIGHTED)
+			.target("http://127.0.0.1:" + server.getAddress().getPort())
+			.weight(weight)
+			.build();
 	}
 
 	private static Upstream tcpUpstream(@Nullable ServerSocket server) {
@@ -258,7 +273,7 @@ class RoundRobinE2ETest {
 	}
 
 	@Test
-	void httpRequestsAlternateBetweenTheTwoClients() throws Exception {
+	void httpRequestsAlternateBetweenTheTwoClientsOrGoByTheirWeights() throws Exception {
 		startClients();
 		String portA = String.valueOf(java.util.Objects.requireNonNull(httpUpstreamA).getAddress().getPort());
 		String portB = String.valueOf(java.util.Objects.requireNonNull(httpUpstreamB).getAddress().getPort());
@@ -271,6 +286,13 @@ class RoundRobinE2ETest {
 		assertThat(second).isEqualTo(portA.equals(first) ? portB : portA);
 		assertThat(third).isEqualTo(first);
 		assertThat(fourth).isEqualTo(second);
+		// 2 of every 3 to the client of weight 2, whatever the order they registered in
+		java.util.List<String> weighted = new java.util.ArrayList<>();
+		for (int i = 0; i < 6; i++) {
+			weighted.add(httpGet(WEIGHTED));
+		}
+		assertThat(weighted).filteredOn(portA::equals).hasSize(4);
+		assertThat(weighted).filteredOn(portB::equals).hasSize(2);
 	}
 
 	@Test

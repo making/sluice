@@ -61,7 +61,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 /**
  * Drives the management console in a real browser against a running server with one
  * tunnel client advertising an http and a tcp upstream, feeding its access log to a
- * sluice-flume started after the server.
+ * sluice-flume started after the server, and a second client standing by for one of its
+ * hosts and sharing another by their weights.
  */
 @SpringBootTest(classes = SluiceServerApplication.class, webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT)
 @TestInstance(Lifecycle.PER_CLASS)
@@ -73,7 +74,10 @@ class ConsoleE2ETest {
 
 	private static final String CONSOLE_PASSWORD = "console-pass";
 
-	/** A second client on the same host; the larger id stands by. */
+	/**
+	 * A second client on the same host; the larger id stands by. On {@code h1only.local}
+	 * both carry a weight, sharing it.
+	 */
 	private static final String STANDBY_ID = "console-z";
 
 	/** The browser's zone: unlike that of any machine running the server. */
@@ -177,6 +181,7 @@ class ConsoleE2ETest {
 					.target("http://127.0.0.1:" + http.getAddress().getPort())
 					.rewriteHost(false)
 					.forceHttp1(true)
+					.weight(2)
 					.build())
 				.token("it-token")
 				.build())
@@ -193,6 +198,12 @@ class ConsoleE2ETest {
 					.host("demo.local")
 					.target("http://127.0.0.1:" + http.getAddress().getPort())
 					.rewriteHost(false)
+					.build())
+				.upstream(Upstream.builder()
+					.host("h1only.local")
+					.target("http://127.0.0.1:" + http.getAddress().getPort())
+					.forceHttp1(true)
+					.weight(1)
 					.build())
 				.token("it-token")
 				.build())
@@ -320,16 +331,22 @@ class ConsoleE2ETest {
 			.isEqualToNormalizingWhitespace("""
 					HTTP demo.local http://127.0.0.1:%d Serving Keeps Host
 					TCP :%d db.local tcp://127.0.0.1:%d Serving
-					HTTP h1only.local http://127.0.0.1:%d Serving Keeps Host, HTTP/1.1 only
+					HTTP h1only.local http://127.0.0.1:%d Weight 2 of 3 Keeps Host, HTTP/1.1 only
 					""".formatted(httpPort, tcpRoutePort, tcpPort, httpPort));
 		assertThat(page.locator("[data-client='" + STANDBY_ID + "'] table.upstreams tbody").innerText())
 			.isEqualToNormalizingWhitespace("""
 					HTTP demo.local http://127.0.0.1:%d Standby, console-client serves Keeps Host
-					""".formatted(httpPort));
+					HTTP h1only.local http://127.0.0.1:%d Weight 1 of 3 Keeps Host, HTTP/1.1 only
+					""".formatted(httpPort, httpPort));
 		assertThat(page.locator("tbody[data-route='demo.local']").innerText()).isEqualToNormalizingWhitespace("""
 				demo.local Smallest client id wins Open Shut
 				console-client 127.0.0.1:%d Serving
 				console-z 127.0.0.1:%d Standby
+				""".formatted(httpPort, httpPort));
+		assertThat(page.locator("tbody[data-route='h1only.local']").innerText()).isEqualToNormalizingWhitespace("""
+				h1only.local Requests rotate across these clients by their weights Open Auth: bearer Log: off Shut
+				console-client 127.0.0.1:%d Weight 2 of 3 HTTP/1.1 only
+				console-z 127.0.0.1:%d Weight 1 of 3 HTTP/1.1 only
 				""".formatted(httpPort, httpPort));
 		assertThat(page.locator("tbody[data-route='h1only.local'] [data-testid=route-auth]").innerText())
 			.isEqualTo("Auth: bearer");
@@ -406,7 +423,7 @@ class ConsoleE2ETest {
 		assertThat(page.locator("[id='outlet-" + CLIENT_ID + "'] text").allTextContents())
 			.containsExactly("console-client0 open", "Serves demo.local, h1only.local, :" + tcpRoutePort);
 		assertThat(page.locator("[id='outlet-" + STANDBY_ID + "'] text").allTextContents())
-			.containsExactly("console-z0 open", "Standby for demo.local");
+			.containsExactly("console-z0 open", "Serves h1only.local", "Standby for demo.local");
 	}
 
 	@Test

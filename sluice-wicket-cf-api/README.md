@@ -824,9 +824,11 @@ cf restart blog
 them, so one wicket can stop while the apps serve on -- those of `-i 2` or more on their other
 instances, all of them once moved off a wicket told to stop, or gone -- and the wickets be
 updated one at a time. Clients reach them through a [sluice server](../README.md), each wicket
-advertising the hosts of the apps it runs and the server sending a host to one of the wickets
-serving it. A wicket's `--listen` serves its own apps only and drains nothing (a signal ends it
-once evacuated): local mode stays one wicket.
+advertising the hosts of the apps it runs, the app's instances on it their weight, and the server
+spreading a host's requests over the wickets serving it by them (its
+[Scale-out](../README.md#scale-out)): `-i 3` over two wickets, 2 of every 3 to the wicket of two.
+A wicket's `--listen` serves its own apps only and drains nothing (a signal ends it once
+evacuated): local mode stays one wicket.
 
 - **Placement.** Each index of an app's web process is on a wicket, kept in the state: a new
   index goes to a wicket with room for it holding none of the app's while there is one, else to
@@ -930,14 +932,12 @@ once evacuated): local mode stays one wicket.
   the other wicket; started again, it serves the apps of its console directory before it
   advertises them (a Firecracker wicket each once a VM of it is up and passed its [readiness
   check](#mapping-to-vms)), those of the cf-api once it confirmed them (above), and the cf-api
-  puts nothing again but the indices it takes back. Every
-  app moved serves on; without an evacuation, one of `-i 1`, or one mapping a store of each
-  wicket's host (all its instances on one wicket), answers 503 until its wicket is back. The
-  server's default `sluice.http-load-balance`, `smallest-client-id`, sends every request to one
-  wicket, the other standing by; `round-robin` shares them. Let a stop take longer than the
-  evacuation and the drain together (`stop_grace_period` / `terminationGracePeriodSeconds`: 90s
-  for an evacuation of 60s, 20s more for a Firecracker wicket's disks), and update the next wicket
-  once the first serves again: its readiness probe (`--health`, see the wicket's [Readiness
+  puts nothing again but the indices it takes back. Every app moved serves on; without an
+  evacuation, one of `-i 1`, or one mapping a store of each wicket's host (all its instances on
+  one wicket), answers 503 until its wicket is back. Let a stop take longer than the evacuation
+  and the drain together (`stop_grace_period` / `terminationGracePeriodSeconds`: 90s for an
+  evacuation of 60s, 20s more for a Firecracker wicket's disks), and update the next wicket once
+  the first serves again: its readiness probe (`--health`, see the wicket's [Readiness
   probe](../sluice-wicket-runtime-wasi/README.md#readiness-probe)) says so once every node of the
   server took its routes, each with an instance ready and none held. A route that does not start
   ends the wicket's start. On Kubernetes the cf-api reaches a wicket leaving (a pod terminating, no
@@ -1024,7 +1024,7 @@ keyvalue:
 docker compose up -d
 cf login -a http://127.0.0.1:9091 --sso
 cf push hello -p hello/ -i 2               # an instance on each wicket
-curl http://hello.localhost:28000/         # through the server
+curl http://hello.localhost:28000/         # through the server, each wicket taking half
 cf curl "/v3/apps/$(cf app hello --guid)/processes/web/stats" | jq -c '.resources[] | [.index, .host]'
 # an update, one wicket at a time: each moves its apps to the other and drains (hello goes on
 # through the other), and is waited for until it is ready again, taking hello's second back
@@ -1371,7 +1371,9 @@ groups, service keys, sharing a service instance with another space, an organiza
 other than an admin, more than 1000 instances of an app, a deployment of a revision (there are
 none: `cf rollback` finds none). One quota, of no limit. One owner (`cf`) per wicket: two cf-apis
 must not share one. The wickets of one cf-api run apps one way, and are told apart by their names
-alone: two names of one console behind two URLs defeat the spread.
+alone: two names of one console behind two URLs defeat the spread. No session affinity (the
+gorouter's `JSESSIONID` / `__VCAP_ID__`): a request goes to any instance of its app, so what a
+session holds belongs in a service.
 
 ## Tests
 

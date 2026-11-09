@@ -21,14 +21,16 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * server-wide allow list), and how long a connection relayed verbatim -- TLS passthrough,
  * a tcp route, a hostless connection, an upgraded HTTP/1.1 connection -- may relay no
  * byte in either direction before the server closes it ({@code verbatim-idle-timeout};
- * {@code 0} = the server's default), and the filters its HTTP/1.1 exchanges pass, in
- * request order ({@code filters}): such an upstream is {@code force-http1}, and it cannot
- * be relayed verbatim.
+ * {@code 0} = the server's default), the filters its HTTP/1.1 exchanges pass, in request
+ * order ({@code filters}): such an upstream is {@code force-http1}, and it cannot be
+ * relayed verbatim, and its share of its route among the clients serving it
+ * ({@code weight}; {@code 0} = none): when every one carries one, the server spreads the
+ * route by them, whatever its load balancing strategy.
  */
 public record Upstream(String host, @DefaultValue("") String hostPattern, String target,
 		@DefaultValue("false") boolean rewriteHost, boolean tlsPassthrough, @DefaultValue("false") boolean forceHttp1,
 		int listenPort, @DefaultValue List<String> allowedCidrs, @DefaultValue("0") Duration verbatimIdleTimeout,
-		@DefaultValue List<FilterConfig> filters) {
+		@DefaultValue List<FilterConfig> filters, @DefaultValue("0") int weight) {
 
 	public Upstream {
 		host = host == null ? "" : host.trim();
@@ -43,6 +45,9 @@ public record Upstream(String host, @DefaultValue("") String hostPattern, String
 		}
 		target = normalizeTarget(target);
 		listenPort = Math.max(0, listenPort);
+		if (weight < 0) {
+			throw new IllegalArgumentException("upstream " + target + " has a negative weight: " + weight);
+		}
 		allowedCidrs = allowedCidrs == null ? List.of() : List.copyOf(allowedCidrs);
 		verbatimIdleTimeout = verbatimIdleTimeout == null || verbatimIdleTimeout.isNegative() ? Duration.ZERO
 				: verbatimIdleTimeout;
@@ -133,6 +138,8 @@ public record Upstream(String host, @DefaultValue("") String hostPattern, String
 
 		private List<FilterConfig> filters = List.of();
 
+		private int weight;
+
 		private Builder() {
 		}
 
@@ -186,10 +193,15 @@ public record Upstream(String host, @DefaultValue("") String hostPattern, String
 			return this;
 		}
 
+		public Builder weight(int weight) {
+			this.weight = weight;
+			return this;
+		}
+
 		public Upstream build() {
 			return new Upstream(this.host, this.hostPattern, Objects.requireNonNull(this.target, "target is required"),
 					this.rewriteHost, this.tlsPassthrough, this.forceHttp1, this.listenPort, this.allowedCidrs,
-					this.verbatimIdleTimeout, this.filters);
+					this.verbatimIdleTimeout, this.filters, this.weight);
 		}
 
 	}

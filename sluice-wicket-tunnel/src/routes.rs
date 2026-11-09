@@ -14,6 +14,11 @@
 //! still bound: the server may have routed a connection to it before. So is a
 //! route held ([`Table::held`]): an app a wicket serves once its controller
 //! confirmed it since the wicket's start.
+//!
+//! A route's weight (`Upstream::weight`: its instances, by which the server
+//! spreads its host over the clients serving it) is no change of the routes
+//! ([`same_routes`]): a wicket publishes a change of it in the generation it
+//! was, which every stream advertises all the same.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -214,6 +219,18 @@ impl<T: Table> Routes<T> {
             false => Err(why.join("; ")),
         }
     }
+}
+
+/// Whether `a` and `b` advertise the same routes, in the same order, whatever their weights.
+pub fn same_routes(a: &[Upstream], b: &[Upstream]) -> bool {
+    a.len() == b.len()
+        && a.iter().zip(b).all(|(a, b)| {
+            let weighed = Upstream {
+                weight: b.weight,
+                ..a.clone()
+            };
+            weighed == *b
+        })
 }
 
 /// A live stream's acknowledgements; dropping it unregisters the stream.

@@ -122,7 +122,7 @@ class TunnelSessionStreamLogTest {
 				"client " + clientId + " advertised 1 upstream(s), 0 listen port(s) rejected",
 				"client " + clientId + " upstream: host=[" + clientId
 						+ ".example.com] target=http://127.0.0.1:9 rewrite-host=false tls-passthrough=false "
-						+ "listen-port=0 verbatim-idle-timeout=server default",
+						+ "listen-port=0 verbatim-idle-timeout=server default weight=none",
 				"closing session for client " + clientId);
 	}
 
@@ -170,9 +170,9 @@ class TunnelSessionStreamLogTest {
 		assertThat(messages(Level.INFO).stream().filter(line -> line.startsWith("client r upstream: ")))
 			.containsExactly(
 					"client r upstream: host=[a.example.com] target=http://127.0.0.1:9 rewrite-host=false "
-							+ "tls-passthrough=false listen-port=0 verbatim-idle-timeout=server default",
+							+ "tls-passthrough=false listen-port=0 verbatim-idle-timeout=server default weight=none",
 					"client r upstream: host=[b.example.com] target=http://127.0.0.1:9 rewrite-host=false "
-							+ "tls-passthrough=false listen-port=0 verbatim-idle-timeout=server default");
+							+ "tls-passthrough=false listen-port=0 verbatim-idle-timeout=server default weight=none");
 		assertThat(debugMessages().stream().filter(line -> line.startsWith("client r advertised"))).hasSize(2);
 	}
 

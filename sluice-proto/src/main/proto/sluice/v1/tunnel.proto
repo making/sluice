@@ -234,4 +234,11 @@ message Upstream {
   // connection) may relay no byte in either direction before the server closes it;
   // 0 = the server's default applies.
   uint64 verbatim_idle_timeout_millis = 9;
+  // The upstream's share of its route among the clients serving the route, as
+  // instances (a wicket's route: its `instances`); 0 = none. When every client
+  // serving the route carries one, each server node spreads the route's
+  // connections and requests over them by it (smooth weighted round robin),
+  // whatever its load balancing strategy; otherwise the strategy picks, the
+  // weights aside. A server predating the field ignores it.
+  uint32 weight = 10;
 }

@@ -329,7 +329,8 @@ stay as they were until a file changes again or SIGHUP. Otherwise
   unchanged, so nothing is advertised again
 - a sandbox changed in `warm`, `instances`, `keep-ms` or `concurrency` alone keeps its handler, what runs on it
   included ([instance pool](#instance-pool)): a route's goes on under the target naming the new
-  numbers, an app's target names none of them (`adjusted`), so nothing is advertised
+  numbers, an app's target names none of them (`adjusted`), so only the weight its
+  `instances` make is advertised ([Cluster / reconnect](#cluster--reconnect))
 - an added or removed host, or a changed sandbox (a new target; its env included), is
   advertised again on every node stream. A removed target keeps being served -- a
   connection the server routed before it took the new routes included -- until every
@@ -572,7 +573,7 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
 - an app's routes share a handler, and never with another app (its target names it,
   `…/counter.wasm?app=counter&…`): its pool, its `instances` cap and its guests' output stay
   its own. Its target names none of `warm`, `instances`, `keep-ms` and `concurrency`: a PUT changing them is
-  [no change of what runs](#instance-pool), and advertises nothing
+  [no change of what runs](#instance-pool), and advertises only the weight its `instances` make
 - answered as the console's edits, and 409 for a host another source, the page or another app
   routes, for another owner's app, and for a component or files no upload kept (`"missing":
   ["<sha256>", ..]`, every digest missing); a 422 names the host whose route did not load
@@ -890,7 +891,9 @@ bootstrap for a node without one), following `MembershipUpdate`. So the
 bootstrap may be a load balancer over any node, but each public url must
 reach its own node (the wicket warns when a stream reaches another one). A
 dropped stream reconnects with jittered exponential backoff (ceiling
-1s..30s, each wait drawn from its upper half).
+1s..30s, each wait drawn from its upper half). A route advertises its
+`instances` as its weight (none without): the server spreads a host several
+wickets serve by them.
 
 ## Readiness probe
 

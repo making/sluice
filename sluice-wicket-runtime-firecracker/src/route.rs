@@ -503,6 +503,14 @@ impl RouteSpec {
         Ok(readiness)
     }
 
+    /// What the route advertises as its weight: its `instances` (a booted route's VMs, a pool's or
+    /// a cloned route's most), by which the server spreads its host over the wickets serving it;
+    /// none without.
+    pub fn weight(&self) -> u32 {
+        let instances = self.bounds.instances;
+        instances.map_or(0, |vms| u32::try_from(vms).unwrap_or(u32::MAX))
+    }
+
     /// Whether `other` asks for the same VMs, its host and its [`Bounds`] aside.
     pub fn same_vms(&self, other: &RouteSpec) -> bool {
         self.vm == other.vm

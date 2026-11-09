@@ -31,7 +31,9 @@ import am.ik.sluice.v1.proto.Upstream;
  * http route keyed by its domain or, when it declares a host pattern, by that regular
  * expression; lookup tries the exact matches, then the patterns, and falls back to the
  * catch-all entry registered with an empty domain. When several clients serve one key the
- * configured load balancing strategy picks the target.
+ * configured load balancing strategy picks the target, unless every one of them carries a
+ * weight ({@code Upstream.weight}, a wicket's route its instances): then they share the
+ * key by their weights ({@link WeightedRoundRobinStrategy}), whatever the strategy.
  */
 public class Router {
 
@@ -193,12 +195,33 @@ public class Router {
 	 * @param key the domain ({@code ""} = catch-all) or the listen port of tcp routes
 	 * @param candidates every registered route, in registration order
 	 * @param preferred the route lookups resolve to when the load balancing is
-	 * deterministic; {@code null} when the strategy rotates or randomizes
+	 * deterministic; {@code null} when the candidates share the key by their weights, or
+	 * the strategy rotates or randomizes
+	 * @param weights the weight each candidate carries, in their order; {@code 0} = none
 	 */
-	public record RouteGroup(String key, List<Route> candidates, @Nullable Route preferred) {
+	public record RouteGroup(String key, List<Route> candidates, @Nullable Route preferred, List<Long> weights) {
 
 		public RouteGroup {
 			candidates = List.copyOf(candidates);
+			weights = List.copyOf(weights);
+			if (weights.size() != candidates.size()) {
+				throw new IllegalArgumentException(
+						"%d weights for %d candidates".formatted(weights.size(), candidates.size()));
+			}
+		}
+
+		/**
+		 * Whether the candidates share the key by their weights: every one carries one.
+		 */
+		public boolean weighted() {
+			return !this.weights.isEmpty() && !this.weights.contains(0L);
+		}
+
+		/**
+		 * The sum of the candidates' weights.
+		 */
+		public long totalWeight() {
+			return this.weights.stream().mapToLong(Long::longValue).sum();
 		}
 
 		public static Builder builder() {
@@ -212,6 +235,8 @@ public class Router {
 			private List<Route> candidates = List.of();
 
 			private @Nullable Route preferred;
+
+			private @Nullable List<Long> weights;
 
 			private Builder() {
 			}
@@ -231,18 +256,32 @@ public class Router {
 				return this;
 			}
 
+			/**
+			 * The weight of each candidate, in their order; unset, none carries one.
+			 */
+			public Builder weights(List<Long> weights) {
+				this.weights = weights;
+				return this;
+			}
+
 			public RouteGroup build() {
+				List<Long> weights = this.weights != null ? this.weights
+						: this.candidates.stream().map(candidate -> 0L).toList();
 				return new RouteGroup(Objects.requireNonNull(this.key, "key is required"), this.candidates,
-						this.preferred);
+						this.preferred, weights);
 			}
 
 		}
 
 	}
 
+	/**
+	 * A registered upstream; {@code weight} its share of its key among the targets
+	 * carrying one, {@code 0} = none.
+	 */
 	record Target(String clientId, String domain, String address, boolean rewriteHost, boolean tlsPassthrough,
 			boolean forceHttp1, int listenPort, List<String> allowedCidrs, Duration verbatimIdleTimeout,
-			@Nullable Pattern hostPattern, @Nullable String literalHost) {
+			@Nullable Pattern hostPattern, @Nullable String literalHost, long weight) {
 
 		Target {
 			allowedCidrs = allowedCidrs == null ? List.of() : List.copyOf(allowedCidrs);
@@ -275,6 +314,8 @@ public class Router {
 			private @Nullable Pattern hostPattern;
 
 			private @Nullable String literalHost;
+
+			private long weight;
 
 			private Builder() {
 			}
@@ -334,12 +375,17 @@ public class Router {
 				return this;
 			}
 
+			Builder weight(long weight) {
+				this.weight = weight;
+				return this;
+			}
+
 			Target build() {
 				return new Target(Objects.requireNonNull(this.clientId, "clientId is required"),
 						Objects.requireNonNull(this.domain, "domain is required"),
 						Objects.requireNonNull(this.address, "address is required"), this.rewriteHost,
 						this.tlsPassthrough, this.forceHttp1, this.listenPort, this.allowedCidrs,
-						this.verbatimIdleTimeout, this.hostPattern, this.literalHost);
+						this.verbatimIdleTimeout, this.hostPattern, this.literalHost, this.weight);
 			}
 
 		}
@@ -361,13 +407,9 @@ public class Router {
 
 	private final Object lock = new Object();
 
-	private final LoadBalance httpLoadBalance;
+	private final Balancing http;
 
-	private final LoadBalance tcpLoadBalance;
-
-	private final LoadBalanceStrategy httpStrategy;
-
-	private final LoadBalanceStrategy tcpStrategy;
+	private final Balancing tcp;
 
 	private final RouteGate gate;
 
@@ -388,11 +430,9 @@ public class Router {
 	 * through to the next candidate
 	 */
 	public Router(LoadBalance httpLoadBalance, LoadBalance tcpLoadBalance, RouteGate gate) {
-		this.httpLoadBalance = httpLoadBalance;
-		this.tcpLoadBalance = tcpLoadBalance;
+		this.http = new Balancing(httpLoadBalance);
+		this.tcp = new Balancing(tcpLoadBalance);
 		this.gate = Objects.requireNonNull(gate, "gate is required");
-		this.httpStrategy = httpLoadBalance.instance();
-		this.tcpStrategy = tcpLoadBalance.instance();
 	}
 
 	/**
@@ -421,6 +461,7 @@ public class Router {
 				.verbatimIdleTimeout(verbatimIdleTimeoutOf(upstream))
 				.hostPattern(hostPattern)
 				.literalHost(upstream.getHost())
+				.weight(Integer.toUnsignedLong(upstream.getWeight()))
 				.build());
 		}
 		if (clientId == null || clientId.isBlank()) {
@@ -487,19 +528,25 @@ public class Router {
 		if (old == null) {
 			return;
 		}
+		// a key left without a target: the load balancing lets go of its state
 		for (Target target : old) {
 			if (target.listenPort() > 0) {
-				this.byPort.compute(target.listenPort(), (k, existing) -> without(existing, clientId));
+				if (this.byPort.compute(target.listenPort(), (k, existing) -> without(existing, clientId)).isEmpty()) {
+					this.tcp.forget(Integer.toString(target.listenPort()));
+				}
 			}
 			else if (target.hostPattern() != null) {
 				// an empty list is dropped entirely so stale pattern keys go away
-				this.byPattern.compute(target.domain(), (k, existing) -> {
+				List<Target> left = this.byPattern.compute(target.domain(), (k, existing) -> {
 					List<Target> remaining = without(existing, clientId);
 					return remaining.isEmpty() ? null : remaining;
 				});
+				if (left == null) {
+					this.http.forget(target.domain());
+				}
 			}
-			else {
-				this.byDomain.compute(target.domain(), (k, existing) -> without(existing, clientId));
+			else if (this.byDomain.compute(target.domain(), (k, existing) -> without(existing, clientId)).isEmpty()) {
+				this.http.forget(target.domain());
 			}
 		}
 	}
@@ -529,10 +576,11 @@ public class Router {
 	 * without its port, whole match, keys in their natural String order), then the
 	 * catch-all entry. When several clients serve the same domain the configured http
 	 * load balancing strategy picks the target (the default, smallest client id, is
-	 * deterministic across nodes -- in fan-out mode every node holds every client).
+	 * deterministic across nodes -- in fan-out mode every node holds every client),
+	 * unless every one carries a weight: then they share it by their weights.
 	 */
 	public Optional<Route> lookup(@Nullable String host) {
-		return match(host).map(candidate -> toRoute(this.httpStrategy.pick(candidate.key(), candidate.targets())));
+		return match(host).map(candidate -> toRoute(this.http.pick(candidate.key(), candidate.targets())));
 	}
 
 	/**
@@ -544,7 +592,7 @@ public class Router {
 		if (targets == null || targets.isEmpty() || !this.gate.isOpen("tcp:" + port)) {
 			return Optional.empty();
 		}
-		return Optional.of(toRoute(this.tcpStrategy.pick(Integer.toString(port), targets)));
+		return Optional.of(toRoute(this.tcp.pick(Integer.toString(port), targets)));
 	}
 
 	/**
@@ -552,7 +600,7 @@ public class Router {
 	 * candidate order as {@link #lookup} but without advancing any load balancing state.
 	 */
 	public Optional<RouteGroup> resolve(@Nullable String host) {
-		return match(host).map(candidate -> group(candidate.key(), candidate.targets(), this.httpLoadBalance));
+		return match(host).map(candidate -> this.http.group(candidate.key(), candidate.targets()));
 	}
 
 	/**
@@ -689,10 +737,7 @@ public class Router {
 				merged.merge(key, targets, Router::concat);
 			}
 		});
-		return merged.entrySet()
-			.stream()
-			.map(entry -> group(entry.getKey(), entry.getValue(), this.httpLoadBalance))
-			.toList();
+		return merged.entrySet().stream().map(entry -> this.http.group(entry.getKey(), entry.getValue())).toList();
 	}
 
 	private static List<Target> concat(List<Target> first, List<Target> second) {
@@ -709,16 +754,16 @@ public class Router {
 			.stream()
 			.filter(entry -> !entry.getValue().isEmpty())
 			.sorted(Comparator.comparing(Map.Entry::getKey))
-			.map(entry -> group(Integer.toString(entry.getKey()), entry.getValue(), this.tcpLoadBalance))
+			.map(entry -> this.tcp.group(Integer.toString(entry.getKey()), entry.getValue()))
 			.toList();
 	}
 
 	public LoadBalance httpLoadBalance() {
-		return this.httpLoadBalance;
+		return this.http.loadBalance;
 	}
 
 	public LoadBalance tcpLoadBalance() {
-		return this.tcpLoadBalance;
+		return this.tcp.loadBalance;
 	}
 
 	/** The route gates; the console shuts and reopens them. */
@@ -726,15 +771,56 @@ public class Router {
 		return this.gate;
 	}
 
-	private static RouteGroup group(String key, List<Target> targets, LoadBalance loadBalance) {
-		// only the stateless deterministic strategy can be previewed without side effects
-		Route preferred = loadBalance == LoadBalance.SMALLEST_CLIENT_ID
-				? toRoute(LoadBalance.SMALLEST_CLIENT_ID.instance().pick(key, targets)) : null;
-		return RouteGroup.builder()
-			.key(key)
-			.candidates(targets.stream().map(Router::toRoute).toList())
-			.preferred(preferred)
-			.build();
+	/**
+	 * Whether every target carries a weight: then they share their key by it.
+	 */
+	private static boolean weighted(List<Target> targets) {
+		for (Target target : targets) {
+			if (target.weight() == 0) {
+				return false;
+			}
+		}
+		return !targets.isEmpty();
+	}
+
+	/**
+	 * How one route space, http or tcp, picks among the targets of a key: by their
+	 * weights when every one carries one, else by its strategy. Each keeps its own state.
+	 */
+	private static final class Balancing {
+
+		private final LoadBalance loadBalance;
+
+		private final LoadBalanceStrategy strategy;
+
+		private final LoadBalanceStrategy weighted = new WeightedRoundRobinStrategy();
+
+		Balancing(LoadBalance loadBalance) {
+			this.loadBalance = loadBalance;
+			this.strategy = loadBalance.instance();
+		}
+
+		Target pick(String key, List<Target> targets) {
+			return weighted(targets) ? this.weighted.pick(key, targets) : this.strategy.pick(key, targets);
+		}
+
+		void forget(String key) {
+			this.strategy.forget(key);
+			this.weighted.forget(key);
+		}
+
+		RouteGroup group(String key, List<Target> targets) {
+			// only a deterministic winner can be previewed without side effects
+			Route preferred = this.loadBalance == LoadBalance.SMALLEST_CLIENT_ID && !weighted(targets)
+					? toRoute(LoadBalance.SMALLEST_CLIENT_ID.instance().pick(key, targets)) : null;
+			return RouteGroup.builder()
+				.key(key)
+				.candidates(targets.stream().map(Router::toRoute).toList())
+				.preferred(preferred)
+				.weights(targets.stream().map(Target::weight).toList())
+				.build();
+		}
+
 	}
 
 	private static Route toRoute(Target target) {

@@ -15,7 +15,8 @@
 //!
 //! A sandbox's `warm`, `instances`, `keep-ms` and `concurrency` are no change of what serves:
 //! the handler takes them as it runs ([`Handler::resize`]). An app's target names none of them,
-//! so nothing is advertised; a route's does, so its handler goes on under the target of its new
+//! so its routes stay, but for the weight its `instances` make ([`weight`]), advertised in the
+//! generation it was; a route's target does, so its handler goes on under the target of its new
 //! numbers, the old one lingering as a removed one does.
 //!
 //! The console changes its own routes and its API's apps through the same
@@ -32,6 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use sluice_wicket_console::held::Held;
+use sluice_wicket_tunnel::routes::same_routes;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -105,6 +107,14 @@ fn app_target(locator: &str, sandbox: &Sandbox, app: &str) -> String {
         query if query.is_empty() => format!("{locator}?app={app}"),
         query => format!("{locator}?app={app}&{query}"),
     }
+}
+
+/// What a route advertises as its weight: its `instances`, by which the server spreads its host
+/// over the wickets serving it; none without.
+fn weight(sandbox: &Sandbox) -> u32 {
+    sandbox
+        .instances
+        .map_or(0, |instances| u32::try_from(instances).unwrap_or(u32::MAX))
 }
 
 /// A target's handler, and the token its connections watch.
@@ -848,6 +858,7 @@ impl Reloader {
                 host: spec.host.clone(),
                 target_url: target.clone(),
                 rewrite_host: false,
+                weight: weight(&spec.sandbox),
                 ..Default::default()
             });
             plan.origins.insert(spec.host.clone(), spec.origin.clone());
@@ -943,12 +954,12 @@ impl Reloader {
     }
 
     /// Publishes `plan` and retires the handlers it replaced, the others taking their `warm`,
-    /// `instances`, `keep-ms` and `concurrency`; None when it changes no route. Origins or those changed alone
-    /// (an app's tag, a scale) are published in the generation they were: nothing to advertise
-    /// or acknowledge.
+    /// `instances`, `keep-ms` and `concurrency`; None when it changes no route. Origins, weights
+    /// or those changed alone (an app's tag, a scale) are published in the generation they were:
+    /// no route to acknowledge, a weight advertised all the same.
     fn commit(&mut self, plan: Plan) -> Option<Change> {
         let current = self.routes.current();
-        let unchanged = plan.advertised == current.advertised
+        let unchanged = same_routes(&plan.advertised, &current.advertised)
             && plan
                 .targets
                 .iter()
@@ -966,11 +977,11 @@ impl Reloader {
             }
         }
         if unchanged && current.generation > 0 {
-            let moved_on = plan.origins != current.origins;
+            let moved_on = plan.origins != current.origins || plan.advertised != current.advertised;
             if moved_on {
                 self.routes.publish(Table {
                     generation: current.generation,
-                    advertised: current.advertised.clone(),
+                    advertised: plan.advertised,
                     origins: plan.origins,
                     entries: current.entries.clone(),
                     console: current.console,
@@ -1963,7 +1974,12 @@ pub(crate) mod tests {
         assert_eq!(reloader.routes().current().origins["s1.local"], origin);
         assert!(status.borrow().revision > revision, "the console sees it");
         assert!(manifest().contains("tag: \"v2\""), "{}", manifest());
-        // nor does a scale: its target names no count, and the handler running takes it
+        // nor does a scale: its target names no count, and the handler running takes it; the
+        // weight its instances make is advertised, in the same generation
+        let weight_of = |table: &Table| {
+            let up = table.advertised.iter().find(|up| up.host == "s1.local");
+            up.expect("advertised").weight
+        };
         let revision = status.borrow().revision;
         let scaled = match shop(&["s1.local"], &fetch, &place) {
             Edit::PutApp { name, mut app } => {
@@ -1978,6 +1994,7 @@ pub(crate) mod tests {
         };
         let unscaled = reloader.routes().current();
         let unscaled_target = unscaled.target("s1.local");
+        assert_eq!(weight_of(&unscaled), 0, "no instances: no weight");
         assert_eq!(
             reloader.apply(scaled).await,
             Ok(Outcome {
@@ -1990,6 +2007,7 @@ pub(crate) mod tests {
         );
         let scaled = reloader.routes().current();
         assert_eq!(scaled.target("s1.local"), unscaled_target);
+        assert_eq!(weight_of(&scaled), 3);
         assert!(Arc::ptr_eq(
             scaled.handler(&unscaled_target).unwrap(),
             unscaled.handler(&unscaled_target).unwrap()

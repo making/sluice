@@ -274,6 +274,7 @@ public record SluiceClientProperties(String serverUrl, @Nullable Client client, 
 				.setListenPort(upstream.listenPort())
 				.addAllAllowedCidrs(upstream.allowedCidrs())
 				.setVerbatimIdleTimeoutMillis(upstream.verbatimIdleTimeoutMillis())
+				.setWeight(upstream.weight())
 				.build())
 			.toList();
 	}

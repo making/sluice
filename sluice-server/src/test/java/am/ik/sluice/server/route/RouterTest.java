@@ -3,11 +3,13 @@ package am.ik.sluice.server.route;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
+import java.util.stream.IntStream;
 
 import am.ik.sluice.v1.proto.Upstream;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.Timeout;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.junit.jupiter.params.provider.ValueSource;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -347,6 +349,74 @@ class RouterTest {
 		router.remove("c1");
 		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c2");
 		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c2");
+		// a key left without a target starts its rotation afresh
+		router.remove("c2");
+		router.register("c1", List.of(upstream("demo.local", "http://127.0.0.1:3000")));
+		router.register("c2", List.of(upstream("demo.local", "http://127.0.0.2:3000")));
+		assertThat(router.lookup("demo.local").orElseThrow().clientId()).isEqualTo("c1");
+	}
+
+	private static Upstream weighted(Upstream upstream, int weight) {
+		return upstream.toBuilder().setWeight(weight).build();
+	}
+
+	private static List<String> picks(Router router, String host, int times) {
+		return IntStream.range(0, times).mapToObj(i -> router.lookup(host).orElseThrow().clientId()).toList();
+	}
+
+	/**
+	 * Targets each carrying a weight share their key by it, whatever the strategy: smooth
+	 * weighted round robin, each its weight in every round of their sum, interleaved,
+	 * http and tcp routes alike. A weight changed by a re-registration goes on from where
+	 * the rotation is; a key left without a target starts afresh.
+	 */
+	@ParameterizedTest
+	@EnumSource(LoadBalance.class)
+	void targetsCarryingWeightsShareTheirKeyByThemWhateverTheStrategy(LoadBalance loadBalance) {
+		Router router = new Router(loadBalance, loadBalance);
+		Upstream one = upstream("demo.local", "http://127.0.0.1:3001");
+		Upstream two = upstream("demo.local", "http://127.0.0.2:3002");
+		router.register("c1", List.of(weighted(one, 2), weighted(portUpstream(16379, "tcp://127.0.0.1:7001"), 2)));
+		router.register("c2", List.of(weighted(two, 1), weighted(portUpstream(16379, "tcp://127.0.0.2:7002"), 1)));
+		assertThat(picks(router, "demo.local", 6)).containsExactly("c1", "c2", "c1", "c1", "c2", "c1");
+		assertThat(IntStream.range(0, 3).mapToObj(i -> router.lookupByPort(16379).orElseThrow().clientId()))
+			.containsExactly("c1", "c2", "c1");
+
+		router.register("c2", List.of(weighted(two, 2)));
+		assertThat(picks(router, "demo.local", 5)).containsExactly("c1", "c2", "c1", "c2", "c1");
+
+		router.remove("c1");
+		router.remove("c2");
+		router.register("c1", List.of(weighted(one, 2)));
+		router.register("c2", List.of(weighted(two, 1)));
+		assertThat(picks(router, "demo.local", 3)).containsExactly("c1", "c2", "c1");
+	}
+
+	/**
+	 * A key not every target of which carries a weight goes by the strategy, the weights
+	 * aside: a client predating them among wickets carrying theirs. The route table tells
+	 * the weights, and no winner of a key shared by them; a weight is unsigned.
+	 */
+	@Test
+	void aKeyWithATargetCarryingNoWeightGoesByTheStrategy() {
+		Router router = new Router();
+		router.register("c5", List.of(weighted(upstream("demo.local", "http://127.0.0.5:3005"), 3)));
+		router.register("c2", List.of(upstream("demo.local", "http://127.0.0.2:3002")));
+		assertThat(picks(router, "demo.local", 3)).containsExactly("c2", "c2", "c2");
+		Router.RouteGroup mixed = router.resolve("demo.local").orElseThrow();
+		assertThat(mixed.weights()).containsExactly(3L, 0L);
+		assertThat(mixed.weighted()).isFalse();
+		assertThat(mixed.preferred()).extracting(Router.Route::clientId).isEqualTo("c2");
+
+		router.register("c2", List.of(weighted(upstream("demo.local", "http://127.0.0.2:3002"), 1)));
+		Router.RouteGroup shared = router.httpRoutes().get(0);
+		assertThat(shared.weighted()).isTrue();
+		assertThat(shared.preferred()).isNull();
+		assertThat(shared.totalWeight()).isEqualTo(4);
+		assertThat(picks(router, "demo.local", 4)).containsExactly("c5", "c5", "c2", "c5");
+
+		router.register("c2", List.of(weighted(upstream("demo.local", "http://127.0.0.2:3002"), -1)));
+		assertThat(router.resolve("demo.local").orElseThrow().weights()).containsExactly(3L, 0xFFFF_FFFFL);
 	}
 
 	@Test

@@ -62,7 +62,7 @@ class SluiceClientPropertiesTest {
 		Map<String, Object> source = Map.of("sluice.server-url", "grpc://127.0.0.1:8001",
 				"sluice.client.upstream[0].host", "demo.local", "sluice.client.upstream[0].target", "127.0.0.1:8080",
 				"sluice.client.upstream[1].host", "", "sluice.client.upstream[1].target", "https://fallback:8443",
-				"sluice.client.upstream[1].rewrite-host", "true");
+				"sluice.client.upstream[1].rewrite-host", "true", "sluice.client.upstream[1].weight", "3");
 		StandardEnvironment environment = new StandardEnvironment();
 		environment.getPropertySources().addFirst(new MapPropertySource("test", source));
 		SluiceClientProperties properties = Binder.get(environment)
@@ -72,6 +72,8 @@ class SluiceClientPropertiesTest {
 		assertThat(properties.client().upstream()).hasSize(2);
 		assertThat(properties.upstreamTargets()).containsExactly("http://127.0.0.1:8080", "https://fallback:8443");
 		assertThat(properties.toProtoUpstreams().get(1).getRewriteHost()).isTrue();
+		assertThat(properties.toProtoUpstreams()).extracting(am.ik.sluice.v1.proto.Upstream::getWeight)
+			.containsExactly(0, 3);
 	}
 
 	@Test
@@ -259,9 +261,12 @@ class SluiceClientPropertiesTest {
 	}
 
 	@Test
-	void invalidHostPatternFailsTheBinding() {
+	void anInvalidHostPatternOrANegativeWeightFailsTheBinding() {
 		Upstream.Builder builder = Upstream.builder().hostPattern("[(").target("http://127.0.0.1:8080");
 		assertThatThrownBy(builder::build).isInstanceOf(IllegalArgumentException.class);
+		Upstream.Builder weighed = Upstream.builder().host("demo.local").target("http://127.0.0.1:8080").weight(-1);
+		assertThatThrownBy(weighed::build).isInstanceOf(IllegalArgumentException.class)
+			.hasMessageContaining("negative weight");
 	}
 
 	@Test

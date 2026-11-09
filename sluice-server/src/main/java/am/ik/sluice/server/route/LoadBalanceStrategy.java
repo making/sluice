@@ -17,4 +17,12 @@ public interface LoadBalanceStrategy {
 	 */
 	Router.Target pick(String key, List<Router.Target> candidates);
 
+	/**
+	 * The key has no target left: a stateful implementation lets go of what it keeps for
+	 * it.
+	 * @param key lookup key, as {@link #pick} takes it
+	 */
+	default void forget(String key) {
+	}
+
 }

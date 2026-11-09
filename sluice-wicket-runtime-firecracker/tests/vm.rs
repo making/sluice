@@ -1895,6 +1895,12 @@ fn advertised_at(advertised: &sluice_wicket_tunnel::proto::Advertise, host: &str
     target_at(advertised, host).unwrap_or_else(|| panic!("{host} not advertised"))
 }
 
+/// The weight `host` is advertised with in `advertised`, if it is.
+fn weight_at(advertised: &sluice_wicket_tunnel::proto::Advertise, host: &str) -> Option<u32> {
+    let up = advertised.upstreams.iter().find(|up| up.host == host);
+    up.map(|up| up.weight)
+}
+
 /// The address `host` is advertised at in `advertised`, if it is.
 fn target_at(advertised: &sluice_wicket_tunnel::proto::Advertise, host: &str) -> Option<String> {
     let up = advertised.upstreams.iter().find(|up| up.host == host);
@@ -2024,10 +2030,11 @@ async fn adjusted_route(
     assert_eq!(served(&[last]), [stays + 2], "the VM that stays");
 }
 
-/// An app's numbers of a pool changed, by its PUT: the target stays, so nothing is advertised,
-/// and the VMs serve on as a route's do ([`adjusted_route`]); up again before it went, the VM past
-/// the limit takes connections again. A connection's bound applies to the next ones. What a VM is
-/// still starts it anew.
+/// An app's numbers of a pool changed, by its PUT: the target stays, so its routes do, but for
+/// the weight its `instances` make, advertised in the same generation, and the VMs serve on as a
+/// route's do ([`adjusted_route`]); up again before it went, the VM past the limit takes
+/// connections again. A connection's bound applies to the next ones. What a VM is still starts it
+/// anew.
 async fn adjusted_pool_app(
     tunnel: &mut ServerTunnel,
     wicket: &Wicket,
@@ -2054,6 +2061,8 @@ async fn adjusted_pool_app(
     assert_eq!(put(pool(1)).await, format!("added {HOST}"));
     let address = advertised_anew(tunnel, HOST, None).await;
     assert!(address.ends_with("?app=sized&mode=pool"), "{address}");
+    let advertised = advertised_as(tunnel, &[HOST], false).await;
+    assert_eq!(weight_at(&advertised, HOST), Some(1), "its instances");
     let of = generation().await;
     let route = Route {
         tunnel,
@@ -2112,6 +2121,13 @@ async fn adjusted_pool_app(
     let fresh = route.get(next(), "/").await;
     assert_ne!(field(&fresh, "boot id: "), boot_id, "another template");
     drop((held, route));
+
+    let of = generation().await;
+    let more = serde_json::json!({"mode": "pool", "instances": 3, "warm": 2, "keep-ms": keep, "env": {"AGAIN": "1"}});
+    assert_eq!(put(more).await, adjusted);
+    assert_eq!(generation().await, of, "no route to acknowledge");
+    let weighed = tunnel.advertise_where(|advertised| weight_at(advertised, HOST) == Some(3));
+    assert!(advertised_at(&weighed.await, HOST).ends_with("?app=sized&mode=pool"));
 
     let gone = "/api/apps/sized?owner=cf";
     let (status, removed) = console(at, "DELETE", gone, true, Bytes::new()).await;

@@ -16,6 +16,7 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.SortedMap;
 import java.util.stream.Collectors;
+import java.util.stream.IntStream;
 
 import org.jspecify.annotations.Nullable;
 
@@ -52,6 +53,9 @@ import am.ik.sluice.v1.proto.Upstream;
 class ConsoleView {
 
 	private static final DateTimeFormatter CLOCK = DateTimeFormatter.ofPattern("HH:mm:ss", Locale.ROOT);
+
+	/** How the role of a candidate sharing its route by its weight begins. */
+	private static final String WEIGHT_ROLE = "Weight ";
 
 	private final SessionRegistry sessions;
 
@@ -241,11 +245,21 @@ class ConsoleView {
 		if (group.candidates().size() == 1) {
 			return "Serving";
 		}
+		if (group.weighted()) {
+			return weightRole(Integer.toUnsignedLong(upstream.getWeight()), group.totalWeight());
+		}
 		Router.Route preferred = group.preferred();
 		if (preferred == null) {
 			return this.router.httpLoadBalance() == LoadBalance.ROUND_ROBIN ? "In rotation" : "Picked at random";
 		}
 		return preferred.clientId().equals(clientId) ? "Serving" : "Standby, " + preferred.clientId() + " serves";
+	}
+
+	/**
+	 * The role of a candidate sharing its route by its weight.
+	 */
+	private static String weightRole(long weight, long total) {
+		return WEIGHT_ROLE + weight + " of " + total;
 	}
 
 	/**
@@ -334,14 +348,21 @@ class ConsoleView {
 	}
 
 	private static List<Candidate> candidates(Router.RouteGroup group, LoadBalance loadBalance) {
-		boolean single = group.candidates().size() == 1;
-		// listed in the order the strategy decides by, so the winner comes first
-		Comparator<Router.Route> order = loadBalance == LoadBalance.SMALLEST_CLIENT_ID
-				? Comparator.comparing(Router.Route::clientId) : (a, b) -> 0;
-		return group.candidates().stream().sorted(order).map(route -> {
+		List<Router.Route> routes = group.candidates();
+		boolean single = routes.size() == 1;
+		boolean weighted = !single && group.weighted();
+		// listed in the order the strategy decides by, so the winner comes first;
+		// shared by their weights, by client id, whatever order they registered in
+		Comparator<Integer> order = loadBalance == LoadBalance.SMALLEST_CLIENT_ID || weighted
+				? Comparator.comparing(index -> routes.get(index).clientId()) : (a, b) -> 0;
+		return IntStream.range(0, routes.size()).boxed().sorted(order).map(index -> {
+			Router.Route route = routes.get(index);
 			String role;
 			if (single || route.equals(group.preferred())) {
 				role = "Serving";
+			}
+			else if (weighted) {
+				role = weightRole(group.weights().get(index), group.totalWeight());
 			}
 			else if (group.preferred() != null) {
 				role = "Standby";
@@ -408,7 +429,11 @@ class ConsoleView {
 		if (candidates.size() < 2) {
 			return "";
 		}
-		return switch (candidates.get(candidates.size() - 1).role()) {
+		String role = candidates.get(candidates.size() - 1).role();
+		if (role.startsWith(WEIGHT_ROLE)) {
+			return "Requests rotate across these clients by their weights";
+		}
+		return switch (role) {
 			case "In rotation" -> "Requests rotate across these clients";
 			case "Picked at random" -> "Each request goes to a client picked at random";
 			default -> "Smallest client id wins";

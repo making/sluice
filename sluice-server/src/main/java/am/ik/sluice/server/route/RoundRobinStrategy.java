@@ -20,4 +20,9 @@ final class RoundRobinStrategy implements LoadBalanceStrategy {
 		return candidates.get(index);
 	}
 
+	@Override
+	public void forget(String key) {
+		this.counters.remove(key);
+	}
+
 }

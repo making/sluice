@@ -334,7 +334,8 @@ their snapshot kept (`adjusted <host>`):
 Anything else is what a VM is and [restarts the target](#reloading-routes): `mode` too, and `prime`, what
 its snapshot holds.
 
-An app's target names none of the numbers: nothing is advertised, and a server's keep-alive
+An app's target names none of the numbers: only its weight is advertised, its `instances`, by
+which a sluice server spreads its host over the wickets serving it, and a server's keep-alive
 connection stays on its VM. A route's does, as routes on one image with other numbers have VMs of
 their own: its VMs go on under the target of its new numbers, advertised, the old one served by
 them until every stream acknowledged it. A host going to other numbers away from a host staying

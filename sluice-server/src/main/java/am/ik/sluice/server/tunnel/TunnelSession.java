@@ -830,11 +830,12 @@ public final class TunnelSession implements AutoCloseable {
 					rejected.size(), first ? "" : demoted(unreported));
 		for (Upstream upstream : advertised) {
 			log.atLevel(level)
-				.log("client {} upstream: host=[{}] target={} rewrite-host={} tls-passthrough={} listen-port={} verbatim-idle-timeout={}",
+				.log("client {} upstream: host=[{}] target={} rewrite-host={} tls-passthrough={} listen-port={} verbatim-idle-timeout={} weight={}",
 						this.clientId, upstream.getHost(), upstream.getTargetUrl(), upstream.getRewriteHost(),
 						upstream.getTlsPassthrough(), upstream.getListenPort(),
 						upstream.getVerbatimIdleTimeoutMillis() == 0 ? "server default"
-								: Long.toUnsignedString(upstream.getVerbatimIdleTimeoutMillis()) + "ms");
+								: Long.toUnsignedString(upstream.getVerbatimIdleTimeoutMillis()) + "ms",
+						upstream.getWeight() == 0 ? "none" : Integer.toUnsignedString(upstream.getWeight()));
 			String routeKey = upstream.getHostPattern().isEmpty() ? upstream.getHost() : upstream.getHostPattern();
 			if (upstream.getTlsPassthrough() && upstream.getListenPort() == 0
 					&& this.requiresCredentials.test(routeKey)) {

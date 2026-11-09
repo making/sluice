@@ -485,9 +485,15 @@ Behavior:
   (a client warns when a stream reaches another one)
 - routing: a domain (or listen port) claimed by several clients is served by the one with
   the smallest `sluice.client.id` -- deterministically on every node, since every node sees
-  every client. A smaller id takes over a bound listen port on advertise; a larger id gets
-  the port rejected and retries on the same stream. A port whose owner leaves is bound
-  for the next smallest id serving it
+  every client -- unless `sluice.http-load-balance` / `sluice.tcp-load-balance` say
+  otherwise. Clients that each carry a weight for it (an upstream's `weight`; a wicket's
+  route, its `instances`) share it by their weights whatever those say: each node spreads
+  its connections and requests over them by smooth weighted round robin (weights 2 and 1:
+  the first, the second, the first, and again), every request of an HTTP/1.1 connection
+  and every h2 stream picked anew (no session affinity). One of them carrying none puts the
+  domain back to the setting. A smaller id takes over a bound listen port on advertise; a
+  larger id gets the port rejected and retries on the same stream. A port whose owner
+  leaves is bound for the next smallest id serving it
 - lifecycle: readiness (`/actuator/health/readiness`) is DOWN for `sluice.cluster.warmup`
   after start (clients connect first) and while draining. On shutdown the node sends a
   `DRAIN` frame, waits up to `sluice.cluster.drain-grace` for in-flight virtual connections
@@ -873,8 +879,8 @@ its discovery document advertises an `end_session_endpoint`; register
 
 | Property | Default | Description |
 |---|---|---|
-| `sluice.http-load-balance` | `smallest-client-id` | target picked when several clients serve the same domain: `smallest-client-id` (deterministic across nodes) / `round-robin` (per node) / `random` |
-| `sluice.tcp-load-balance` | `smallest-client-id` | target picked for tcp routes when several clients serve the same listen port (same values); the listen port bind itself always follows the smallest client id |
+| `sluice.http-load-balance` | `smallest-client-id` | target picked when several clients serve the same domain: `smallest-client-id` (deterministic across nodes) / `round-robin` (per node) / `random`; clients each carrying a weight share it by their weights instead (see [Scale-out](#scale-out)) |
+| `sluice.tcp-load-balance` | `smallest-client-id` | target picked for tcp routes when several clients serve the same listen port (same values, weights alike); the listen port bind itself always follows the smallest client id |
 | `sluice.tcp-port-range` | (unset = any port) | listen ports a client may claim for tcp routes, comma separated single ports or `min-max` ranges (e.g. `9000-9010,8080`); a port outside the range is not bound |
 | `sluice.access-control.allow-cidrs` | (empty = every address) | data plane IP allow list, literal IPv4/IPv6 CIDRs or bare addresses; denied connections get 403 (http routes) or a plain close (tcp routes / TLS passthrough) |
 | `sluice.access-control.deny-cidrs` | (empty) | data plane IP deny list, evaluated before any allow list and never overridden |
@@ -976,6 +982,7 @@ its discovery document advertises an `end_session_endpoint`; register
 | `sluice.client.upstream[n].allowed-cidrs` | (empty = the server-wide `sluice.access-control.allow-cidrs` applies) | CIDRs / bare addresses allowed to connect to this upstream on the data plane; replaces the server-wide allow list for the route (the deny list still applies) |
 | `sluice.client.upstream[n].verbatim-idle-timeout` | `0` = the server's `sluice.limits.verbatim-idle-timeout` applies | how long a connection of this upstream relayed verbatim (TLS passthrough, tcp route, hostless, upgraded HTTP/1.1) may relay no byte in either direction before the server closes it; replaces the server's default for the route; see "Connection limits" |
 | `sluice.client.upstream[n].filters[m]` | - | the filters of the route, in request order; see [Filters](#filters-1) |
+| `sluice.client.upstream[n].weight` | `0` = none | the upstream's share of its route among the clients serving it, e.g. its capacity: when every one carries one, the server spreads the route by them, whatever `sluice.http-load-balance` / `sluice.tcp-load-balance` say; see [Scale-out](#scale-out) |
 | `sluice.strict-forwarding` | `true` | only dial upstreams present in the map |
 | `sluice.client.connect-timeout` | `10s` | how long dialing an upstream may wait: for the TCP connect, then for each read of the TLS handshake of an `https` upstream; the `CONNECT` is answered with an ERROR past it |
 
