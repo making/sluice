@@ -527,14 +527,14 @@ fn passcode_page(http: &Http, api: &str) -> (u16, String) {
     (status, page)
 }
 
-/// The code of the passcode page.
-fn passcode(http: &Http, api: &str) -> String {
+/// The code of the passcode page, and the page.
+fn passcode(http: &Http, api: &str) -> (String, String) {
     let (status, page) = passcode_page(http, api);
     assert_eq!(status, 200, "{page}");
     let (_, rest) = page
         .split_once("id=\"passcode\" class=\"big\">")
         .expect("the code");
-    rest.split_once("</code>").unwrap().0.to_string()
+    (rest.split_once("</code>").unwrap().0.to_string(), page)
 }
 
 #[test]
@@ -1268,8 +1268,15 @@ fn the_cf_cli_deploys_to_the_wicket() {
     provider.sign_in(json!({
         "sub": "1", "email": "alice@example.com", "preferred_username": "alice", "groups": ["devs"]
     }));
-    let code = passcode(&http, &url);
+    let (code, page) = passcode(&http, &url);
     assert_eq!(code.len(), 8);
+    assert!(
+        page.contains(
+            "Your groups (the ID token's claim groups): [&quot;devs&quot;]; \
+             --group-role gives devs=space_developer@sluice/wicket."
+        ),
+        "{page}"
+    );
     let output = cf.ok_with_stdin(&["login", "--sso"], &format!("{code}\n"));
     assert!(output.contains("Authenticating...\nOK"), "{output}");
     assert!(cf.ok(&["target"]).contains("user:           alice"));
@@ -1315,7 +1322,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
     // who edits the security groups: the rule at the request, whoever else logged in
     let login = |who: Value| {
         provider.sign_in(who);
-        let code = passcode(&http, &url);
+        let (code, _) = passcode(&http, &url);
         cf.ok_with_stdin(&["login", "--sso"], &format!("{code}\n"));
     };
     login(json!({
@@ -1342,7 +1349,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
     provider.sign_in(json!({
         "sub": "4", "email": "dave@example.com", "preferred_username": "dave", "groups": ["devs"]
     }));
-    let code = passcode(&http, &url);
+    let (code, _) = passcode(&http, &url);
     cf.ok_with_stdin(
         &["login", "--sso", "-o", "team", "-s", "dev"],
         &format!("{code}\n"),
@@ -2862,7 +2869,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     provider.sign_in(json!({
         "sub": "1", "email": "alice@example.com", "preferred_username": "alice", "groups": []
     }));
-    let code = passcode(&http, &vm_url);
+    let (code, _) = passcode(&http, &vm_url);
     let output = cf.ok_with_stdin(&["login", "--sso"], &format!("{code}\n"));
     assert!(output.contains("Authenticating...\nOK"), "{output}");
     assert!(cf.ok(&["apps"]).contains("kept"));

@@ -98,6 +98,16 @@ pub enum Grant {
     Space(RoleType, String, String),
 }
 
+impl std::fmt::Display for Grant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Grant::Admin => f.write_str("admin"),
+            Grant::Org(kind, org) => write!(f, "{}@{org}", kind.as_str()),
+            Grant::Space(kind, org, space) => write!(f, "{}@{org}/{space}", kind.as_str()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct GroupRole {
     pub group: String,
@@ -185,13 +195,73 @@ impl Policy {
                 .any(|mapped| mapped.grant == Grant::Admin)
     }
 
-    /// The groups `identity` (an ID token's claims) lists: the claim's strings.
-    fn groups<'a>(&self, identity: Option<&'a Value>) -> Vec<&'a str> {
-        match identity.map(|identity| &identity[&self.groups_claim]) {
+    /// The mappings of `--group-role` the groups of `identity` (an ID token's claims) match:
+    /// the strings of its claim `--oidc-groups-claim`.
+    fn mapped<'a>(&'a self, identity: Option<&'a Value>) -> impl Iterator<Item = &'a GroupRole> {
+        let groups: Vec<&str> = match identity.map(|identity| &identity[&self.groups_claim]) {
             Some(Value::Array(groups)) => groups.iter().filter_map(Value::as_str).collect(),
             Some(Value::String(group)) => vec![group.as_str()],
             _ => Vec::new(),
+        };
+        self.group_roles
+            .iter()
+            .filter(move |mapped| groups.contains(&mapped.group.as_str()))
+    }
+
+    /// What `--group-role` gives the login whose ID token's claims are `claims`, for its
+    /// passcode page: the groups claim as the token has it and the roles it maps them to, or
+    /// the claims the token has instead; None without `--group-role`.
+    pub fn explain_groups(&self, state: &State, claims: &Value) -> Option<String> {
+        if self.group_roles.is_empty() {
+            return None;
         }
+        let claim = &self.groups_claim;
+        let Some(value) = claims.get(claim) else {
+            let mut names: Vec<&str> = claims
+                .as_object()
+                .map(|claims| claims.keys().map(String::as_str).collect())
+                .unwrap_or_default();
+            names.sort_unstable();
+            return Some(format!(
+                "The ID token has no claim {claim} (--oidc-groups-claim): --group-role gives \
+                 no role. Is its scope asked for (--oidc-scopes), and does the provider put it \
+                 in the ID token, not only in the userinfo or the access token? The ID token's \
+                 claims: {}.",
+                names.join(", ")
+            ));
+        };
+        let given: Vec<String> = self
+            .mapped(Some(claims))
+            .map(|mapped| {
+                let missing = match &mapped.grant {
+                    Grant::Admin => None,
+                    Grant::Org(_, org) => state
+                        .org_named(org)
+                        .is_none()
+                        .then(|| format!(" (no organization {org})")),
+                    Grant::Space(_, org, space) => state
+                        .org_named(org)
+                        .and_then(|org| state.space_named(&org.guid, space))
+                        .is_none()
+                        .then(|| format!(" (no space {org}/{space})")),
+                };
+                format!(
+                    "{}={}{}",
+                    mapped.group,
+                    mapped.grant,
+                    missing.unwrap_or_default()
+                )
+            })
+            .collect();
+        Some(match given.is_empty() {
+            true => format!(
+                "Your groups (the ID token's claim {claim}): {value}; --group-role maps none of them."
+            ),
+            false => format!(
+                "Your groups (the ID token's claim {claim}): {value}; --group-role gives {}.",
+                given.join(", ")
+            ),
+        })
     }
 }
 
@@ -219,12 +289,7 @@ impl Access {
             .collect();
         let mut admin =
             policy.everyone_admin || policy.admins.check(token, identity, "admin").is_ok();
-        let groups = policy.groups(identity);
-        for mapped in policy
-            .group_roles
-            .iter()
-            .filter(|mapped| groups.contains(&mapped.group.as_str()))
-        {
+        for mapped in policy.mapped(identity) {
             match &mapped.grant {
                 Grant::Admin => admin = true,
                 Grant::Org(kind, org) => {
@@ -373,6 +438,24 @@ mod tests {
         );
         assert!(!nobody.admin && !nobody.sees_org(&state, &org));
         assert!(!nobody.can(&state, &dev, Need::Read));
+        // the passcode page says why: the groups as they came, what they give, what is missing
+        let explain = |claims: Value| policy.explain_groups(&state, &claims).unwrap();
+        assert_eq!(
+            explain(serde_json::json!({"teams": ["ghosts", "cn=ops"]})),
+            "Your groups (the ID token's claim teams): [\"ghosts\",\"cn=ops\"]; --group-role \
+             gives cn=ops=admin, ghosts=space_auditor@none/dev (no space none/dev)."
+        );
+        assert!(explain(serde_json::json!({"teams": ["/devs"]})).ends_with("maps none of them."));
+        let absent = explain(serde_json::json!({"sub": "1", "groups": ["devs"]}));
+        assert!(
+            absent.starts_with("The ID token has no claim teams"),
+            "{absent}"
+        );
+        assert!(absent.ends_with("claims: groups, sub."), "{absent}");
+        assert_eq!(
+            Policy::default().explain_groups(&state, &serde_json::json!({})),
+            None
+        );
 
         // a group's space role: the space and its organization, not the other spaces
         let dev_member = access(&state, "u2", "oidc", serde_json::json!({"teams": "devs"}));

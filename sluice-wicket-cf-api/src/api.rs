@@ -451,12 +451,18 @@ impl Api {
                 {
                     Ok(identity) => {
                         let user = identity.user_name.clone();
+                        // what the groups give: who sees less than expected tells why
+                        let groups = self
+                            .store
+                            .read(|state| self.policy.explain_groups(state, &identity.claims))
+                            .map(|groups| format!("<p>{}</p>", escape(&groups)))
+                            .unwrap_or_default();
                         match self.uaa.passcode(identity) {
                             Ok(passcode) => Ok(page(
                                 StatusCode::OK,
                                 "Temporary Authentication Code",
                                 format!(
-                                    "<p>Signed in as <b>{}</b>. Paste this code into <code>cf login --sso</code> (or <code>cf login --sso-passcode {passcode}</code>) within {} minutes; it works once.</p><p><code id=\"passcode\" class=\"big\">{passcode}</code></p>",
+                                    "<p>Signed in as <b>{}</b>. Paste this code into <code>cf login --sso</code> (or <code>cf login --sso-passcode {passcode}</code>) within {} minutes; it works once.</p><p><code id=\"passcode\" class=\"big\">{passcode}</code></p>{groups}",
                                     escape(&user),
                                     uaa::PASSCODE_TTL.as_secs() / 60
                                 ),
