@@ -30,6 +30,7 @@ use sluice_wicket_server::http::{self as connection, Body};
 use tokio::net::TcpListener;
 
 use crate::controller::{Controller, Held};
+use crate::deployments;
 use crate::env;
 use crate::logs::{self, Logs};
 use crate::manifest;
@@ -1054,7 +1055,7 @@ impl Api {
                         .deployments
                         .iter()
                         .filter(|deployment| app_read(state, &deployment.app))
-                        .map(|deployment| views::deployment(base, deployment))
+                        .map(|deployment| views::deployment(base, state, deployment))
                         .collect()
                 }),
                 None,
@@ -1065,15 +1066,18 @@ impl Api {
                     state
                         .deployment(guid)
                         .filter(|deployment| app_read(state, &deployment.app))
-                        .map(|deployment| views::deployment(base, deployment))
+                        .map(|deployment| views::deployment(base, state, deployment))
                 })
                 .map_or_else(
                     || Err(ApiError::not_found("Deployment")),
                     |deployment| Ok(json(StatusCode::OK, &deployment)),
                 ),
-            (&Method::POST, ["deployments", _, "actions", _]) => Err(ApiError::unprocessable(
-                "a deployment is finalized at once: the wicket swaps the app in place",
-            )),
+            (&Method::POST, ["deployments", guid, "actions", "cancel"]) => {
+                self.cancel_deployment(req, guid).await
+            }
+            (&Method::POST, ["deployments", guid, "actions", "continue"]) => {
+                self.continue_deployment(req, guid).await
+            }
             // a job's guid is its asker's alone to know: no space hides it
             (&Method::GET, ["jobs", guid]) => store
                 .read(|state| state.job(guid).map(|job| views::job(base, job)))
@@ -1156,6 +1160,18 @@ impl Api {
                 .ok_or_else(|| ApiError::not_found("Process"))?;
             access.check(state, &app.space, need, "Process")?;
             Ok(app.clone())
+        })
+    }
+
+    /// The app of the deployment `guid`, as [`Api::app_as`].
+    fn deployment_as(&self, req: &Req, guid: &str, need: Need) -> Result<String, ApiError> {
+        let access = req.access()?;
+        self.store.read(|state| {
+            let deployment = state.deployment(guid);
+            let app = deployment.and_then(|deployment| state.app(&deployment.app));
+            let app = app.ok_or_else(|| ApiError::not_found("Deployment"))?;
+            access.check(state, &app.space, need, "Deployment")?;
+            Ok(app.guid.clone())
         })
     }
 
@@ -1913,20 +1929,21 @@ impl Api {
 
     /// A start (and a restart) takes the snapshot the wicket gets: the
     /// current droplet, the memory, the annotations, the bindings' grants
-    /// and the environment; a stop removes the app from the wicket. The
+    /// and the environment; a stop removes the app from the wicket. Either
+    /// supersedes a deployment under way, every share put at once. The
     /// outcome is in the stats and the log.
     async fn lifecycle(&self, req: &Req, guid: &str, action: &str) -> Reply {
         self.app_as(req, guid, Need::Operate)?;
         let _app = self.controller.hold(guid).await;
-        let app = self.store.update(|state| {
+        let (app, superseded) = self.store.update(|state| {
             let running = if action == "stop" {
                 None
             } else {
                 Some(snapshot(state, guid, &req.base)?)
             };
-            let app = state
-                .app_mut(guid)
-                .ok_or_else(|| ApiError::not_found("App"))?;
+            state.app(guid).ok_or_else(|| ApiError::not_found("App"))?;
+            let superseded = state.supersede(guid);
+            let app = state.app_mut(guid).expect("found above");
             match running {
                 Some(running) => {
                     app.running = Some(running);
@@ -1935,8 +1952,11 @@ impl Api {
                 None => app.started = false,
             }
             app.updated_at = now();
-            Ok::<_, ApiError>(app.clone())
+            Ok::<_, ApiError>((app.clone(), superseded))
         })?;
+        if let Some(line) = superseded {
+            self.logs.add(guid, "API", line);
+        }
         self.logs.add(
             guid,
             "API",
@@ -2339,9 +2359,10 @@ impl Api {
 
     // --- deployments
 
-    /// A rolling deployment: the app is put with the droplet (the current
-    /// one, or the one given, made current), and the wicket swaps it in
-    /// place. Finalized at once; the outcome is in the stats and the log.
+    /// A deployment (`crate::deployments`): the app's new snapshot, of the droplet given (made
+    /// current) or the current one, the web process as its options set it, put a wicket's share
+    /// at a time while the others serve the snapshot before; at once when the app serves nothing.
+    /// Answered as it starts: the CLI polls it, the outcome is in the stats and the log.
     async fn create_deployment(&self, req: &Req) -> Reply {
         let body: Value = req.json()?;
         let app = body["relationships"]["app"]["data"]["guid"]
@@ -2349,61 +2370,120 @@ impl Api {
             .ok_or_else(|| ApiError::unprocessable("relationships.app names the app"))?
             .to_string();
         self.app_as(req, &app, Need::Operate)?;
-        let strategy = body["strategy"].as_str().unwrap_or("rolling").to_string();
-        if strategy != "rolling" {
-            return Err(ApiError::unprocessable(format!(
-                "the {strategy} strategy is not supported: rolling swaps the app in place"
-            )));
-        }
-        let given = body["droplet"]["guid"].as_str().map(String::from);
+        let asked = deployments::Asked::parse(&body).map_err(ApiError::unprocessable)?;
         let _app = self.controller.hold(&app).await;
-        let (deployment, blobs) = self.store.update(|state| {
-            let previous = state.app(&app).and_then(|app| app.current_droplet.clone());
-            let mut blobs = Vec::new();
-            if let Some(droplet) = &given {
-                match state.droplet(droplet) {
-                    Some(found) if found.app == app => {}
-                    _ => return Err(ApiError::unprocessable("Unable to use droplet. Ensure the droplet exists and belongs to this app.")),
-                }
-                blobs = state.set_current_droplet(&app, droplet);
-            }
-            let running = snapshot(state, &app, &req.base)?;
-            let droplet = running.droplet.clone();
-            let kept = state.app_mut(&app).expect("found above");
-            kept.running = Some(running);
-            kept.started = true;
-            kept.updated_at = now();
-            let at = now();
-            let deployment = Deployment {
-                guid: guid(),
-                app: app.clone(),
-                previous_droplet: previous.unwrap_or_else(|| droplet.clone()),
-                droplet,
-                strategy,
-                created_at: at.clone(),
-                updated_at: at,
-            };
-            state.deployments.push(deployment.clone());
-            if state.deployments.len() > 1000 {
-                state.deployments.remove(0);
-            }
-            Ok::<_, ApiError>((deployment, blobs))
+        let owner = self.controller.owner();
+        let (deployment, superseded, blobs, before) = self.store.update(|state| {
+            let found = state.app(&app).ok_or_else(|| ApiError::not_found("App"))?;
+            let before = Controller::desired(state, found, owner);
+            // all of it or none
+            let mut next = state.clone();
+            let (deployment, superseded, blobs) = deploy_on(&mut next, &app, &asked, &req.base)?;
+            *state = next;
+            Ok::<_, ApiError>((deployment, superseded, blobs, before))
         })?;
         self.store.delete(&blobs);
+        if let Some(line) = superseded {
+            self.logs.add(&app, "API", line);
+        }
         self.logs.add(
             &app,
             "API",
             format!(
-                "Created a rolling deployment with droplet {}",
-                deployment.droplet
+                "Created the {} deployment {} with droplet {}",
+                deployment.strategy, deployment.guid, deployment.droplet
             ),
         );
-        self.controller.sync(&app).await;
-        Ok(json(
-            StatusCode::CREATED,
-            &views::deployment(&req.base, &deployment),
-        ))
+        match deployment.stepping() {
+            // what changes at once: the shares of a scale it asked
+            true => {
+                self.controller.sync_changed(&app, &before).await;
+                let controller = self.controller.clone();
+                tokio::spawn(controller.deploy(app.clone(), deployment.guid.clone()));
+            }
+            // the app served nothing: started
+            false => self.controller.sync(&app).await,
+        }
+        let view = self.store.read(|state| {
+            let kept = state.deployment(&deployment.guid).unwrap_or(&deployment);
+            views::deployment(&req.base, state, kept)
+        });
+        Ok(json(StatusCode::CREATED, &view))
     }
+
+    /// `cf cancel-deployment`: the app back on its snapshot and droplet before the deployment,
+    /// every share put at once, canceling meanwhile (`crate::deployments`).
+    async fn cancel_deployment(&self, req: &Req, guid: &str) -> Reply {
+        let app = self.deployment_as(req, guid, Need::Operate)?;
+        let _app = self.controller.hold(&app).await;
+        let canceling = (self.store)
+            .update(|state| state.cancel_deployment(guid))
+            .map_err(ApiError::unprocessable)?;
+        if canceling {
+            self.logs
+                .add(&app, "API", format!("Canceling the deployment {guid}"));
+            self.controller.cancel_held(&app, guid).await;
+        }
+        self.deployment_view(req, guid)
+    }
+
+    /// `cf continue-deployment`: a paused canary's next step, else the rest of it.
+    async fn continue_deployment(&self, req: &Req, guid: &str) -> Reply {
+        let app = self.deployment_as(req, guid, Need::Operate)?;
+        let _app = self.controller.hold(&app).await;
+        (self.store)
+            .update(|state| state.continue_deployment(guid))
+            .map_err(ApiError::unprocessable)?;
+        self.logs
+            .add(&app, "API", format!("Continuing the deployment {guid}"));
+        let controller = self.controller.clone();
+        tokio::spawn(controller.deploy(app, guid.to_string()));
+        self.deployment_view(req, guid)
+    }
+
+    /// The deployment `guid` as it is now.
+    fn deployment_view(&self, req: &Req, guid: &str) -> Reply {
+        let view = self.store.read(|state| {
+            let deployment = state.deployment(guid);
+            deployment.map(|deployment| views::deployment(&req.base, state, deployment))
+        });
+        view.map_or_else(
+            || Err(ApiError::not_found("Deployment")),
+            |view| Ok(json(StatusCode::OK, &view)),
+        )
+    }
+}
+
+/// Deploys on `state` what `asked` asks of the app `guid`: the droplet given made current, the
+/// web process as asked, its snapshot taken ([`State::deploy`]). The deployment, the line saying
+/// what it superseded, and the blobs no droplet names any more.
+fn deploy_on(
+    state: &mut State,
+    guid: &str,
+    asked: &deployments::Asked,
+    base: &str,
+) -> Result<(Deployment, Option<String>, Vec<Blob>), ApiError> {
+    let app = state.app(guid).ok_or_else(|| ApiError::not_found("App"))?;
+    let previous = app.current_droplet.clone();
+    let serving = state.serving(app);
+    let mut blobs = Vec::new();
+    if let Some(droplet) = &asked.droplet {
+        match state.droplet(droplet) {
+            Some(found) if found.app == guid => {}
+            _ => {
+                return Err(ApiError::unprocessable(
+                    "Unable to use droplet. Ensure the droplet exists and belongs to this app.",
+                ));
+            }
+        }
+        blobs = state.set_current_droplet(guid, droplet);
+    }
+    let app = state.app_mut(guid).expect("found above");
+    asked.scaled.apply(app).map_err(ApiError::unprocessable)?;
+    let running = snapshot(state, guid, base)?;
+    let previous = previous.unwrap_or_else(|| running.droplet.clone());
+    let (deployment, superseded) = state.deploy(guid, running, serving, previous, asked);
+    Ok((deployment, superseded, blobs))
 }
 
 /// The snapshot a start takes: the current droplet, the memory, the

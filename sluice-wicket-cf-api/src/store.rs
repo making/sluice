@@ -215,10 +215,60 @@ pub struct App {
     /// What the wickets serve since the last start, restart or deployment:
     /// the snapshot taken then.
     pub running: Option<Running>,
+    /// A deployment of `running` under way: what the shares it has not reached serve
+    /// (`crate::deployments`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling: Option<Rolling>,
     /// The wicket of each index of the web process, by name (`crate::placement`): where it
     /// runs while the app is started.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub placement: Vec<String>,
+}
+
+/// A deployment of an app's `running` snapshot under way (`crate::deployments`): the wickets
+/// whose share it has not reached serve the snapshot before.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Rolling {
+    /// The deployment's guid.
+    pub deployment: String,
+    /// The app's snapshot before the deployment: what a cancel puts back.
+    pub previous: Running,
+    /// The wickets whose share the deployment has not reached, by name, each serving
+    /// `previous` or the snapshot given: one a deployment it superseded had not reached either.
+    pub pending: BTreeMap<String, Option<Running>>,
+}
+
+impl App {
+    /// The snapshot the share of `wicket` serves: `running`, but on a wicket a deployment has not
+    /// reached.
+    pub fn running_on(&self, wicket: &str) -> Option<&Running> {
+        let running = self.running.as_ref()?;
+        let Some(rolling) = &self.rolling else {
+            return Some(running);
+        };
+        Some(match rolling.pending.get(wicket) {
+            None => running,
+            Some(other) => other.as_ref().unwrap_or(&rolling.previous),
+        })
+    }
+
+    /// Every snapshot of it a share serves, or a cancel puts back.
+    pub fn snapshots(&self) -> impl Iterator<Item = &Running> {
+        let rolling = self.rolling.iter();
+        let before = rolling.flat_map(|rolling| {
+            std::iter::once(&rolling.previous).chain(rolling.pending.values().flatten())
+        });
+        self.running.iter().chain(before)
+    }
+
+    /// [`App::snapshots`], to change.
+    pub fn snapshots_mut(&mut self) -> impl Iterator<Item = &mut Running> {
+        let rolling = self.rolling.iter_mut();
+        let before = rolling.flat_map(|rolling| {
+            std::iter::once(&mut rolling.previous).chain(rolling.pending.values_mut().flatten())
+        });
+        self.running.iter_mut().chain(before)
+    }
 }
 
 /// An app's lifecycle, as CC names it: a droplet is a component either way.
@@ -858,15 +908,143 @@ pub struct Files {
     pub bytes: u64,
 }
 
+/// A deployment of an app's droplet (`crate::deployments`).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Deployment {
     pub guid: String,
     pub app: String,
     pub droplet: String,
     pub previous_droplet: String,
+    /// `rolling` or `canary`.
     pub strategy: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Where it is; one written before there were more is deployed.
+    #[serde(default)]
+    pub state: DeploymentState,
+    /// Finalized by the next deployment, or a start or stop of its app, before its end.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub superseded: bool,
+    /// The instances a step puts at most, a wicket's share at least.
+    #[serde(default = "one")]
+    pub max_in_flight: u64,
+    /// A canary's steps, each the percentage of the instances on the new droplet; none: one
+    /// instance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub canary_steps: Vec<u64>,
+    /// A canary's step under way or paused after, from 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub canary_step: Option<u64>,
+    /// What it set of the web process, as asked.
+    #[serde(default, skip_serializing_if = "Scaled::is_empty")]
+    pub scaled: Scaled,
+    /// Why it does not go on: a wicket refusing, or not answering, a share it reached.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// When every share it reached last served it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_healthy_at: Option<String>,
+    /// When its state last changed; none in one written before: `updated_at`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_changed_at: Option<String>,
+}
+
+fn one() -> u64 {
+    1
+}
+
+/// Where a deployment is, as Cloud Controller names it.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Default)]
+#[serde(rename_all = "UPPERCASE")]
+pub enum DeploymentState {
+    /// Taking its steps.
+    Deploying,
+    /// Taking a canary's step.
+    Prepaused,
+    /// A canary's, after a step: until it is continued.
+    Paused,
+    /// Its app going back to the droplet before.
+    Canceling,
+    #[default]
+    Deployed,
+    Canceled,
+}
+
+impl DeploymentState {
+    /// Its name, Cloud Controller's (a deployment's deprecated `state`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DeploymentState::Deploying => "DEPLOYING",
+            DeploymentState::Prepaused => "PREPAUSED",
+            DeploymentState::Paused => "PAUSED",
+            DeploymentState::Canceling => "CANCELING",
+            DeploymentState::Deployed => "DEPLOYED",
+            DeploymentState::Canceled => "CANCELED",
+        }
+    }
+}
+
+/// The web process's scale a deployment set (its `options`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct Scaled {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub web_instances: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_in_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_in_mb: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_rate_limit_in_bytes_per_second: Option<i64>,
+}
+
+impl Scaled {
+    pub fn is_empty(&self) -> bool {
+        *self == Scaled::default()
+    }
+}
+
+impl Deployment {
+    /// Cloud Controller's `status.value` and `status.reason`.
+    pub fn status(&self) -> (&'static str, &'static str) {
+        match (self.state, self.superseded) {
+            (DeploymentState::Deploying | DeploymentState::Prepaused, _) => ("ACTIVE", "DEPLOYING"),
+            (DeploymentState::Paused, _) => ("ACTIVE", "PAUSED"),
+            (DeploymentState::Canceling, _) => ("ACTIVE", "CANCELING"),
+            (_, true) => ("FINALIZED", "SUPERSEDED"),
+            (DeploymentState::Deployed, false) => ("FINALIZED", "DEPLOYED"),
+            (DeploymentState::Canceled, false) => ("FINALIZED", "CANCELED"),
+        }
+    }
+
+    /// Whether it takes its steps: deploying, a canary's step included.
+    pub fn stepping(&self) -> bool {
+        matches!(
+            self.state,
+            DeploymentState::Deploying | DeploymentState::Prepaused
+        )
+    }
+
+    /// Whether a cancel takes it: under way, paused or canceling.
+    pub fn cancelable(&self) -> bool {
+        self.stepping()
+            || matches!(
+                self.state,
+                DeploymentState::Paused | DeploymentState::Canceling
+            )
+    }
+
+    /// Whether `cf continue-deployment` takes it: paused.
+    pub fn continuable(&self) -> bool {
+        self.state == DeploymentState::Paused
+    }
+
+    /// Moves it to `state`, now.
+    pub fn set(&mut self, state: DeploymentState) {
+        let at = now();
+        self.state = state;
+        self.status_changed_at = Some(at.clone());
+        self.updated_at = at;
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -1219,6 +1397,7 @@ impl State {
             current_droplet: None,
             env: BTreeMap::new(),
             running: None,
+            rolling: None,
             placement: Vec::new(),
         });
         self.apps.last_mut().expect("just pushed")
@@ -1352,15 +1531,23 @@ impl State {
         blobs
     }
 
-    /// Makes `droplet` the app's current one and keeps only it and the one
-    /// before; the droplet blobs no droplet names any more are listed to
-    /// delete.
+    /// Makes `droplet` the app's current one and keeps only it, the one before and those its
+    /// shares serve (a deployment under way's); the droplet blobs no droplet names any more are
+    /// listed to delete.
     pub fn set_current_droplet(&mut self, app: &str, droplet: &str) -> Vec<Blob> {
         let previous = self
             .app(app)
             .and_then(|app| app.current_droplet.clone())
             .filter(|previous| previous != droplet);
-        let keep = |guid: &str| guid == droplet || previous.as_deref() == Some(guid);
+        let serving: Vec<String> = (self.app(app).into_iter())
+            .flat_map(App::snapshots)
+            .map(|running| running.droplet.clone())
+            .collect();
+        let keep = |guid: &str| {
+            guid == droplet
+                || previous.as_deref() == Some(guid)
+                || serving.iter().any(|s| s == guid)
+        };
         let gone: Vec<Droplet> = self
             .droplets
             .iter()

@@ -11,7 +11,8 @@
 //! own -- `cf login --sso` through the passcode page, a refresh, the
 //! clients configured, who is refused, who may edit the security groups --, a second
 //! wicket -- the one wicket's indices placed again, an app's instances spread over both,
-//! one stopped and back, a scale --, a component the wicket refuses
+//! one stopped and back, a rolling push a wicket at a time, one refused, taken up by a restart
+//! of the cf-api and canceled, a canary continued, a scale --, a component the wicket refuses
 //! until a service binding grants what it needs, the services' lifecycle -- a store of each
 //! wicket's host keeping its apps on one wicket, one they share (Redis) counting once over
 //! both --, a service broker
@@ -460,6 +461,44 @@ fn eventually(what: &str, done: impl Fn() -> bool) {
     }
 }
 
+/// Requests to a host's `/` on listeners in turn, until stopped.
+struct Hammer {
+    stop: Arc<AtomicBool>,
+    requests: std::thread::JoinHandle<(usize, usize)>,
+}
+
+impl Hammer {
+    /// Requests `host` on each of `listens` in turn, counting the answers `hello from wasm` and
+    /// the others.
+    fn start(listens: &[&str], host: &str) -> Hammer {
+        let stop = Arc::new(AtomicBool::new(false));
+        let listens: Vec<String> = listens.iter().map(|listen| listen.to_string()).collect();
+        let (stopped, host) = (stop.clone(), host.to_string());
+        let requests = std::thread::spawn(move || {
+            let (mut served, mut failed) = (0, 0);
+            for listen in listens.iter().cycle() {
+                if stopped.load(Ordering::Relaxed) {
+                    break;
+                }
+                match std::panic::catch_unwind(|| get(listen, &host, "/", None)) {
+                    Ok((200, body)) if body.starts_with("hello from wasm") => served += 1,
+                    _ => failed += 1,
+                }
+            }
+            (served, failed)
+        });
+        Hammer { stop, requests }
+    }
+
+    /// Stops it: some requests answered, none failed.
+    fn stop(self) {
+        self.stop.store(true, Ordering::Relaxed);
+        let (served, failed) = self.requests.join().unwrap();
+        assert_eq!(failed, 0, "of {}", served + failed);
+        assert!(served > 0);
+    }
+}
+
 /// `rules` as a file `cf create-security-group` takes.
 fn security_group_file(dir: &Path, name: &str, rules: &Value) -> String {
     let file = dir.join(format!("{name}.json"));
@@ -793,24 +832,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
     }
 
     // a rolling push of another component, with no failed request during it
-    let stop = Arc::new(AtomicBool::new(false));
-    let (served, failed) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-    let hammer = {
-        let (stop, served, failed, listen) =
-            (stop.clone(), served.clone(), failed.clone(), listen.clone());
-        std::thread::spawn(move || {
-            while !stop.load(Ordering::Relaxed) {
-                match std::panic::catch_unwind(|| get(&listen, "hello.localhost", "/", None)) {
-                    Ok((200, body)) if body.starts_with("hello from wasm") => {
-                        served.fetch_add(1, Ordering::Relaxed);
-                    }
-                    _ => {
-                        failed.fetch_add(1, Ordering::Relaxed);
-                    }
-                }
-            }
-        })
-    };
+    let hammering = Hammer::start(&[&listen], "hello.localhost");
     cf.ok(&[
         "push",
         "hello",
@@ -819,10 +841,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "--strategy",
         "rolling",
     ]);
-    stop.store(true, Ordering::Relaxed);
-    hammer.join().unwrap();
-    assert_eq!(failed.load(Ordering::Relaxed), 0);
-    assert!(served.load(Ordering::Relaxed) > 0);
+    hammering.stop();
     let apps = listing(&console);
     assert_eq!(
         apps["apps"][0]["component"]["sha256"],
@@ -1533,6 +1552,112 @@ fn the_cf_cli_deploys_to_the_wicket() {
         hosted() == both
     });
 
+    // a rolling push of another component puts the first wicket's share, then the second's, both
+    // listeners answering all along
+    let component = |console: &str| {
+        let apps = listing(console)["apps"].as_array().unwrap().clone();
+        let app = apps
+            .into_iter()
+            .find(|app| app["hosts"][0] == "spread.localhost");
+        app.map(|app| app["component"]["sha256"].as_str().unwrap().to_string())
+    };
+    let (hello_sha, variant_sha) = (
+        sha256(&dir.join("app/hello.wasm")),
+        sha256(&dir.join("app2/hello.wasm")),
+    );
+    let hammering = Hammer::start(&[&listen, &listen_b], "spread.localhost");
+    let app2 = dir.join("app2");
+    cf.ok(&[
+        "push",
+        "spread",
+        "-p",
+        app2.to_str().unwrap(),
+        "--strategy",
+        "rolling",
+    ]);
+    hammering.stop();
+    for console in [&console, &console_b] {
+        assert_eq!(component(console), Some(variant_sha.clone()));
+    }
+    // in order in the cf-api's log (the app's has its requests' lines, past its ring)
+    for wicket in ["a", "b"] {
+        let step = api.line(&format!("[{spread}] API: The rolling deployment "));
+        assert!(step.ends_with(&format!("on the wicket {wicket}")), "{step}");
+    }
+    api.line(&format!("[{spread}] API: Finished the rolling deployment "));
+
+    // one the wicket refuses (counter needs wasi=keyvalue) stops at the first wicket, active, its
+    // instance crashed with the wicket's reason, the second serving the one before; each listener
+    // answers the one before. Canceled, the first is back on it
+    cf.ok(&[
+        "push",
+        "spread",
+        "-p",
+        dir.join("counter").to_str().unwrap(),
+        "--strategy",
+        "rolling",
+        "--no-wait",
+    ]);
+    let stopped = [at(0, "RUNNING", "b"), at(1, "CRASHED", "a")];
+    eventually("the deployment stopped at the first wicket", || {
+        hosted() == stopped
+    });
+    let active =
+        format!("/v3/deployments?app_guids={spread}&status_values=ACTIVE&order_by=-created_at");
+    let active: Value = serde_json::from_str(&cf.ok(&["curl", &active])).unwrap();
+    let error = &active["resources"][0]["status"]["details"]["error"];
+    assert!(
+        error.as_str().unwrap().contains("needs wasi=keyvalue"),
+        "{active}"
+    );
+    for listen in [&listen, &listen_b] {
+        let (status, body) = get(listen, "spread.localhost", "/", None);
+        assert!(
+            status == 200 && body.starts_with("hello from wasm"),
+            "{body}"
+        );
+    }
+    // the cf-api restarted takes it up where it was
+    drop(api);
+    let (api, _) = with_rules(&two_wickets, &["email=*@example.com", "groups=devs"]);
+    eventually("the deployment taken up", || hosted() == stopped);
+    let shown = cf.ok(&["app", "spread"]);
+    assert!(
+        shown.contains("Active deployment with status DEPLOYING"),
+        "{shown}"
+    );
+    cf.ok(&["cancel-deployment", "spread"]);
+    eventually("the first wicket back", || hosted() == both);
+    eventually("the deployment canceled", || {
+        !cf.ok(&["app", "spread"]).contains("Active deployment")
+    });
+    for console in [&console, &console_b] {
+        assert_eq!(component(console), Some(variant_sha.clone()));
+    }
+
+    // a canary puts the first wicket's share and pauses, until continued
+    let paused = cf.ok(&[
+        "push",
+        "spread",
+        "-p",
+        dir.join("app").to_str().unwrap(),
+        "--strategy",
+        "canary",
+    ]);
+    assert!(
+        paused.contains("Active deployment with status PAUSED")
+            && paused.contains("cf continue-deployment spread"),
+        "{paused}"
+    );
+    assert_eq!(
+        (component(&console), component(&console_b)),
+        (Some(hello_sha.clone()), Some(variant_sha.clone()))
+    );
+    cf.ok(&["continue-deployment", "spread"]);
+    for console in [&console, &console_b] {
+        assert_eq!(component(console), Some(hello_sha.clone()));
+    }
+
     // `cf scale -i 3` gives the wicket of the most room two, `-i 1` keeps index 0 alone, the
     // app removed from the other
     let instances = |console: &str, host: &str| {
@@ -1981,7 +2106,8 @@ fn the_cf_cli_deploys_to_the_wicket() {
         cf.ok(&["delete", app, "-r", "-f"]);
     }
     for (console, listen) in [(&console, &listen), (&console_b, &listen_b)] {
-        assert!(listing(console)["apps"].as_array().unwrap().is_empty());
+        let left = listing(console);
+        assert!(left["apps"].as_array().unwrap().is_empty(), "{left}");
         assert_eq!(get(listen, "hello.localhost", "/", None).0, 404);
     }
     assert!(!cf.ok(&["apps"]).contains("hello"));

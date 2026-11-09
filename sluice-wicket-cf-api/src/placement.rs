@@ -358,7 +358,7 @@ impl State {
         self.droplets
             .iter_mut()
             .for_each(|droplet| unnamed(&mut droplet.made));
-        let running = self.apps.iter_mut().filter_map(|app| app.running.as_mut());
+        let running = self.apps.iter_mut().flat_map(App::snapshots_mut);
         running.for_each(|running| unnamed(&mut running.made));
         let mut said = Vec::new();
         // a namespace's data on a wicket no --wicket names: its apps start on another without it

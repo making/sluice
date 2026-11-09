@@ -67,6 +67,24 @@ What the CLI (8.19.0) does with them, against the stub broker of `tests/broker`:
 - `cf marketplace` asks with `space_guids`, `cf create-service` takes the plan by name without:
   the visibility is checked at the create too
 
+## Deployments
+
+What the CLI (8.19.0) does with them (`cf push`, `restart`, `restage --strategy rolling|canary`):
+
+- it polls `GET /v3/deployments/<guid>` every 3s (fixed), the first 1ms after creating it, until
+  `FINALIZED` / `DEPLOYED` (a canary's `ACTIVE` / `PAUSED` too), reading no instance meanwhile: a
+  deployment done within that 1ms returns at once, any other takes 3s more. Then it waits for an
+  instance `RUNNING` (or none) as a start does
+- at `CF_STARTUP_TIMEOUT` (minutes, a float, 5 by default) it cancels the deployment itself and
+  fails (`Start app timeout`): a deployment stopped by a refusal is canceled so, 5 minutes on
+- `--no-wait` polls the stats of the deployment's `new_processes` instead, ending at an instance
+  `RUNNING`; none listed, at once
+- `-i`, `-m`, `-k`, `-l` given with `--strategy` go in the deployment's `options` (`web_instances`,
+  `memory_in_mb`, ...), not in the manifest the push applies first
+- `cf app`, `cancel-deployment` and `continue-deployment` find the deployment as
+  `GET /v3/deployments?app_guids=<guid>&status_values=ACTIVE&order_by=-created_at&per_page=1`;
+  `cf app` shows it (`Active deployment with status ...`) only when it is `ACTIVE`
+
 ## The demo's GIF
 
 2.5MB ([demo/README.md](../sluice-wicket-cf-api/demo/README.md)).

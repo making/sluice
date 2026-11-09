@@ -11,7 +11,7 @@ use crate::store::{
     App, Build, Deployment, Droplet, Job, Lifecycle, Named, Outcome, Package, ROOTFS_STACK, Route,
     STACK, SecurityGroup, Space, State, epoch_secs, now,
 };
-use crate::wicket::{ListedApp, Runtime, Sandbox};
+use crate::wicket::{ListedApp, Runtime};
 
 /// The Cloud Controller version announced.
 pub const CC_VERSION: &str = "3.200.0";
@@ -318,13 +318,17 @@ pub fn process(base: &str, app: &App) -> Value {
 pub fn stats(state: &State, app: &App, owner: &str, listed: &BTreeMap<String, ListedApp>) -> Value {
     let instances = app.process.instances.min(MAX_INSTANCES);
     let entries = match (&app.running, app.started) {
-        (Some(running), true) => {
+        (Some(_), true) => {
             let mut entries = Vec::new();
             let shares = Controller::desired(state, app, owner);
             for (wicket, indices) in state.indices(app) {
-                if !shares.contains_key(&wicket) {
+                // the snapshot of its share: a deployment's, or the one before it
+                let Some(running) = app
+                    .running_on(&wicket)
+                    .filter(|_| shares.contains_key(&wicket))
+                else {
                     continue;
-                }
+                };
                 let all = |shown, details: Option<&String>| -> Vec<Entry> {
                     let shown_ones = indices.iter().filter(|index| **index < instances);
                     (shown_ones)
@@ -451,7 +455,7 @@ fn alive(listed: &ListedApp, wicket: &str, indices: &[u64], instances: u64) -> V
         ));
     }
     if down.is_empty() {
-        let short = kept(&listed.app.sandbox).saturating_sub(up.len() as u64);
+        let short = listed.app.sandbox.kept().saturating_sub(up.len() as u64);
         let starting = free.into_iter().take(short as usize);
         down.extend(starting.map(|index| entry(index, "STARTING", None, epoch_secs())));
     }
@@ -464,21 +468,6 @@ fn alive(listed: &ListedApp, wicket: &str, indices: &[u64], instances: u64) -> V
         .collect();
     entries.sort_by_key(|entry| entry.index);
     entries
-}
-
-/// The VMs a wicket keeps up of a route as listed, whatever its requests: of a pool `warm`, its
-/// default `instances`, booted `instances`, 1 going unlisted. None of the other modes, a clone
-/// coming and going with its connection, nor of a component, whose units the wicket lists as it
-/// has them.
-fn kept(sandbox: &Sandbox) -> u64 {
-    let Sandbox::Vm(vm) = sandbox else {
-        return 0;
-    };
-    match vm.mode.as_deref() {
-        Some("pool") => vm.warm.or(vm.instances).unwrap_or(0),
-        Some("boot") => vm.instances.unwrap_or(1),
-        _ => 0,
-    }
 }
 
 pub fn route(base: &str, state: &State, route: &Route) -> Value {
@@ -607,23 +596,61 @@ pub fn droplet(base: &str, droplet: &Droplet) -> Value {
     })
 }
 
-pub fn deployment(base: &str, deployment: &Deployment) -> Value {
+/// A deployment: its status as CC's (`state` too, which CC deprecated), what it was asked, its
+/// app's web process as the one it deploys, and the actions it takes.
+pub fn deployment(base: &str, state: &State, deployment: &Deployment) -> Value {
+    let (value, reason) = deployment.status();
+    let changed = (deployment.status_changed_at.as_ref()).unwrap_or(&deployment.updated_at);
+    let mut status = json!({"value": value, "reason": reason, "details": {
+        "last_successful_healthcheck": deployment.last_healthy_at,
+        "last_status_change": changed,
+    }});
+    if let Some(error) = &deployment.error {
+        status["details"]["error"] = error.as_str().into();
+    }
+    let mut options = json!({"max_in_flight": deployment.max_in_flight});
+    if let Value::Object(scaled) = json!(deployment.scaled) {
+        options.as_object_mut().expect("an object").extend(scaled);
+    }
+    if deployment.strategy == "canary" {
+        let total = deployment.canary_steps.len().max(1);
+        status["canary"] =
+            json!({"steps": {"current": deployment.canary_step.unwrap_or(1), "total": total}});
+        if !deployment.canary_steps.is_empty() {
+            let steps = (deployment.canary_steps.iter())
+                .map(|weight| json!({"instance_weight": weight}))
+                .collect::<Vec<_>>();
+            options["canary"] = json!({"steps": steps});
+        }
+    }
+    let path = format!("{base}/v3/deployments/{}", deployment.guid);
+    let mut links = json!({
+        "self": {"href": path},
+        "app": {"href": format!("{base}/v3/apps/{}", deployment.app)},
+    });
+    if deployment.cancelable() {
+        links["cancel"] = json!({"href": format!("{path}/actions/cancel"), "method": "POST"});
+    }
+    if deployment.continuable() {
+        links["continue"] = json!({"href": format!("{path}/actions/continue"), "method": "POST"});
+    }
+    let process = state.app(&deployment.app).map(|app| &app.process.guid);
+    let new_processes: Vec<Value> = (process.into_iter())
+        .map(|guid| json!({"guid": guid, "type": "web"}))
+        .collect();
     json!({
         "guid": deployment.guid, "created_at": deployment.created_at, "updated_at": deployment.updated_at,
-        "state": "DEPLOYED",
-        "status": {"value": "FINALIZED", "reason": "DEPLOYED", "details": {"last_successful_healthcheck": deployment.updated_at}},
+        "state": deployment.state.as_str(),
+        "status": status,
         "strategy": deployment.strategy,
-        "options": {"max_in_flight": 1},
+        "options": options,
         "droplet": {"guid": deployment.droplet},
         "previous_droplet": {"guid": deployment.previous_droplet},
-        "new_processes": [],
+        "new_processes": new_processes,
         "revision": null,
         "relationships": {"app": rel(Some(&deployment.app))},
         "metadata": metadata(None),
-        "links": {
-            "self": {"href": format!("{base}/v3/deployments/{}", deployment.guid)},
-            "app": {"href": format!("{base}/v3/apps/{}", deployment.app)},
-        },
+        "links": links,
     })
 }
 
@@ -773,7 +800,7 @@ pub fn manifest(state: &State, app: &App) -> String {
 
 /// The filters the CLI sends, as JSON pointers into a resource's view;
 /// `app_guids` of a route reads its destinations.
-const FILTERS: [(&str, &str); 27] = [
+const FILTERS: [(&str, &str); 28] = [
     ("names", "/name"),
     ("guids", "/guid"),
     ("space_guids", "/relationships/space/data/guid"),
@@ -792,6 +819,7 @@ const FILTERS: [(&str, &str); 27] = [
     ("types", "/type"),
     ("states", "/state"),
     ("status_values", "/status/value"),
+    ("status_reasons", "/status/reason"),
     ("stacks", "/lifecycle/data/stack"),
     ("lifecycle_type", "/lifecycle/type"),
     ("package_guids", "/package/guid"),
@@ -932,6 +960,7 @@ pub fn page(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::wicket::Sandbox;
 
     fn query(text: &str) -> Vec<(String, String)> {
         form_urlencoded::parse(text.as_bytes())

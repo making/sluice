@@ -207,6 +207,23 @@ impl Sandbox {
     }
 }
 
+impl Sandbox {
+    /// The VMs a wicket keeps up of a route as listed, whatever its requests: of a pool `warm`,
+    /// its default `instances`, booted `instances`, 1 going unlisted. None of the other modes, a
+    /// clone coming and going with its connection, nor of a component, whose units the wicket
+    /// lists as it has them.
+    pub fn kept(&self) -> u64 {
+        let Sandbox::Vm(vm) = self else {
+            return 0;
+        };
+        match vm.mode.as_deref() {
+            Some("pool") => vm.warm.or(vm.instances).unwrap_or(0),
+            Some("boot") => vm.instances.unwrap_or(1),
+            _ => 0,
+        }
+    }
+}
+
 /// What a wicket runs apps as.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Runtime {

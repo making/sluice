@@ -69,7 +69,7 @@ curl http://site.localhost:8080/
 cf push img --docker-image ghcr.io/making/sluice/sluice-wicket-runtime-wasi/examples/hello
 cf map-route hello localhost --hostname hi
 cf scale hello -i 2
-cf push hello -p hello/ --strategy rolling     # swapped in place
+cf push hello -p hello/ --strategy rolling     # a wicket at a time, swapped in place
 cf logs hello --recent
 cf marketplace                                 # the wicket's keyvalue stores and capabilities
 cf create-service keyvalue local kv            # a namespace of the store local
@@ -846,11 +846,12 @@ mode stays one wicket.
   (`cf curl /v3/apps/<guid>/processes/web/stats`): a wicket away shows its indices `STARTING`, one
   refusing its share `CRASHED` with its reason. An edit applying at once (`cf scale -i`, routes,
   annotations) is put on each wicket whose share it changes, and a refusal by one changes nothing;
-  a start, restart or restage puts every share at once, each wicket's outcome its own. `cf logs`
-  names a line's instance as `cf app` does, by the wicket whose flume node fed it: `[APP/PROC/WEB/1]`
-  for the second wicket's first instance of an app of `-i 2`. A request's `RTR` index is its
-  wicket's place among the `--wicket`s (each a router of its share), its `app_index` the instance.
-  The lines a wicket dropped (`LGR`) are in the logs of the apps it holds indices of
+  a start, restart or restage puts every share at once, each wicket's outcome its own, a
+  [deployment](#behavior) a wicket's share at a time. `cf logs` names a line's instance as `cf
+  app` does, by the wicket whose flume node fed it: `[APP/PROC/WEB/1]` for the second wicket's
+  first instance of an app of `-i 2`. A request's `RTR` index is its wicket's place among the
+  `--wicket`s (each a router of its share), its `app_index` the instance. The lines a wicket
+  dropped (`LGR`) are in the logs of the apps it holds indices of
 - **What they share.** The wickets run apps one way: one listing another runtime than the first
   is logged, and none placed or put on it. They share one `--wicket-token`, not a console
   directory (a volume each; a StatefulSet on Kubernetes). The marketplace is what every wicket
@@ -1025,7 +1026,7 @@ What holds on both wickets; a component's and a VM's are in
 | route `<host>.<domain>` | a host: labels of `a-z`, `0-9` and `-`. No path, port or wildcard (422). A route serves one app: a second destination is refused; zero-downtime updates are `--strategy rolling` |
 | shared domain | `--domain` |
 | instance state | once the wicket took the app, an entry per [instance alive](#instances), `RUNNING`, its `since` its own start, `routable` unless it fails its [readiness check](#mapping-to-vms), for a VM it keeps and has not up yet `STARTING`, and for a VM it keeps gone down or not starting (no room in the wicket's budget, a snapshot gone), or none alive at `warm: 0` with a request's restore failing for anything but room, `CRASHED` with why as `details`, `since` the failure began, until it is up; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable or has not taken the app. These two list an entry per index the wicket holds. Each entry's `host` is its wicket's name |
-| rolling deployment | the app put with the new droplet: each wicket swaps it in place, all at once; finalized at once |
+| deployment (`--strategy rolling`, `canary`) | the app put with the new droplet a wicket's share at a time, each wicket swapping it in place ([Behavior](#behavior)) |
 | org / space | the cf-api's own ([Organizations, spaces and roles](#organizations-spaces-and-roles)): the wicket knows none, its hosts are every space's |
 | readiness check (`readiness-health-check-*`, a manifest's alone, as on CF) | kept and shown (`cf get-readiness-health-check`, the process's `readiness_health_check`); `process`, the default, on both wickets; `port` and `http` on a Firecracker wicket ([Mapping to VMs](#mapping-to-vms)), refused on a wasm wicket, where an instance takes requests as they come |
 | liveness health check, log rate, stack, buildpacks | accepted and shown, no effect (but a VM's `timeout`) |
@@ -1175,6 +1176,23 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
   is not tried again there until what is asked of it changes (`cf restart`), the wicket comes
   back or the cf-api restarts; one a wicket refused for another reason (no room, a host taken)
   whenever its revision moves
+- a deployment (`--strategy rolling` of `cf push`, `restart`, `restage`) puts the app's new
+  snapshot a wicket's share at a time, in the order of the `--wicket`s (as many as
+  `--max-in-flight` instances take, a share at least), the others serving the app as it was: each
+  wicket swaps its share in place, the app answering all along. The next goes once those put serve
+  it: their wicket took it (a Firecracker wicket's VMs started, a wasm wicket's route loaded) and,
+  with a [readiness check](#mapping-to-vms), the VMs it keeps are ready. `cf app` shows `Active
+  deployment with status DEPLOYING` meanwhile; `cf push` waits for its end. A share refused stops
+  it there, active as CF keeps one whose new instances crash: the share's instances `CRASHED` with
+  the wicket's reason (the deployment's `status.details.error`), the other wickets on the app as
+  it was, until `cf cancel-deployment` puts every share back on it (the CLI cancels it itself
+  after `CF_STARTUP_TIMEOUT`, 5 minutes); the share taken later (the wicket's revision moved, the
+  cf-api restarted), it goes on. `--strategy canary` pauses once the first wicket's share serves
+  it (`--instance-steps`: each step's percentage of the instances) until `cf
+  continue-deployment`. A start, restart or stop supersedes one under way, every share put at
+  once; so does the next deployment, the wickets it has not reached serving on. `-i` and `-m` of
+  the push apply with it; an app serving nothing (stopped, at 0, without a route) starts at once.
+  A restart of the cf-api takes it up where it was
 - the desired state is the cf-api's: at startup and whenever a wicket's revision moves
   (`GET /api/apps?after=`), it lists that wicket's apps of its owner and puts / deletes the
   difference (the same app again changes nothing: the wicket's generation stays), each wicket
@@ -1288,9 +1306,10 @@ state written before there were more takes its apps, routes and service instance
 Refused with why (422): route paths, ports and wildcards, private and internal domains, tasks,
 ssh, sidecars, process types but `web`, route services, syslog drains, environment variable
 groups, service keys, sharing a service instance with another space, an organization made by
-other than an admin, more than 1000 instances of an app. One quota, of no limit. One owner (`cf`)
-per wicket: two cf-apis must not share one. The wickets of one cf-api run apps one way, and are
-told apart by their names alone: two names of one console behind two URLs defeat the spread.
+other than an admin, more than 1000 instances of an app, a deployment of a revision (there are
+none: `cf rollback` finds none). One quota, of no limit. One owner (`cf`) per wicket: two cf-apis
+must not share one. The wickets of one cf-api run apps one way, and are told apart by their names
+alone: two names of one console behind two URLs defeat the spread.
 
 ## Tests
 

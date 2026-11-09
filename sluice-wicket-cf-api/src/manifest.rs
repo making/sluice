@@ -766,7 +766,7 @@ pub fn check_scale(app: &App, instances: u64, runtime: Option<Runtime>) -> Resul
 }
 
 /// Whether an app may have `instances`: each is placed on a wicket, kept and listed.
-fn check_instances(instances: u64) -> Result<(), String> {
+pub(crate) fn check_instances(instances: u64) -> Result<(), String> {
     match instances > MAX_INSTANCES {
         true => Err(format!(
             "instances: {instances} is past the {MAX_INSTANCES} an app has at most"

@@ -1,11 +1,13 @@
 //! The wickets serve what the state wants. Each index of an app's web process is placed on a
 //! wicket (`crate::placement`), and an app started with a droplet and a route is, on each wicket
 //! holding some of its indices, an app of that wicket named by its guid, its share: its routes'
-//! hosts, the snapshot's component and sandbox -- its env, which a wicket lists by the names only,
-//! told by the snapshot's tag -- and its indices' count as the route's `instances`, those of them
-//! below the annotated `warm` as its `warm` (the warm ones are the lowest, as a wasm wicket's units
-//! are `0..warm`), each taking `concurrency` requests at once, or a droplet's rootfs as a
-//! Firecracker wicket's VMs: [`vm_sandbox`]; stopped, scaled to 0, or without a route, it is none.
+//! hosts, the snapshot's component and sandbox (a deployment's under way once it reached the
+//! wicket, else the one before: `crate::deployments`) -- its env, which a wicket lists by the
+//! names only, told by the snapshot's tag -- and its indices' count as the route's `instances`,
+//! those of them below the annotated `warm` as its `warm` (the warm ones are the lowest, as a wasm
+//! wicket's units are `0..warm`), each taking `concurrency` requests at once, or a droplet's rootfs
+//! as a Firecracker wicket's VMs: [`vm_sandbox`]; stopped, scaled to 0, or without a route, it is
+//! none.
 //! The desired state is the cf-api's: at startup and whenever a wicket's revision moves, its apps
 //! of the owner are listed and the difference put / deleted, each wicket watched apart. The
 //! wickets serve on while the cf-api is down.
@@ -176,13 +178,11 @@ impl Controller {
     }
 
     /// The shares of `app` as `state` wants it, by wicket name: on each wicket holding some of its
-    /// indices the app of them. None when the app is stopped, scaled to 0, was never started
-    /// with a droplet, or has no route.
+    /// indices the app of them, of the snapshot it serves (a deployment's under way, or the one
+    /// before where it has not reached: [`App::running_on`]). None when the app is stopped,
+    /// scaled to 0, was never started with a droplet, or has no route.
     pub fn desired(state: &State, app: &App, owner: &str) -> BTreeMap<String, AppBody> {
-        let Some(running) = app.running.as_ref().filter(|_| app.started) else {
-            return BTreeMap::new();
-        };
-        if app.process.instances == 0 {
+        if app.running.is_none() || !app.started || app.process.instances == 0 {
             return BTreeMap::new();
         }
         let mut hosts: Vec<String> = state
@@ -193,19 +193,20 @@ impl Controller {
             return BTreeMap::new();
         }
         hosts.sort();
-        let rootfs = running.file.ends_with(crate::staging::ROOTFS);
-        // the lowest indices are the warm ones: of a component all unless annotated, of a VM
-        // those its wicket keeps unless annotated
-        let warm = match rootfs {
-            true => running.lifetime.warm,
-            false => Some(running.lifetime.warm.unwrap_or(app.process.instances)),
-        };
         let timeout = app
             .process
             .health_check
             .timeout
             .unwrap_or(DEFAULT_HEALTH_CHECK_TIMEOUT);
         let share = |wicket: &str, indices: &[u64]| {
+            let running = app.running_on(wicket)?;
+            let rootfs = running.file.ends_with(crate::staging::ROOTFS);
+            // the lowest indices are the warm ones: of a component all unless annotated, of a VM
+            // those its wicket keeps unless annotated
+            let warm = match rootfs {
+                true => running.lifetime.warm,
+                false => Some(running.lifetime.warm.unwrap_or(app.process.instances)),
+            };
             let instances = indices.len() as u64;
             let warm =
                 warm.map(|warm| indices.iter().filter(|index| **index < warm).count() as u64);
@@ -234,7 +235,7 @@ impl Controller {
                     env: running.env.clone(),
                 }),
             };
-            AppBody {
+            Some(AppBody {
                 owner: owner.to_string(),
                 hosts: hosts.clone(),
                 component: ComponentRef {
@@ -244,13 +245,13 @@ impl Controller {
                 files: running.files.clone().map(|sha256| FilesRef { sha256 }),
                 sandbox,
                 tag: running.tag.clone(),
-            }
+            })
         };
         let indices = state.indices(app).into_iter();
         indices
-            .map(|(wicket, indices)| {
-                let share = share(&wicket, &indices);
-                (wicket, share)
+            .filter_map(|(wicket, indices)| {
+                let share = share(&wicket, &indices)?;
+                Some((wicket, share))
             })
             .collect()
     }
@@ -480,18 +481,19 @@ impl Controller {
     }
 
     /// Deletes through `wicket` the data of the deleted instances no started app's snapshot maps
-    /// any more, as far as it lets it: one a route of it still maps (409) waits, as does an
-    /// unreachable wicket; one it cannot delete (a store gone: 404) is dropped there. Of a store
-    /// of each wicket's host, gone through every wicket, a deletion is done; of a store they
-    /// share, gone through this one once no wicket maps it ([`Controller::unmapped`]).
+    /// any more (a deployment's under way, or the one before), as far as it lets it: one a route
+    /// of it still maps (409) waits, as does an unreachable wicket; one it cannot delete (a store
+    /// gone: 404) is dropped there. Of a store of each wicket's host, gone through every wicket, a
+    /// deletion is done; of a store they share, gone through this one once no wicket maps it
+    /// ([`Controller::unmapped`]).
     async fn purge_on(&self, wicket: &Wicket) {
         let due: Vec<Purge> = self.store.read(|state| {
             let mapped = |place: &str| {
                 state.apps.iter().any(|app| {
                     app.started
-                        && app.running.as_ref().is_some_and(|running| {
-                            running.keyvalue.values().any(|kept| *kept == place)
-                        })
+                        && app
+                            .snapshots()
+                            .any(|running| running.keyvalue.values().any(|kept| *kept == place))
                 })
             };
             (state.purges.iter())
@@ -788,7 +790,7 @@ impl Controller {
                         droplet.made_as(on, &made.sha256);
                     }
                 }
-                let running = state.apps.iter_mut().filter_map(|app| app.running.as_mut());
+                let running = state.apps.iter_mut().flat_map(App::snapshots_mut);
                 for running in running.filter(|running| running.sha256_on(on) == sha256) {
                     running.made_as(on, &made.sha256);
                 }
@@ -846,9 +848,18 @@ impl Controller {
     /// app from it. A share refused for room has an index passed to a wicket with room, and the
     /// shares applied again.
     pub async fn sync(&self, guid: &str) {
+        self.sync_on(guid, None).await;
+    }
+
+    /// [`Controller::sync`] on the wickets `only` names (all: None): a share refused for room
+    /// passes an index, and every share is applied again.
+    pub async fn sync_on(&self, guid: &str, only: Option<&[String]>) {
+        let mut only = only;
         // each pass fills a wicket: as many as there are
         for _ in 0..=self.wickets.len() {
-            let full = join_all(self.wickets.iter().map(|wicket| async move {
+            let wickets = (self.wickets.iter())
+                .filter(|wicket| only.is_none_or(|only| only.contains(&wicket.name)));
+            let full = join_all(wickets.map(|wicket| async move {
                 let _share = self.hold_share(guid, &wicket.name).await;
                 let synced = self.sync_held(wicket, guid).await;
                 synced.is_err_and(|e| e.no_room()).then_some(&wicket.name)
@@ -861,6 +872,25 @@ impl Controller {
             if !passed {
                 return;
             }
+            only = None;
+        }
+    }
+
+    /// Applies the shares of `guid` that are not as `before` had them, at once
+    /// ([`Controller::sync_on`]).
+    pub async fn sync_changed(&self, guid: &str, before: &BTreeMap<String, AppBody>) {
+        let owner = self.owner();
+        let now = self.store.read(|state| {
+            let app = state.app(guid);
+            app.map(|app| Controller::desired(state, app, owner))
+                .unwrap_or_default()
+        });
+        let changed: Vec<String> = (self.wickets.iter())
+            .map(|wicket| wicket.name.clone())
+            .filter(|name| now.get(name) != before.get(name))
+            .collect();
+        if !changed.is_empty() {
+            self.sync_on(guid, Some(&changed)).await;
         }
     }
 
