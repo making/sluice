@@ -149,6 +149,9 @@ pub struct Shared<T> {
     /// Tunnel streams up (their advertise acked) and not ended yet; the
     /// supervisor asks the bootstrap for the nodes while there is none.
     pub up: AtomicUsize,
+    /// The sessions of the membership (spawned, not ended yet), whose streams
+    /// tell the readiness ([`Shared::readiness`]).
+    sessions: std::sync::Mutex<Vec<Arc<Session>>>,
     /// This wicket's build, sent in every Advertise.
     pub build: PeerBuild,
     /// See [`Settings::workers`].
@@ -180,9 +183,50 @@ impl<T> Shared<T> {
             drain: Drain::default(),
             tasks: TaskTracker::new(),
             up: AtomicUsize::new(0),
+            sessions: std::sync::Mutex::default(),
             build,
             workers,
         })
+    }
+}
+
+impl<T: Table> Shared<T> {
+    /// Whether the wicket serves through the server, as a readiness probe asks: not from the drain
+    /// on; else once every node of the membership has a stream up that took the current routes'
+    /// generation, and every route has an instance ready ([`Routes::readiness`]). Err says why not.
+    pub fn readiness(&self) -> Result<(), String> {
+        if self.drain.begin.is_cancelled() {
+            return Err("draining".into());
+        }
+        let generation = self.routes.current().generation();
+        let behind: Vec<String> = {
+            let sessions = self.sessions.lock().unwrap();
+            let members: Vec<&Arc<Session>> = sessions
+                .iter()
+                .filter(|session| !session.token.is_cancelled())
+                .collect();
+            if members.is_empty() {
+                return Err("no server node known yet".into());
+            }
+            members
+                .into_iter()
+                .filter(|session| {
+                    session
+                        .took
+                        .lock()
+                        .unwrap()
+                        .is_none_or(|took| took < generation)
+                })
+                .map(|session| session.label())
+                .collect()
+        };
+        if !behind.is_empty() {
+            return Err(format!(
+                "no stream up that took the routes of generation {generation} to {}",
+                behind.join(", ")
+            ));
+        }
+        self.routes.readiness()
     }
 }
 
@@ -195,6 +239,28 @@ pub struct Session {
     pub node_id: String,
     /// Cancelled by the supervisor to stop the reconnect loop.
     pub token: CancellationToken,
+    /// The newest generation the server took on the session's stream up; None while none is up.
+    took: std::sync::Mutex<Option<u64>>,
+}
+
+impl Session {
+    fn new(url: String, node_id: String) -> Session {
+        Session {
+            url,
+            node_id,
+            token: CancellationToken::new(),
+            took: std::sync::Mutex::default(),
+        }
+    }
+
+    /// The node id, the url while it is unknown.
+    fn label(&self) -> String {
+        if self.node_id.is_empty() {
+            self.url.clone()
+        } else {
+            self.node_id.clone()
+        }
+    }
 }
 
 /// A session task's fixed state across its reconnect attempts.
@@ -273,16 +339,9 @@ pub fn spawn_session<T: Table>(
     url: String,
     events: mpsc::Sender<Vec<proto::Node>>,
 ) -> Arc<Session> {
-    let label = if node_id.is_empty() {
-        url.clone()
-    } else {
-        node_id.clone()
-    };
-    let session = Arc::new(Session {
-        url,
-        node_id,
-        token: CancellationToken::new(),
-    });
+    let session = Arc::new(Session::new(url, node_id));
+    let label = session.label();
+    shared.sessions.lock().unwrap().push(session.clone());
     let task = NodeTask {
         shared: shared.clone(),
         session: session.clone(),
@@ -301,6 +360,13 @@ impl<T: Table> NodeTask<T> {
     /// (`NodeConnection#runLoop`); exits once the supervisor cancels the token
     /// or the drain began, after the stream's end.
     async fn run(self) {
+        self.reconnecting().await;
+        let mut sessions = self.shared.sessions.lock().unwrap();
+        sessions.retain(|session| !Arc::ptr_eq(session, &self.session));
+    }
+
+    /// [`NodeTask::run`]'s loop.
+    async fn reconnecting(&self) {
         let mut backoff = Backoff::new();
         loop {
             match self.attempt().await {
@@ -344,6 +410,7 @@ impl<T: Table> NodeTask<T> {
             upstreams: offered,
             unacked: VecDeque::from([routes.generation()]),
             acks,
+            session: self.session.clone(),
         };
         let mut request = tonic::Request::new(frames);
         identify(&mut request, &self.shared.token, &self.shared.id)?;
@@ -596,6 +663,8 @@ struct Advertised {
     /// Oldest first: acknowledgements come in the order of the advertises.
     unacked: VecDeque<u64>,
     acks: StreamAcks,
+    /// The stream's session, told what the server took ([`Session::took`]) until the stream ends.
+    session: Arc<Session>,
 }
 
 impl Advertised {
@@ -612,7 +681,7 @@ impl Advertised {
         }
         match self.unacked.back_mut() {
             Some(pending) => *pending = routes.generation(),
-            None => self.acks.acked(routes.generation()),
+            None => self.took(routes.generation()),
         }
         false
     }
@@ -620,8 +689,22 @@ impl Advertised {
     /// The server acknowledged the oldest advertise.
     fn acked(&mut self) {
         if let Some(generation) = self.unacked.pop_front() {
-            self.acks.acked(generation);
+            self.took(generation);
         }
+    }
+
+    /// The server took the routes of `generation` on the stream.
+    fn took(&self, generation: u64) {
+        self.acks.acked(generation);
+        let mut took = self.session.took.lock().unwrap();
+        *took = Some(took.map_or(generation, |took| took.max(generation)));
+    }
+}
+
+impl Drop for Advertised {
+    /// The stream ended: none of the session's is up.
+    fn drop(&mut self) {
+        *self.session.took.lock().unwrap() = None;
     }
 }
 
@@ -805,11 +888,7 @@ mod tests {
         let (events, _received) = mpsc::channel(32);
         let task = NodeTask {
             shared,
-            session: Arc::new(Session {
-                url,
-                node_id: String::new(),
-                token: CancellationToken::new(),
-            }),
+            session: Arc::new(Session::new(url, String::new())),
             label: "stalling".into(),
             events,
         };
@@ -894,6 +973,7 @@ mod tests {
             upstreams: vec![upstream("a")],
             unacked: VecDeque::from([1]),
             acks: routes.stream(),
+            session: Arc::new(Session::new("grpc://node".into(), String::new())),
         };
         let table = |generation, hosts: &[&str]| Fixed {
             generation,

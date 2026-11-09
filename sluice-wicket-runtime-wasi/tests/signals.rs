@@ -1,7 +1,8 @@
 //! The signals of the process: SIGHUP reloads the routes; SIGTERM starts the
 //! drain and a second one ends it at once; with `--drain-grace 0` SIGTERM ends
 //! the process at once, through its handler (exit 0, not the default action:
-//! the init of a container has none).
+//! the init of a container has none). The readiness probe (`--health`) says
+//! ready once the server took the routes, not from the drain on.
 #![cfg(unix)]
 
 use std::io::{BufRead, BufReader};
@@ -97,7 +98,8 @@ impl Drop for Wicket {
 }
 
 /// The wicket on `server` serving `component` for `hello.local`, polling
-/// nothing (SIGHUP alone reloads), its stdout lines on the receiver.
+/// nothing (SIGHUP alone reloads), its readiness probe on a port of its
+/// choosing, its stdout lines on the receiver.
 fn wicket(
     server: &str,
     drain_grace: &str,
@@ -105,7 +107,7 @@ fn wicket(
 ) -> (Wicket, mpsc::Receiver<String>) {
     let mut child = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-runtime-wasi"))
         .args(["--server", server, "--drain-grace", drain_grace])
-        .args(["--watch-interval", "0", "--wasm"])
+        .args(["--watch-interval", "0", "--health", "127.0.0.1:0", "--wasm"])
         .arg(format!("hello.local={}", component.display()))
         .stdout(Stdio::piped())
         .spawn()
@@ -122,8 +124,8 @@ fn wicket(
     (Wicket(child), received)
 }
 
-/// Waits for a line containing `text`.
-fn await_line(lines: &mpsc::Receiver<String>, text: &str) {
+/// Waits for a line containing `text`; the line.
+fn await_line(lines: &mpsc::Receiver<String>, text: &str) -> String {
     let deadline = Instant::now() + HANG;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
@@ -131,9 +133,30 @@ fn await_line(lines: &mpsc::Receiver<String>, text: &str) {
             .recv_timeout(left)
             .unwrap_or_else(|e| panic!("no line with '{text}': {e}"));
         if line.contains(text) {
-            return;
+            return line;
         }
     }
+}
+
+/// What `--probe` makes of the readiness probe its line (`url`) names: whether ready, and what
+/// it printed.
+fn probe(url: &str) -> (bool, String) {
+    let address = url
+        .strip_prefix("readiness probe on http://")
+        .and_then(|rest| rest.strip_suffix("/ready"))
+        .unwrap_or_else(|| panic!("a probe's line: {url}"));
+    let output = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-runtime-wasi"))
+        .args(["--probe", address])
+        .output()
+        .expect("run sluice-wicket-runtime-wasi --probe");
+    let said = match output.status.success() {
+        true => output.stdout,
+        false => output.stderr,
+    };
+    (
+        output.status.success(),
+        String::from_utf8_lossy(&said).into_owned(),
+    )
 }
 
 fn sigterm(child: &Child) {
@@ -173,7 +196,9 @@ async fn sigterm_drains_and_a_second_one_ends_the_drain() {
     // the server never acknowledges the withdrawal: only the second signal
     // ends the drain before its 60s grace
     let (mut child, lines) = wicket(&server, "60", &component);
+    let probed = await_line(&lines, "readiness probe on ");
     await_line(&lines, "advertise acked by");
+    assert_eq!(probe(&probed), (true, "ready\n".to_string()));
     // SIGHUP reloads the routes, and ends nothing
     signal(&child, "-HUP");
     await_line(&lines, "routes reload (SIGHUP): no change");
@@ -185,6 +210,7 @@ async fn sigterm_drains_and_a_second_one_ends_the_drain() {
     );
     sigterm(&child);
     await_line(&lines, "withdrawing the routes");
+    assert_eq!(probe(&probed), (false, "not ready: draining\n".to_string()));
     sigterm(&child);
     let status = exit_within(&mut child, Duration::from_secs(15));
     assert!(status.success(), "{status:?}");

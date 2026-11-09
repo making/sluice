@@ -28,6 +28,9 @@ usage: sluice-wicket-runtime-wasi --server <url> --wasm <host>=<locator>[?<optio
   --server <url>                  bootstrap endpoint, grpc://host:port or grpcs://host:port
   --listen <host:port>            also (or only, without --server) serve the routes over plain
                                   TCP, http/1.1 and h2c, routed by the request's host
+  --health <host:port>            serve the readiness probe: GET /ready answers 200 once
+                                  the routes started and, with --server, every server node
+                                  took them, 503 before and from the drain on
   --wasm <host>=<locator>         a route: a component path, file:// or http(s):// url;
                                   repeatable. ?budget-ms=N&concurrency=N&instances=N&keep-ms=N
                                   &memory-mib=N&warm=N&wasi=<cap>,... sets its sandbox (wasi=keyvalue: the
@@ -74,6 +77,8 @@ usage: sluice-wicket-runtime-wasi --server <url> --wasm <host>=<locator>[?<optio
                                   (default 60, 0 = off)
   --drain-grace <secs>            the SIGTERM drain's bound (default 20, 0 = no drain)
   --watch-interval <secs>         poll the routes' files (default 1, 0 = SIGHUP only)
+  --probe <host:port>             ask the readiness probe there (--health): exit 0 when
+                                  ready, 1 when not (a distroless image's healthcheck)
   --version                       print the build (version, commit, build time) and exit
 
 Each option but --wasm also reads SLUICE_WICKET_RUNTIME_WASI_<NAME> from the environment, e.g.
@@ -97,6 +102,8 @@ pub struct Settings {
     /// None: local mode alone (`listen`).
     pub server: Option<String>,
     pub listen: Option<String>,
+    /// The readiness probe's listener (`--health`).
+    pub health: Option<String>,
     pub token: String,
     pub client_id: String,
     pub insecure: bool,
@@ -122,6 +129,8 @@ pub use sluice_wicket_console::settings::ConsoleSettings;
 pub enum Command {
     Help,
     Version,
+    /// Ask the readiness probe at this `host:port` (`--probe`).
+    Probe(String),
     Run(Box<Settings>),
 }
 
@@ -132,6 +141,7 @@ struct Flags {
     config: Option<PathBuf>,
     server: Option<String>,
     listen: Option<String>,
+    health: Option<String>,
     token: Option<String>,
     token_file: Option<PathBuf>,
     client_id: Option<String>,
@@ -163,6 +173,7 @@ const VALUED: &[&str] = &[
     "config",
     "server",
     "listen",
+    "health",
     "token",
     "token-file",
     "client-id",
@@ -233,6 +244,13 @@ pub fn parse(
         match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
             "-V" | "--version" => return Ok(Command::Version),
+            "--probe" => {
+                let address = args.next().ok_or("--probe needs a value")?;
+                return Ok(Command::Probe(address));
+            }
+            probe if probe.starts_with("--probe=") => {
+                return Ok(Command::Probe(probe["--probe=".len()..].to_string()));
+            }
             "--insecure" => insecure = true,
             "--flume-insecure" => flume_insecure = true,
             _ => {
@@ -292,6 +310,7 @@ pub fn parse(
         config: value("config").map(PathBuf::from),
         server: value("server"),
         listen: value("listen"),
+        health: value("health"),
         token: value("token"),
         token_file: value("token-file").map(PathBuf::from),
         client_id: value("client-id"),
@@ -364,6 +383,10 @@ fn merge(flags: Flags) -> Result<Settings, String> {
         .listen
         .or_else(|| settings.listen.clone())
         .filter(|listen| !listen.is_empty());
+    let health = flags
+        .health
+        .or_else(|| settings.health.clone())
+        .filter(|health| !health.is_empty());
     if server.is_none() && listen.is_none() {
         return Err(
             "--server or --listen (or `server` / `listen` in the --config file) is required".into(),
@@ -482,6 +505,7 @@ fn merge(flags: Flags) -> Result<Settings, String> {
     Ok(Settings {
         server,
         listen,
+        health,
         token,
         client_id,
         insecure,
@@ -640,6 +664,7 @@ impl ConfigFile {
 struct File {
     server: Option<String>,
     listen: Option<String>,
+    health: Option<String>,
     token: Option<String>,
     token_file: Option<PathBuf>,
     client_id: Option<String>,
@@ -698,6 +723,7 @@ impl File {
         compare!(
             server => "server",
             listen => "listen",
+            health => "health",
             token => "token",
             token_file => "token-file",
             client_id => "client-id",
@@ -1292,6 +1318,7 @@ tunnel-stall-timeout: 90s
 drain-grace: 0
 watch-interval: 250ms
 listen: 127.0.0.1:8080
+health: 127.0.0.1:8081
 console: 127.0.0.1:9090
 console-token: t0ken
 console-dir: kept
@@ -1357,6 +1384,7 @@ routes:
         let file = settings(&["--config", config]).unwrap();
         assert_eq!(file.server.as_deref(), Some("grpc://file:8001"));
         assert_eq!(file.listen.as_deref(), Some("127.0.0.1:8080"));
+        assert_eq!(file.health.as_deref(), Some("127.0.0.1:8081"));
         assert_eq!(
             file.token,
             format!("{}${{literal}}", std::env::var("HOME").unwrap())
@@ -1525,6 +1553,7 @@ routes:
                 "flag.pem",
                 "--listen",
                 "0.0.0.0:9",
+                "--health=0.0.0.0:10",
                 "--console-dir",
                 "/var/kept",
                 "--flume",
@@ -1536,6 +1565,7 @@ routes:
         .unwrap();
         assert_eq!(flagged.server.as_deref(), Some("grpc://flag:1"));
         assert_eq!(flagged.listen.as_deref(), Some("0.0.0.0:9"));
+        assert_eq!(flagged.health.as_deref(), Some("0.0.0.0:10"));
         assert_eq!(flagged.max_instances, 16, "the flag's");
         assert_eq!(flagged.max_connections, 12, "the environment's");
         assert_eq!(flagged.drain_grace, Duration::from_secs(5));
@@ -1595,6 +1625,7 @@ routes:
         assert_eq!(defaults.watch_interval, DEFAULT_WATCH_INTERVAL);
         assert!(!defaults.insecure);
         assert_eq!(defaults.listen, None);
+        assert_eq!(defaults.health, None);
         assert!(defaults.console.is_none());
         assert_eq!(defaults.flume, None);
         assert_eq!(defaults.routes.read().unwrap().0, [], "no route yet");
@@ -1933,6 +1964,15 @@ routes:
             Ok(Command::Help)
         ));
         assert!(matches!(parse(args(&["-V"]), none), Ok(Command::Version)));
+        for probe in [
+            &["--probe", "127.0.0.1:8081"][..],
+            &["--probe=127.0.0.1:8081"],
+        ] {
+            assert!(matches!(
+                parse(args(probe), none),
+                Ok(Command::Probe(address)) if address == "127.0.0.1:8081"
+            ));
+        }
     }
 
     #[test]

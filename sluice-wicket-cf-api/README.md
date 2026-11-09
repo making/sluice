@@ -883,8 +883,10 @@ mode stays one wicket.
   back. The server's default `sluice.http-load-balance`, `smallest-client-id`, sends
   every request to one wicket, the other standing by; `round-robin` shares them. Let a stop take
   longer than the drain (`stop_grace_period` / `terminationGracePeriodSeconds` 30s, a Firecracker
-  wicket's 40s), and update the next wicket once the first serves again (`cf app` shows its
-  instances running): a route that does not start ends the wicket's start
+  wicket's 40s), and update the next wicket once the first serves again: its readiness probe
+  (`--health`, see the wicket's [Readiness probe](../sluice-wicket-runtime-wasi/README.md#readiness-probe))
+  says so once every node of the server took its routes, each with an instance ready. A route
+  that does not start ends the wicket's start
 
 The [Docker Compose](#docker-compose) sample with a sluice server and two wickets: in its
 `compose.yaml`, the services below in place of `wicket` and `cf-api`, the volumes `wicket-a` and
@@ -910,6 +912,9 @@ data in the Redis both wickets share.
       FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD}
     stop_grace_period: 30s          # above drain-grace: a stop drains
+    healthcheck:                    # ready: the server routes to it (wicket.yaml's health)
+      test: [CMD, /usr/local/bin/sluice-wicket-runtime-wasi, --probe, 127.0.0.1:8081]
+      interval: 5s
     volumes:
       - ./wicket.yaml:/etc/sluice/wicket.yaml:ro
       - wicket-a:/data              # its console directory: one each
@@ -944,6 +949,7 @@ data in the Redis both wickets share.
 # wicket.yaml, both wickets': the apps through the server
 server: grpc://server:8001
 token: ${SERVER_TOKEN}
+health: 127.0.0.1:8081
 console: 0.0.0.0:9090
 console-token: ${CONSOLE_TOKEN}
 console-dir: /data/deployed
@@ -962,7 +968,10 @@ cf login -a http://127.0.0.1:9091 --sso
 cf push hello -p hello/ -i 2               # an instance on each wicket
 curl http://hello.localhost:28000/         # through the server
 cf curl "/v3/apps/$(cf app hello --guid)/processes/web/stats" | jq -c '.resources[] | [.index, .host]'
-docker compose restart wicket-a            # it drains: hello goes on through wicket-b
+# an update, one wicket at a time: each drains (hello goes on through the other) and is
+# waited for until it is ready again
+docker compose up -d --force-recreate --wait wicket-a
+docker compose up -d --force-recreate --wait wicket-b
 ```
 
 ## Options

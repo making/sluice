@@ -29,6 +29,9 @@
 //! components as routes, through the same reload; they are kept in the
 //! console's directory (`deployed`) across restarts.
 //!
+//! `--health` serves the readiness probe (`sluice-wicket-server`'s `health`): whether the
+//! wicket serves, as `sluice-wicket-tunnel`'s `ready` tells.
+//!
 //! `--flume` feeds the guests' output and the answered requests to a
 //! sluice-flume (`sluice-wicket-tunnel`'s `flume`), the live access log the
 //! sluice console and the cf-api watch.
@@ -69,6 +72,7 @@ use sluice_wicket_console::identity::Identity;
 use std::sync::Arc;
 
 use sluice_wicket_tunnel::flume::{self, Tap};
+use sluice_wicket_tunnel::ready::Readiness;
 use sluice_wicket_tunnel::session::Shared;
 use sluice_wicket_tunnel::signals::{self, Signals};
 use tokio::sync::mpsc;
@@ -97,6 +101,21 @@ pub fn build() -> PeerBuild {
     }
 }
 
+/// Serves the readiness probe on `address` (`--health`), as `readiness` tells.
+async fn serve_health(
+    address: &str,
+    readiness: Arc<Readiness<routes::Table>>,
+) -> Result<(), BoxError> {
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|e| format!("--health {address}: {e}"))?;
+    println!("readiness probe on http://{}/ready", listener.local_addr()?);
+    tokio::spawn(sluice_wicket_server::health::run(listener, move || {
+        readiness.check()
+    }));
+    Ok(())
+}
+
 /// [`build`] in one line, see [`sluice_wicket_tunnel::describe`].
 pub fn describe_build() -> String {
     sluice_wicket_tunnel::describe(&build())
@@ -109,6 +128,7 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
     let config::Settings {
         server,
         listen,
+        health,
         token,
         client_id,
         insecure,
@@ -137,6 +157,11 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         routes.deploy(deployed);
     }
 
+    // probed from now on: not ready while the routes start
+    let readiness = Readiness::starting();
+    if let Some(address) = health {
+        serve_health(&address, readiness.clone()).await?;
+    }
     // Fetches / prewarms every route's component (fail fast) and builds its
     // handler on `instances`.
     let reloader = Reloader::start(routes, instances.clone()).await?;
@@ -211,6 +236,7 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
     // container, a process without a handler ignores SIGTERM
     let mut signals = Signals::install()?;
     let Some(server) = server else {
+        readiness.local(routes);
         // local mode alone: nothing to drain, a signal ends the process at once
         let reloads = reloader.run(
             watch_interval,
@@ -244,6 +270,7 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
         },
         routes,
     );
+    readiness.tunnel(shared.clone());
 
     // the drain stops the reloads (the console's edits too): the routes are withdrawn
     tokio::spawn(reloader.run(

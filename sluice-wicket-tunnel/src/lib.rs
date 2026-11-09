@@ -30,12 +30,15 @@
 //! A wicket serves its routes over plain TCP as well in local mode
 //! ([`listener`]: `--listen`), routed by the host its client asks for.
 //!
+//! A wicket's readiness probe asks [`ready`] whether it serves.
+//!
 //! A wicket feeds its live access log -- its guests' output, the requests it
 //! answered -- to a sluice-flume as a node does ([`flume`]).
 
 pub mod drain;
 pub mod flume;
 pub mod listener;
+pub mod ready;
 pub mod routes;
 pub mod session;
 pub mod signals;

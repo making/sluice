@@ -36,6 +36,18 @@ fn main() -> ExitCode {
             println!("{}", sluice_wicket_runtime_firecracker::describe_build());
             return ExitCode::SUCCESS;
         }
+        Ok(Command::Probe(address)) => {
+            return match sluice_wicket_server::health::probe(&address) {
+                Ok(ready) => {
+                    print!("{ready}");
+                    ExitCode::SUCCESS
+                }
+                Err(not) => {
+                    eprintln!("{}", not.trim_end());
+                    ExitCode::FAILURE
+                }
+            };
+        }
         Ok(Command::Run(settings)) => *settings,
         Err(message) => {
             eprintln!("{message}\n\n{}", config::USAGE);

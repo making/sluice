@@ -769,7 +769,8 @@ async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> 
 /// A booted route checking its VMs' readiness (`readiness=http`): advertised once a VM passed its
 /// check, listed so; a VM failing it takes no connection, and with none ready the route leaves the
 /// advertisement until one answers again, its connections failing meanwhile, on the tunnel and on
-/// `--listen`; a process ending likewise, until the VM in its place is ready.
+/// `--listen`; a process ending likewise, until the VM in its place is ready. The wicket's
+/// readiness probe says ready only while the route has a VM ready.
 async fn readiness(scratch: &Path, rootfs: &Path, start: impl Fn(&str, &[String]) -> Wicket) {
     const READY: &str = "ready.local";
     let config = scratch.join("readiness.yaml");
@@ -792,6 +793,8 @@ async fn readiness(scratch: &Path, rootfs: &Path, start: impl Fn(&str, &[String]
         CONSOLE_TOKEN,
         "--console-dir",
         "readiness-console",
+        "--health",
+        "127.0.0.1:0",
     ]
     .map(String::from);
     let (url, mut streams) = tunnel_server(None).await;
@@ -810,8 +813,16 @@ async fn readiness(scratch: &Path, rootfs: &Path, start: impl Fn(&str, &[String]
     };
     assert_eq!(hosts(&first), Vec::<String>::new(), "{}", wicket.log());
     said(wicket, "VM 0 not ready: GET /ready?after=20: HTTP/1.1 503").await;
+    let probe = probed(wicket.health()).await;
+    assert!(probe.starts_with("HTTP/1.1 503 "), "{probe}");
     let advertised = tunnel.advertise().await;
     assert_eq!(hosts(&advertised), [READY], "{}", wicket.log());
+    // the server's ack on its way
+    let deadline = Instant::now() + HANG;
+    while !probed(wicket.health()).await.ends_with("\r\n\r\nready\n") {
+        assert!(Instant::now() < deadline, "not ready; {}", wicket.log());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     let address = dial_address(&advertised.upstreams[0].target_url);
     fn on<'a>(tunnel: &'a ServerTunnel, address: &str) -> Route<'a> {
         Route {
@@ -850,6 +861,12 @@ async fn readiness(scratch: &Path, rootfs: &Path, start: impl Fn(&str, &[String]
     assert_ne!(other, failing);
     let withdrawn = tunnel.advertise().await;
     assert_eq!(hosts(&withdrawn), Vec::<String>::new(), "{}", wicket.log());
+    let probe = probed(wicket.health()).await;
+    assert!(
+        probe.starts_with("HTTP/1.1 503 ")
+            && probe.ends_with("\r\n\r\nnot ready: no instance ready for ready.local\n"),
+        "{probe}"
+    );
     let none = listed(wicket, READY).await;
     assert_eq!(
         (&none["ready"], &none["instances"]["ready"]),
@@ -881,6 +898,13 @@ async fn readiness(scratch: &Path, rootfs: &Path, start: impl Fn(&str, &[String]
     assert!(replaced != other && replaced != failing, "{}", wicket.log());
     let restarted = listed(wicket, READY).await;
     assert_eq!(restarted["instances"]["restarts"], 1, "{restarted}");
+}
+
+/// What the readiness probe at `health` answers, head and body.
+async fn probed(health: std::net::SocketAddr) -> String {
+    let client = tokio::net::TcpStream::connect(health).await.unwrap();
+    let request = "GET /ready HTTP/1.1\r\nhost: probe\r\nconnection: close\r\n\r\n";
+    exchange(client, request).await
 }
 
 /// The instances the listing of the app `name` has alive, as `(index, since)`, and its `down`.
@@ -3796,32 +3820,29 @@ impl Wicket {
 
     /// The address `--listen` bound, from its log.
     fn listening(&self) -> std::net::SocketAddr {
-        let deadline = Instant::now() + HANG;
-        loop {
-            let log = std::fs::read_to_string(&self.log).unwrap_or_default();
-            let line = log
-                .lines()
-                .find_map(|line| line.strip_prefix("listening on "));
-            if let Some(line) = line {
-                return line.split(',').next().unwrap().parse().unwrap();
-            }
-            assert!(Instant::now() < deadline, "not listening; {}", self.log());
-            std::thread::sleep(Duration::from_millis(50));
-        }
+        self.logged("listening on ", ',')
     }
 
     /// The address its console listens on, from its log.
     fn console(&self) -> std::net::SocketAddr {
+        self.logged("console on http://", ' ')
+    }
+
+    /// The address its readiness probe (`--health`) listens on, from its log.
+    fn health(&self) -> std::net::SocketAddr {
+        self.logged("readiness probe on http://", '/')
+    }
+
+    /// The address its log names first on a line starting with `prefix`, up to `end`.
+    fn logged(&self, prefix: &str, end: char) -> std::net::SocketAddr {
         let deadline = Instant::now() + HANG;
         loop {
             let log = std::fs::read_to_string(&self.log).unwrap_or_default();
-            let line = log
-                .lines()
-                .find_map(|line| line.strip_prefix("console on http://"));
+            let line = log.lines().find_map(|line| line.strip_prefix(prefix));
             if let Some(line) = line {
-                return line.split(' ').next().unwrap().parse().unwrap();
+                return line.split(end).next().unwrap().parse().unwrap();
             }
-            assert!(Instant::now() < deadline, "no console; {}", self.log());
+            assert!(Instant::now() < deadline, "no '{prefix}'; {}", self.log());
             std::thread::sleep(Duration::from_millis(50));
         }
     }

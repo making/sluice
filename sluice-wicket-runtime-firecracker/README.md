@@ -236,7 +236,11 @@ connections ended; a second signal ends at once). Each also reads
 `SLUICE_WICKET_RUNTIME_FIRECRACKER_<NAME>` from the environment, e.g. `SLUICE_WICKET_RUNTIME_FIRECRACKER_TOKEN`;
 another variable of that prefix but the two below, a misspelled one, is refused at the start.
 `--workers` (4, at most the CPUs) sets the threads relaying the connections (see
-[findings](../.kb/wicket-firecracker-findings.md#relay-workers)).
+[findings](../.kb/wicket-firecracker-findings.md#relay-workers)). `--health <host:port>` serves the
+wicket's readiness probe, `GET /ready`, as sluice-wicket-runtime-wasi's ([Readiness
+probe](../sluice-wicket-runtime-wasi/README.md#readiness-probe)): ready once the routes started,
+each with a VM [ready](#readiness), and with `--server` every node took them; not from the drain on.
+`--probe <host:port>` asks it (exit 0 when ready, 1 when not).
 
 `SLUICE_WICKET_RUNTIME_FIRECRACKER_SERIAL_CONSOLE=1` gives the VMs a serial console, the kernel's and
 `/init`'s own output into each VM's `firecracker.log` (the processes' reaches the wicket
@@ -407,6 +411,7 @@ has it serve once its readiness check passed as well, as a CF app's readiness he
   Its target stays bound: a connection the server routed before fails. `--listen` routes its host
   as ever, its connections failing alike
 - **per connection, reused**: refused, a connection's VM being its own, restored as it comes
+- **the wicket's probe** (`--health`) is not ready while a route has no VM ready
 - **told**: the log says each change (`route app.local: VM 1 not ready: GET /ready: HTTP/1.1 503
   Service Unavailable`, `route app.local: VM 1 ready`); the console's listing a route's `ready`
   (advertised) and `instances.ready` (its VMs taking connections), an app's `alive` each VM's `ready`
@@ -992,6 +997,9 @@ docker run --rm --device /dev/kvm --group-add $(stat -c %g /dev/kvm) \
 - **`--stop-timeout`** above `--drain-grace` (20s; Docker's default stop timeout is 10s), and
   20s more with an app's [disk](#disks). The wicket is the container's PID 1: it drains on
   SIGTERM and reaps its VMs, no init needed
+- **a healthcheck** in its exec form (the image has no shell, which `docker run --health-cmd`
+  runs): with `--health 127.0.0.1:8081`, Compose's `healthcheck: {test: [CMD,
+  /usr/local/bin/sluice-wicket-runtime-firecracker, --probe, 127.0.0.1:8081]}`
 - **`/data`** on a volume with `--console`: `deployed/`, the console's directory, holds the
   routes, the images and the apps' [disks](#disks). The volume is the image's user's (65532),
   as a new named volume is
@@ -1033,8 +1041,9 @@ of runs ([findings](../.kb/wicket-firecracker-findings.md#through-the-docker-ima
 Kubernetes: `/dev/kvm` reaches a Pod through a device plugin (KubeVirt's
 `devices.kubevirt.io/kvm`, or a generic one), or a privileged container;
 `securityContext.supplementalGroups` holds the node's `kvm` gid, `/run/sluice` is an
-`emptyDir` of `medium: Memory` (counted against the Pod's memory limit), and
-`terminationGracePeriodSeconds` exceeds `--drain-grace`. Jail mode: `runAsUser: 0`,
+`emptyDir` of `medium: Memory` (counted against the Pod's memory limit),
+`terminationGracePeriodSeconds` exceeds `--drain-grace`, and a `readinessProbe`'s `httpGet` asks
+`/ready` of `--health` (on `0.0.0.0`). Jail mode: `runAsUser: 0`,
 `capabilities.add: [SYS_ADMIN]`, `seccompProfile` (the wicket's filters replace it) and
 `appArmorProfile` `Unconfined` (or a privileged container).
 

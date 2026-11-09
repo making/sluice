@@ -227,6 +227,7 @@ tunnel-stall-timeout: 60s
 drain-grace: 20s
 watch-interval: 1s              # 0 = no polling, SIGHUP only
 # listen: 127.0.0.1:8080        # local mode, see Local mode
+# health: 127.0.0.1:8081        # see Readiness probe
 # console: 127.0.0.1:9090       # see Console
 # console-token: ${CONSOLE_TOKEN}
 # console-dir: deployed         # relative to this file
@@ -435,7 +436,7 @@ services:
   wicket:
     image: ghcr.io/making/sluice/sluice-wicket-runtime-wasi
     pull_policy: always
-    command: --listen 0.0.0.0:8080 --console 0.0.0.0:9090
+    command: --listen 0.0.0.0:8080 --console 0.0.0.0:9090 --health 127.0.0.1:8081
     environment:
       SLUICE_WICKET_RUNTIME_WASI_CONSOLE_TOKEN: ${CONSOLE_TOKEN:?set CONSOLE_TOKEN}
       # through a sluice server too (see Run):
@@ -448,6 +449,9 @@ services:
     - wicket-data:/data      # deployed/ (the console's routes) and keyvalue.db
     # with a server: above --drain-grace, see Shutdown (drain)
     # stop_grace_period: 30s
+    healthcheck:             # see Readiness probe
+      test: [CMD, /usr/local/bin/sluice-wicket-runtime-wasi, --probe, 127.0.0.1:8081]
+      interval: 5s
 volumes:
   wicket-data:
 ```
@@ -873,6 +877,25 @@ reach its own node (the wicket warns when a stream reaches another one). A
 dropped stream reconnects with jittered exponential backoff (ceiling
 1s..30s, each wait drawn from its upper half).
 
+## Readiness probe
+
+`--health <host:port>` (or `health:` in the config file) serves `GET /ready`, asking no
+credentials: `200 ready` while the wicket serves, else `503 not ready: <why>`:
+
+- while the routes start (`starting the routes`): it listens before they do
+- with `--server`, until every node of the membership has a stream up that took the current
+  routes (`no stream up that took the routes of generation N to <node>`), a reload's as well;
+  from the drain on (`draining`)
+- while a route has no instance ready (`no instance ready for <host>`; a wasm route always has
+  one, a Firecracker wicket's VMs may not)
+- without `--server`, ready once the routes started
+
+`sluice-wicket-runtime-wasi --probe <host:port>` asks it and exits 0 when ready, 1 when not: the
+image is distroless, with no HTTP client for a healthcheck. On Kubernetes a `readinessProbe`'s
+`httpGet` asks `/ready` itself. There is no liveness endpoint: what a wicket cannot do without
+ends it. Updating several wickets one at a time (a StatefulSet's rolling update, `docker compose
+up --wait`, a script), the next one stops once the one before is ready again.
+
 ## Shutdown (drain)
 
 On SIGTERM / SIGINT the wicket drains as the Java client does (see "Client shutdown
@@ -887,6 +910,7 @@ On SIGTERM / SIGINT the wicket drains as the Java client does (see "Client shutd
   then closed (`drain grace 20s expired; closing N open connection(s)`). `0` turns the
   drain off: a signal ends the process at once
 - a second SIGTERM / SIGINT ends the drain at once
+- the [readiness probe](#readiness-probe) answers 503 from the first signal on
 - a server predating the drain acknowledges the withdrawal without `withdrawn` and keeps
   routing to the wicket: the wicket closes that stream at once
 

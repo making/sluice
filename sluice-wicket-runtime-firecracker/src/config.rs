@@ -29,6 +29,10 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
                                   first request's host (Host, h2c :authority), a --vm
                                   route alone without --console whatever the host, an
                                   unknown host answered 404
+  --health <host:port>            serve the readiness probe: GET /ready answers 200 once
+                                  the routes started, each with a VM ready, and, with
+                                  --server, every server node took them; 503 before and
+                                  from the drain on
   --vm <host>=<rootfs>[?<opts>]   a route served by Firecracker microVMs booted from the
                                   rootfs; repeatable. mode=boot (default: instances=N VMs,
                                   1, each booted, none restored, each serving many
@@ -120,6 +124,8 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
   --oidc-scopes <list>            the scopes asked for, comma-separated (default
                                   openid,email,profile)
   --oidc-ca-cert <path>           PEM CA verifying the provider (default the webPKI roots)
+  --probe <host:port>             ask the readiness probe there (--health): exit 0 when
+                                  ready, 1 when not (a distroless image's healthcheck)
   --version                      print the build (version, commit, build time) and exit
 
 Each option but --vm also reads SLUICE_WICKET_RUNTIME_FIRECRACKER_<NAME> from the environment, e.g.
@@ -141,6 +147,8 @@ const DEFAULT_WATCH_INTERVAL: Duration = Duration::from_secs(1);
 pub enum Command {
     Help,
     Version,
+    /// Ask the readiness probe at this `host:port` (`--probe`).
+    Probe(String),
     Run(Box<Settings>),
 }
 
@@ -148,6 +156,8 @@ pub enum Command {
 pub struct Settings {
     pub server: Option<String>,
     pub listen: Option<String>,
+    /// The readiness probe's listener (`--health`).
+    pub health: Option<String>,
     pub token: String,
     pub client_id: String,
     pub insecure: bool,
@@ -195,6 +205,7 @@ const VALUED: &[&str] = &[
     "config",
     "server",
     "listen",
+    "health",
     "kernel",
     "firecracker",
     "state-dir",
@@ -285,6 +296,13 @@ pub fn parse(
         match arg.as_str() {
             "-h" | "--help" => return Ok(Command::Help),
             "-V" | "--version" => return Ok(Command::Version),
+            "--probe" => {
+                let address = args.next().ok_or("--probe needs a value")?;
+                return Ok(Command::Probe(address));
+            }
+            probe if probe.starts_with("--probe=") => {
+                return Ok(Command::Probe(probe["--probe=".len()..].to_string()));
+            }
             "--insecure" => insecure = true,
             "--flume-insecure" => flume_insecure = true,
             _ => {
@@ -375,6 +393,7 @@ pub fn parse(
     );
     let server = flag("server").or_else(|| file.and_then(|file| file.server.clone()));
     let listen = flag("listen").or_else(|| file.and_then(|file| file.listen.clone()));
+    let health = flag("health").or_else(|| file.and_then(|file| file.health.clone()));
     if server.is_none() && listen.is_none() {
         return Err("--server or --listen is required".into());
     }
@@ -474,6 +493,7 @@ pub fn parse(
     Ok(Command::Run(Box::new(Settings {
         server,
         listen,
+        health,
         token,
         client_id: flag("client-id")
             .or_else(|| file.and_then(|file| file.client_id.clone()))
@@ -712,6 +732,7 @@ impl RouteSource {
 pub struct File {
     server: Option<String>,
     listen: Option<String>,
+    health: Option<String>,
     token: Option<String>,
     token_file: Option<PathBuf>,
     client_id: Option<String>,
@@ -956,6 +977,7 @@ mod tests {
         std::fs::write(
             &config,
             "server: grpc://file:8001\ntoken: from-file\nkernel: vmlinux\nmax-instances: 8\nworkers: 2\n\
+             health: 127.0.0.1:8081\n\
              drain-grace: 5s\nflume: grpc://file:8002\nflume-token: from-file\n\
              flume-ca-cert: flume-ca.pem\njail-ids: 900000-900063\njail-user: from-file\n\
              console: 127.0.0.1:9090\nconsole-dir: kept\noidc-claim: [email=*]\n\
@@ -982,6 +1004,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(settings.server.as_deref(), Some("grpc://file:8001"));
+        assert_eq!(settings.health.as_deref(), Some("127.0.0.1:8081"));
         assert_eq!(settings.token, "from-env");
         assert_eq!(
             settings.jail,
@@ -1048,6 +1071,7 @@ mod tests {
                 "flag",
                 "--max-instances=4",
                 "--workers=3",
+                "--health=0.0.0.0:10",
                 "--flume=grpcs://flag:8002",
                 "--flume-ca-cert",
                 "ca.pem",
@@ -1079,6 +1103,7 @@ mod tests {
             "the flags' rules add up, over the file's"
         );
         assert_eq!(settings.token, "flag");
+        assert_eq!(settings.health.as_deref(), Some("0.0.0.0:10"));
         assert_eq!(settings.max_instances, 4);
         assert_eq!(settings.workers, 3);
         assert_eq!(

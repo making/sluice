@@ -156,6 +156,22 @@ impl<T: Table> Routes<T> {
     pub fn bind(self: &Arc<Self>, address: &str) -> Result<T::Binding, String> {
         T::bind(self, address)
     }
+
+    /// Whether every route of the current table has an instance ready ([`Table::ready`]); Err
+    /// names the hosts of those without.
+    pub fn readiness(&self) -> Result<(), String> {
+        let table = self.current();
+        let unready: Vec<&str> = table
+            .advertised()
+            .iter()
+            .filter(|route| !table.ready(route))
+            .map(|route| route.host.as_str())
+            .collect();
+        match unready.is_empty() {
+            true => Ok(()),
+            false => Err(format!("no instance ready for {}", unready.join(", "))),
+        }
+    }
 }
 
 /// A live stream's acknowledgements; dropping it unregisters the stream.

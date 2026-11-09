@@ -142,9 +142,19 @@ mod tests {
         );
     }
 
+    /// Whether `ok` holds within [`HANG`].
+    async fn until(ok: impl Fn() -> bool) -> bool {
+        let start = tokio::time::Instant::now();
+        while !ok() && start.elapsed() < HANG {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        ok()
+    }
+
     /// The bootstrap only lists the nodes: every stream goes to a node's
     /// public url, none to the bootstrap, and the stream of a node that left
-    /// the membership is closed.
+    /// the membership is closed. The wicket is ready once every node of the
+    /// membership took its routes.
     #[tokio::test]
     async fn the_bootstrap_lists_the_nodes_and_the_streams_go_to_their_public_urls() {
         let (shared, _, _) = hello_shared(Duration::ZERO);
@@ -166,13 +176,18 @@ mod tests {
         n0.advertise().await;
         n0.ack(false);
         n1.advertise().await;
+        // ready once every node took the routes
+        let behind = until(|| shared.readiness().is_err_and(|why| why.ends_with(" to n1"))).await;
+        assert!(behind, "{:?}", shared.readiness());
         n1.ack(false);
+        assert!(until(|| shared.readiness().is_ok()).await);
         // n1 leaves: its stream ends (within the hang guard)
         n0.send(Body::MembershipUpdate(proto::MembershipUpdate {
             nodes: vec![node("n0", &url0)],
             membership_version: 2,
         }));
         n1.ended().await;
+        assert_eq!(shared.readiness(), Ok(()), "n0 alone is the membership");
 
         assert!(
             bootstrap_streams.try_recv().is_err(),

@@ -22,6 +22,9 @@
 //! `--listen` serves the routes over plain TCP as well, each connection routed
 //! by its first request's host (`listener`).
 //!
+//! `--health` serves the readiness probe (`sluice-wicket-server`'s `health`): whether the
+//! wicket serves, as `sluice-wicket-tunnel`'s `ready` tells.
+//!
 //! The processes' output in the VMs reaches the wicket's stdout / stderr, and
 //! with `--flume` the live access log (`output`, through `sluice-wicket-tunnel`'s
 //! feed).
@@ -67,6 +70,7 @@ use std::sync::Arc;
 use sluice_wicket_console::identity::Identity;
 use sluice_wicket_tunnel::flume::{self, Tap};
 use sluice_wicket_tunnel::proto::PeerBuild;
+use sluice_wicket_tunnel::ready::Readiness;
 use sluice_wicket_tunnel::session::{self, Shared};
 use sluice_wicket_tunnel::signals::{self, Signals};
 use sluice_wicket_tunnel::workers::Workers;
@@ -126,6 +130,7 @@ async fn serving(
     let config::Settings {
         server,
         listen,
+        health,
         token,
         client_id,
         insecure,
@@ -181,6 +186,11 @@ async fn serving(
         console.dir = deployed.dir().to_path_buf();
         intake = Some(deployed.images().intake());
         routes.deploy(deployed);
+    }
+    // probed from now on: not ready while the routes start
+    let readiness = Readiness::starting();
+    if let Some(address) = health {
+        serve_health(&address, readiness.clone()).await?;
     }
     let reloader = Reloader::start(
         routes,
@@ -251,6 +261,7 @@ async fn serving(
         None => drop(requests),
     }
     let Some(server) = server else {
+        readiness.local(routes.clone());
         // local mode alone: nothing to drain, a signal ends the process at once
         let reloads = reloader.run(
             watch_interval,
@@ -278,6 +289,7 @@ async fn serving(
         },
         Arc::clone(&routes),
     );
+    readiness.tunnel(shared.clone());
     // the drain stops the reloads: the routes are withdrawn
     let reloads = tokio::spawn(reloader.run(
         watch_interval,
@@ -291,6 +303,21 @@ async fn serving(
     let _ = reloads.await;
     routes.current().stop_disks().await;
     served
+}
+
+/// Serves the readiness probe on `address` (`--health`), as `readiness` tells.
+async fn serve_health(
+    address: &str,
+    readiness: Arc<Readiness<routes::Table>>,
+) -> Result<(), BoxError> {
+    let listener = tokio::net::TcpListener::bind(address)
+        .await
+        .map_err(|e| format!("--health {address}: {e}"))?;
+    println!("readiness probe on http://{}/ready", listener.local_addr()?);
+    tokio::spawn(sluice_wicket_server::health::run(listener, move || {
+        readiness.check()
+    }));
+    Ok(())
 }
 
 /// What the console makes rootfs images with (`--guest`), in the directory `dir`.
