@@ -18,6 +18,7 @@
 //! GET    /api/apps[?after=<revision>]           the apps, as `/api/routes`
 //! PUT    /api/apps/<name>                       serves the app the body (JSON) has
 //! DELETE /api/apps/<name>?owner=<owner>         removes the app
+//! GET    /api/keyvalue/<store>/<namespace>      the routes mapping a namespace
 //! DELETE /api/keyvalue/<store>/<namespace>      deletes the data of a namespace no route maps
 //! ```
 //!
@@ -150,10 +151,11 @@ impl Console {
                     }
                 } else if let Some(place) = path.strip_prefix("/api/keyvalue/") {
                     match *method {
+                        Method::GET => self.mapping(place),
                         Method::DELETE => self.purge(place).await,
                         _ => error(
                             StatusCode::METHOD_NOT_ALLOWED,
-                            "a keyvalue namespace takes DELETE",
+                            "a keyvalue namespace takes GET or DELETE",
                         ),
                     }
                 } else {
@@ -291,10 +293,11 @@ impl Console {
         self.stores
             .described()
             .into_iter()
-            .map(|(name, kind, default)| StoreView {
+            .map(|(name, kind, default, shared)| StoreView {
                 name: name.to_string(),
                 kind,
                 default,
+                shared,
             })
             .collect()
     }
@@ -497,21 +500,33 @@ impl Console {
         }
     }
 
-    /// Deletes the data of the keyvalue namespace `place`
-    /// (`<store>/<namespace>`, percent-decoded: the namespace may hold `/`).
-    async fn purge(&self, place: &str) -> Response {
-        let place = percent_encoding::percent_decode_str(place).decode_utf8_lossy();
-        let place = match place.split_once('/') {
-            Some((store, namespace)) if !store.is_empty() && !namespace.is_empty() => Place {
-                store: store.to_string(),
-                namespace: namespace.to_string(),
+    /// The routes mapping the keyvalue namespace `place` ([`place_of`]), a
+    /// route being drained included: what a purge waits for.
+    fn mapping(&self, place: &str) -> Response {
+        let place = match place_of(place) {
+            Ok(place) => place,
+            Err(e) => return error(StatusCode::BAD_REQUEST, e),
+        };
+        if let Err(e) = self.stores.known(&place.store) {
+            let named = format!("{}/{}", place.store, place.namespace);
+            return error(StatusCode::NOT_FOUND, format!("{named}: {e}"));
+        }
+        let mapped_by = self.routes.current().mapping(&place);
+        json(
+            StatusCode::OK,
+            &Mapping {
+                store: place.store,
+                namespace: place.namespace,
+                mapped_by,
             },
-            _ => {
-                return error(
-                    StatusCode::BAD_REQUEST,
-                    format!("'{place}' is no keyvalue <store>/<namespace>"),
-                );
-            }
+        )
+    }
+
+    /// Deletes the data of the keyvalue namespace `place` ([`place_of`]).
+    async fn purge(&self, place: &str) -> Response {
+        let place = match place_of(place) {
+            Ok(place) => place,
+            Err(e) => return error(StatusCode::BAD_REQUEST, e),
         };
         let (reply, purged) = oneshot::channel();
         let request = Request::Purge {
@@ -635,6 +650,28 @@ struct Purged {
 }
 
 #[derive(Serialize)]
+struct Mapping {
+    store: String,
+    namespace: String,
+    /// The hosts whose routes map it, "a route being drained" for one no
+    /// longer advertised.
+    mapped_by: Vec<String>,
+}
+
+/// The keyvalue namespace of a path's `<store>/<namespace>`, percent-decoded:
+/// the namespace may hold `/`.
+fn place_of(place: &str) -> Result<Place, String> {
+    let place = percent_encoding::percent_decode_str(place).decode_utf8_lossy();
+    match place.split_once('/') {
+        Some((store, namespace)) if !store.is_empty() && !namespace.is_empty() => Ok(Place {
+            store: store.to_string(),
+            namespace: namespace.to_string(),
+        }),
+        _ => Err(format!("'{place}' is no keyvalue <store>/<namespace>")),
+    }
+}
+
+#[derive(Serialize)]
 struct Listing {
     revision: u64,
     generation: u64,
@@ -666,6 +703,9 @@ struct StoreView {
     #[serde(rename = "type")]
     kind: &'static str,
     default: bool,
+    /// Which store it is when the wickets of other hosts may reach it too
+    /// (none of the host's own): what tells two wickets' stores one.
+    shared: Option<String>,
 }
 
 #[derive(Serialize)]

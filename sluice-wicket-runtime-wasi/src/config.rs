@@ -1490,6 +1490,20 @@ routes:
                 },
             })
         );
+        // the redis store is the wickets' of every host reaching it: which one, no password in it
+        assert_eq!(
+            stores.described(),
+            [
+                (
+                    "cache",
+                    "redis",
+                    false,
+                    Some("rediss://cache.example:6380/2?prefix=wicket:".into())
+                ),
+                ("local", "sqlite", true, None),
+                ("shared", "sqlite", false, None),
+            ]
+        );
 
         let env = |name: &str| match name {
             "SLUICE_WICKET_RUNTIME_WASI_MAX_CONNECTIONS" => Some("12".to_string()),

@@ -143,6 +143,27 @@ impl Table {
         self.entries.get(target).map(|entry| &entry.handler)
     }
 
+    /// The hosts whose routes map the keyvalue namespace `place`, by name, "a route being
+    /// drained" for one no longer advertised: it may still serve.
+    pub fn mapping(&self, place: &keyvalue::Place) -> Vec<String> {
+        let mut users: Vec<String> = Vec::new();
+        for (target, entry) in &self.entries {
+            let sandbox = entry.handler.sandbox();
+            if !sandbox.keyvalue.values().any(|mapped| mapped == place) {
+                continue;
+            }
+            let hosts = self.advertised.iter().filter(|up| up.target_url == *target);
+            let before = users.len();
+            users.extend(hosts.map(|up| up.host.clone()));
+            if users.len() == before {
+                users.push("a route being drained".into());
+            }
+        }
+        users.sort_unstable();
+        users.dedup();
+        users
+    }
+
     /// The handler serving a request for `host` (no port) on the listener
     /// (`sluice_wicket_tunnel::routes::Table::host_route`); None for an unknown
     /// host.
@@ -656,31 +677,8 @@ impl Reloader {
         self.stores
             .known(&place.store)
             .map_err(|e| Refused::Unknown(format!("{named}: {e}")))?;
-        let table = self.routes.current();
-        let mut users: Vec<&str> = Vec::new();
-        for (target, entry) in &table.entries {
-            if !entry
-                .handler
-                .sandbox()
-                .keyvalue
-                .values()
-                .any(|mapped| mapped == place)
-            {
-                continue;
-            }
-            let hosts = table
-                .advertised
-                .iter()
-                .filter(|up| up.target_url == *target);
-            let before = users.len();
-            users.extend(hosts.map(|up| up.host.as_str()));
-            if users.len() == before {
-                users.push("a route being drained");
-            }
-        }
+        let users = self.routes.current().mapping(place);
         if !users.is_empty() {
-            users.sort_unstable();
-            users.dedup();
             return Err(Refused::Taken(format!(
                 "the keyvalue namespace {named} is mapped by {}",
                 users.join(", ")

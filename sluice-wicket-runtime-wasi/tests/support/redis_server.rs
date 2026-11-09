@@ -1,8 +1,8 @@
 //! A `redis-server` child process for the redis store's tests (the unit
-//! tests include this file too), killed on drop: on a unix socket, stopped
-//! and started again at its path, or serving TLS alone on a free port.
-//! `redis-server` (built with TLS) is on the PATH wherever the tests run;
-//! CI installs it.
+//! tests and sluice-wicket-cf-api's include this file too), killed on drop:
+//! on a unix socket, stopped and started again at its path, or serving TLS
+//! alone or plain TCP on a free port. `redis-server` (built with TLS) is on
+//! the PATH wherever the tests run; CI installs it.
 #![allow(dead_code, reason = "each includer uses some of it")]
 
 use std::io::{BufRead, BufReader};
@@ -46,29 +46,46 @@ impl RedisServer {
     /// One serving TLS alone on a free port of 127.0.0.1, with the
     /// certificate and key of the PEM files `cert` and `key`.
     pub fn tls(cert: &Path, key: &Path) -> RedisServer {
+        RedisServer::on_free_port(|port| {
+            let args = args(&[
+                "--port",
+                "0",
+                "--bind",
+                "127.0.0.1",
+                "--tls-port",
+                port,
+                "--tls-cert-file",
+                cert.to_str().unwrap(),
+                "--tls-key-file",
+                key.to_str().unwrap(),
+                "--tls-auth-clients",
+                "no",
+            ]);
+            (args, format!("rediss://127.0.0.1:{port}"))
+        })
+    }
+
+    /// One serving plain TCP on a free port of 127.0.0.1.
+    pub fn tcp() -> RedisServer {
+        RedisServer::on_free_port(|port| {
+            let args = args(&["--port", port, "--bind", "127.0.0.1"]);
+            (args, format!("redis://127.0.0.1:{port}"))
+        })
+    }
+
+    /// One of the arguments and url `on` makes of a free port.
+    fn on_free_port(on: impl Fn(&str) -> (Vec<String>, String)) -> RedisServer {
         for _ in 0..10 {
             let port = std::net::TcpListener::bind("127.0.0.1:0")
                 .and_then(|listener| listener.local_addr())
                 .unwrap()
                 .port()
                 .to_string();
+            let (args, url) = on(&port);
             let mut server = RedisServer {
                 child: None,
-                args: args(&[
-                    "--port",
-                    "0",
-                    "--bind",
-                    "127.0.0.1",
-                    "--tls-port",
-                    &port,
-                    "--tls-cert-file",
-                    cert.to_str().unwrap(),
-                    "--tls-key-file",
-                    key.to_str().unwrap(),
-                    "--tls-auth-clients",
-                    "no",
-                ]),
-                url: format!("rediss://127.0.0.1:{port}"),
+                args,
+                url,
                 socket: None,
             };
             match server.try_start() {

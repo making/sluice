@@ -324,18 +324,19 @@ impl Stores {
         ))
     }
 
-    /// Each store's name and type (`sqlite`, `redis`), and whether it is the
-    /// default one; by name.
-    pub fn described(&self) -> Vec<(&str, &'static str, bool)> {
+    /// Each store's name and type (`sqlite`, `redis`), whether it is the
+    /// default one, and which store it is when the wickets of other hosts may
+    /// reach it too (None: one of this host, a `sqlite` file); by name.
+    pub fn described(&self) -> Vec<(&str, &'static str, bool, Option<String>)> {
         self.configs
             .iter()
             .map(|(name, config)| {
-                let kind = match config.kind {
-                    Kind::Sqlite { .. } => "sqlite",
+                let (kind, shared) = match &config.kind {
+                    Kind::Sqlite { .. } => ("sqlite", None),
                     #[cfg(feature = "redis")]
-                    Kind::Redis { .. } => "redis",
+                    Kind::Redis { url, prefix, .. } => ("redis", redis::identity(url, prefix)),
                 };
-                (name.as_str(), kind, *name == self.default)
+                (name.as_str(), kind, *name == self.default, shared)
             })
             .collect()
     }

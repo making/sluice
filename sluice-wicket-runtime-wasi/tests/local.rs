@@ -669,7 +669,7 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
     assert!(target.contains("&env="), "a digest: {target}");
     assert_eq!(
         listing["keyvalue_stores"],
-        serde_json::json!([{"name": "local", "type": "sqlite", "default": true}])
+        serde_json::json!([{"name": "local", "type": "sqlite", "default": true, "shared": null}])
     );
     // listed as put, the env named only: put again, it changes nothing; with
     // what a sandbox may hold
@@ -879,6 +879,15 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
     let (status, _, _) = console(&at, "DELETE /api/apps/site?owner=cf", &[bearer], b"").await;
     assert_eq!(status, 200);
     // its keyvalue namespace's data is deleted once no route maps it
+    let mapping = "GET /api/keyvalue/local/cf%2Fshop";
+    let (status, _, body) = console(&at, mapping, &[bearer], b"").await;
+    assert_eq!(
+        (status, body.as_str()),
+        (
+            200,
+            r#"{"store":"local","namespace":"cf/shop","mapped_by":["a.localhost","b.localhost"]}"#
+        )
+    );
     let purge = "DELETE /api/keyvalue/local/cf%2Fshop";
     let (status, _, body) = console(&at, purge, &[bearer], b"").await;
     assert_eq!(
@@ -888,8 +897,11 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
             r#"{"error":"the keyvalue namespace local/cf/shop is mapped by a.localhost, b.localhost"}"#
         )
     );
-    let (status, _, body) = console(&at, "DELETE /api/keyvalue/nope/x", &[bearer], b"").await;
-    assert_eq!(status, 404, "{body}");
+    for unknown in ["GET", "DELETE"] {
+        let request = format!("{unknown} /api/keyvalue/nope/x");
+        let (status, _, body) = console(&at, &request, &[bearer], b"").await;
+        assert_eq!(status, 404, "{body}");
+    }
     // removed by its owner only
     let intruder = "DELETE /api/apps/shop?owner=intruder";
     let (status, _, _) = console(&at, intruder, &[bearer], b"").await;

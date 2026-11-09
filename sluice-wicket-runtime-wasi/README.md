@@ -485,7 +485,8 @@ starts with no data; what it stored stays under the old host.
 The listing names each route's `origin` (`config`, `flag`, `console`, `api`), its advertised
 `target` (the route's identity on the server: the component's absolute URL and the sandbox),
 its component and sandbox (its `env` by the names), and the wicket's `keyvalue_stores`
-(`name`, `type`, `default`).
+(`name`, `type`, `default`, `shared`: which store it is when the wickets of other hosts may
+reach it too, null for one of the host's own; see [Key-value stores](#key-value-stores-experimental)).
 
 #### Apps
 
@@ -500,6 +501,7 @@ removed by its owner: the API of a controller keeping the desired state of its a
 | `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "wicket", "budget", "capabilities", "keyvalue_stores", "apps": [..]}`; `capabilities` and `keyvalue_stores` name what a sandbox may hold; `wicket` which wicket this is: `id`, made at its first start and kept in the console directory (`wicket-id`), `node`, its flume node (`wicket:<client-id>`, null without `--flume`), `build`; `budget` `max_instances` (`--max-instances`) and `instances`, the slots the routes' pools hold for good. An app needing more is refused 422 with `"no_room": true` |
 | `PUT /api/apps/<name>` | serves the app of the body (JSON, below) |
 | `DELETE /api/apps/<name>?owner=<owner>` | removes the app of `owner` |
+| `GET /api/keyvalue/<store>/<namespace>` | the routes mapping the namespace, one being drained included (`"a route being drained"`): `{"store", "namespace", "mapped_by": [..]}`; 404 for an unknown store. What a controller asks every wicket before it deletes a shared store's namespace through one |
 | `DELETE /api/keyvalue/<store>/<namespace>` | deletes the namespace's keys (its usage too): `{"store", "namespace", "keys": <deleted>}`. Refused (409) while a route maps it, one being drained included; 404 for an unknown store. The namespace may hold `/` (percent-encoded or not) |
 
 ```json
@@ -675,6 +677,12 @@ route creates no file. A map naming an unknown store fails the startup or the re
   The connection opens on the first call and again once lost: a server down fails the calls
   with why (logged), not the startup. Each call answers within `timeout` or fails; one
   timing out has the next call open a new connection
+- which store a store is, as listed (`shared`): none for a `sqlite` store or a `redis` one on
+  a unix socket, a file or server of the host; else the server as its `url` names it, without
+  the credentials, and the prefix (`redis://cache:6379/0?prefix=wicket:`), so two wickets
+  naming one server alike list one store (`sluice-wicket-cf-api` spreads an app over wickets
+  sharing its stores so). A loopback address names each host's own server: wickets of several
+  hosts name it by an address they share
 - every store: a key past `max-key-bytes` (default 1Ki) and a value past `max-value-bytes`
   (default 1Mi) are rejected before the store sees them
 

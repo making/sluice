@@ -36,9 +36,12 @@
 //! its apps of the owner list. A share it refuses for room has an index passed to a wicket with
 //! room, the wicket taking none until its revision moves.
 //!
-//! The data of a deleted keyvalue instance is deleted through every wicket once no app maps its
-//! namespace, a wicket's draining routes included: tried at the deletion and again after each
-//! listing.
+//! The data of a deleted keyvalue instance is deleted once no app maps its namespace, a wicket's
+//! draining routes included: of a store of each wicket's host through every wicket, each telling
+//! its own routes, of a store the wickets share through one, once every wicket says none of its
+//! routes maps it. Tried at the deletion and again after each listing. Which stores they share
+//! is what they list (`crate::services::Offer::stores`); an app mapping a namespace of a store of
+//! each one's host runs on the wicket holding its data (`crate::placement`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -84,6 +87,8 @@ pub struct Controller {
     /// The apps of the owner the state does not know, by wicket name and app name, as logged:
     /// once each.
     strangers: Mutex<BTreeSet<(String, String)>>,
+    /// Held deleting the data of a store the wickets share: through one wicket at a time.
+    purging: tokio::sync::Mutex<()>,
 }
 
 impl Controller {
@@ -97,6 +102,7 @@ impl Controller {
             did_not_start: Mutex::default(),
             listed: Mutex::default(),
             strangers: Mutex::default(),
+            purging: tokio::sync::Mutex::default(),
         }
     }
 
@@ -318,6 +324,11 @@ impl Controller {
 
     /// What every wicket listed of the wickets' runtime offers.
     fn offered(&self) -> Option<Offer> {
+        self.with_offers(Offer::common)
+    }
+
+    /// What `f` makes of the offers of the wickets listed of the wickets' runtime.
+    fn with_offers<R>(&self, f: impl FnOnce(&[&Offer]) -> R) -> R {
         let (runtime, _) = self.runtimes();
         let listed = self.listed.lock().expect("no panic under the lock");
         let offers: Vec<&Offer> = (self.wickets.iter())
@@ -325,7 +336,7 @@ impl Controller {
             .filter(|noted| Some(noted.runtime) == runtime)
             .map(|noted| &noted.offer)
             .collect();
-        Offer::common(&offers)
+        f(&offers)
     }
 
     /// Notes what `wicket` listed: what it offers and runs apps as, which wicket it is, its
@@ -342,6 +353,14 @@ impl Controller {
         };
         let before = (self.listed.lock().expect("no panic under the lock"))
             .insert(wicket.name.clone(), noted);
+        // which stores they share: the apps are placed by it
+        let stores = self.with_offers(Offer::stores);
+        let changed = self
+            .store
+            .note(|state| std::mem::replace(&mut state.wickets.stores, stores.clone()) != stores);
+        if changed {
+            self.store.update(|_| ());
+        }
         if id.is_none() && before.is_none_or(|before| before.id.is_some()) {
             println!(
                 "CELL: {} lists no id nor budget (a wicket predating them): placed on with room \
@@ -461,8 +480,9 @@ impl Controller {
 
     /// Deletes through `wicket` the data of the deleted instances no started app's snapshot maps
     /// any more, as far as it lets it: one a route of it still maps (409) waits, as does an
-    /// unreachable wicket; one it cannot delete (a store gone: 404) is dropped there. Gone
-    /// through every wicket, a deletion is done.
+    /// unreachable wicket; one it cannot delete (a store gone: 404) is dropped there. Of a store
+    /// of each wicket's host, gone through every wicket, a deletion is done; of a store they
+    /// share, gone through this one once no wicket maps it ([`Controller::unmapped`]).
     async fn purge_on(&self, wicket: &Wicket) {
         let due: Vec<Purge> = self.store.read(|state| {
             let mapped = |place: &str| {
@@ -480,35 +500,74 @@ impl Controller {
                 .collect()
         });
         for purge in due {
+            let same =
+                |kept: &Purge| kept.store == purge.store && kept.namespace == purge.namespace;
+            let shared = self
+                .store
+                .read(|state| state.wickets.stores.get(&purge.store) == Some(&true));
+            // one wicket at a time, and once
+            let _one = match shared {
+                true => Some(self.purging.lock().await),
+                false => None,
+            };
+            if shared
+                && (!self.store.read(|state| state.purges.iter().any(same))
+                    || !self.unmapped(&purge).await)
+            {
+                continue;
+            }
             let named = format!(
                 "the data of service instance {} on {} ({}/{})",
                 purge.instance, wicket.label, purge.store, purge.namespace
             );
-            match wicket.purge(&purge.store, &purge.namespace).await {
-                Ok(keys) => println!("SERVICES: deleted {named}: {keys} key(s)"),
+            let deleted = match wicket.purge(&purge.store, &purge.namespace).await {
+                Ok(keys) => {
+                    println!("SERVICES: deleted {named}: {keys} key(s)");
+                    true
+                }
                 Err(Failure::Refused {
                     status: status @ (400 | 404),
                     error,
                     ..
-                }) => println!(
-                    "SERVICES: dropped {named}: {} refused it ({status}): {error}",
-                    wicket.label
-                ),
-                Err(_) => continue,
-            }
-            self.store.update(|state| {
-                let same = |kept: &&mut Purge| {
-                    kept.store == purge.store && kept.namespace == purge.namespace
-                };
-                if let Some(kept) = state.purges.iter_mut().find(same) {
-                    kept.purged.push(wicket.name.clone());
+                }) => {
+                    println!(
+                        "SERVICES: dropped {named}: {} refused it ({status}): {error}",
+                        wicket.label
+                    );
+                    false
                 }
+                Err(_) => continue,
+            };
+            self.store.update(|state| {
                 let configured = &state.wickets.configured;
-                state
-                    .purges
-                    .retain(|kept| !configured.iter().all(|name| kept.purged.contains(name)));
+                if let Some(kept) = state.purges.iter_mut().find(|kept| same(kept)) {
+                    match shared && deleted {
+                        true => kept.purged.clone_from(configured),
+                        false => kept.purged.push(wicket.name.clone()),
+                    }
+                }
+                let homes = &mut state.homes;
+                state.purges.retain(|kept| {
+                    let done = configured.iter().all(|name| kept.purged.contains(name));
+                    if done {
+                        homes.remove(&format!("{}/{}", kept.store, kept.namespace));
+                    }
+                    !done
+                });
             });
         }
+    }
+
+    /// Whether no wicket's route maps the namespace of `purge`, one being drained included: every
+    /// wicket answers so, or has no such store.
+    async fn unmapped(&self, purge: &Purge) -> bool {
+        let wickets = self.wickets.iter();
+        let mappings =
+            join_all(wickets.map(|wicket| wicket.mapping(&purge.store, &purge.namespace))).await;
+        mappings.into_iter().all(|mapping| match mapping {
+            Ok(hosts) => hosts.is_empty(),
+            Err(e) => matches!(e, Failure::Refused { status: 404, .. }),
+        })
     }
 
     /// Removes from `wicket` the apps deleted while it did not take it, as far as it answers.

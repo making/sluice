@@ -12,7 +12,9 @@
 //! clients configured, who is refused, who may edit the security groups --, a second
 //! wicket -- the one wicket's indices placed again, an app's instances spread over both,
 //! one stopped and back, a scale --, a component the wicket refuses
-//! until a service binding grants what it needs, the services' lifecycle, a service broker
+//! until a service binding grants what it needs, the services' lifecycle -- a store of each
+//! wicket's host keeping its apps on one wicket, one they share (Redis) counting once over
+//! both --, a service broker
 //! (a stub) -- who registers it, who sees its plans, its operations at once and polled
 //! across a restart of the cf-api, failed, its bindings' credentials, a manifest's and an
 //! app's delete waiting for it, its catalog fetched again --,
@@ -28,8 +30,11 @@
 //! across a restart of the VM, a wicket killed right after a push and an upgrade.
 
 mod broker;
+#[path = "../../sluice-wicket-runtime-wasi/tests/support/redis_server.rs"]
+mod redis_server;
 mod registry;
 
+use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
@@ -575,12 +580,22 @@ fn the_cf_cli_deploys_to_the_wicket() {
         &["--host", "127.0.0.1", "--port", "0", "--token", FLUME_TOKEN],
     );
     let flume_url = flume.logged("listening on ");
+    let redis = redis_server::RedisServer::tcp();
     // a wicket on the flume, its console at `console`, of a console directory and a keyvalue
-    // file of its own (`deployed<suffix>`, `kv<suffix>.db`), and `more`: its listener and its
-    // console
+    // file of its own (`deployed<suffix>`, `kv<suffix>.db`, the default store `local`), the
+    // Redis every wicket shares (`redis`), and `more`: its listener and its console
     let start_wicket = |console: &str, suffix: &str, more: &[&str]| {
         let console_dir = dir.join(format!("deployed{suffix}"));
-        let kv_file = dir.join(format!("kv{suffix}.db"));
+        let config = dir.join(format!("wicket{suffix}.yaml"));
+        std::fs::write(
+            &config,
+            format!(
+                "keyvalue:\n  default: local\n  stores:\n    local: {{type: sqlite, path: \
+                 kv{suffix}.db}}\n    redis: {{type: redis, url: '{}/0'}}\n",
+                redis.url
+            ),
+        )
+        .unwrap();
         let mut args = vec![
             "--flume",
             &flume_url,
@@ -594,8 +609,8 @@ fn the_cf_cli_deploys_to_the_wicket() {
             TOKEN,
             "--console-dir",
             console_dir.to_str().unwrap(),
-            "--keyvalue-file",
-            kv_file.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
             "--watch-interval",
             "0",
         ];
@@ -1583,6 +1598,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
     for offered in [
         "keyvalue",
         "local",
+        "redis",
         "wasi",
         "inherit-network",
         "sluice-wicket",
@@ -1628,7 +1644,57 @@ fn the_cf_cli_deploys_to_the_wicket() {
     cf.ok(&["restart", "counter"]);
     assert_eq!(count("/"), "hits 1\n");
     // through each wicket: the first held them, a file of its host
-    let purged = api.line("SERVICES: deleted the data of service instance counts on the wicket a");
+    let purged: BTreeSet<String> = [(); 2]
+        .map(|()| api.line("SERVICES: deleted the data of service instance counts on the wicket "))
+        .into_iter()
+        .map(|line| {
+            let (on, keys) = line
+                .split_once(" on the wicket ")
+                .unwrap()
+                .1
+                .split_once(' ')
+                .unwrap();
+            format!("{on}{}", keys.rsplit(':').next().unwrap())
+        })
+        .collect();
+    assert_eq!(
+        purged,
+        ["a 1 key(s)", "b 0 key(s)"].map(String::from).into()
+    );
+    // its store each wicket's host's own, its instances are kept on the wicket of its data
+    cf.ok(&["scale", "counter", "-i", "2"]);
+    assert_eq!(
+        (
+            instances(&console, "counter.localhost"),
+            instances(&console_b, "counter.localhost")
+        ),
+        (Some(json!(2)), None)
+    );
+    // a store the wickets share: an app's instances spread over both count once, its data
+    // deleted through one wicket
+    cf.ok(&["create-service", "keyvalue", "redis", "tallies"]);
+    let tally_manifest = dir.join("counter/tally.yml");
+    std::fs::write(
+        &tally_manifest,
+        "applications:\n- name: tally\n  instances: 2\n  routes:\n  - route: tally.localhost\n  services:\n  - tallies\n",
+    )
+    .unwrap();
+    let counter_dir = dir.join("counter");
+    cf.ok(&[
+        "push",
+        "-f",
+        tally_manifest.to_str().unwrap(),
+        "-p",
+        counter_dir.to_str().unwrap(),
+    ]);
+    let tally = |listen: &str| get(listen, "tally.localhost", "/", None).1;
+    assert_eq!(
+        [tally(&listen), tally(&listen_b), tally(&listen)],
+        ["hits 1\n", "hits 2\n", "hits 3\n"]
+    );
+    cf.ok(&["delete", "tally", "-r", "-f"]);
+    cf.ok(&["delete-service", "tallies", "-f"]);
+    let purged = api.line("SERVICES: deleted the data of service instance tallies on the wicket ");
     assert!(purged.ends_with(": 1 key(s)"), "{purged}");
 
     // a capability as a service, bound by the manifest: cli links relay's

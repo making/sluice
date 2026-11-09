@@ -61,6 +61,29 @@ pub fn check(url: &str) -> Result<bool, String> {
     Ok(matches!(info.addr(), ConnectionAddr::TcpTls { .. }))
 }
 
+/// Which store the keys after `prefix` on the server at `url` are, no
+/// credential in it (`redis://cache:6379/0?prefix=wicket:`): the server as
+/// the url names it, so wickets naming one server alike list one identity.
+/// None for a server of the host (a unix socket).
+pub fn identity(url: &str, prefix: &str) -> Option<String> {
+    let info = url.into_connection_info().ok()?;
+    let (scheme, host, port) = match info.addr() {
+        ConnectionAddr::Tcp(host, port) => ("redis", host, port),
+        ConnectionAddr::TcpTls { host, port, .. } => ("rediss", host, port),
+        _ => return None,
+    };
+    let host = match host.contains(':') {
+        true => format!("[{host}]"),
+        false => host.clone(),
+    };
+    let db = info.redis_settings().db();
+    let prefix = match prefix.is_empty() {
+        true => String::new(),
+        false => format!("?prefix={prefix}"),
+    };
+    Some(format!("{scheme}://{host}:{port}/{db}{prefix}"))
+}
+
 impl Redis {
     /// A store on the server at `url` (a `rediss://` one's certificate
     /// verified against `ca_pem`, else the webPKI roots), its keys after

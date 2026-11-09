@@ -407,6 +407,7 @@ jobs:
   # and a wicket in local mode on a flume: the test builds the wicket (debug), its example
   # guests (the nightly toolchain examples/ pins), sluice-wicket-site (the cf-api's build
   # embeds it; the nightly it pins) and the flume with cargo, so their targets are cached too.
+  # Its wickets share a redis-server's keyvalue store.
   sluice-wicket-cf-api:
     needs: changes
     if: needs.changes.outputs.cf-api == 'true'
@@ -418,8 +419,8 @@ jobs:
     steps:
     - name: Checkout
       uses: actions/checkout@v4
-    - name: Install protoc
-      run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends protobuf-compiler
+    - name: Install protoc and redis-server
+      run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends protobuf-compiler redis-server
     - name: Install the cf CLI
       run: |
         curl -sSL https://github.com/cloudfoundry/cli/releases/download/v8.19.0/cf8-cli_8.19.0_linux_x86-64.tgz | sudo tar -xz -C /usr/local/bin cf8

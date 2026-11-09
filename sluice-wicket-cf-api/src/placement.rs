@@ -15,6 +15,11 @@
 //! no longer configured is placed again at the start ([`State::follow_wickets`]). None is placed
 //! on a wicket running apps another way than the first, nor on a second name of one: an index
 //! there stays.
+//!
+//! A keyvalue namespace of a store of each wicket's host (`sqlite`) has its data on one wicket,
+//! its home ([`State::homes`]): the wicket of index 0 of the first app whose start maps it. An
+//! app whose last start maps one has all its indices there (the first namespace's home), no index
+//! passed elsewhere; a store the wickets share pins nothing.
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
@@ -40,6 +45,19 @@ pub struct Wickets {
     pub full: BTreeMap<String, u64>,
     /// The wicket of each flume node (`wicket:<client-id>`), as each last listed it.
     pub nodes: BTreeMap<String, String>,
+    /// Each keyvalue store the wickets list, by name: whether it is one store of them all, else
+    /// each wicket's host's own (`crate::services::Offer::stores`).
+    pub stores: BTreeMap<String, bool>,
+}
+
+/// Where all the indices of an app go: a namespace of a store of each wicket's host has its
+/// data there.
+#[derive(Clone, Debug, PartialEq)]
+enum Pin {
+    /// The namespace's home.
+    To(String),
+    /// Where index 0 is, or goes: no namespace has a home yet.
+    Together,
 }
 
 /// What a wicket's budget leaves the apps placed on it.
@@ -77,23 +95,37 @@ fn need(app: &App) -> u64 {
 /// `placement` of `count` indices: the highest dropped; an index on a wicket not configured, and
 /// each new one, on a wicket with room for it holding the fewest of the others, of them the one
 /// with the most room, the first configured of those. `rooms` is the room for the app's indices
-/// on the wickets of a known budget, its own aside: the others have room enough.
+/// on the wickets of a known budget, its own aside: the others have room enough. Pinned, every
+/// index on the one wicket, room or not.
 fn placed(
     placement: &[String],
     count: usize,
     wickets: &Wickets,
     rooms: &BTreeMap<String, i64>,
+    pin: Option<&Pin>,
 ) -> Vec<String> {
+    // the one wicket of them all: index 0's, unpinned, without a home
+    let home = pin.map(|pin| match pin {
+        Pin::To(home) => Some(home.clone()),
+        Pin::Together => placed(placement, count, wickets, rooms, None)
+            .into_iter()
+            .next(),
+    });
+    let allowed = |wicket: &String| {
+        home.as_ref()
+            .is_none_or(|home| home.as_ref() == Some(wicket))
+    };
     let mut placed: Vec<Option<&String>> = placement
         .iter()
         .take(count)
         .map(|wicket| wickets.configured.iter().find(|kept| *kept == wicket))
+        .map(|wicket| wicket.filter(|wicket| allowed(wicket)))
         .collect();
     placed.resize(count, None);
     let candidates: Vec<&String> = wickets
         .configured
         .iter()
-        .filter(|wicket| !wickets.odd.contains(*wicket))
+        .filter(|wicket| !wickets.odd.contains(*wicket) && allowed(wicket))
         .collect();
     let mut held: Vec<usize> = candidates
         .iter()
@@ -140,8 +172,19 @@ impl State {
     /// The wicket of each index of `app`, as [`State::place`] keeps it.
     pub fn placement<'a>(&self, app: &'a App) -> Cow<'a, [String]> {
         let count = count(app);
+        let pin = self.pin(app);
         let configured = |wicket: &String| self.wickets.configured.contains(wicket);
-        if app.placement.len() == count && app.placement.iter().all(configured) {
+        let pinned = |wicket: &String| match &pin {
+            Some(Pin::To(home)) => wicket == home,
+            Some(Pin::Together) => app.placement.first() == Some(wicket),
+            None => true,
+        };
+        if app.placement.len() == count
+            && app
+                .placement
+                .iter()
+                .all(|wicket| configured(wicket) && pinned(wicket))
+        {
             return Cow::Borrowed(&app.placement);
         }
         Cow::Owned(placed(
@@ -149,7 +192,33 @@ impl State {
             count,
             &self.wickets,
             &self.rooms(app),
+            pin.as_ref(),
         ))
+    }
+
+    /// The keyvalue namespaces of a store of each wicket's host that the last start of `app`
+    /// maps, as `store/namespace`.
+    pub fn local_places<'a>(&self, app: &'a App) -> impl Iterator<Item = &'a String> {
+        let running = app.running.iter();
+        running
+            .flat_map(|running| running.keyvalue.values())
+            .filter(|place| {
+                let store = place
+                    .split_once('/')
+                    .map_or(place.as_str(), |(store, _)| store);
+                self.wickets.stores.get(store) == Some(&false)
+            })
+    }
+
+    /// Where every index of `app` goes: the home of the first namespace of a store of each
+    /// wicket's host its last start maps that has one.
+    fn pin(&self, app: &App) -> Option<Pin> {
+        let mut places = self.local_places(app).peekable();
+        places.peek()?;
+        Some(match places.find_map(|place| self.homes.get(place)) {
+            Some(home) => Pin::To(home.clone()),
+            None => Pin::Together,
+        })
     }
 
     /// The room for the indices of `app` on each wicket of a known budget: the indices of its
@@ -190,6 +259,10 @@ impl State {
     /// to a wicket with room for it: the line saying so; none without one.
     pub fn pass(&mut self, guid: &str, wicket: &str) -> Option<String> {
         let app = self.app(guid)?;
+        if self.pin(app).is_some() {
+            // its data's wicket
+            return None;
+        }
         let rooms = self.rooms(app);
         let placement = self.placement(app).into_owned();
         let at = placement.iter().rposition(|on| on == wicket)?;
@@ -236,19 +309,24 @@ impl State {
         indices
     }
 
-    /// Keeps the placement of every app as [`State::placement`] has it: at every change.
+    /// Keeps the placement of every app as [`State::placement`] has it, in turn: at every
+    /// change. A namespace of a store of each wicket's host an app maps without a home has it
+    /// where the app's index 0 is.
     pub fn place(&mut self) {
-        let placed: Vec<Option<Vec<String>>> = self
-            .apps
-            .iter()
-            .map(|app| match self.placement(app) {
-                Cow::Owned(placed) => Some(placed),
-                Cow::Borrowed(_) => None,
-            })
-            .collect();
-        for (app, placed) in self.apps.iter_mut().zip(placed) {
-            if let Some(placed) = placed {
-                app.placement = placed;
+        for at in 0..self.apps.len() {
+            if let Cow::Owned(placed) = self.placement(&self.apps[at]) {
+                self.apps[at].placement = placed;
+            }
+            let app = &self.apps[at];
+            let Some(home) = app.placement.first() else {
+                continue;
+            };
+            let homeless: Vec<String> = (self.local_places(app))
+                .filter(|place| !self.homes.contains_key(*place))
+                .cloned()
+                .collect();
+            for place in homeless {
+                self.homes.insert(place, home.clone());
             }
         }
     }
@@ -283,6 +361,17 @@ impl State {
         let running = self.apps.iter_mut().filter_map(|app| app.running.as_mut());
         running.for_each(|running| unnamed(&mut running.made));
         let mut said = Vec::new();
+        // a namespace's data on a wicket no --wicket names: its apps start on another without it
+        self.homes.retain(|place, home| {
+            let named = configured.contains(home);
+            if !named {
+                said.push(format!(
+                    "SERVICES: the data of the keyvalue namespace {place} stays on the wicket \
+                     {home}, which no --wicket names: its apps run on another without it"
+                ));
+            }
+            named
+        });
         self.removals.retain(|removal| {
             let named = configured.contains(&removal.wicket);
             if !named {
@@ -368,9 +457,27 @@ mod tests {
                 .map(|(wicket, room)| (wicket.to_string(), *room))
                 .collect();
             assert_eq!(
-                placed(&names(placement), count, wickets, &rooms),
+                placed(&names(placement), count, wickets, &rooms, None),
                 names(expected),
                 "{placement:?} at {count} on {wickets:?}, {rooms:?}"
+            );
+        }
+        // pinned: every index on the namespace's home, room or not; without one, where index 0
+        // is or goes
+        let to = |home: &str| Pin::To(home.into());
+        let full_a = [("a".to_string(), 0), ("b".to_string(), 5)].into();
+        let none = BTreeMap::new();
+        for (placement, count, pin, rooms, expected) in [
+            (&["a", "b"][..], 3, to("b"), &none, &["b", "b", "b"][..]),
+            (&[], 2, to("a"), &full_a, &["a", "a"]),
+            (&["a", "b"], 2, Pin::Together, &none, &["a", "a"]),
+            (&["x", "b"], 2, Pin::Together, &none, &["a", "a"]),
+            (&[], 2, Pin::Together, &full_a, &["b", "b"]),
+        ] {
+            assert_eq!(
+                placed(&names(placement), count, &ab, rooms, Some(&pin)),
+                names(expected),
+                "{placement:?} at {count} pinned {pin:?}, {rooms:?}"
             );
         }
     }
@@ -452,5 +559,37 @@ mod tests {
         let small_app = state.app(&small).unwrap();
         assert_eq!(state.instance_of(small_app, None, 4), 0, "on a alone");
         assert_eq!(app_index(&[], 3, 0), 3, "an app at 0 lists none");
+
+        // a namespace of a store of each wicket's host has its home where index 0 of the first
+        // app mapping it is: every index of an app mapping it there, none passed elsewhere; a
+        // store the wickets share pins nothing
+        state.wickets.stores = [("local".to_string(), false), ("redis".to_string(), true)].into();
+        state.wickets.full.clear();
+        let mapping = |state: &mut State, guid: &str, places: &[&str]| {
+            let running = state.app_mut(guid).unwrap().running.as_mut().unwrap();
+            running.keyvalue = (places.iter().enumerate())
+                .map(|(at, place)| (at.to_string(), place.to_string()))
+                .collect();
+            state.place();
+        };
+        mapping(&mut state, &big, &["redis/cf/r"]);
+        assert_eq!(state.app(&big).unwrap().placement, ["a", "b", "a"]);
+        mapping(&mut state, &big, &["redis/cf/r", "local/cf/l"]);
+        assert_eq!(state.app(&big).unwrap().placement, ["a", "a", "a"]);
+        assert_eq!(state.homes, [("local/cf/l".into(), "a".into())].into());
+        state.app_mut(&small).unwrap().placement = names(&["b"]);
+        mapping(&mut state, &small, &["local/cf/l"]);
+        assert_eq!(state.app(&small).unwrap().placement, ["a"]);
+        state.wickets.full.insert("a".into(), 9);
+        assert_eq!(state.pass(&big, "a"), None);
+        // its home no longer named: the data stays there, the apps run on another without it
+        let said = state.follow_wickets(&names(&["b"]));
+        assert!(
+            said.iter()
+                .any(|line| line.contains("local/cf/l stays on the wicket a")),
+            "{said:?}"
+        );
+        assert_eq!(state.app(&big).unwrap().placement, ["b", "b", "b"]);
+        assert_eq!(state.homes, [("local/cf/l".into(), "b".into())].into());
     }
 }

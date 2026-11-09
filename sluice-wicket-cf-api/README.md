@@ -330,7 +330,8 @@ config.
   instance is bound (as on CF); a keyvalue instance deleted has its data deleted once no app
   maps its namespace any more -- no started app's snapshot, no route of the wicket, a draining
   one included (`DELETE /api/keyvalue/<store>/<namespace>`, tried at the deletion and after each
-  listing of the wicket). `cf purge-service-instance` drops the bindings with the instance
+  listing of the wicket; of [several wickets](#several-wickets), see there).
+  `cf purge-service-instance` drops the bindings with the instance
 - `cf rename-service` and `cf update-service -t` apply at once; a plan change, instance
   parameters, service keys and sharing are refused (422)
 
@@ -852,12 +853,26 @@ mode stays one wicket.
 - **What they share.** The wickets run apps one way: one listing another runtime than the first
   is logged, and none placed or put on it. They share one `--wicket-token`, not a console
   directory (a volume each; a StatefulSet on Kubernetes). The marketplace is what every wicket
-  offers. A `local` keyvalue store is a file of each wicket's host: an app over two
-  wickets reads and writes two namespaces, so bind it a store they share (`redis`). Firecracker
+  offers. Firecracker
   wickets make an image's rootfs each, one at staging, the others at their first put of it, the
   cf-api keeping the digest each made: wickets of two guests, as during an update of the wickets
   changing the guest, serve one image as two digests. The cf-api runs beside the wickets, not as
   an app of one, which would stop with it
+- **Keyvalue stores.** Each wicket lists its stores, each one of its host (`sqlite`) or shared
+  with the wickets of other hosts, by an identity: its server as its `url` names it and its
+  prefix (`redis`; see the wicket's [Key-value stores](../sluice-wicket-runtime-wasi/README.md#key-value-stores-experimental)).
+  A plan is a store every wicket lists, a shared one by one identity on all: two servers of one
+  name are offered by none. A shared store's instance is one namespace for every wicket, so an
+  app over two counts once (`redis` in the sample below). A store of each wicket's host holds an
+  instance's data on one wicket, its home: where index 0 of the first app whose start maps it
+  runs. An app whose start maps one has all its instances there, from that start on: `cf scale
+  -i 3` puts the three on that wicket (refused with its reason when it has no room, no index
+  passed to another), and `cf bind-service` refuses (422) an instance whose data is on another
+  wicket than that of one the app binds already. A wicket no `--wicket` names any more keeps the
+  data it holds (logged): the apps start on another without it. A deleted instance's data is
+  deleted of a store of each wicket's host through every wicket, each once none of its routes
+  maps it; of a shared store through one, once every wicket answers that none of its routes
+  maps it (`GET /api/keyvalue/<store>/<namespace>`), a draining one included
 - **Updating the wickets**, one at a time: a wicket stopping drains (`--drain-grace`, 20s), its
   routes withdrawn on every node, and the server sends their hosts to the other wicket; started
   again, it serves the apps of its console directory before it advertises them, and the cf-api

@@ -15,6 +15,9 @@ it settles the networked-store questions (timeouts, connection loss, config shap
   `putIfAbsent`; increment as the trait's default swap loop
 - blocking calls run on `spawn_blocking`, bounded by the client's own operation timeout (a
   dropped future does not stop a blocking call)
+- a shared store: `Stores::described` gives its identity (the locators or REST endpoint and the
+  region, no credential), as `redis::identity` does, so sluice-wicket-cf-api spreads its apps
+  over the wickets and purges a namespace through one
 
 ## Acceptance
 

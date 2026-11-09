@@ -97,6 +97,10 @@ pub struct State {
     /// (`crate::controller`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub wicket_ids: BTreeMap<String, String>,
+    /// The wicket holding the data of each keyvalue namespace of a store of each wicket's host,
+    /// by `store/namespace`: where the apps mapping it run (`crate::placement`).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub homes: BTreeMap<String, String>,
     /// What each wicket answered of each app, by guid, then by wicket; not kept: a start
     /// lists the wickets.
     #[serde(skip)]

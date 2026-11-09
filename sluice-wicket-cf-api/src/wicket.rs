@@ -310,6 +310,10 @@ pub struct ListedStore {
     #[serde(rename = "type")]
     pub kind: String,
     pub default: bool,
+    /// Which store it is when the wickets of other hosts reach it too (`redis://cache:6379/0`);
+    /// none for one of the wicket's host, as from a wicket predating it.
+    #[serde(default)]
+    pub shared: Option<String>,
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -581,16 +585,40 @@ impl Wicket {
             .map_err(|e| Failure::Unreachable(format!("the answer: {e}")))
     }
 
+    /// The hosts whose routes map the keyvalue namespace, "a route being drained" for one no
+    /// longer advertised.
+    pub async fn mapping(&self, store: &str, namespace: &str) -> Result<Vec<String>, Failure> {
+        let request = self
+            .client
+            .get(format!(
+                "{}/api/keyvalue/{}",
+                self.base,
+                place(store, namespace)
+            ))
+            .timeout(EDIT_TIMEOUT);
+        let (status, body) = self.send(request).await?;
+        if !status.is_success() {
+            return Err(refused(status, &body));
+        }
+        #[derive(Deserialize)]
+        struct Mapping {
+            mapped_by: Vec<String>,
+        }
+        serde_json::from_slice::<Mapping>(&body)
+            .map(|mapping| mapping.mapped_by)
+            .map_err(|e| Failure::Unreachable(format!("the answer: {e}")))
+    }
+
     /// Deletes the data of the keyvalue namespace: how many keys it held.
     /// Refused (409) while a route maps it.
     pub async fn purge(&self, store: &str, namespace: &str) -> Result<u64, Failure> {
-        // no space in a store's name nor in `cf/<guid>`: form encoding is
-        // path encoding here
-        let place: String =
-            form_urlencoded::byte_serialize(format!("{store}/{namespace}").as_bytes()).collect();
         let request = self
             .client
-            .delete(format!("{}/api/keyvalue/{place}", self.base))
+            .delete(format!(
+                "{}/api/keyvalue/{}",
+                self.base,
+                place(store, namespace)
+            ))
             .timeout(EDIT_TIMEOUT);
         let (status, body) = self.send(request).await?;
         if !status.is_success() {
@@ -629,6 +657,12 @@ impl Wicket {
         }
         Ok((status, body))
     }
+}
+
+/// The path of a keyvalue namespace: no space in a store's name nor in `cf/<guid>`, so form
+/// encoding is path encoding here.
+fn place(store: &str, namespace: &str) -> String {
+    form_urlencoded::byte_serialize(format!("{store}/{namespace}").as_bytes()).collect()
 }
 
 fn refused(status: reqwest::StatusCode, body: &[u8]) -> Failure {

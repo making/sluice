@@ -958,6 +958,18 @@ mod tests {
         ] {
             instance(&mut state, name, offering, plan);
         }
+        // local is each wicket's host's own: kv's data on the wicket a, other's on b
+        state.wickets.stores = [("local".to_string(), false)].into();
+        for (name, home) in [("kv", "a"), ("other", "b")] {
+            let guid = &state
+                .instances
+                .iter()
+                .find(|i| i.name == name)
+                .unwrap()
+                .guid;
+            let place = format!("local/{}", services::namespace(guid));
+            state.homes.insert(place, home.into());
+        }
         let mut refused = |text: &str| {
             let manifest = parse(text).unwrap();
             apply(&mut state, &manifest, None).unwrap_err()
@@ -984,10 +996,14 @@ mod tests {
                 "- name: creds\n    parameters: {x: 1}",
                 "Binding parameters are not supported for user-provided service instances",
             ),
-            // the last: kv is bound then
+            // the last two: kv is bound then
             (
                 "- kv\n  - other",
                 "a binds kv at the keyvalue identifier \"\" already: bind other at another",
+            ),
+            (
+                "- name: other\n    parameters: {identifier: x}",
+                "a binds kv, whose data is on the wicket a: the data of other is on the wicket b",
             ),
         ];
         for (entries, error) in services {

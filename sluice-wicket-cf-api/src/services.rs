@@ -6,7 +6,10 @@
 //! A keyvalue instance is the namespace `cf/<instance guid>` of its plan's
 //! store, opened by the apps bound to it at an identifier (the binding's
 //! parameter `identifier`, default `""`); renaming the instance or moving
-//! the app's routes leaves its data where it is. A wasi instance grants its
+//! the app's routes leaves its data where it is. A store of each wicket's
+//! host (`sqlite`) holds an instance's data on one wicket, its home, where
+//! the apps mapping it run (`crate::placement`): an app is not bound to two
+//! instances of two homes. A store the wickets share is one by its identity. A wasi instance grants its
 //! capability, a network one `cli` too. A binding applies at the app's next
 //! start, restart or restage, as the rest of the sandbox; its credentials
 //! are in `VCAP_SERVICES`. Instance and binding operations complete at
@@ -73,7 +76,8 @@ const NO_BINDING_PARAMETERS: &str =
 
 /// What a wicket offers: a keyvalue plan per store, a wasi plan per
 /// capability but `keyvalue` (which a keyvalue binding grants); of several
-/// wickets, what every one does ([`Offer::common`]).
+/// wickets, what every one does ([`Offer::common`]): a store of each one's
+/// host by its name, a shared one by its name and identity.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Offer {
     pub plans: Vec<Plan>,
@@ -84,6 +88,8 @@ pub struct Plan {
     pub offering: String,
     pub name: String,
     pub description: String,
+    /// A keyvalue store's identity when the wickets of other hosts reach it too.
+    pub shared: Option<String>,
 }
 
 impl Offer {
@@ -92,11 +98,16 @@ impl Offer {
             offering: KEYVALUE.into(),
             name: store.name.clone(),
             description: format!(
-                "a namespace of the wicket's {} store '{}'{}",
+                "a namespace of the {} store '{}'{}, {}",
                 store.kind,
                 store.name,
-                if store.default { " (its default)" } else { "" }
+                if store.default { " (the default)" } else { "" },
+                match store.shared {
+                    Some(_) => "shared by the wickets",
+                    None => "each wicket's host's own: the apps bound run on one wicket",
+                }
             ),
+            shared: store.shared.clone(),
         });
         let capabilities = capabilities
             .iter()
@@ -105,6 +116,7 @@ impl Offer {
                 offering: WASI.into(),
                 name: name.clone(),
                 description: describe(name),
+                shared: None,
             });
         Offer {
             plans: stores.chain(capabilities).collect(),
@@ -116,8 +128,11 @@ impl Offer {
     pub fn common(offers: &[&Offer]) -> Option<Offer> {
         let (first, others) = offers.split_first()?;
         let offered = |offer: &Offer, plan: &Plan| {
-            (offer.plans.iter())
-                .any(|kept| kept.offering == plan.offering && kept.name == plan.name)
+            (offer.plans.iter()).any(|kept| {
+                kept.offering == plan.offering
+                    && kept.name == plan.name
+                    && kept.shared == plan.shared
+            })
         };
         let plans = first.plans.iter();
         Some(Offer {
@@ -126,6 +141,24 @@ impl Offer {
                 .cloned()
                 .collect(),
         })
+    }
+
+    /// Each keyvalue store `offers` list, by name: whether it is one store of them all (each
+    /// listing it shared, of one identity), else each wicket's host's own.
+    pub fn stores(offers: &[&Offer]) -> BTreeMap<String, bool> {
+        let mut identities: BTreeMap<&str, BTreeSet<Option<&str>>> = BTreeMap::new();
+        let plans = offers.iter().flat_map(|offer| offer.plans.iter());
+        for plan in plans.filter(|plan| plan.offering == KEYVALUE) {
+            let identity = plan.shared.as_deref();
+            identities.entry(&plan.name).or_default().insert(identity);
+        }
+        identities
+            .into_iter()
+            .map(|(name, identities)| {
+                let one = identities.len() == 1 && !identities.contains(&None);
+                (name.to_string(), one)
+            })
+            .collect()
     }
 }
 
@@ -207,6 +240,29 @@ pub fn grants(state: &State, app: &str) -> (Vec<String>, BTreeMap<String, String
     (wasi.into_iter().collect(), keyvalue)
 }
 
+/// The home of `instance`'s data, a namespace of a store of each wicket's host
+/// (`crate::placement`), when an instance `app` binds already has its data on another wicket:
+/// that one's name, the home and its wicket.
+fn elsewhere<'a>(
+    state: &'a State,
+    app: &str,
+    instance: &Instance,
+) -> Option<(&'a str, &'a str, &'a str)> {
+    let home = |instance: &Instance| {
+        let local = instance.offering == KEYVALUE
+            && state.wickets.stores.get(&instance.plan) == Some(&false);
+        let place = format!("{}/{}", instance.plan, namespace(&instance.guid));
+        local.then(|| state.homes.get(&place)).flatten()
+    };
+    let its = home(instance)?;
+    let bound = state.bindings_of(app);
+    let others = bound.filter_map(|binding| state.instance(&binding.instance));
+    others
+        .filter_map(|other| Some((other, home(other)?)))
+        .find(|(_, home)| *home != its)
+        .map(|(other, home)| (other.name.as_str(), its.as_str(), home.as_str()))
+}
+
 /// The capabilities a wasi plan grants.
 fn granted(capability: &str) -> Vec<String> {
     let mut granted = vec![capability.to_string()];
@@ -283,6 +339,15 @@ pub fn bind(
             "{app_name} binds {other} at the keyvalue identifier \"{identifier}\" already: \
              bind {} at another (-c '{{\"identifier\":\"<name>\"}}')",
             found.name
+        )));
+    }
+    if let Some((other, home, its)) = elsewhere(state, app, &found) {
+        let app_name = state.app(app).map_or(app, |app| app.name.as_str());
+        return Err(Unbound::Refused(format!(
+            "{app_name} binds {other}, whose data is on the wicket {its}: the data of {} is on \
+             the wicket {home}, and an app runs on one wicket of the stores of each wicket's \
+             host ({})",
+            found.name, found.plan
         )));
     }
     let at = now();
@@ -497,6 +562,7 @@ fn wicket_plans(offer: &Offer, state: &State) -> Vec<(Plan, bool)> {
                     offering: instance.offering.clone(),
                     name: instance.plan.clone(),
                     description: "offered by the wicket no more".into(),
+                    shared: None,
                 },
                 false,
             ));
@@ -2016,4 +2082,59 @@ fn bindings(req: &Req, state: &State, access: &Access) -> Reply {
         }
         included
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The wickets offer a store of each one's host by its name, a shared one by its name and
+    /// identity: two servers of one name are offered by none, and of each wicket's host.
+    #[test]
+    fn a_store_is_offered_when_every_wicket_lists_it_alike() {
+        let store = |name: &str, shared: Option<&str>| ListedStore {
+            name: name.into(),
+            kind: "redis".into(),
+            default: false,
+            shared: shared.map(String::from),
+        };
+        let caps = ["cli".to_string(), KEYVALUE.to_string()];
+        let a = Offer::new(
+            &caps,
+            &[
+                store("local", None),
+                store("cache", Some("redis://r:6379/0")),
+                store("other", Some("redis://r:6379/1")),
+            ],
+        );
+        let b = Offer::new(
+            &caps[..1],
+            &[
+                store("local", None),
+                store("cache", Some("redis://r:6379/0")),
+                store("other", Some("redis://s:6379/1")),
+            ],
+        );
+        let common = Offer::common(&[&a, &b]).unwrap();
+        let plans: Vec<(&str, &str)> = (common.plans.iter())
+            .map(|plan| (plan.offering.as_str(), plan.name.as_str()))
+            .collect();
+        assert_eq!(
+            plans,
+            [(KEYVALUE, "local"), (KEYVALUE, "cache"), (WASI, "cli")]
+        );
+        assert!(
+            common.plans[0]
+                .description
+                .contains("each wicket's host's own")
+        );
+        assert!(
+            common.plans[1]
+                .description
+                .contains("shared by the wickets")
+        );
+        let stores = [("cache", true), ("local", false), ("other", false)]
+            .map(|(name, shared)| (name.to_string(), shared));
+        assert_eq!(Offer::stores(&[&a, &b]), stores.into());
+    }
 }
