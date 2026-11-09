@@ -151,7 +151,9 @@ the log of the app holding its host, which `cf logs` shows as Cloud Foundry does
   after another rotate over instances 0 to 2; one arriving while all three are busy runs on
   an instance of its own, the wicket's index 3 or above, named as one of 0 to 2 (the requests
   an instance takes at once). On a Firecracker wicket it is its VMs: a pool of
-  `cf scale -i 3` names 0 to 2 and nothing above, as they are.
+  `cf scale -i 3` names 0 to 2 and nothing above, as they are. Over several wickets each
+  wicket's `instance` is its own, the line's `WatchRecord.node_id` unread: each wicket's
+  first is `0` (`cf app` maps a wicket's index to the app's, through the indices it holds).
 - The watch resumes past its cursor (kept in `state.json`) when the hosts change or the
   stream drops. Without a host it holds no watch: an empty filter passes every line.
 - Its startup line names the flume (`flume none` without `--flume`); a watch opened for

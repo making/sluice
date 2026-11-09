@@ -11,6 +11,7 @@ use std::collections::BTreeMap;
 use serde::Deserialize;
 use serde::de::IgnoredAny;
 
+use crate::placement::MAX_INSTANCES;
 use crate::services::{self, Unbound};
 use crate::store::{
     App, BUDGET_ANNOTATION, CONCURRENCY_ANNOTATION, INSTANCES_ANNOTATION, KEEP_ANNOTATION,
@@ -224,6 +225,7 @@ fn apply_app(
     }));
     for (instances, memory, disk, command, check, endpoint, invocation, timeout) in fields {
         if let Some(instances) = instances {
+            check_instances(instances).map_err(|e| format!("{name}: {e}"))?;
             process.instances = instances;
         }
         if let Some(memory) = memory {
@@ -655,8 +657,19 @@ pub fn check_running(app: &App, instances: u64) -> Result<(), String> {
 /// Whether `cf scale` may take `app` to `instances`: it applies at once, to what the last start
 /// took, and is what the next start takes the annotations with.
 pub fn check_scale(app: &App, instances: u64, runtime: Option<Runtime>) -> Result<(), String> {
+    check_instances(instances)?;
     check_annotations(&app.annotations, instances, runtime)?;
     check_running(app, instances)
+}
+
+/// Whether an app may have `instances`: each is placed on a wicket, kept and listed.
+fn check_instances(instances: u64) -> Result<(), String> {
+    match instances > MAX_INSTANCES {
+        true => Err(format!(
+            "instances: {instances} is past the {MAX_INSTANCES} an app has at most"
+        )),
+        false => Ok(()),
+    }
 }
 
 /// What a `cf push` tells of `app`: [`connections_warning`] as its start takes the annotations.
@@ -952,6 +965,10 @@ mod tests {
         assert!(
             refused("applications:\n- name: a\n  env:\n    VCAP_SERVICES: v\n")
                 .contains("a: environment variable \"VCAP_SERVICES\": cannot start with VCAP_")
+        );
+        assert!(
+            refused("applications:\n- name: a\n  instances: 1001\n")
+                .contains("a: instances: 1001 is past the 1000 an app has at most")
         );
         let services = [
             ("- nope", "service instance 'nope' not found"),
@@ -1256,6 +1273,16 @@ mod tests {
             (&[], &booted, true, 1, Some(Firecracker), &[]),
             (&[], &booted, true, 0, Some(Firecracker), &[]),
             (&[], &none, true, 2, Some(Firecracker), &[]),
+            (&[], &none, true, 1000, Some(Wasm), &[]),
+            // past what is placed
+            (
+                &[],
+                &none,
+                true,
+                1001,
+                Some(Wasm),
+                &["1001 is past the 1000"],
+            ),
         ] {
             let kept = state.app_mut(&guid).unwrap();
             kept.annotations = annotated

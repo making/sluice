@@ -1,16 +1,19 @@
 //! sluice-wicket-cf-api: the Cloud Foundry API facade the stock cf CLI
-//! deploys wasm components (or, on a Firecracker wicket, rootfs images) through
+//! deploys wasm components (or, on Firecracker wickets, rootfs images) through
 //! -- the subset of the Cloud Controller v3 API, the UAA token endpoints and
 //! log-cache's read API it uses -- keeping the desired state of its apps and
-//! having one wicket serve them through the wicket's app API; a component comes
+//! having its wickets serve them through each wicket's app API, an app's
+//! instances spread over them (`placement`, `controller`); a component comes
 //! in a zip or from an OCI registry (`registry`), a rootfs in a zip or made by
-//! the wicket of an OCI image, and the wicket's keyvalue stores and capabilities
-//! are its services. With a flume, the apps' output and requests reach their logs
-//! from the live access log the wicket feeds (`flume`).
+//! a wicket of an OCI image, and what every wicket offers of its keyvalue stores
+//! and capabilities are its services. With a flume, the apps' output and requests
+//! reach their logs from the live access log the wickets feed (`flume`). Several
+//! wickets are reached through a sluice server, each advertising the hosts of the
+//! apps it runs.
 //!
 //! ```text
-//! cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> a wicket
-//!                                                  ^                              |
+//! cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> wickets
+//!                                                  ^                            |
 //!                                                  +--Watch-- sluice-flume <--Feed+
 //! ```
 
@@ -28,6 +31,7 @@ pub mod osb;
 /// The OpenID Provider client, shared with the wicket's console.
 pub use sluice_wicket_oidc as oidc;
 pub mod orgs;
+pub mod placement;
 pub mod registry;
 pub mod roles;
 pub mod security_groups;
@@ -50,7 +54,7 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
-/// The owner the apps are put under in the wicket.
+/// The owner the apps are put under in the wickets.
 pub const OWNER: &str = "cf";
 
 /// This binary's build, embedded by `build.rs`; an empty commit means git
@@ -94,9 +98,9 @@ pub fn describe_build() -> String {
 /// What the server needs once its listener is bound.
 #[derive(Clone, Debug)]
 pub struct Settings {
-    /// The wicket's console, `http://host:port`.
-    pub wicket: String,
-    /// Its `--console-token`.
+    /// The wickets, one at least: the first takes a state of one wicket.
+    pub wickets: Vec<WicketSettings>,
+    /// Their `--console-token`, one for all.
     pub wicket_token: Option<String>,
     /// The shared domains; the first takes the default and random routes.
     pub domains: Vec<String>,
@@ -119,6 +123,15 @@ pub struct Settings {
     pub service_broker_editors: security_groups::Editors,
     /// The listener's own TLS; None: plain HTTP.
     pub tls: Option<TlsSettings>,
+}
+
+/// A wicket the apps are placed on.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WicketSettings {
+    /// What the state places an app's indices on, and `cf app` shows as their host.
+    pub name: String,
+    /// Its console, `http://host:port`.
+    pub url: String,
 }
 
 /// The listener's certificate chain and private key, PEM.
@@ -175,7 +188,7 @@ fn tls_acceptor(tls: &TlsSettings) -> Result<tokio_rustls::TlsAcceptor, String> 
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
-/// Serves the API on `listener` until `shutdown` completes, the wicket
+/// Serves the API on `listener` until `shutdown` completes, the wickets
 /// reconciled all along.
 pub async fn serve(
     listener: TcpListener,
@@ -185,11 +198,13 @@ pub async fn serve(
     // reqwest brings no crypto provider of its own (sluice-wicket-oidc's
     // rustls-no-provider): ring, as tonic's TLS and the listener's
     let _ = rustls::crypto::ring::default_provider().install_default();
+    let names: Vec<String> = settings.wickets.iter().map(|w| w.name.clone()).collect();
     let store = Arc::new(store::Store::open(
         &settings.data_dir,
         &settings.org,
         &settings.space,
         &settings.domains,
+        &names,
     )?);
     let mode = match &settings.oidc {
         Some(oidc) => uaa::Mode::Provider {
@@ -208,21 +223,24 @@ pub async fn serve(
         None => None,
     };
     let logs = Arc::new(logs::Logs::default());
-    let wicket = Arc::new(wicket::Wicket::new(
-        &settings.wicket,
-        settings.wicket_token.clone(),
-        OWNER,
+    let of = settings.wickets.len();
+    let wickets = (settings.wickets.iter())
+        .map(|wicket| {
+            let token = settings.wicket_token.clone();
+            Arc::new(wicket::Wicket::new(
+                &wicket.name,
+                of,
+                &wicket.url,
+                token,
+                OWNER,
+            ))
+        })
+        .collect();
+    let controller = Arc::new(controller::Controller::new(
+        store.clone(),
+        wickets,
+        logs.clone(),
     ));
-    let controller = Arc::new(controller::Controller {
-        store: store.clone(),
-        wicket,
-        logs: logs.clone(),
-        held: std::sync::Mutex::default(),
-        did_not_start: std::sync::Mutex::default(),
-        offer: std::sync::Mutex::new(None),
-        runtime: std::sync::Mutex::new(None),
-        strangers: std::sync::Mutex::default(),
-    });
     let flume = settings
         .flume
         .clone()
@@ -275,7 +293,10 @@ mod tests {
 
     fn settings(data_dir: PathBuf, tls: Option<TlsSettings>) -> Settings {
         Settings {
-            wicket: "http://127.0.0.1:1".into(),
+            wickets: vec![WicketSettings {
+                name: "wicket".into(),
+                url: "http://127.0.0.1:1".into(),
+            }],
             wicket_token: None,
             domains: vec!["apps.test".into()],
             data_dir,

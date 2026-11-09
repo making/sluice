@@ -9,8 +9,9 @@
 //! the digest staged when the tag moves, a restage taking the new one --, a
 //! restart of the cf-api with an OpenID Provider (a mock) and TLS of its
 //! own -- `cf login --sso` through the passcode page, a refresh, the
-//! clients configured, who is refused, who may edit the security groups --, a component
-//! the wicket refuses
+//! clients configured, who is refused, who may edit the security groups --, a second
+//! wicket -- the one wicket's indices placed again, an app's instances spread over both,
+//! one stopped and back, a scale --, a component the wicket refuses
 //! until a service binding grants what it needs, the services' lifecycle, a service broker
 //! (a stub) -- who registers it, who sees its plans, its operations at once and polled
 //! across a restart of the cf-api, failed, its bindings' credentials, a manifest's and an
@@ -412,19 +413,18 @@ fn variant(hello: &[u8]) -> Vec<u8> {
     component
 }
 
+/// The cf-api on `listen` of the wickets `wickets` (each `--wicket`'s value), its URL once it
+/// listens.
 fn start_api(
     listen: &str,
-    console: &str,
+    wickets: &[String],
     flume: &str,
     data: &Path,
     more: &[&str],
 ) -> (Process, String) {
-    let wicket = format!("http://{console}");
     let mut args = vec![
         "--listen",
         listen,
-        "--wicket",
-        &wicket,
         "--wicket-token",
         TOKEN,
         "--data-dir",
@@ -434,6 +434,9 @@ fn start_api(
         "--flume-token",
         FLUME_TOKEN,
     ];
+    for wicket in wickets {
+        args.extend_from_slice(&["--wicket", wicket]);
+    }
     args.extend_from_slice(more);
     let api = Process::spawn(Path::new(env!("CARGO_BIN_EXE_sluice-wicket-cf-api")), &args);
     let started = api.line("listening on ");
@@ -572,38 +575,48 @@ fn the_cf_cli_deploys_to_the_wicket() {
         &["--host", "127.0.0.1", "--port", "0", "--token", FLUME_TOKEN],
     );
     let flume_url = flume.logged("listening on ");
-    let wicket = Process::spawn(
-        &wicket_binary,
-        &[
-            "--flume",
-            &flume_url,
-            "--flume-token",
-            FLUME_TOKEN,
-            "--listen",
-            "127.0.0.1:0",
-            "--console",
-            "127.0.0.1:0",
-            "--console-token",
-            TOKEN,
-            "--console-dir",
-            dir.join("deployed").to_str().unwrap(),
-            "--keyvalue-file",
-            dir.join("kv.db").to_str().unwrap(),
-            "--watch-interval",
-            "0",
-        ],
-    );
-    let listen = wicket.logged("listening on ");
-    let console = wicket.logged("console on http://");
-    // a port of its own, kept across the restart (the CLI targets it)
-    let port = std::net::TcpListener::bind("127.0.0.1:0")
-        .and_then(|listener| listener.local_addr())
-        .unwrap()
-        .port();
-    let api_listen = format!("127.0.0.1:{port}");
+    // a wicket on the flume, its console at `console`, of a console directory and a keyvalue
+    // file of its own (`deployed<suffix>`, `kv<suffix>.db`): its listener and its console
+    let start_wicket = |console: &str, suffix: &str| {
+        let wicket = Process::spawn(
+            &wicket_binary,
+            &[
+                "--flume",
+                &flume_url,
+                "--flume-token",
+                FLUME_TOKEN,
+                "--listen",
+                "127.0.0.1:0",
+                "--console",
+                console,
+                "--console-token",
+                TOKEN,
+                "--console-dir",
+                dir.join(format!("deployed{suffix}")).to_str().unwrap(),
+                "--keyvalue-file",
+                dir.join(format!("kv{suffix}.db")).to_str().unwrap(),
+                "--watch-interval",
+                "0",
+            ],
+        );
+        let listen = wicket.logged("listening on ");
+        let console = wicket.logged("console on http://");
+        (wicket, listen, console)
+    };
+    let (wicket, listen, console) = start_wicket("127.0.0.1:0", "");
+    // ports of its own, kept across the restarts (the CLI targets it; the cf-api names the
+    // second wicket's console)
+    let free = || {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .unwrap()
+            .to_string()
+    };
+    let api_listen = free();
+    let one_wicket = [format!("http://{console}")];
     let (mut api, url) = start_api(
         &api_listen,
-        &console,
+        &one_wicket,
         &flume_url,
         &dir.join("cf"),
         &["--any-credentials"],
@@ -1194,7 +1207,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
     // log says so
     let (lost, _) = start_api(
         &api_listen,
-        &console,
+        &one_wicket,
         &flume_url,
         &dir.join("cf-lost"),
         &["--any-credentials"],
@@ -1238,14 +1251,14 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "--tls-key",
         key_file.to_str().unwrap(),
     ];
-    let with_rules = |rules: &[&str]| {
+    let with_rules = |wickets: &[String], rules: &[&str]| {
         let mut args: Vec<&str> = oidc.to_vec();
         for rule in rules {
             args.extend_from_slice(&["--oidc-claim", rule]);
         }
-        start_api(&api_listen, &console, &flume_url, &dir.join("cf"), &args)
+        start_api(&api_listen, wickets, &flume_url, &dir.join("cf"), &args)
     };
-    let (api, url) = with_rules(&["email=*@example.com", "groups=devs"]);
+    let (api, url) = with_rules(&one_wicket, &["email=*@example.com", "groups=devs"]);
     assert!(url.starts_with("https://"), "{url}");
     api.logged("Found in the wicket as wanted");
     assert_eq!(listing(&console)["generation"], generation);
@@ -1384,6 +1397,106 @@ fn the_cf_cli_deploys_to_the_wicket() {
 
     cf.ok(&["delete-security-group", "group", "-f"]);
 
+    // a second wicket, the two named: an app's instances spread over them. The one wicket's
+    // indices are placed again at the restart, its name no --wicket's: hello's second goes to
+    // the second wicket
+    let console_b = free();
+    let (mut wicket_b, mut listen_b, _) = start_wicket(&console_b, "-b");
+    let two_wickets = [
+        format!("a=http://{console}"),
+        format!("b=http://{console_b}"),
+    ];
+    drop(api);
+    let (api, _) = with_rules(&two_wickets, &["email=*@example.com", "groups=devs"]);
+    let guid_of = |app: &str| cf.ok(&["app", app, "--guid"]).trim().to_string();
+    let hello = guid_of("hello");
+    let placed = api.line(&format!("[{hello}] CELL: index 1 placed on the wicket b"));
+    assert!(placed.ends_with(": no --wicket names wicket"), "{placed}");
+    // the sandbox of the app of `host` as a wicket lists it, if it has it
+    let share = |console: &str, host: &str| {
+        let apps = listing(console)["apps"].as_array().unwrap().clone();
+        let app = apps.into_iter().find(|app| app["hosts"][0] == host);
+        app.map(|app| app["sandbox"].clone())
+    };
+    eventually("hello's second instance on the second wicket", || {
+        [&console, &console_b].into_iter().all(|console| {
+            share(console, "hello.localhost").is_some_and(|sandbox| sandbox["instances"] == 1)
+        })
+    });
+
+    // pushed at -i 2: an instance on each wicket, each listing the app at 1 and answering it on
+    // its listener; `cf app` the two running, each on its wicket
+    let app = dir.join("app");
+    cf.ok(&["push", "spread", "-p", app.to_str().unwrap(), "-i", "2"]);
+    for (console, listen) in [(&console, &listen), (&console_b, &listen_b)] {
+        assert_eq!(share(console, "spread.localhost").unwrap()["instances"], 1);
+        assert_eq!(get(listen, "spread.localhost", "/", None).0, 200);
+    }
+    let stats = format!("/v3/apps/{}/processes/web/stats", guid_of("spread"));
+    let hosted = || {
+        let stats: Value = serde_json::from_str(&cf.ok(&["curl", &stats])).unwrap();
+        let entries = stats["resources"].as_array().unwrap().clone();
+        let entry = |entry: &Value| {
+            let text = |key: &str| entry[key].as_str().unwrap().to_string();
+            (
+                entry["index"].as_u64().unwrap(),
+                text("state"),
+                text("host"),
+            )
+        };
+        entries.iter().map(entry).collect::<Vec<_>>()
+    };
+    let at = |index, state: &str, host: &str| (index, state.to_string(), host.to_string());
+    let both = [at(0, "RUNNING", "a"), at(1, "RUNNING", "b")];
+    eventually("an instance running on each wicket", || hosted() == both);
+    let shown = cf.ok(&["app", "spread"]);
+    for index in ["#0", "#1"] {
+        let running = |line: &&str| line.starts_with(index) && line.contains("running");
+        assert!(shown.lines().any(|line| running(&line)), "{shown}");
+    }
+
+    // the second wicket stopped: its index starting. Back, it serves what it kept, as the
+    // cf-api finds it, putting nothing again
+    let deployed = |console: &str| {
+        let apps = listing(console)["apps"].as_array().unwrap().clone();
+        let app = apps
+            .into_iter()
+            .find(|app| app["hosts"][0] == "spread.localhost");
+        app.map(|app| app["deployed"].clone())
+    };
+    let kept = deployed(&console_b);
+    wicket_b.kill();
+    let away = [at(0, "RUNNING", "a"), at(1, "STARTING", "b")];
+    eventually("the second wicket's index starting", || hosted() == away);
+    let shown = cf.ok(&["app", "spread"]);
+    let starting = |line: &&str| line.starts_with("#1") && line.contains("starting");
+    assert!(shown.lines().any(|line| starting(&line)), "{shown}");
+    (wicket_b, listen_b, _) = start_wicket(&console_b, "-b");
+    let spread = guid_of("spread");
+    api.line(&format!("[{spread}] CELL: Found in the wicket b as wanted"));
+    assert_eq!(deployed(&console_b), kept);
+    assert_eq!(get(&listen_b, "spread.localhost", "/", None).0, 200);
+    eventually("an instance running on each wicket again", || {
+        hosted() == both
+    });
+
+    // `cf scale -i 3` gives one wicket two, `-i 1` removes the app from the other
+    let instances = |console: &str| {
+        share(console, "spread.localhost").map(|sandbox| sandbox["instances"].clone())
+    };
+    cf.ok(&["scale", "spread", "-i", "3"]);
+    assert_eq!(
+        (instances(&console), instances(&console_b)),
+        (Some(json!(2)), Some(json!(1)))
+    );
+    cf.ok(&["scale", "spread", "-i", "1"]);
+    assert_eq!(
+        (instances(&console), instances(&console_b)),
+        (Some(json!(1)), None)
+    );
+    assert_eq!(get(&listen_b, "spread.localhost", "/", None).0, 404);
+    cf.ok(&["delete", "spread", "-r", "-f"]);
+
     // a component the wicket refuses: its reason reaches the user
     let output = cf.fails(&[
         "push",
@@ -1445,7 +1558,8 @@ fn the_cf_cli_deploys_to_the_wicket() {
     cf.ok(&["bind-service", "counter", "kv"]);
     cf.ok(&["restart", "counter"]);
     assert_eq!(count("/"), "hits 1\n");
-    let purged = api.line("SERVICES: deleted the data of service instance counts");
+    // through each wicket: the first held them, a file of its host
+    let purged = api.line("SERVICES: deleted the data of service instance counts on the wicket a");
     assert!(purged.ends_with(": 1 key(s)"), "{purged}");
 
     // a capability as a service, bound by the manifest: cli links relay's
@@ -1577,7 +1691,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "{output}"
     );
     drop(api);
-    let (api, _) = with_rules(&["email=*@example.com", "groups=devs"]);
+    let (api, _) = with_rules(&two_wickets, &["email=*@example.com", "groups=devs"]);
     broker.hold(false);
     eventually("the instance made after the restart", || {
         cf.ok(&["service", "db2"]).contains("create succeeded")
@@ -1727,12 +1841,14 @@ fn the_cf_cli_deploys_to_the_wicket() {
     cf.ok(&["push", "site", "-p", site.to_str().unwrap()]);
     assert_eq!(page("/"), (200, "<h1>home, again</h1>".into()));
 
-    // gone from the wicket; their instances stay, unbound
+    // gone from the wickets; their instances stay, unbound
     for app in ["hello", "counter", "relay", "img", "site"] {
         cf.ok(&["delete", app, "-r", "-f"]);
     }
-    assert!(listing(&console)["apps"].as_array().unwrap().is_empty());
-    assert_eq!(get(&listen, "hello.localhost", "/", None).0, 404);
+    for (console, listen) in [(&console, &listen), (&console_b, &listen_b)] {
+        assert!(listing(console)["apps"].as_array().unwrap().is_empty());
+        assert_eq!(get(listen, "hello.localhost", "/", None).0, 404);
+    }
     assert!(!cf.ok(&["apps"]).contains("hello"));
     let services = cf.ok(&["services"]);
     assert!(
@@ -1749,7 +1865,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
     // alice no longer allowed (the rules changed): her next refresh is
     // refused, and her session with it
     drop(api);
-    let (api, url) = with_rules(&["email=*@example.com", "groups=ops"]);
+    let (api, url) = with_rules(&two_wickets, &["email=*@example.com", "groups=ops"]);
     let (status, refused) = http.token(
         &url,
         &format!("grant_type=refresh_token&refresh_token={alice_refresh}"),
@@ -1763,6 +1879,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
 
     drop(api);
     drop(wicket);
+    drop(wicket_b);
     drop(flume);
     drop(provider);
     let _ = std::fs::remove_dir_all(&dir);
@@ -1936,7 +2053,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     // an API taking any credentials names who edits the security groups by the name given
     let (api, url) = start_api(
         &api_listen,
-        &console,
+        &[format!("http://{console}")],
         &flume_url,
         &dir.join("cf"),
         &[

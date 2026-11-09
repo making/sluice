@@ -424,7 +424,8 @@ mod tests {
     fn lines_reach_the_app_of_their_host_and_losses_every_app() {
         let dir = std::env::temp_dir().join(format!("sluice-cf-api-flume-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Store::open(&dir, "o", "s", &["localhost".to_string()]).unwrap();
+        let localhost = ["localhost".to_string()];
+        let store = Store::open(&dir, "o", "s", &localhost, &["wicket".to_string()]).unwrap();
         store.update(|state| {
             state.flume = Some(FlumeCursor { epoch: 1, seq: 9 });
         });

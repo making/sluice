@@ -1,11 +1,12 @@
 # sluice-wicket-cf-api
 
-A Cloud Foundry API facade for one sluice wicket: the subset of the Cloud Controller v3 API, the
+A Cloud Foundry API facade for sluice wickets: the subset of the Cloud Controller v3 API, the
 UAA token endpoints and log-cache's read API the stock `cf` CLI uses, on one origin. It keeps the
-desired state of its apps and has the wicket serve them through the wicket's app API, so routes,
-scaling, rolling updates, stop and start and `cf logs` work as the CLI expects. Users log in
-through an OpenID Provider (`cf login --sso`; see [Login](#login)), or, with `--any-credentials`,
-on the loopback with any credentials.
+desired state of its apps and has its wickets serve them through each wicket's app API, an app's
+instances spread over them ([Several wickets](#several-wickets)), so routes, scaling, rolling
+updates, stop and start and `cf logs` work as the CLI expects. Users log in through an OpenID
+Provider (`cf login --sso`; see [Login](#login)), or, with `--any-credentials`, on the loopback
+with any credentials.
 
 What `cf push` deploys depends on the wicket, whose listing names its runtime:
 
@@ -17,12 +18,12 @@ What `cf push` deploys depends on the wicket, whose listing names its runtime:
 | services | the wicket's keyvalue stores and capabilities; [user-provided](#user-provided-services); a [service broker](#service-brokers)'s | [user-provided](#user-provided-services); a [service broker](#service-brokers)'s |
 | `cf logs` | the app's output and requests | the process's output |
 
-The rest holds for both: [Options](#options), [Mapping](#mapping), [Behavior](#behavior),
-[Login](#login), [Limits](#limits), [Tests](#tests).
+The rest holds for both: [Several wickets](#several-wickets), [Options](#options),
+[Mapping](#mapping), [Behavior](#behavior), [Login](#login), [Limits](#limits), [Tests](#tests).
 
 ```text
-cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> a wicket <--tunnel-- sluice server
-                                             ^                             |
+cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> wickets <--tunnel-- sluice server
+                                             ^                            |
                                              +--Watch-- sluice-flume <--Feed  (cf logs, optional)
 ```
 
@@ -807,13 +808,136 @@ cf restart blog
   with `/init`'s line in the logs. Only `/init` knows the port (an image's `EXPOSE`), so neither
   the cf-api nor the wicket refuses the rule before
 
+## Several wickets
+
+`--wicket <name>=<url>` names each wicket, repeated: the cf-api spreads an app's instances over
+them, so one wicket can stop while the apps of `-i 2` or more serve on, and the wickets be updated
+one at a time. Clients reach them through a [sluice server](../README.md), each wicket advertising
+the hosts of the apps it runs and the server sending a host to one of the wickets serving it. A
+wicket's `--listen` serves its own apps only and drains nothing (a signal ends it at once): local
+mode stays one wicket.
+
+- **Placement.** Each index of an app's web process is on a wicket, kept in the state: a new
+  index goes to a wicket holding none of the app's while there is one, else to one holding the
+  fewest, the first named of them, so every app of `-i 1` is on the first wicket. A scale down
+  drops the highest indices, as on CF, and removes the app from a wicket left with none. A wicket
+  runs an app of its indices: their count is its `instances`, those below the app's `warm` (the
+  lowest are the warm ones) its `warm`. Nothing else moves an index: a wicket added takes new
+  ones. A state of one wicket has its indices on the first wicket named, and the indices of a
+  wicket no name gives any more are placed again at the start (logged): a wicket keeps its apps
+  while it keeps its name, and the one wicket of `--wicket <url>` is `wicket`
+  (`--wicket wicket=<url>`)
+- **`cf app`** lists each wicket's instances at their indices, the wicket's name as their `host`
+  (`cf curl /v3/apps/<guid>/processes/web/stats`): a wicket away shows its indices `STARTING`, one
+  refusing its share `CRASHED` with its reason. An edit applying at once (`cf scale -i`, routes,
+  annotations) is put on each wicket whose share it changes, and a refusal by one changes nothing;
+  a start, restart or restage puts every share at once, each wicket's outcome its own. `cf logs`
+  names an instance by its wicket's own index: each wicket's first is `0`
+- **What they share.** The wickets run apps one way: one listing another runtime than the first
+  is logged, and none placed or put on it. They share one `--wicket-token`, not a console
+  directory (a volume each; a StatefulSet on Kubernetes). The marketplace is what every wicket
+  offers. A `local` keyvalue store is a file of each wicket's host: an app over two
+  wickets reads and writes two namespaces, so bind it a store they share (`redis`). Firecracker
+  wickets make an image's rootfs each, one at staging, the others at their first put of it:
+  wickets of two guests make two digests, so push no image while they run, as during an update of
+  the wickets changing the guest. The cf-api runs beside the wickets, not as an app of one, which
+  would stop with it
+- **Updating the wickets**, one at a time: a wicket stopping drains (`--drain-grace`, 20s), its
+  routes withdrawn on every node, and the server sends their hosts to the other wicket; started
+  again, it serves the apps of its console directory before it advertises them, and the cf-api
+  puts nothing again. An app of `-i 2` or more serves on; one of `-i 1` answers 503 until its
+  wicket is back. The server's default `sluice.http-load-balance`, `smallest-client-id`, sends
+  every request to one wicket, the other standing by; `round-robin` shares them. Let a stop take
+  longer than the drain (`stop_grace_period` / `terminationGracePeriodSeconds` 30s, a Firecracker
+  wicket's 40s), and update the next wicket once the first serves again (`cf app` shows its
+  instances running): a route that does not start ends the wicket's start
+
+The [Docker Compose](#docker-compose) sample with a sluice server and two wickets: in its
+`compose.yaml`, the services below in place of `wicket` and `cf-api`, the volumes `wicket-a` and
+`wicket-b` in place of `wicket`; `wicket.yaml` as below (the consoles the cf-api's alone: no
+sign-in, no port); in `.env`, a `SERVER_TOKEN` too (`openssl rand -hex 16`). The apps keep their
+data in the Redis both wickets share.
+
+```yaml
+  server:
+    image: ghcr.io/making/sluice/sluice-server:native
+    pull_policy: always
+    command: ["--sluice.token=${SERVER_TOKEN:?SERVER_TOKEN}"]
+    ports:
+      - "28000:8000"                # the apps, through the server
+    restart: unless-stopped
+  wicket-a: &wicket
+    image: ghcr.io/making/sluice/sluice-wicket-runtime-wasi
+    pull_policy: always
+    command: [--config, /etc/sluice/wicket.yaml]
+    environment:                    # what wicket.yaml's ${...} take
+      SERVER_TOKEN: ${SERVER_TOKEN:?SERVER_TOKEN}
+      CONSOLE_TOKEN: ${CONSOLE_TOKEN:?CONSOLE_TOKEN}
+      FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD}
+    stop_grace_period: 30s          # above drain-grace: a stop drains
+    volumes:
+      - ./wicket.yaml:/etc/sluice/wicket.yaml:ro
+      - wicket-a:/data              # its console directory: one each
+    depends_on: [server, redis]
+    restart: unless-stopped
+  wicket-b:
+    <<: *wicket
+    volumes:
+      - ./wicket.yaml:/etc/sluice/wicket.yaml:ro
+      - wicket-b:/data
+  cf-api:
+    image: ghcr.io/making/sluice/sluice-wicket-cf-api
+    pull_policy: always
+    command: [--listen, 0.0.0.0:9091, --wicket, a=http://wicket-a:9090, --wicket, b=http://wicket-b:9090, --flume, grpc://flume:8002, --oidc-issuer, http://dex.localhost:5556/dex]
+    environment:
+      SLUICE_WICKET_CF_API_WICKET_TOKEN: ${CONSOLE_TOKEN:?CONSOLE_TOKEN}
+      SLUICE_WICKET_CF_API_FLUME_TOKEN: ${FLUME_TOKEN:?FLUME_TOKEN}
+      SLUICE_WICKET_CF_API_DOMAIN: ${APPS_DOMAIN:-localhost}
+      SLUICE_WICKET_CF_API_OIDC_CLIENT_ID: sluice
+      SLUICE_WICKET_CF_API_OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET}
+      SLUICE_WICKET_CF_API_OIDC_CLAIM: email=admin@example.com
+      SLUICE_WICKET_CF_API_ADMIN: email=admin@example.com
+    ports:
+      - "127.0.0.1:9091:9091"
+    volumes:
+      - cf-api:/data
+    depends_on: [wicket-a, wicket-b, dex]
+    restart: unless-stopped
+```
+
+```yaml
+# wicket.yaml, both wickets': the apps through the server
+server: grpc://server:8001
+token: ${SERVER_TOKEN}
+console: 0.0.0.0:9090
+console-token: ${CONSOLE_TOKEN}
+console-dir: /data/deployed
+flume: grpc://flume:8002
+flume-token: ${FLUME_TOKEN}
+keyvalue:
+  stores:
+    redis:
+      type: redis
+      url: redis://:${REDIS_PASSWORD}@redis:6379/0
+```
+
+```text
+docker compose up -d
+cf login -a http://127.0.0.1:9091 --sso
+cf push hello -p hello/ -i 2               # an instance on each wicket
+curl http://hello.localhost:28000/         # through the server
+cf curl "/v3/apps/$(cf app hello --guid)/processes/web/stats" | jq -c '.resources[] | [.index, .host]'
+docker compose restart wicket-a            # it drains: hello goes on through wicket-b
+```
+
 ## Options
 
 | option | |
 |---|---|
 | `--listen <host:port>` | bind address (default `127.0.0.1:9091`); with `--any-credentials` a loopback address only |
-| `--wicket <url>` | the wicket's console, `http://host:port` |
-| `--wicket-token <token>` / `--wicket-token-file <path>` | its `--console-token` |
+| `--wicket <name>=<url>` | a wicket's console, `http://host:port`, and its name (letters, digits, `-`, `_`, `.`): repeatable (or comma-separated), an app's instances spread over the wickets ([Several wickets](#several-wickets)). `--wicket <url>` names the one wicket `wicket` |
+| `--wicket-token <token>` / `--wicket-token-file <path>` | their `--console-token`, one for all |
 | `--domain <name>` | a shared domain; repeatable (or comma-separated): the first takes the default and random routes (default `localhost`). Through a sluice server, a suffix whose wildcard DNS reaches it |
 | `--data-dir <path>` | the state and the blobs (default `cf-api`): `state.json` (written by a rename on every change), `jwt.key` and `sessions.json` (the logins), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app) |
 | `--org <name>` / `--space <name>` | the organization and its space the first start makes (default `sluice` / `wicket`) |
@@ -853,12 +977,12 @@ What holds on both wickets; a component's and a VM's are in
 
 | CF | wicket |
 |---|---|
-| app, started, with a droplet and a route | an app named by its guid, owner `cf`: its routes' hosts, the droplet's component, the sandbox below |
-| app stopped, scaled to 0, or without a route | no app in the wicket: a request gets the wicket's 404, as gorouter answers a route with no instance registered. `cf app` shows `0/0` (stopped: `0/N`, each `DOWN`), `cf push` of `instances: 0` waits for none |
+| app, started, with a droplet and a route | on each wicket holding some of its instances ([Several wickets](#several-wickets)), an app named by its guid, owner `cf`: its routes' hosts, the droplet's component, the sandbox below |
+| app stopped, scaled to 0, or without a route | no app in the wickets: a request gets a wicket's 404, as gorouter answers a route with no instance registered. `cf app` shows `0/0` (stopped: `0/N`, each `DOWN`), `cf push` of `instances: 0` waits for none |
 | route `<host>.<domain>` | a host: labels of `a-z`, `0-9` and `-`. No path, port or wildcard (422). A route serves one app: a second destination is refused; zero-downtime updates are `--strategy rolling` |
 | shared domain | `--domain` |
-| instance state | once the wicket took the app, an entry per [instance alive](#instances), `RUNNING`, its `since` its own start, for a VM it keeps and has not up yet `STARTING`, and for a VM it keeps gone down or not starting (no room in the wicket's budget, a snapshot gone), or none alive at `warm: 0` with a request's restore failing for anything but room, `CRASHED` with why as `details`, `since` the failure began, until it is up; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable or has not taken the app. These two list `instances` entries |
-| rolling deployment | the app put with the new droplet: the wicket swaps it in place; finalized at once |
+| instance state | once the wicket took the app, an entry per [instance alive](#instances), `RUNNING`, its `since` its own start, for a VM it keeps and has not up yet `STARTING`, and for a VM it keeps gone down or not starting (no room in the wicket's budget, a snapshot gone), or none alive at `warm: 0` with a request's restore failing for anything but room, `CRASHED` with why as `details`, `since` the failure began, until it is up; `CRASHED` with the wicket's refusal as `details` (`cf push` prints it: `Error starting instances: '...'`); `STARTING` while the wicket is unreachable or has not taken the app. These two list an entry per index the wicket holds. Each entry's `host` is its wicket's name |
+| rolling deployment | the app put with the new droplet: each wicket swaps it in place, all at once; finalized at once |
 | org / space | the cf-api's own ([Organizations, spaces and roles](#organizations-spaces-and-roles)): the wicket knows none, its hosts are every space's |
 | health check, log rate, stack, buildpacks | accepted and shown, no effect |
 
@@ -955,7 +1079,8 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
   `cf push` and `cf scale` warn of the count, and the connection finding no room waits for it
   within the route's `wait-ms` (10s), then gets a 502 saying so
 - **A limit above the wicket's own** runs, bounded by the wicket: N past `--max-instances`
-  is no refusal
+  is no refusal. N is 1000 at most: each index is placed on a wicket, kept and listed
+  ([Several wickets](#several-wickets))
 - **`cf app`** lists the instances alive, as the wicket has them at each request: a warm one, a VM
   serving or kept, one started for a request while it serves, each `since` its own start (a unit replaced, a VM
   cloned anew: then; those of one index, as `cf logs` has them below: the lowest's). So `3/3` below a limit of 4, and `0/0`,
@@ -972,7 +1097,8 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
 - **`cf logs`** names what `cf app` lists, `0` to `N - 1`: of a component the units alive may
   outnumber N, the work of N instances, and the cf-api names one `index % N`, knowing N as the
   wicket does not; those of one index are one entry. A VM's index is within N already, but for one
-  past a scale down finishing its connections, named so too
+  past a scale down finishing its connections, named so too. Over several wickets, each names its
+  own: `cf app` maps a wicket's index to the app's, `cf logs` does not
 
 ## Behavior
 
@@ -995,20 +1121,22 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
   password is in no answer (`***` in the package) and no log; `state.json` holds it. An app is an
   image's after a push of one, a zip's after a push of bits. A build the cf-api's restart cut
   short fails: restage
-- an edit the wicket answers at once (map-route, unmap-route, scale -i, a manifest's routes)
-  is refused with 422 and the wicket's reason, and changes nothing; a start, restart or
-  deployment is accepted, and its outcome shows in the process stats and the log (`cf logs`)
+- an edit the wickets answer at once (map-route, unmap-route, scale -i, a manifest's routes)
+  is refused with 422 and the reason of the wicket refusing it, and changes nothing; a start,
+  restart or deployment is accepted, and its outcome shows in the process stats and the log
+  (`cf logs`)
 - a VM's start may take the health check's timeout (`cf push -t`, 60s by default): only that app's
   edits that touch the wicket wait for it (`cf set-env` does not), and a client giving up leaves
-  it going, its outcome shown all the same. An app whose VMs did not start (`CRASHED`) is not
-  tried again until what is asked of it changes (`cf restart`), the wicket comes back or the
-  cf-api restarts; one the wicket refused for another reason (no room, a host taken) whenever
-  its revision moves
-- the desired state is the cf-api's: at startup and whenever the wicket's revision moves
-  (`GET /api/apps?after=`), it lists the wicket's apps of its owner and puts / deletes the
-  difference (the same app again changes nothing: the wicket's generation stays). The wicket
-  serves on while the cf-api is down; with the wicket down, the apps show `STARTING` and are
-  put when it is back, and an app deleted meanwhile (or whose removal it refused) is removed then
+  it going, its outcome shown all the same. An app whose VMs did not start on a wicket (`CRASHED`)
+  is not tried again there until what is asked of it changes (`cf restart`), the wicket comes
+  back or the cf-api restarts; one a wicket refused for another reason (no room, a host taken)
+  whenever its revision moves
+- the desired state is the cf-api's: at startup and whenever a wicket's revision moves
+  (`GET /api/apps?after=`), it lists that wicket's apps of its owner and puts / deletes the
+  difference (the same app again changes nothing: the wicket's generation stays), each wicket
+  watched apart. The wickets serve on while the cf-api is down; with a wicket down, the apps'
+  indices on it show `STARTING` and are put when it is back, and an app deleted meanwhile (or
+  whose removal it refused) is removed then, as is one it holds none of any more
 - an app of its owner the state does not know is left where it is: a new or lost `--data-dir`
   removes nothing. It is logged (`CELL: left in the wicket`), still serves, and keeps its hosts
   (a push of one is refused, naming it): `DELETE /api/apps/<guid>?owner=cf` of the wicket's
@@ -1116,14 +1244,15 @@ state written before there were more takes its apps, routes and service instance
 Refused with why (422): route paths, ports and wildcards, private and internal domains, tasks,
 ssh, sidecars, process types but `web`, route services, syslog drains, environment variable
 groups, service keys, sharing a service instance with another space, an organization made by
-other than an admin. One quota, of no limit. One owner (`cf`) per wicket: two cf-apis must not
-share one.
+other than an admin, more than 1000 instances of an app. One quota, of no limit. One owner (`cf`)
+per wicket: two cf-apis must not share one. The wickets of one cf-api run apps one way, and are
+told apart by their names alone: two names of one console behind two URLs defeat the spread.
 
 ## Tests
 
 The integration test (`tests/cli.rs`) runs the OSS CLI -- `SLUICE_CF_CLI`, else `cf8` on the
 PATH, never a `cf` that may be the Tanzu one -- against the cf-api and a wicket in local mode
-on a flume, building the wicket and its example guests from `../sluice-wicket-runtime-wasi` and the
+on a flume, then two, building the wicket and its example guests from `../sluice-wicket-runtime-wasi` and the
 flume from `../sluice-flume` (or taking `SLUICE_WICKET_RUNTIME_WASI`, `SLUICE_WICKET_GUESTS` and
 `SLUICE_FLUME`); the login through a provider runs against a mock of one in the test, with TLS
 of the cf-api's own, and the images against a registry in the test (`tests/registry`). Where

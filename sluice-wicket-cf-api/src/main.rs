@@ -39,16 +39,19 @@ async fn main() -> ExitCode {
     let address = listener
         .local_addr()
         .map_or_else(|_| config.listen.clone(), |a| a.to_string());
+    let wickets: Vec<String> = (config.settings.wickets.iter())
+        .map(|wicket| format!("{}={}", wicket.name, wicket.url))
+        .collect();
     // a parent process waits for this line before it dials
     println!(
-        "{} listening on {}://{address} (wicket {}, domains {}, data {}, auth {}, flume {})",
+        "{} listening on {}://{address} (wickets {}, domains {}, data {}, auth {}, flume {})",
         sluice_wicket_cf_api::describe_build(),
         if config.settings.tls.is_some() {
             "https"
         } else {
             "http"
         },
-        config.settings.wicket,
+        wickets.join(" "),
         config.settings.domains.join(", "),
         config.settings.data_dir.display(),
         config

@@ -1,6 +1,6 @@
 //! The desired state: the organizations and their spaces, the roles users and clients hold in
-//! them, the shared domains, the apps of the spaces with their web process and environment
-//! variables, the routes,
+//! them, the shared domains, the apps of the spaces with their web process (each index placed
+//! on a wicket: `crate::placement`) and environment variables, the routes,
 //! packages, builds, droplets, deployments and jobs, the service brokers
 //! registered with their catalogs, the service instances and their bindings.
 //! In memory, written by a rename to `state.json` in the
@@ -77,26 +77,59 @@ pub struct State {
     pub instances: Vec<Instance>,
     #[serde(default)]
     pub bindings: Vec<Binding>,
-    /// The keyvalue namespaces of deleted instances whose data the wicket
-    /// is yet to delete.
+    /// The keyvalue namespaces of deleted instances whose data the wickets
+    /// are yet to delete.
     #[serde(default)]
     pub purges: Vec<Purge>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub security_groups: Vec<SecurityGroup>,
-    /// The guids of the apps deleted while the wicket did not take it, to remove from it
-    /// when it does. All an app of the owner is ever removed for without an app here to
-    /// say so: a state that is not the one that put an app (a lost data directory, another
-    /// cf-api) knows nothing of it, and leaves it.
+    /// The apps deleted while a wicket did not take it, to remove from it when it does. All
+    /// an app of the owner is ever removed for without an app here to say so: a state that
+    /// is not the one that put an app (a lost data directory, another cf-api) knows nothing
+    /// of it, and leaves it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub removals: Vec<String>,
+    pub removals: Vec<Removal>,
     /// Where the watch of the flume resumes: past the last line it took
     /// (`flume`); None before one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub flume: Option<FlumeCursor>,
-    /// What the wicket answered of each app, by guid; not kept: a start
-    /// lists the wicket.
+    /// What each wicket answered of each app, by guid, then by wicket; not kept: a start
+    /// lists the wickets.
     #[serde(skip)]
-    pub wicket: BTreeMap<String, Outcome>,
+    pub outcomes: BTreeMap<String, BTreeMap<String, Outcome>>,
+    /// The wickets the apps are placed on (`crate::placement`): the configuration's.
+    #[serde(skip)]
+    pub wickets: crate::placement::Wickets,
+}
+
+/// An app to remove from a wicket that did not take its removal.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(from = "RemovalForm")]
+pub struct Removal {
+    pub app: String,
+    /// The wicket's name: none in a state of one wicket, which the first configured takes
+    /// (`State::follow_wickets`).
+    pub wicket: String,
+}
+
+/// A removal as a state has it: a state of one wicket's the app's guid alone.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum RemovalForm {
+    Guid(String),
+    Removal { app: String, wicket: String },
+}
+
+impl From<RemovalForm> for Removal {
+    fn from(form: RemovalForm) -> Removal {
+        match form {
+            RemovalForm::Guid(app) => Removal {
+                app,
+                wicket: String::new(),
+            },
+            RemovalForm::Removal { app, wicket } => Removal { app, wicket },
+        }
+    }
 }
 
 /// A position in the flume's lines: its run (`epoch`) and the line's `seq`.
@@ -171,9 +204,13 @@ pub struct App {
     /// at its next start.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// What the wicket serves since the last start, restart or deployment:
+    /// What the wickets serve since the last start, restart or deployment:
     /// the snapshot taken then.
     pub running: Option<Running>,
+    /// The wicket of each index of the web process, by name (`crate::placement`): where it
+    /// runs while the app is started.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub placement: Vec<String>,
 }
 
 /// An app's lifecycle, as CC names it: a droplet is a component either way.
@@ -627,13 +664,16 @@ impl Binding {
     }
 }
 
-/// The data of a deleted keyvalue instance, deleted once no app maps it.
+/// The data of a deleted keyvalue instance, deleted through every wicket once no app maps it.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Purge {
     pub store: String,
     pub namespace: String,
     /// The instance's name, for the log.
     pub instance: String,
+    /// The wickets that deleted it, or have no such store.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub purged: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -788,7 +828,7 @@ pub struct JobError {
     pub detail: String,
 }
 
-/// What the wicket last answered of an app.
+/// What a wicket last answered of its share of an app.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Outcome {
     Running,
@@ -797,6 +837,11 @@ pub enum Outcome {
 }
 
 impl State {
+    /// What `wicket` last answered of its share of the app `guid`.
+    pub fn outcome(&self, guid: &str, wicket: &str) -> Option<&Outcome> {
+        self.outcomes.get(guid)?.get(wicket)
+    }
+
     /// A new state with the organization, its space and the domains named.
     pub fn new(org: &str, space: &str, domains: &[String]) -> State {
         let named = |name: &str| Named {
@@ -1092,6 +1137,7 @@ impl State {
             current_droplet: None,
             env: BTreeMap::new(),
             running: None,
+            placement: Vec::new(),
         });
         self.apps.last_mut().expect("just pushed")
     }
@@ -1220,7 +1266,7 @@ impl State {
         self.droplets.retain(|droplet| droplet.app != guid);
         blobs.extend(self.unnamed(gone));
         self.apps.retain(|app| app.guid != guid);
-        self.wicket.remove(guid);
+        self.outcomes.remove(guid);
         blobs
     }
 
@@ -1386,8 +1432,15 @@ pub struct Store {
 }
 
 impl Store {
-    /// Opens the data directory: the state kept there, else a new one.
-    pub fn open(dir: &Path, org: &str, space: &str, domains: &[String]) -> Result<Store, String> {
+    /// Opens the data directory: the state kept there, else a new one, its apps placed on the
+    /// `wickets` configured (`State::follow_wickets`, logged).
+    pub fn open(
+        dir: &Path,
+        org: &str,
+        space: &str,
+        domains: &[String],
+        wickets: &[String],
+    ) -> Result<Store, String> {
         for sub in ["packages", "droplets"] {
             std::fs::create_dir_all(dir.join(sub))
                 .map_err(|e| format!("{}: {e}", dir.join(sub).display()))?;
@@ -1407,7 +1460,7 @@ impl Store {
             }
         }
         let file = dir.join("state.json");
-        let state = match std::fs::read(&file) {
+        let mut state = match std::fs::read(&file) {
             Ok(json) => {
                 let mut state: State = serde_json::from_slice(&json)
                     .map_err(|e| format!("{}: {e}", file.display()))?;
@@ -1420,6 +1473,9 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::new(org, space, domains),
             Err(e) => return Err(format!("{}: {e}", file.display())),
         };
+        for line in state.follow_wickets(wickets) {
+            println!("{line}");
+        }
         let store = Store {
             dir: dir.to_path_buf(),
             state: Mutex::new(state),
@@ -1433,10 +1489,11 @@ impl Store {
         f(&self.state.lock().expect("no panic under the lock"))
     }
 
-    /// Changes the state, and writes it.
+    /// Changes the state, its apps placed as they are by then (`State::place`), and writes it.
     pub fn update<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         let mut state = self.state.lock().expect("no panic under the lock");
         let result = f(&mut state);
+        state.place();
         if let Err(e) = self.save(&state) {
             eprintln!("cannot write the state: {e}");
         }
@@ -1451,7 +1508,7 @@ impl Store {
         self.changes.notified().await;
     }
 
-    /// Changes what is not kept (the wicket's outcomes).
+    /// Changes what is not kept (the wickets' outcomes, those of another runtime).
     pub fn note<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         f(&mut self.state.lock().expect("no panic under the lock"))
     }
@@ -1804,14 +1861,18 @@ mod tests {
         assert_eq!(rfc3339(1_793_323_067), "2026-10-30T01:17:47Z");
     }
 
-    /// A state of one organization and space, before there were more, takes them as its first.
+    /// A state of one organization and space, before there were more, takes them as its first;
+    /// one of one wicket has its apps' indices and its removals on the first configured. An
+    /// index on a wicket no longer configured is placed again, a removal from one dropped, each
+    /// logged.
     #[test]
-    fn a_state_of_one_space_migrates_to_its_first() {
+    fn a_state_of_one_space_and_one_wicket_migrates_to_their_first() {
         use serde_json::json;
         let mut written = State::new("o", "s", &["localhost".into()]);
         let space = written.spaces[0].clone();
         let org = written.orgs[0].clone();
-        written.create_app("hello", STACK, &space.guid);
+        let hello = written.create_app("hello", STACK, &space.guid).guid.clone();
+        written.app_mut(&hello).unwrap().process.instances = 2;
         let mut legacy = serde_json::to_value(&written).unwrap();
         legacy["org"] = json!(org);
         legacy["space"] =
@@ -1819,13 +1880,45 @@ mod tests {
         legacy["orgs"] = json!([]);
         legacy["spaces"] = json!([]);
         legacy["apps"][0]["space"] = json!("");
+        legacy["removals"] = json!(["gone"]);
         let mut state: State = serde_json::from_value(legacy).unwrap();
         state.migrate();
         assert_eq!(state.orgs, [org]);
         assert_eq!(state.spaces, std::slice::from_ref(&space));
         assert_eq!(state.apps[0].space, space.guid);
+        let names =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| n.to_string()).collect() };
+        assert_eq!(
+            state.follow_wickets(&names(&["a", "b"])),
+            Vec::<String>::new()
+        );
+        assert_eq!(state.apps[0].placement, ["a", "a"]);
+        let gone = |wicket: &str| Removal {
+            app: "gone".into(),
+            wicket: wicket.into(),
+        };
+        assert_eq!(state.removals, [gone("a")]);
         // written again, none of the one organization or space is kept apart
         let again = serde_json::to_value(&state).unwrap();
         assert!(again.get("org").is_none() && again.get("space").is_none());
+        let mut again: State = serde_json::from_value(again).unwrap();
+        assert_eq!(
+            (&again.apps[0].placement, &again.removals),
+            (&names(&["a", "a"]), &vec![gone("a")])
+        );
+        assert_eq!(
+            again.follow_wickets(&names(&["b", "c"])),
+            [
+                "[gone] CELL: not removed from the wicket a: no --wicket names it".to_string(),
+                format!("[{hello}] CELL: index 0 placed on the wicket b: no --wicket names a"),
+                format!("[{hello}] CELL: index 1 placed on the wicket c: no --wicket names a"),
+            ]
+        );
+        assert_eq!(again.apps[0].placement, ["b", "c"]);
+        assert!(again.removals.is_empty());
+        // its count followed at every change
+        again.app_mut(&hello).unwrap().process.instances = 3;
+        again.place();
+        assert_eq!(again.apps[0].placement, ["b", "c", "b"]);
     }
 }

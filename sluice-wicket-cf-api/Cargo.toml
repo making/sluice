@@ -14,8 +14,10 @@ hyper = { version = "1", features = ["server", "http1"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
-# the wicket's app API (plain HTTP: the cf-api sits next to its wicket); a droplet as a stream
+# the wickets' app API (plain HTTP: the cf-api sits next to its wickets); a droplet as a stream
 reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+# a start's puts to the wickets, and their watches, at once
+futures-util = "0.3"
 # the OpenID Provider behind cf login --sso
 sluice-wicket-oidc = { path = "../sluice-wicket-oidc" }
 # its connections

@@ -30,11 +30,16 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(40);
 /// One without is answered at once: `cf app` does not wait long to show the wicket away.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// A wicket's app API, as one of the wickets configured.
 pub struct Wicket {
     client: reqwest::Client,
     base: String,
     token: Option<String>,
     pub owner: String,
+    /// Its name: the configuration's, the state's placement's and `cf app`'s `host`.
+    pub name: String,
+    /// What the log lines call it: `the wicket`, or of several `the wicket <name>`.
+    pub label: String,
 }
 
 /// The body of an app's PUT, and an app as listed: `S` its sandbox, as a wicket of a runtime has
@@ -381,7 +386,8 @@ struct ErrorBody {
 }
 
 impl Wicket {
-    pub fn new(base: &str, token: Option<String>, owner: &str) -> Wicket {
+    /// The wicket `name` at `base`, one of `of` wickets.
+    pub fn new(name: &str, of: usize, base: &str, token: Option<String>, owner: &str) -> Wicket {
         Wicket {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(5))
@@ -392,7 +398,19 @@ impl Wicket {
             base: base.trim_end_matches('/').to_string(),
             token,
             owner: owner.to_string(),
+            name: name.to_string(),
+            label: match of {
+                1 => "the wicket".to_string(),
+                _ => format!("the wicket {name}"),
+            },
         }
+    }
+
+    /// [`Wicket::label`] opening a sentence.
+    pub fn sentence(&self) -> String {
+        let mut label = self.label.clone();
+        label.replace_range(..1, "T");
+        label
     }
 
     /// The apps; with `after` the current revision, once they changed (25s

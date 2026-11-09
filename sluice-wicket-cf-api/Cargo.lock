@@ -1616,6 +1616,7 @@ dependencies = [
  "bytes",
  "flate2",
  "form_urlencoded",
+ "futures-util",
  "getrandom 0.4.3",
  "http",
  "http-body-util",

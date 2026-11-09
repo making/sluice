@@ -71,8 +71,9 @@ const NO_INSTANCE_PARAMETERS: &str =
 const NO_BINDING_PARAMETERS: &str =
     "This service does not support fetching service binding parameters.";
 
-/// What the wicket offers: a keyvalue plan per store, a wasi plan per
-/// capability but `keyvalue` (which a keyvalue binding grants).
+/// What a wicket offers: a keyvalue plan per store, a wasi plan per
+/// capability but `keyvalue` (which a keyvalue binding grants); of several
+/// wickets, what every one does ([`Offer::common`]).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Offer {
     pub plans: Vec<Plan>,
@@ -108,6 +109,23 @@ impl Offer {
         Offer {
             plans: stores.chain(capabilities).collect(),
         }
+    }
+
+    /// What every one of `offers` offers, as the first describes it: an app may run on any of
+    /// them. None of no offer.
+    pub fn common(offers: &[&Offer]) -> Option<Offer> {
+        let (first, others) = offers.split_first()?;
+        let offered = |offer: &Offer, plan: &Plan| {
+            (offer.plans.iter())
+                .any(|kept| kept.offering == plan.offering && kept.name == plan.name)
+        };
+        let plans = first.plans.iter();
+        Some(Offer {
+            plans: plans
+                .filter(|plan| others.iter().all(|offer| offered(offer, plan)))
+                .cloned()
+                .collect(),
+        })
     }
 }
 
@@ -1613,6 +1631,7 @@ impl Api {
                     store: instance.plan.clone(),
                     namespace: namespace(guid),
                     instance: instance.name.clone(),
+                    purged: Vec::new(),
                 });
             }
             Ok((instance, bound, None))

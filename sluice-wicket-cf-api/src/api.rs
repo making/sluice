@@ -5,7 +5,7 @@
 //! UAA endpoints needs a token of [`Uaa`]; with a [`Provider`], the browser
 //! pages `/uaa/passcode` and `/uaa/callback` of `cf login --sso`.
 //!
-//! Routes and `instances` apply at once: an edit the wicket refuses is
+//! Routes and `instances` apply at once: an edit a wicket refuses is
 //! answered 422 with its reason and changes nothing. The droplet and the
 //! rest of the sandbox, the service bindings' grants and the environment
 //! variables included, apply at a start, restart or deployment: the running
@@ -14,9 +14,11 @@
 //! environment variables in [`crate::env`], the security groups, which
 //! apply at a start too, in [`crate::security_groups`].
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures_util::future::join_all;
 use http::header::{HeaderMap, HeaderValue};
 use http::{Method, StatusCode, header};
 use http_body_util::{BodyExt as _, Full, Limited};
@@ -27,7 +29,7 @@ use sluice_wicket_server::accept::{self, Slot};
 use sluice_wicket_server::http::{self as connection, Body};
 use tokio::net::TcpListener;
 
-use crate::controller::Controller;
+use crate::controller::{Controller, Held};
 use crate::env;
 use crate::logs::{self, Logs};
 use crate::manifest;
@@ -43,7 +45,7 @@ use crate::store::{
 };
 use crate::uaa::{self, Uaa};
 use crate::views;
-use crate::wicket::{AppBody, Failure, Runtime};
+use crate::wicket::{AppBody, Failure, ListedApp, Runtime, Wicket};
 
 /// Largest package upload, and component pulled.
 pub(crate) const MAX_UPLOAD_BYTES: usize = 160 << 20;
@@ -58,6 +60,15 @@ const STAGING_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 pub(crate) type Response = hyper::Response<Full<Bytes>>;
 pub(crate) type Reply = Result<Response, ApiError>;
+
+/// The shares an edit put before its commit ([`Api::try_shares`]).
+#[derive(Default)]
+struct Tried {
+    /// The wicket and the app of each: what goes back on a refusal.
+    put: Vec<(Arc<Wicket>, String)>,
+    /// Their puts, held until the edit is committed or gone back on.
+    held: Vec<Held>,
+}
 
 pub struct Api {
     pub store: Arc<Store>,
@@ -174,9 +185,9 @@ impl ApiError {
         }
     }
 
-    /// The wicket's refusal, as the user reads it.
-    fn refused(failure: &Failure) -> ApiError {
-        ApiError::unprocessable(format!("the wicket refused it: {failure}"))
+    /// `wicket`'s refusal, as the user reads it.
+    fn refused(wicket: &Wicket, failure: &Failure) -> ApiError {
+        ApiError::unprocessable(format!("{} refused it: {failure}", wicket.label))
     }
 
     fn job_error(&self) -> JobError {
@@ -1178,28 +1189,35 @@ impl Api {
         Ok(json(StatusCode::OK, &views::app(&req.base, &app)))
     }
 
-    /// The process stats, of the instances alive as the wicket lists them at this request: its
+    /// The process stats, of the instances alive as each wicket lists them at this request: its
     /// long poll answers when its apps change, not when an instance comes or goes. None read of
-    /// a wicket known away, or not serving the app.
+    /// a wicket known away, or not serving its share.
     async fn stats(&self, guid: &str) -> Reply {
         let app = self.app(guid)?;
-        let wicket = &self.controller.wicket;
-        let serving = self.store.read(|state| {
-            matches!(state.wicket.get(guid), Some(Outcome::Running))
-                && Controller::desired(state, &app, &wicket.owner).is_some()
+        let owner = self.controller.owner();
+        let serving: Vec<&Arc<Wicket>> = self.store.read(|state| {
+            let shares = Controller::desired(state, &app, owner);
+            let wickets = self.controller.wickets.iter();
+            wickets
+                .filter(|wicket| shares.contains_key(&wicket.name))
+                .filter(|wicket| {
+                    matches!(state.outcome(guid, &wicket.name), Some(Outcome::Running))
+                })
+                .collect()
         });
-        let listed = match serving {
-            true => wicket.list(None).await.ok().and_then(|listing| {
-                let mut apps = listing.apps.into_iter();
-                apps.find(|listed| listed.name == guid && listed.app.owner == wicket.owner)
-            }),
-            false => None,
-        };
+        let listed = join_all(serving.into_iter().map(|wicket| async move {
+            let listing = wicket.list(None).await.ok()?;
+            let mut apps = listing.apps.into_iter();
+            let listed = apps.find(|listed| listed.name == guid && listed.app.owner == owner)?;
+            Some((wicket.name.clone(), listed))
+        }))
+        .await;
+        let listed: BTreeMap<String, ListedApp> = listed.into_iter().flatten().collect();
         Ok(json(
             StatusCode::OK,
             &self
                 .store
-                .read(|state| views::stats(state, &app, &wicket.owner, listed.as_ref())),
+                .read(|state| views::stats(state, &app, owner, &listed)),
         ))
     }
 
@@ -1229,8 +1247,8 @@ impl Api {
         response
     }
 
-    /// Changes the state as `change` says, once the wicket took the apps
-    /// `guids` as they would be: a refusal changes nothing. The wicket
+    /// Changes the state as `change` says, once the wickets took the apps
+    /// `guids` as they would be: a refusal changes nothing. A wicket
     /// unreachable, the change is kept: it is put when the wicket is back.
     async fn edit_at_once(
         &self,
@@ -1241,45 +1259,87 @@ impl Api {
         let trial = self.store.read(|state| {
             let mut trial = state.clone();
             change(&mut trial)?;
-            Ok::<_, ApiError>(
-                guids
-                    .iter()
-                    .map(|guid| (guid.clone(), self.controller.desired_of(&trial, guid)))
-                    .collect::<Vec<_>>(),
-            )
+            Ok::<_, ApiError>(self.shares(&trial, guids))
         })?;
-        let mut applied: Vec<&str> = Vec::new();
-        for (guid, desired) in &trial {
-            match self.trial_put(guid, desired.as_ref()).await {
-                Ok(()) | Err(Failure::Unreachable(_)) => applied.push(guid),
-                Err(refused) => {
-                    // the apps put before go back to what the state has
-                    for guid in applied {
-                        let _ = self.controller.sync(guid).await;
+        let tried = self.try_shares(&trial).await?;
+        let committed = self.store.update(|state| change(state));
+        if committed.is_err() {
+            self.go_back(&tried).await;
+        }
+        committed
+    }
+
+    /// The shares of the apps `guids` in `trial`, by wicket name.
+    fn shares(&self, trial: &State, guids: &[String]) -> Vec<(String, BTreeMap<String, AppBody>)> {
+        let owner = self.controller.owner();
+        let shares = |guid: &String| {
+            let app = trial.app(guid);
+            app.map(|app| Controller::desired(trial, app, owner))
+                .unwrap_or_default()
+        };
+        guids
+            .iter()
+            .map(|guid| (guid.clone(), shares(guid)))
+            .collect()
+    }
+
+    /// Puts each app's shares as `trial` has them, on every wicket whose share it changes, a
+    /// wicket at a time: a refusal puts those put before back as the state has them, and is
+    /// answered. What was put is held until the edit is committed, or gone back on.
+    async fn try_shares(
+        &self,
+        trial: &[(String, BTreeMap<String, AppBody>)],
+    ) -> Result<Tried, ApiError> {
+        let mut tried = Tried::default();
+        for (guid, shares) in trial {
+            for wicket in &self.controller.wickets {
+                let desired = shares.get(&wicket.name);
+                // as it was, it is not tried: nothing changes there, and a refusal of it is
+                // known, which may have taken the health check's whole timeout (the app held,
+                // its shares stay as they are)
+                let unchanged = self.store.read(|state| {
+                    let share = self.controller.desired_on(state, guid, &wicket.name);
+                    share.as_ref() == desired
+                });
+                if unchanged {
+                    continue;
+                }
+                let share = self.controller.hold_share(guid, &wicket.name).await;
+                match self.trial_put(wicket, guid, desired).await {
+                    Ok(()) | Err(Failure::Unreachable(_)) => {
+                        tried.put.push((wicket.clone(), guid.clone()));
+                        tried.held.push(share);
                     }
-                    return Err(ApiError::refused(&refused));
+                    Err(refused) => {
+                        self.go_back(&tried).await;
+                        return Err(ApiError::refused(wicket, &refused));
+                    }
                 }
             }
         }
-        self.store.update(|state| change(state))
+        Ok(tried)
     }
 
-    /// Puts an app as an edit would leave it. An app the wicket is not known to serve (it
-    /// refused it) has nothing to break: refused it goes
-    /// through, or what would fix the app (a push of another image, more memory) could not
-    /// be made. As it was, it is not tried: the refusal is known, and may have taken the
-    /// health check's whole timeout.
-    async fn trial_put(&self, guid: &str, desired: Option<&AppBody>) -> Result<(), Failure> {
-        let (serving, unchanged) = self.store.read(|state| {
-            (
-                matches!(state.wicket.get(guid), Some(Outcome::Running)),
-                self.controller.desired_of(state, guid).as_ref() == desired,
-            )
-        });
-        if !serving && unchanged {
-            return Ok(());
+    /// Puts the shares `tried` put back as the state has them.
+    async fn go_back(&self, tried: &Tried) {
+        for (wicket, guid) in &tried.put {
+            let _ = self.controller.sync_held(wicket, guid).await;
         }
-        match self.controller.apply(guid, desired).await {
+    }
+
+    /// Puts an app's share on `wicket` as an edit would leave it, the share held. One the wicket
+    /// is not known to serve (it refused it) has nothing to break: refused it goes through, or
+    /// what would fix the app (a push of another image, more memory) could not be made.
+    async fn trial_put(
+        &self,
+        wicket: &Wicket,
+        guid: &str,
+        desired: Option<&AppBody>,
+    ) -> Result<(), Failure> {
+        let serving = self
+            .store
+            .read(|state| matches!(state.outcome(guid, &wicket.name), Some(Outcome::Running)));
+        match self.controller.apply(wicket, guid, desired).await {
             Err(Failure::Refused { .. }) if !serving => Ok(()),
             put => put,
         }
@@ -1329,32 +1389,12 @@ impl Api {
             }
         };
         // the routes apply at once: a started app is put as it would be
-        let mut applied: Vec<&str> = Vec::new();
-        for guid in &guids {
-            let desired = self.controller.desired_of(&trial, guid);
-            if desired.is_none()
-                && self
-                    .store
-                    .read(|state| self.controller.desired_of(state, guid))
-                    .is_none()
-            {
-                continue;
+        let tried = match self.try_shares(&self.shares(&trial, &guids)).await {
+            Ok(tried) => tried,
+            Err(refused) => {
+                return self.job(req, "space.apply_manifest", vec![refused.job_error()], None);
             }
-            match self.trial_put(guid, desired.as_ref()).await {
-                Ok(()) | Err(Failure::Unreachable(_)) => applied.push(guid),
-                Err(refused) => {
-                    for guid in applied {
-                        let _ = self.controller.sync(guid).await;
-                    }
-                    return self.job(
-                        req,
-                        "space.apply_manifest",
-                        vec![ApiError::refused(&refused).job_error()],
-                        None,
-                    );
-                }
-            }
-        }
+        };
         // made on the state as it is by now: all of it or, the other edits since refusing it,
         // none. An app new since the trial was not put: it is no started one
         let committed = self.store.update(|state| {
@@ -1380,9 +1420,7 @@ impl Api {
         let (guids, bound) = match committed {
             Ok(committed) => committed,
             Err(e) => {
-                for guid in applied {
-                    let _ = self.controller.sync(guid).await;
-                }
+                self.go_back(&tried).await;
                 return self.job(
                     req,
                     "space.apply_manifest",
@@ -1857,7 +1895,7 @@ impl Api {
                 if app.started { "STARTED" } else { "STOPPED" }
             ),
         );
-        let _ = self.controller.sync(guid).await;
+        self.controller.sync(guid).await;
         Ok(json(StatusCode::OK, &views::app(&req.base, &app)))
     }
 
@@ -2310,7 +2348,7 @@ impl Api {
                 deployment.droplet
             ),
         );
-        let _ = self.controller.sync(&app).await;
+        self.controller.sync(&app).await;
         Ok(json(
             StatusCode::CREATED,
             &views::deployment(&req.base, &deployment),

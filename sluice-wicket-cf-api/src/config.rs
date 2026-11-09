@@ -7,15 +7,19 @@ use std::path::PathBuf;
 use crate::flume::FlumeSettings;
 use crate::oidc::{OidcSettings, parse_rules};
 use crate::security_groups::Editors;
-use crate::{Settings, TlsSettings};
+use crate::{Settings, TlsSettings, WicketSettings};
 
 pub const USAGE: &str = "\
 usage: sluice-wicket-cf-api --wicket <url> [options]
+       sluice-wicket-cf-api --wicket <name>=<url> --wicket <name>=<url> ... [options]
 
   --listen <host:port>        bind address (default 127.0.0.1:9091); with --any-credentials a
                               loopback address only
-  --wicket <url>              the wicket's console, http://host:port
-  --wicket-token <token>      its --console-token
+  --wicket <name>=<url>       a wicket's console, http://host:port, and its name: an app's
+                              instances are spread over the wickets, a state of one wicket
+                              kept on the first; repeatable (or comma-separated). --wicket
+                              <url> names the one wicket 'wicket'
+  --wicket-token <token>      their --console-token, one for all
   --wicket-token-file <path>  read the token from a file instead
   --domain <name>             a shared domain; repeatable (or comma-separated): the first
                               takes the default and random routes (default localhost)
@@ -209,10 +213,7 @@ pub fn parse(
         })
     };
     let value = |name: &str| values(name).pop();
-    let wicket = value("wicket").ok_or("--wicket is required")?;
-    if !wicket.starts_with("http://") && !wicket.starts_with("https://") {
-        return Err(format!("--wicket: not an http(s) url: {wicket}"));
-    }
+    let wickets = wickets(&values("wicket"))?;
     // a secret, else the file holding it
     let secret = |name: &str| -> Result<Option<String>, String> {
         match (value(name), value(&format!("{name}-file"))) {
@@ -405,7 +406,7 @@ pub fn parse(
         exit_on_stdin_close: exit_on_stdin_close
             || env("SLUICE_WICKET_CF_API_EXIT_ON_STDIN_CLOSE").is_some_and(|value| value == "true"),
         settings: Settings {
-            wicket,
+            wickets,
             wicket_token,
             domains,
             data_dir: PathBuf::from(value("data-dir").unwrap_or_else(|| "cf-api".to_string())),
@@ -420,6 +421,61 @@ pub fn parse(
             tls,
         },
     })))
+}
+
+/// The name of the one wicket `--wicket <url>` gives.
+pub const ONE_WICKET: &str = "wicket";
+
+/// The wickets `--wicket` names, each `<name>=<url>` (or comma-separated), or one `<url>`, named
+/// [`ONE_WICKET`]: distinct names of distinct consoles.
+fn wickets(given: &[String]) -> Result<Vec<WicketSettings>, String> {
+    let entries: Vec<&str> = (given.iter())
+        .flat_map(|value| value.split(','))
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .collect();
+    if entries.is_empty() {
+        return Err("--wicket is required".into());
+    }
+    let url = |text: &str| text.starts_with("http://") || text.starts_with("https://");
+    let mut wickets: Vec<WicketSettings> = Vec::new();
+    for entry in &entries {
+        let (name, at) = match (url(entry), entries.len()) {
+            (true, 1) => (ONE_WICKET, *entry),
+            (true, _) => {
+                return Err(format!(
+                    "--wicket: each of several wickets is <name>=<url>, not {entry}"
+                ));
+            }
+            (false, _) => entry.split_once('=').ok_or_else(|| {
+                format!("--wicket: expected <name>=<url> or an http(s) url, got '{entry}'")
+            })?,
+        };
+        let named = |b: u8| b.is_ascii_alphanumeric() || b"-_.".contains(&b);
+        if name.is_empty() || !name.bytes().all(named) {
+            return Err(format!(
+                "--wicket: a name is of letters, digits, '-', '_' and '.', not '{name}'"
+            ));
+        }
+        if !url(at) {
+            return Err(format!("--wicket {name}: not an http(s) url: {at}"));
+        }
+        let at = at.trim_end_matches('/');
+        if wickets.iter().any(|kept| kept.name == name) {
+            return Err(format!("--wicket: {name} is named twice"));
+        }
+        if let Some(kept) = wickets.iter().find(|kept| kept.url == at) {
+            return Err(format!(
+                "--wicket: {} and {name} are one console, {at}",
+                kept.name
+            ));
+        }
+        wickets.push(WicketSettings {
+            name: name.to_string(),
+            url: at.to_string(),
+        });
+    }
+    Ok(wickets)
 }
 
 #[cfg(test)]
@@ -468,7 +524,14 @@ mod tests {
             env,
         ));
         assert_eq!(config.listen, "0.0.0.0:9191");
-        assert_eq!(config.settings.wicket, "http://wicket:9090");
+        let wicket = |name: &str, url: &str| WicketSettings {
+            name: name.into(),
+            url: url.into(),
+        };
+        assert_eq!(
+            config.settings.wickets,
+            [wicket("wicket", "http://wicket:9090")]
+        );
         assert_eq!(config.settings.wicket_token.as_deref(), Some("from-env"));
         assert_eq!(config.settings.domains, ["c.example"]);
         assert_eq!(config.settings.data_dir, PathBuf::from("cf-api"));
@@ -541,6 +604,30 @@ mod tests {
             |_| None,
         ));
         assert_eq!(config.settings.domains, ["x.io", "y.io", "z.io"]);
+        // several wickets, each named, in the order given: of the options, else the environment
+        let config = serve(parse(
+            args("--wicket a=http://a:9090/ --wicket b-1=https://b:9090,c.2=http://c:9090"),
+            |name| match name {
+                "SLUICE_WICKET_CF_API_WICKET" => Some("d=http://d:9090".to_string()),
+                "SLUICE_WICKET_CF_API_ANY_CREDENTIALS" => Some("true".to_string()),
+                _ => None,
+            },
+        ));
+        assert_eq!(
+            config.settings.wickets,
+            [
+                wicket("a", "http://a:9090"),
+                wicket("b-1", "https://b:9090"),
+                wicket("c.2", "http://c:9090")
+            ]
+        );
+        let config = serve(parse(args("--any-credentials"), |name| {
+            (name == "SLUICE_WICKET_CF_API_WICKET").then(|| "a=http://a:1, b=http://b:1".into())
+        }));
+        assert_eq!(
+            config.settings.wickets,
+            [wicket("a", "http://a:1"), wicket("b", "http://b:1")]
+        );
         let config = serve(parse(
             args("--wicket http://w:1 --exit-on-stdin-close"),
             |name| (name == "SLUICE_WICKET_CF_API_ANY_CREDENTIALS").then(|| "true".to_string()),
@@ -583,6 +670,23 @@ mod tests {
         let error = |line: &str| parse(args(line), none).unwrap_err();
         assert!(error("").contains("--wicket"));
         assert!(error("--wicket w:1").contains("http(s)"));
+        assert!(error("--wicket a=w:1").contains("--wicket a: not an http(s) url"));
+        // several, each named, distinct, of distinct consoles
+        for (line, refusal) in [
+            (
+                "--wicket http://a:1 --wicket b=http://b:1",
+                "each of several",
+            ),
+            ("--wicket a=http://a:1,a=http://b:1", "a is named twice"),
+            (
+                "--wicket a=http://a:1 --wicket b=http://a:1/",
+                "a and b are one console",
+            ),
+            ("--wicket a/b=http://a:1", "a name is of letters"),
+            ("--wicket =http://a:1", "a name is of letters"),
+        ] {
+            assert!(error(line).contains(refusal), "{line}: {}", error(line));
+        }
         assert!(error("--wicket http://w:1 --domain a_b").contains("--domain"));
         assert!(error("--wicket http://w:1 --colour").contains("--colour"));
         assert!(error("--wicket").contains("needs a value"));

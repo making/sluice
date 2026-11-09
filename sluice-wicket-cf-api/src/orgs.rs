@@ -680,6 +680,7 @@ impl Api {
                         store: instance.plan.clone(),
                         namespace: crate::services::namespace(&instance.guid),
                         instance: instance.name.clone(),
+                        purged: Vec::new(),
                     });
                 }
             }

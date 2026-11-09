@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use serde_json::{Value, json};
 
 use crate::controller::Controller;
+use crate::placement::MAX_INSTANCES;
 use crate::store::{
     App, Build, Deployment, Droplet, Job, Lifecycle, Named, Outcome, Package, ROOTFS_STACK, Route,
     STACK, SecurityGroup, Space, State, epoch_secs, now,
@@ -300,37 +301,60 @@ pub fn process(base: &str, app: &App) -> Value {
 /// What `cf app` lists, as the CLI reads it: it counts the entries and, at a start, waits for an
 /// entry `RUNNING` or for none, failing once all are `CRASHED`.
 ///
-/// `DOWN` for a stopped app and, of `instances` entries too, `CRASHED` with the wicket's refusal
-/// as `details` and `STARTING` until it serves the app (`listed`, as it answers now). Serving it,
-/// an entry `RUNNING` per instance alive, by the index `cf logs` names, up since its own start,
+/// Each index is on a wicket (`crate::placement`), whose name an entry has as its `host`. `DOWN`
+/// for a stopped app and, of a wicket's indices too, `CRASHED` with its refusal as `details` and
+/// `STARTING` until it serves its share (`listed`, by wicket, as each answers now). Serving it, an
+/// entry `RUNNING` per instance alive, by the index `cf logs` names, up since its own start,
 /// `CRASHED` for what it says is down, since then, and `STARTING` for a VM it keeps and has not up
-/// yet: none is a limit not reached, no failure, as is an app the wicket has no reason to serve
+/// yet: none is a limit not reached, no failure, as is an app the wickets have no reason to serve
 /// (at 0, without a route).
-pub fn stats(state: &State, app: &App, owner: &str, listed: Option<&ListedApp>) -> Value {
-    let all = |since, state, details: Option<&String>| -> Vec<Entry> {
-        (0..app.process.instances)
-            .map(|index| Entry {
-                index,
-                state,
-                details: details.cloned(),
-                since,
-            })
-            .collect()
-    };
+pub fn stats(state: &State, app: &App, owner: &str, listed: &BTreeMap<String, ListedApp>) -> Value {
+    let instances = app.process.instances.min(MAX_INSTANCES);
     let entries = match (&app.running, app.started) {
         (Some(running), true) => {
-            let all = |state, details| all(running.since, state, details);
-            match state.wicket.get(&app.guid) {
-                _ if Controller::desired(state, app, owner).is_none() => Vec::new(),
-                Some(Outcome::Refused(detail)) => all("CRASHED", Some(detail)),
-                Some(Outcome::Running) => match listed {
-                    Some(listed) => alive(listed, app.process.instances),
-                    None => all("STARTING", None),
-                },
-                Some(Outcome::Unreachable) | None => all("STARTING", None),
+            let mut entries = Vec::new();
+            let shares = Controller::desired(state, app, owner);
+            for (wicket, indices) in state.indices(app) {
+                if !shares.contains_key(&wicket) {
+                    continue;
+                }
+                let all = |shown, details: Option<&String>| -> Vec<Entry> {
+                    let shown_ones = indices.iter().filter(|index| **index < instances);
+                    (shown_ones)
+                        .map(|index| Entry {
+                            index: *index,
+                            host: wicket.clone(),
+                            state: shown,
+                            details: details.cloned(),
+                            since: running.since,
+                        })
+                        .collect()
+                };
+                entries.extend(match state.outcome(&app.guid, &wicket) {
+                    Some(Outcome::Refused(detail)) => all("CRASHED", Some(detail)),
+                    Some(Outcome::Running) => match listed.get(&wicket) {
+                        Some(listed) => alive(listed, &wicket, &indices, instances),
+                        None => all("STARTING", None),
+                    },
+                    Some(Outcome::Unreachable) | None => all("STARTING", None),
+                });
             }
+            entries.sort_by_key(|entry| entry.index);
+            entries
         }
-        _ => all(epoch_secs(), "DOWN", None),
+        _ => {
+            let placement = state.placement(app);
+            let host = |index: u64| placement.get(index as usize).cloned();
+            (0..instances)
+                .map(|index| Entry {
+                    index,
+                    host: host(index).unwrap_or_default(),
+                    state: "DOWN",
+                    details: None,
+                    since: epoch_secs(),
+                })
+                .collect()
+        }
     };
     let resources: Vec<Value> = entries
         .into_iter()
@@ -339,7 +363,7 @@ pub fn stats(state: &State, app: &App, owner: &str, listed: Option<&ListedApp>) 
                 "type": "web", "index": entry.index, "state": entry.state,
                 "routable": entry.state == "RUNNING",
                 "usage": {"time": now(), "cpu": 0.0, "cpu_entitlement": 0.0, "mem": 0, "disk": 0, "log_rate": 0},
-                "host": "wicket", "instance_internal_ip": "127.0.0.1", "instance_ports": [],
+                "host": entry.host, "instance_internal_ip": "127.0.0.1", "instance_ports": [],
                 "uptime": epoch_secs().saturating_sub(entry.since),
                 "mem_quota": app.process.memory_mb << 20,
                 "disk_quota": app.process.disk_mb << 20,
@@ -352,73 +376,74 @@ pub fn stats(state: &State, app: &App, owner: &str, listed: Option<&ListedApp>) 
     json!({"resources": resources})
 }
 
-/// An entry of [`stats`], up `since` a time in seconds since the epoch.
+/// An entry of [`stats`], on the wicket `host`, up `since` a time in seconds since the epoch.
 struct Entry {
     index: u64,
+    host: String,
     state: &'static str,
     details: Option<String>,
     since: u64,
 }
 
-/// The entries of what the wicket lists alive of an app of `instances`, by index, those it names
-/// by one index as one, up since the start of the lowest of them, the one staying as the others
-/// finish; each VM it lists as down at its own index, since that goes on; and what else it is short
-/// of, at the first index below `instances` no other holds. Nothing down, the VMs it keeps and has
-/// not up yet are starting, at the lowest indices free: one down, an entry `STARTING` beside it
-/// would keep the CLI's wait going where all that it lists has failed.
-fn alive(listed: &ListedApp, instances: u64) -> Vec<Entry> {
-    let mut indices = BTreeMap::new();
+/// The entries of what `wicket` lists alive of its share, the app's `indices` (the lowest first)
+/// of `instances`: its index `k` the share's `k`th, of those past it the remainder's, as `cf logs`
+/// names it. Those it names by one index are one, up since the start of the lowest of them, the
+/// one staying as the others finish; each VM it lists as down at its own index, since that goes
+/// on; and what else it is short of, at the first of its indices no other holds. Nothing down,
+/// the VMs it keeps and has not up yet are starting, at the lowest of its indices free: one down,
+/// an entry `STARTING` beside it would keep the CLI's wait going where all that it lists has
+/// failed.
+fn alive(listed: &ListedApp, wicket: &str, indices: &[u64], instances: u64) -> Vec<Entry> {
+    let Some(count) = std::num::NonZeroU64::new(indices.len() as u64) else {
+        return Vec::new();
+    };
+    let named = |index: u64| {
+        let index = indices[(index % count) as usize];
+        crate::flume::listed(index, instances)
+    };
+    let entry = |index, state, details, since| Entry {
+        index,
+        host: wicket.to_string(),
+        state,
+        details,
+        since,
+    };
+    let mut up = BTreeMap::new();
     for instance in &listed.alive {
-        indices
-            .entry(crate::flume::listed(instance.index, instances))
-            .or_insert(instance.since);
+        up.entry(named(instance.index)).or_insert(instance.since);
     }
     let mut crashed = BTreeMap::new();
     for down in &listed.crashed {
-        let index = crate::flume::listed(down.index, instances);
-        if !indices.contains_key(&index) {
+        let index = named(down.index);
+        if !up.contains_key(&index) {
             crashed.entry(index).or_insert(down);
         }
     }
     let mut down: Vec<Entry> = crashed
         .into_iter()
-        .map(|(index, down)| Entry {
-            index,
-            state: "CRASHED",
-            details: Some(down.why.clone()),
-            since: down.since,
-        })
+        .map(|(index, down)| entry(index, "CRASHED", Some(down.why.clone()), down.since))
+        .collect();
+    let free: Vec<u64> = (indices.iter().copied())
+        .filter(|index| *index < instances && !up.contains_key(index))
         .collect();
     if down.is_empty()
         && let Some(short) = &listed.down
-        && let Some(index) = (0..instances).find(|index| !indices.contains_key(index))
+        && let Some(index) = free.first()
     {
-        down.push(Entry {
-            index,
-            state: "CRASHED",
-            details: Some(short.why.clone()),
-            since: short.since,
-        });
+        down.push(entry(
+            *index,
+            "CRASHED",
+            Some(short.why.clone()),
+            short.since,
+        ));
     }
     if down.is_empty() {
-        let short = kept(&listed.app.sandbox).saturating_sub(indices.len() as u64);
-        let free = (0..instances).filter(|index| !indices.contains_key(index));
-        let starting: Vec<u64> = free.take(short as usize).collect();
-        down.extend(starting.into_iter().map(|index| Entry {
-            index,
-            state: "STARTING",
-            details: None,
-            since: epoch_secs(),
-        }));
+        let short = kept(&listed.app.sandbox).saturating_sub(up.len() as u64);
+        let starting = free.into_iter().take(short as usize);
+        down.extend(starting.map(|index| entry(index, "STARTING", None, epoch_secs())));
     }
-    let mut entries: Vec<_> = indices
-        .into_iter()
-        .map(|(index, since)| Entry {
-            index,
-            state: "RUNNING",
-            details: None,
-            since,
-        })
+    let mut entries: Vec<_> = (up.into_iter())
+        .map(|(index, since)| entry(index, "RUNNING", None, since))
         .chain(down)
         .collect();
     entries.sort_by_key(|entry| entry.index);
@@ -877,10 +902,12 @@ mod tests {
             .collect()
     }
 
-    /// What the stats give of an app of 2 instances, as the CLI reads them.
+    /// What the stats give of an app of 2 instances, as the CLI reads them; over two wickets,
+    /// each of its indices'.
     #[test]
     fn the_stats_list_what_is_alive() {
         let mut state = State::new("o", "s", &["localhost".into()]);
+        state.follow_wickets(&["w".into()]);
         let space = state.spaces[0].guid.clone();
         let guid = state
             .create_app("a", crate::store::STACK, &space)
@@ -905,9 +932,16 @@ mod tests {
             .unwrap();
             listed.typed(Runtime::Wasm).unwrap()
         };
+        // the one wicket's listing, if read
+        let on_w = |listed: Option<&ListedApp>| -> BTreeMap<String, ListedApp> {
+            listed
+                .map(|listed| ("w".to_string(), listed.clone()))
+                .into_iter()
+                .collect()
+        };
         let entries = |state: &State, listed: Option<&ListedApp>| {
             let app = state.app(&guid).unwrap();
-            let stats = stats(state, app, "cf", listed);
+            let stats = stats(state, app, "cf", &on_w(listed));
             let resources = stats["resources"].as_array().unwrap().clone();
             let entry = |entry: &Value| {
                 let details = entry["details"].as_str().map(String::from);
@@ -946,17 +980,20 @@ mod tests {
         state.map(&route, &guid);
 
         // the wicket's answer awaited, away, refused
+        let outcome = |state: &mut State, wicket: &str, outcome: Outcome| {
+            let outcomes = state.outcomes.entry(guid.clone()).or_default();
+            outcomes.insert(wicket.to_string(), outcome);
+        };
         let starting = vec![some(0, "STARTING"), some(1, "STARTING")];
         assert_eq!(entries(&state, None), starting);
-        state.wicket.insert(guid.clone(), Outcome::Unreachable);
+        outcome(&mut state, "w", Outcome::Unreachable);
         assert_eq!(entries(&state, None), starting);
-        let refused = Outcome::Refused("no".into());
-        state.wicket.insert(guid.clone(), refused);
+        outcome(&mut state, "w", Outcome::Refused("no".into()));
         let crashed = |index| (index, "CRASHED".to_string(), Some("no".to_string()));
         assert_eq!(entries(&state, None), [crashed(0), crashed(1)]);
 
         // taken, and gone from its listing or the listing not read
-        state.wicket.insert(guid.clone(), Outcome::Running);
+        outcome(&mut state, "w", Outcome::Running);
         assert_eq!(entries(&state, None), starting);
 
         // what is alive, by the index `cf logs` names, one index one entry; none is no failure
@@ -1099,7 +1136,7 @@ mod tests {
             {"index": 3, "since": started - 200},
         ]))
         .unwrap();
-        let uptimes = stats(&state, state.app(&guid).unwrap(), "cf", Some(&one));
+        let uptimes = stats(&state, state.app(&guid).unwrap(), "cf", &on_w(Some(&one)));
         let uptime = |at: usize| uptimes["resources"][at]["uptime"].as_u64().unwrap();
         assert_eq!(uptimes["resources"][1]["state"], "RUNNING");
         assert_eq!(uptimes["resources"][1]["routable"], true);
@@ -1107,6 +1144,56 @@ mod tests {
         assert!((100..110).contains(&uptime(1)), "{uptimes}");
         assert_eq!(uptimes["resources"][0]["state"], "CRASHED");
         assert!((50..60).contains(&uptime(0)), "{uptimes}");
+
+        // over two wickets, of 3 placed on w, v, w: each wicket's entries at its indices, its name
+        // their host, its index k the kth of its indices; away or refusing, all of its indices
+        state.follow_wickets(&["w".into(), "v".into()]);
+        let app = state.app_mut(&guid).unwrap();
+        app.process.instances = 3;
+        app.placement = vec!["w".into(), "v".into(), "w".into()];
+        let hosted = |state: &State, listed: &BTreeMap<String, ListedApp>| {
+            let stats = stats(state, state.app(&guid).unwrap(), "cf", listed);
+            let resources = stats["resources"].as_array().unwrap().clone();
+            let entry = |entry: &Value| {
+                let text = |key: &str| entry[key].as_str().unwrap().to_string();
+                (
+                    entry["index"].as_u64().unwrap(),
+                    text("state"),
+                    text("host"),
+                )
+            };
+            resources.iter().map(entry).collect::<Vec<_>>()
+        };
+        let at = |index, shown: &str, host: &str| (index, shown.to_string(), host.to_string());
+        outcome(&mut state, "v", Outcome::Unreachable);
+        let w_only: BTreeMap<String, ListedApp> =
+            [("w".to_string(), listed(json!([0, 1]), Value::Null))].into();
+        assert_eq!(
+            hosted(&state, &w_only),
+            [
+                at(0, "RUNNING", "w"),
+                at(1, "STARTING", "v"),
+                at(2, "RUNNING", "w")
+            ]
+        );
+        outcome(&mut state, "v", Outcome::Refused("no room".into()));
+        assert_eq!(hosted(&state, &w_only)[1], at(1, "CRASHED", "v"));
+        outcome(&mut state, "v", Outcome::Running);
+        let both: BTreeMap<String, ListedApp> = [
+            ("w".to_string(), listed(json!([1]), Value::Null)),
+            ("v".to_string(), listed(json!([0]), Value::Null)),
+        ]
+        .into();
+        assert_eq!(
+            hosted(&state, &both),
+            [at(1, "RUNNING", "v"), at(2, "RUNNING", "w")]
+        );
+        // stopped: down, each where it is placed
+        state.app_mut(&guid).unwrap().started = false;
+        assert_eq!(
+            hosted(&state, &BTreeMap::new()),
+            [at(0, "DOWN", "w"), at(1, "DOWN", "v"), at(2, "DOWN", "w")]
+        );
     }
 
     #[test]

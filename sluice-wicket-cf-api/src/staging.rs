@@ -109,7 +109,6 @@ pub async fn run(
                     format!("The wicket is making a rootfs of {}", docker.image),
                 );
                 controller
-                    .wicket
                     .make_image(&docker.image, docker.credentials())
                     .await
                     .map(|made| Staged {
