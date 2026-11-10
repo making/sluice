@@ -30,24 +30,29 @@ The sample guest at 1G, a `Full` snapshot: template booted in 689ms, snapshot ta
 ## Source staged by buildpacks on the wicket
 
 Measured 2026-11-10: amd64, Linux 6.8, KVM, guest kernel 6.18.56, a release build of the wicket,
-`paketobuildpacks/builder-jammy-base@sha256:71927953...` (lifecycle 0.21.28) on
-`run-jammy-base@sha256:dc8dd702...`, a build VM of 2 vCPUs, 2048 MiB and an 8 GiB scratch disk,
-no cache. The apps: Spring Boot 3.5 (Maven, one starter), Express, a Go module with one
-dependency.
+a build VM of 2 vCPUs, 2048 MiB and an 8 GiB scratch disk, no cache. The apps: Spring Boot 3.5
+(Maven, one starter), Express, a Go module with one dependency. Two builders, both of lifecycle
+0.21.28 (platform API 0.13 used):
 
-| what | time, size |
-|---|---|
-| the builder's rootfs, once per builder and guest | 165s (about 120s of it the pull), 4138 MiB; a debug build of the wicket: 501-517s |
-| Java: build, droplet, rootfs, start | 65s, 235 MiB, 13s to make 538 MiB, `Started` after 5.4s at 1024 MiB |
-| Node: build, droplet, rootfs | 22s, 278 MiB, 18s to make 629 MiB |
-| Go: build, droplet, rootfs | 34s, 17 MiB, 10s to make 251 MiB |
+- `paketobuildpacks/ubuntu-resolute-builder@sha256:b17a8dce...` (Ubuntu 26.04) on
+  `ubuntu-resolute-run@sha256:09a7c9ed...`
+- `paketobuildpacks/builder-jammy-base@sha256:71927953...` (Ubuntu 22.04) on
+  `run-jammy-base@sha256:dc8dd702...`
+
+| what | resolute | jammy |
+|---|---|---|
+| the builder's rootfs, once per builder and guest | 152s, 3648 MiB | 165s (about 120s of it the pull), 4138 MiB; a debug build of the wicket: 501-517s |
+| Java: build, droplet, rootfs, start | 63s, 235 MiB, 14s to make 580 MiB, `Started` after 4.9s at 1024 MiB | 65s, 235 MiB, 13s to make 538 MiB, after 5.4s |
+| Node: build, droplet, rootfs | 20s, 278 MiB, 20s to make 671 MiB | 22s, 278 MiB, 18s to make 629 MiB |
+| Go: build, droplet, rootfs | 35s, 17 MiB, 12s to make 293 MiB | 34s, 17 MiB, 10s to make 251 MiB |
 
 A cold build is well within `CF_STAGING_TIMEOUT` (15 minutes), the first one with a builder
-included. The same builds with `detector` and `builder` alone in Docker on every core of the
+included. The jammy builds with `detector` and `builder` alone in Docker on every core of the
 host: Java 61s (peak 1.7 GiB with the page cache, `/layers` 786 MiB), Node 12s (484 MiB, 293 MiB),
 Go 24s (827 MiB, 389 MiB).
 
-The hosts a build connected to (each on 443), what `egress` has to name:
+The hosts a build connected to (each on 443, the same with both builders), what `egress` has
+to name:
 
 | app | hosts |
 |---|---|

@@ -670,7 +670,7 @@ has no registry and no daemon in reach, and nothing is restored (no cache betwee
 | `DELETE /api/builds/<id>` | ends and forgets it; an ended build is forgotten after ten minutes |
 
 ```json
-{"builder": "paketobuildpacks/builder-jammy-base", "source": "<sha256>",
+{"builder": "paketobuildpacks/ubuntu-resolute-builder", "source": "<sha256>",
  "env": {"BP_JVM_VERSION": "21"}, "egress": ["repo.maven.apache.org:443", "github.com:443"]}
 ```
 
