@@ -22,6 +22,7 @@ on:
     - 'sluice-wicket-console/**'
     - 'sluice-wicket-registry/**'
     - 'sluice-wicket-tunnel/**'
+    - 'sluice-wicket-keyvalue-gemfire/**'
     - 'sluice-proto/src/main/proto/**'
     - '.github/workflows/rust.yaml'
     - '.github/workflows/deploy-flume.yaml'
@@ -53,6 +54,7 @@ jobs:
       console: ${{ steps.filter.outputs.console }}
       registry: ${{ steps.filter.outputs.registry }}
       tunnel: ${{ steps.filter.outputs.tunnel }}
+      keyvalue-gemfire: ${{ steps.filter.outputs.keyvalue-gemfire }}
       flume: ${{ steps.filter.outputs.flume }}
       wicket: ${{ steps.filter.outputs.wicket }}
       cf-api: ${{ steps.filter.outputs.cf-api }}
@@ -102,6 +104,9 @@ jobs:
           - 'sluice-wicket-tunnel/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
+          keyvalue-gemfire:
+          - 'sluice-wicket-keyvalue-gemfire/**'
+          - '.github/workflows/rust.yaml'
           flume:
           - 'sluice-flume/**'
           - 'sluice-build-info/**'
@@ -116,6 +121,7 @@ jobs:
           - 'sluice-wicket-server/**'
           - 'sluice-wicket-console/**'
           - 'sluice-wicket-tunnel/**'
+          - 'sluice-wicket-keyvalue-gemfire/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
           - '.github/workflows/deploy-wicket-runtime-wasi.yaml'
@@ -131,6 +137,7 @@ jobs:
           - 'sluice-wicket-console/**'
           - 'sluice-wicket-registry/**'
           - 'sluice-wicket-tunnel/**'
+          - 'sluice-wicket-keyvalue-gemfire/**'
           - 'sluice-proto/src/main/proto/**'
           - '.github/workflows/rust.yaml'
           - '.github/workflows/deploy-cf-api.yaml'
@@ -306,6 +313,36 @@ jobs:
       run: cargo clippy --all-targets --all-features --locked -- -D warnings
     - name: Test
       run: cargo test --all-features --locked
+  # its tests run the mock cluster (feature mock) in process
+  sluice-wicket-keyvalue-gemfire:
+    needs: changes
+    if: needs.changes.outputs.keyvalue-gemfire == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: sluice-wicket-keyvalue-gemfire
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+    - name: Install protoc
+      run: sudo apt-get update -q && sudo apt-get install -y --no-install-recommends protobuf-compiler
+    # the toolchain rust-toolchain.toml pins
+    - name: Toolchain
+      run: rustup toolchain install
+    - uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          sluice-wicket-keyvalue-gemfire/target
+        key: cargo-wicket-keyvalue-gemfire-${{ runner.os }}-${{ hashFiles('sluice-wicket-keyvalue-gemfire/Cargo.lock', 'sluice-wicket-keyvalue-gemfire/rust-toolchain.toml') }}
+    - name: Format
+      run: cargo fmt --check
+    - name: Clippy
+      run: cargo clippy --all-targets --all-features --locked -- -D warnings
+    - name: Test
+      run: cargo test --all-features --locked
   # sluice-client's plugins run on it, a library the JVM loads: its gates on each platform
   # the client may carry it for (CI's Java build tests it with the JVM on x86_64 and aarch64).
   sluice-client-wasm:
@@ -375,7 +412,8 @@ jobs:
   # The wicket builds on its pinned stable toolchain; its tests build the example guests and
   # sluice-wicket-site through the rustup cargo proxy in examples/ and there, each pinned to a
   # nightly with wasm32-wasip3 (their rust-toolchain.toml), and run redis-server (Debian's has TLS) for the redis
-  # store. The build without it (--no-default-features) is linted, its tests are not run.
+  # store, the gemfire store's mock cluster in process. The build without them
+  # (--no-default-features) is linted, its tests are not run.
   sluice-wicket-runtime-wasi:
     needs: changes
     if: needs.changes.outputs.wicket == 'true'

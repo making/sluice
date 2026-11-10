@@ -1,0 +1,9 @@
+// The part of `google.rpc.Status` (googleapis, Apache-2.0) a NACK carries.
+syntax = "proto3";
+
+package google.rpc;
+
+message Status {
+  int32 code = 1;
+  string message = 2;
+}

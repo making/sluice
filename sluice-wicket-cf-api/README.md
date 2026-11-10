@@ -904,7 +904,8 @@ its wicket's `--listen` (one entry point for both takes a sluice server).
   an app of one, which would stop with it
 - **Keyvalue stores.** Each wicket lists its stores, each one of its host (`sqlite`) or shared
   with the wickets of other hosts, by an identity: its server as its `url` names it and its
-  prefix (`redis`; see the wicket's [Key-value stores](../sluice-wicket-runtime-wasi/README.md#key-value-stores-experimental)).
+  prefix (`redis`), or its cluster's addresses and its region (`gemfire`; see the wicket's
+  [Key-value stores](../sluice-wicket-runtime-wasi/README.md#key-value-stores-experimental)).
   A plan is a store every wicket lists, a shared one by one identity on all: two servers of one
   name are offered by none. A shared store's instance is one namespace for every wicket, so an
   app over two counts once (`redis` in the sample below). A store of each wicket's host holds an

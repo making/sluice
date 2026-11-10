@@ -1,0 +1,32 @@
+// The part of Envoy's aggregated discovery service (envoyproxy/data-plane-api,
+// Apache-2.0) a GemFire locator answers: state-of-the-world subscriptions, the fields
+// with their names and numbers there.
+syntax = "proto3";
+
+package envoy.service.discovery.v3;
+
+import "envoy/config/core/v3/base.proto";
+import "google/protobuf/any.proto";
+import "google/rpc/status.proto";
+
+service AggregatedDiscoveryService {
+  rpc StreamAggregatedResources(stream DiscoveryRequest) returns (stream DiscoveryResponse);
+}
+
+// A subscription (no `response_nonce`), the ACK of a response (its `version_info` and
+// nonce) or its NACK (the version accepted before, its nonce, why).
+message DiscoveryRequest {
+  string version_info = 1;
+  envoy.config.core.v3.Node node = 2;
+  repeated string resource_names = 3;
+  string type_url = 4;
+  string response_nonce = 5;
+  google.rpc.Status error_detail = 6;
+}
+
+message DiscoveryResponse {
+  string version_info = 1;
+  repeated google.protobuf.Any resources = 2;
+  string type_url = 4;
+  string nonce = 5;
+}

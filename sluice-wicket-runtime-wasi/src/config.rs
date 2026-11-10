@@ -1046,13 +1046,27 @@ struct StoreFile {
     max_namespace_bytes: Option<Scalar>,
     /// The server of a `redis` store.
     url: Option<String>,
-    /// The CA of a `rediss://` server's certificate, relative to the config
-    /// file.
+    /// The CA of a `rediss://` server's certificate, or of a `grpcs://`
+    /// cluster's, relative to the config file.
     ca_cert: Option<PathBuf>,
     /// What a `redis` store's keys begin with.
     prefix: Option<String>,
-    /// A `redis` store's bound on each call.
+    /// A `redis` or `gemfire` store's bound on each call.
     timeout: Option<Scalar>,
+    /// The locators naming a `gemfire` store's servers, or the servers
+    /// (`grpc://host:port`, `grpcs://host:port`).
+    locators: Option<Vec<String>>,
+    servers: Option<Vec<String>>,
+    /// The region of a `gemfire` store.
+    region: Option<String>,
+    /// A `grpcs://` cluster's client certificate and its key (mTLS),
+    /// relative to the config file.
+    client_cert: Option<PathBuf>,
+    client_key: Option<PathBuf>,
+    /// The name verified in a `grpcs://` cluster's certificates.
+    server_name: Option<String>,
+    /// The bearer token of a `grpcs://` cluster's calls.
+    token: Option<String>,
 }
 
 impl StoreFile {
@@ -1062,6 +1076,16 @@ impl StoreFile {
             Some((key, _)) => Err(format!("{key}: not a key of a {} store", self.kind)),
             None => Ok(()),
         };
+        // the keys of a gemfire store alone
+        let gemfire = [
+            ("locators", self.locators.is_some()),
+            ("servers", self.servers.is_some()),
+            ("region", self.region.is_some()),
+            ("client-cert", self.client_cert.is_some()),
+            ("client-key", self.client_key.is_some()),
+            ("server-name", self.server_name.is_some()),
+            ("token", self.token.is_some()),
+        ];
         let kind = match self.kind.as_str() {
             "sqlite" => {
                 foreign(&[
@@ -1070,6 +1094,7 @@ impl StoreFile {
                     ("prefix", self.prefix.is_some()),
                     ("timeout", self.timeout.is_some()),
                 ])?;
+                foreign(&gemfire)?;
                 keyvalue::Kind::Sqlite {
                     path: dir.join(
                         self.path
@@ -1088,6 +1113,7 @@ impl StoreFile {
                     ("path", self.path.is_some()),
                     ("max-namespace-bytes", self.max_namespace_bytes.is_some()),
                 ])?;
+                foreign(&gemfire)?;
                 let url = self.url.as_ref().ok_or("url: required by a redis store")?;
                 let tls = keyvalue::check_redis_url(url).map_err(|e| format!("url: {e}"))?;
                 if self.ca_cert.is_some() && !tls {
@@ -1107,9 +1133,25 @@ impl StoreFile {
             "redis" => {
                 return Err("type: a build without the redis store (cargo feature redis)".into());
             }
+            #[cfg(feature = "gemfire")]
+            "gemfire" => {
+                foreign(&[
+                    ("path", self.path.is_some()),
+                    ("max-namespace-bytes", self.max_namespace_bytes.is_some()),
+                    ("url", self.url.is_some()),
+                    ("prefix", self.prefix.is_some()),
+                ])?;
+                self.gemfire(dir)?
+            }
+            #[cfg(not(feature = "gemfire"))]
+            "gemfire" => {
+                return Err(
+                    "type: a build without the gemfire store (cargo feature gemfire)".into(),
+                );
+            }
             other => {
                 return Err(format!(
-                    "type: unknown store type '{other}' (sqlite, redis)"
+                    "type: unknown store type '{other}' (sqlite, redis, gemfire)"
                 ));
             }
         };
@@ -1121,6 +1163,76 @@ impl StoreFile {
             limits.max_value_bytes = max.bytes("max-value-bytes")?;
         }
         Ok(StoreConfig { kind, limits })
+    }
+
+    /// A `gemfire` store: the locators or the servers (one scheme), the
+    /// region, TLS and the token with `grpcs://` alone.
+    #[cfg(feature = "gemfire")]
+    fn gemfire(&self, dir: &Path) -> Result<keyvalue::Kind, String> {
+        let (key, urls) = match (&self.locators, &self.servers) {
+            (Some(urls), None) => ("locators", urls),
+            (None, Some(urls)) => ("servers", urls),
+            _ => return Err("locators, servers: one of them names a gemfire store's".into()),
+        };
+        let parsed = urls
+            .iter()
+            .map(|url| keyvalue::gemfire_address(url).map_err(|e| format!("{key}: {e}")))
+            .collect::<Result<Vec<_>, _>>()?;
+        let tls = match parsed.first() {
+            Some((_, tls)) => *tls,
+            None => return Err(format!("{key}: names none")),
+        };
+        if parsed.iter().any(|(_, other)| *other != tls) {
+            return Err(format!("{key}: grpc:// and grpcs:// at once"));
+        }
+        let addresses = parsed.into_iter().map(|(address, _)| address).collect();
+        let endpoints = match key {
+            "locators" => keyvalue::GemfireEndpoints::Locators(addresses),
+            _ => keyvalue::GemfireEndpoints::Servers(addresses),
+        };
+        let region = self
+            .region
+            .as_ref()
+            .ok_or("region: required by a gemfire store")?;
+        if region.is_empty()
+            || !region
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_".contains(&byte))
+        {
+            return Err(format!(
+                "region: '{region}' is no region name (letters, digits, '-', '_')"
+            ));
+        }
+        let secured = [
+            ("ca-cert", self.ca_cert.is_some()),
+            ("client-cert", self.client_cert.is_some()),
+            ("client-key", self.client_key.is_some()),
+            ("server-name", self.server_name.is_some()),
+            ("token", self.token.is_some()),
+        ];
+        if let Some((secured, _)) = secured.iter().find(|(_, set)| *set && !tls) {
+            return Err(format!("{secured}: needs grpcs:// {key}"));
+        }
+        let client = match (&self.client_cert, &self.client_key) {
+            (Some(cert), Some(key)) => Some((dir.join(cert), dir.join(key))),
+            (None, None) => None,
+            (Some(_), None) => return Err("client-key: required with client-cert".into()),
+            (None, Some(_)) => return Err("client-cert: required with client-key".into()),
+        };
+        Ok(keyvalue::Kind::Gemfire {
+            endpoints,
+            region: region.clone(),
+            tls: tls.then(|| keyvalue::GemfireTls {
+                ca_cert: self.ca_cert.as_ref().map(|path| dir.join(path)),
+                client,
+                server_name: self.server_name.clone(),
+            }),
+            token: self.token.clone(),
+            timeout: match &self.timeout {
+                Some(timeout) => timeout.duration("timeout", false)?,
+                None => keyvalue::DEFAULT_GEMFIRE_TIMEOUT,
+            },
+        })
     }
 }
 
@@ -1369,6 +1481,16 @@ keyvalue:
       prefix: 'wicket:'
       timeout: 2s
       max-value-bytes: 64Ki
+    grid:
+      type: gemfire
+      locators: [grpcs://locator.example:50051, 'grpcs://[fd00::1]:50051']
+      region: sluice
+      ca-cert: grid-ca.pem
+      client-cert: grid.pem
+      client-key: grid.key
+      server-name: gemfire.example
+      token: ${{SLUICE_WICKET_TEST_UNSET:-gr1d}}
+      timeout: 3s
 routes:
   - host: a.local
     component: a.wasm
@@ -1537,7 +1659,28 @@ routes:
                 },
             })
         );
-        // the redis store is the wickets' of every host reaching it: which one, no password in it
+        assert_eq!(
+            stores.config("grid"),
+            Some(&StoreConfig {
+                kind: keyvalue::Kind::Gemfire {
+                    endpoints: keyvalue::GemfireEndpoints::Locators(vec![
+                        "locator.example:50051".into(),
+                        "[fd00::1]:50051".into(),
+                    ]),
+                    region: "sluice".into(),
+                    tls: Some(keyvalue::GemfireTls {
+                        ca_cert: Some(dir.0.join("grid-ca.pem")),
+                        client: Some((dir.0.join("grid.pem"), dir.0.join("grid.key"))),
+                        server_name: Some("gemfire.example".into()),
+                    }),
+                    token: Some("gr1d".into()),
+                    timeout: Duration::from_secs(3),
+                },
+                limits: StoreLimits::default(),
+            })
+        );
+        // the redis and gemfire stores are the wickets' of every host reaching them: which ones,
+        // no secret in them
         assert_eq!(
             stores.described(),
             [
@@ -1546,6 +1689,12 @@ routes:
                     "redis",
                     false,
                     Some("rediss://cache.example:6380/2?prefix=wicket:".into())
+                ),
+                (
+                    "grid",
+                    "gemfire",
+                    false,
+                    Some("gemfire://[fd00::1]:50051,locator.example:50051/sluice".into())
                 ),
                 ("local", "sqlite", true, None),
                 ("shared", "sqlite", false, None),
@@ -1726,6 +1875,9 @@ routes:
                 "server: s\nroutes:\n  - {{host: a, component: a.wasm, sandbox: {{{sandbox}}}}}\n"
             )
         };
+        let gemfire = |keys: &str| {
+            format!("server: s\nkeyvalue: {{stores: {{local: {{type: gemfire, {keys}}}}}}}\n")
+        };
         let cases = [
             ("serverx: s\n".to_string(), "unknown field `serverx`"),
             (
@@ -1783,7 +1935,7 @@ routes:
             (route("warm: 2, instances: 1"), "instances=1 is below warm=2"),
             (
                 "server: s\nkeyvalue: {stores: {local: {type: mem}}}\n".into(),
-                "keyvalue.stores.local.type: unknown store type 'mem' (sqlite, redis)",
+                "keyvalue.stores.local.type: unknown store type 'mem' (sqlite, redis, gemfire)",
             ),
             (
                 "server: s\nkeyvalue: {stores: {local: {type: sqlite}}}\n".into(),
@@ -1816,6 +1968,43 @@ routes:
                 "server: s\nkeyvalue: {stores: {local: {type: redis, url: 'redis://r', timeout: 0s}}}\n"
                     .into(),
                 "keyvalue.stores.local.timeout: must be positive",
+            ),
+            (
+                "server: s\nkeyvalue: {stores: {local: {type: redis, url: 'redis://r', region: r}}}\n"
+                    .into(),
+                "keyvalue.stores.local.region: not a key of a redis store",
+            ),
+            (
+                gemfire("region: r"),
+                "keyvalue.stores.local.locators, servers: one of them names a gemfire store's",
+            ),
+            (
+                gemfire("servers: ['grpc://s:1'], region: r, prefix: p"),
+                "keyvalue.stores.local.prefix: not a key of a gemfire store",
+            ),
+            (
+                gemfire("servers: ['http://s:1'], region: r"),
+                "keyvalue.stores.local.servers: 'http://s:1' is no grpc:// or grpcs:// address",
+            ),
+            (
+                gemfire("locators: ['grpc://l:1', 'grpcs://l:2'], region: r"),
+                "keyvalue.stores.local.locators: grpc:// and grpcs:// at once",
+            ),
+            (
+                gemfire("servers: ['grpc://s:1']"),
+                "keyvalue.stores.local.region: required by a gemfire store",
+            ),
+            (
+                gemfire("servers: ['grpc://s:1'], region: a/b"),
+                "keyvalue.stores.local.region: 'a/b' is no region name",
+            ),
+            (
+                gemfire("servers: ['grpc://s:1'], region: r, token: s3cr3t"),
+                "keyvalue.stores.local.token: needs grpcs:// servers",
+            ),
+            (
+                gemfire("servers: ['grpcs://s:1'], region: r, client-cert: c"),
+                "keyvalue.stores.local.client-key: required with client-cert",
             ),
             (
                 "server: s\nkeyvalue: {stores: {local: {type: sqlite, path: x, max-key-bytes: 0}}}\n"

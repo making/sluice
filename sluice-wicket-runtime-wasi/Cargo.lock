@@ -2311,6 +2311,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "sluice-wicket-keyvalue-gemfire"
+version = "0.0.1-SNAPSHOT"
+dependencies = [
+ "bytes",
+ "prost",
+ "prost-types",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+]
+
+[[package]]
 name = "sluice-wicket-oidc"
 version = "0.0.1-SNAPSHOT"
 dependencies = [
@@ -2350,6 +2364,7 @@ dependencies = [
  "sha2",
  "sluice-build-info",
  "sluice-wicket-console",
+ "sluice-wicket-keyvalue-gemfire",
  "sluice-wicket-oidc",
  "sluice-wicket-server",
  "sluice-wicket-tunnel",

@@ -1,0 +1,150 @@
+// The part of Tanzu GemFire for gRPC's service the client calls, described after the
+// service's API reference: the package, the service, the methods and the fields keep the
+// names and numbers the service has, so this description and the service's own speak one
+// wire format. A service answering these methods is all the client needs, GemFire or not.
+syntax = "proto3";
+
+package gemfire.v1;
+
+import "google/protobuf/any.proto";
+
+service GemFire {
+  // Writes `value` under `key`.
+  rpc Put(PutRequest) returns (PutResponse);
+  // The value of `key`; unset when absent.
+  rpc Get(GetRequest) returns (GetResponse);
+  // Removes `key`; whether it was there.
+  rpc Remove(RemoveRequest) returns (RemoveResponse);
+  // Writes `value` only while `key` is absent; whether it did.
+  rpc PutIfAbsent(PutIfAbsentRequest) returns (PutIfAbsentResponse);
+  // Writes `value` only while `key` holds `expected_value`; whether it did.
+  rpc ReplaceIf(ReplaceIfRequest) returns (ReplaceIfResponse);
+  // Whether `key` is there.
+  rpc ContainsKey(ContainsKeyRequest) returns (ContainsKeyResponse);
+  // Writes the entries the messages after the first (its `config`) carry.
+  rpc PutStream(stream PutStreamRequest) returns (PutStreamResponse);
+  // The entries of the keys the messages after the first carry, the absent ones left out.
+  rpc GetStream(stream GetStreamRequest) returns (stream GetStreamResponse);
+  // Removes the keys the messages after the first carry.
+  rpc RemoveStream(stream RemoveStreamRequest) returns (RemoveStreamResponse);
+  // Every key of the region, a batch a message.
+  rpc KeySetStream(KeySetStreamRequest) returns (stream KeySetStreamResponse);
+}
+
+message Key {
+  oneof key_value {
+    string string = 1;
+    int32 int = 2;
+    int64 long = 3;
+  }
+}
+
+message Value {
+  oneof value_value {
+    string string = 1;
+    bytes bytes = 2;
+    int32 int32 = 3;
+    int64 int64 = 4;
+    bool bool = 5;
+    double double = 6;
+    float float = 7;
+    google.protobuf.Any any = 8;
+  }
+}
+
+message Entry {
+  Key key = 1;
+  Value value = 2;
+}
+
+// The region of a stream, on its first message alone.
+message StreamConfig {
+  string region_name = 1;
+}
+
+message PutRequest {
+  string region_name = 1;
+  Key key = 2;
+  Value value = 3;
+}
+
+message PutResponse {}
+
+message GetRequest {
+  string region_name = 1;
+  Key key = 2;
+}
+
+message GetResponse {
+  Value value = 1;
+}
+
+message RemoveRequest {
+  string region_name = 1;
+  Key key = 2;
+}
+
+message RemoveResponse {
+  bool removed = 1;
+}
+
+message PutIfAbsentRequest {
+  string region_name = 1;
+  Key key = 2;
+  Value value = 3;
+}
+
+message PutIfAbsentResponse {
+  bool inserted = 1;
+}
+
+message ReplaceIfRequest {
+  string region_name = 1;
+  Key key = 2;
+  Value value = 3;
+  Value expected_value = 4;
+}
+
+message ReplaceIfResponse {
+  bool replaced = 1;
+}
+
+message ContainsKeyRequest {
+  string region_name = 1;
+  Key key = 2;
+}
+
+message ContainsKeyResponse {
+  bool contains = 1;
+}
+
+message PutStreamRequest {
+  StreamConfig config = 1;
+  repeated Entry entries = 2;
+}
+
+message PutStreamResponse {}
+
+message GetStreamRequest {
+  StreamConfig config = 1;
+  repeated Key keys = 2;
+}
+
+message GetStreamResponse {
+  repeated Entry entries = 1;
+}
+
+message RemoveStreamRequest {
+  StreamConfig config = 1;
+  repeated Key keys = 2;
+}
+
+message RemoveStreamResponse {}
+
+message KeySetStreamRequest {
+  string region_name = 1;
+}
+
+message KeySetStreamResponse {
+  repeated Key keys = 1;
+}

@@ -53,9 +53,10 @@ target/debug/sluice-wicket-runtime-wasi --listen 127.0.0.1:8080 --console 127.0.
 ```
 
 `cargo test` builds the examples the same way (through the
-rustup `cargo` proxy, so rustup must be installed), and runs `redis-server` (with TLS, as
-Homebrew's and Debian's are) for the redis store. `--no-default-features` builds without
-the redis store.
+rustup `cargo` proxy, so rustup must be installed), runs `redis-server` (with TLS, as
+Homebrew's and Debian's are) for the redis store, and a mock cluster in process for the
+gemfire store (`sluice-wicket-keyvalue-gemfire`'s, feature `mock`). `--no-default-features`
+builds without the redis and gemfire stores (features `redis`, `gemfire`).
 
 ### Local mode
 
@@ -258,6 +259,17 @@ keyvalue:                       # optional: one sqlite store, keyvalue.db next t
       # ca-cert: redis-ca.pem   # the CA of a rediss:// certificate; default: the webPKI roots
       # prefix: ""              # the defaults
       # timeout: 5s
+    grid:
+      type: gemfire
+      locators: [grpcs://locator-a.example:50051, grpcs://locator-b.example:50051]
+      # servers: [grpcs://server-a.example:50052]  # instead: the servers themselves
+      region: sluice            # a region of the cluster
+      # ca-cert: gemfire-ca.pem # grpcs:// alone: the CA of the certificates; default: webPKI
+      # client-cert: client.pem # a client certificate and its key (mTLS)
+      # client-key: client.key
+      # server-name: gemfire.example  # the name verified; default: each address's host
+      # token: ${GEMFIRE_TOKEN} # a bearer token (a SecurityManager's)
+      # timeout: 5s             # the default
 
 routes:
   - host: demo.local
@@ -680,7 +692,7 @@ route creates no file. A map naming an unknown store fails the startup or the re
   the `sqlite3` CLI (`sqlite3 keyvalue.db "SELECT namespace, key, CAST(value AS TEXT) FROM
   kv"`). WAL with `synchronous=NORMAL`: a power loss may drop the last commits, never
   corrupts the file. Several wickets on one host may share the file (they wait up to 5s
-  for each other's lock); sharing across hosts is the `redis` store's job. `list-keys`
+  for each other's lock); sharing across hosts is the `redis` and `gemfire` stores' job. `list-keys`
   pages hold up to 100 keys in key order, the cursor the last key of a page. A namespace
   holds at most `max-namespace-bytes` (default 64Mi) of keys and values, so a guest cannot
   fill the disk: a write past it fails and changes nothing. A purge deletes a namespace's
@@ -697,12 +709,37 @@ route creates no file. A map naming an unknown store fails the startup or the re
   The connection opens on the first call and again once lost: a server down fails the calls
   with why (logged), not the startup. Each call answers within `timeout` or fails; one
   timing out has the next call open a new connection
+- `gemfire`: the namespaces of one region of a Tanzu GemFire cluster, through Tanzu GemFire
+  for gRPC (the `gemfire.v1.GemFire` service: any service answering the methods the store
+  calls serves it), shared by the wickets on every host reaching it. A key is the string key
+  `<namespace>:<key>` of the region, escaped as the `redis` store's; a value is bytes, and a
+  key holding a value of another type (another client's) fails the calls on it. A `swap` is
+  `PutIfAbsent` / `ReplaceIf` (the server compares the bytes), `increment` a read and a swap
+  until no other write came between, the batches `GetStream` / `PutStream` / `RemoveStream`
+  (not atomic). The service lists no namespace alone: each `list-keys` page and a purge read
+  the region's key set (`KeySetStream`), so they cost with the region; a page holds up to
+  100 keys in key order, the cursor the last key of a page. No namespace bound: the cluster
+  bounds the region, and a value must fit a message of its servers
+  (`gemfire.grpc.max-message-size`, 4 MiB by default). The servers are named (`servers`) or
+  named by the locators (`locators`: their xDS, followed as it changes, the next locator
+  when one fails); the region must exist. A call goes round the servers, one failing set
+  aside a while, and moves to another when its request never left, or when sending it twice
+  harms nothing (all but a swap). `grpcs://` verifies the locators' and the servers'
+  certificates against `ca-cert`, else the webPKI roots, for `server-name` when their
+  addresses are not in them; `client-cert` / `client-key` answer a cluster requiring a client
+  certificate (`ssl-require-authentication`), `token` goes as `authorization: Bearer <token>`
+  (a cluster with a `SecurityManager`). The connections open on the first call (the locators'
+  at once): a cluster down fails the calls with why (logged), not the startup. Each call
+  answers within `timeout` or fails (a stream: once no message moved for it); one timing out
+  has the next call to that server open a new connection (a production-like cluster:
+  [.kb/wicket-keyvalue-gemfire.md](../.kb/wicket-keyvalue-gemfire.md))
 - which store a store is, as listed (`shared`): none for a `sqlite` store or a `redis` one on
   a unix socket, a file or server of the host; else the server as its `url` names it, without
-  the credentials, and the prefix (`redis://cache:6379/0?prefix=wicket:`), so two wickets
-  naming one server alike list one store (`sluice-wicket-cf-api` spreads an app over wickets
-  sharing its stores so). A loopback address names each host's own server: wickets of several
-  hosts name it by an address they share
+  the credentials, and the prefix (`redis://cache:6379/0?prefix=wicket:`), or a `gemfire`
+  store's addresses, sorted, and its region (`gemfire://locator-a.example:50051,locator-b.example:50051/sluice`),
+  so two wickets naming one server or cluster alike list one store (`sluice-wicket-cf-api`
+  spreads an app over wickets sharing its stores so). A loopback address names each host's
+  own server: wickets of several hosts name it by an address they share
 - every store: a key past `max-key-bytes` (default 1Ki) and a value past `max-value-bytes`
   (default 1Mi) are rejected before the store sees them
 

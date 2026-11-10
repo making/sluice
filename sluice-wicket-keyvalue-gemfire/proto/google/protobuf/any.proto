@@ -1,0 +1,11 @@
+// `google.protobuf.Any` (protocolbuffers/protobuf, BSD-3-Clause), its fields with their names
+// and numbers there: a value of that type, a discovery answer's resources. Here so the build
+// needs no protoc of the well-known types; the code is prost-types'.
+syntax = "proto3";
+
+package google.protobuf;
+
+message Any {
+  string type_url = 1;
+  bytes value = 2;
+}

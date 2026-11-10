@@ -1,0 +1,28 @@
+// The part of Envoy's endpoint discovery (envoyproxy/data-plane-api, Apache-2.0) a GemFire
+// locator answers with its servers (`gemfire_grpc`), the fields with their names and
+// numbers there.
+syntax = "proto3";
+
+package envoy.config.endpoint.v3;
+
+import "envoy/config/core/v3/base.proto";
+
+message ClusterLoadAssignment {
+  string cluster_name = 1;
+  repeated LocalityLbEndpoints endpoints = 2;
+}
+
+message LocalityLbEndpoints {
+  repeated LbEndpoint lb_endpoints = 2;
+}
+
+message LbEndpoint {
+  oneof host_identifier {
+    Endpoint endpoint = 1;
+  }
+  envoy.config.core.v3.HealthStatus health_status = 2;
+}
+
+message Endpoint {
+  envoy.config.core.v3.Address address = 1;
+}

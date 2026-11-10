@@ -14,6 +14,8 @@
 //! (other tasks of the same guest included) while the host awaits the store,
 //! not the other requests.
 
+#[cfg(feature = "gemfire")]
+mod gemfire;
 #[cfg(feature = "redis")]
 mod redis;
 mod sqlite;
@@ -21,7 +23,7 @@ mod sqlite;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
-#[cfg(feature = "redis")]
+#[cfg(any(feature = "redis", feature = "gemfire"))]
 use std::time::Duration;
 
 use wasmtime::component::{HasData, Linker, Resource, ResourceTable};
@@ -59,6 +61,11 @@ const DEFAULT_MAX_VALUE_BYTES: usize = 1 << 20;
 /// Default of a `sqlite` store's `max-namespace-bytes`.
 pub const DEFAULT_MAX_NAMESPACE_BYTES: u64 = 64 << 20;
 
+#[cfg(feature = "gemfire")]
+pub use self::gemfire::{
+    DEFAULT_TIMEOUT as DEFAULT_GEMFIRE_TIMEOUT, Endpoints as GemfireEndpoints, Tls as GemfireTls,
+    address as gemfire_address,
+};
 #[cfg(feature = "redis")]
 pub use self::redis::{DEFAULT_TIMEOUT as DEFAULT_REDIS_TIMEOUT, check as check_redis_url};
 
@@ -218,6 +225,17 @@ pub enum Kind {
         prefix: String,
         timeout: Duration,
     },
+    /// The namespaces of `region` of a GemFire cluster, its servers named
+    /// or found through its locators (`host:port` each), over TLS when
+    /// `tls` is, with `token` on each call, each call bounded by `timeout`.
+    #[cfg(feature = "gemfire")]
+    Gemfire {
+        endpoints: GemfireEndpoints,
+        region: String,
+        tls: Option<GemfireTls>,
+        token: Option<String>,
+        timeout: Duration,
+    },
 }
 
 /// What one call may write to a store, checked before the store sees it.
@@ -324,9 +342,10 @@ impl Stores {
         ))
     }
 
-    /// Each store's name and type (`sqlite`, `redis`), whether it is the
-    /// default one, and which store it is when the wickets of other hosts may
-    /// reach it too (None: one of this host, a `sqlite` file); by name.
+    /// Each store's name and type (`sqlite`, `redis`, `gemfire`), whether it
+    /// is the default one, and which store it is when the wickets of other
+    /// hosts may reach it too (None: one of this host, a `sqlite` file); by
+    /// name.
     pub fn described(&self) -> Vec<(&str, &'static str, bool, Option<String>)> {
         self.configs
             .iter()
@@ -335,6 +354,10 @@ impl Stores {
                     Kind::Sqlite { .. } => ("sqlite", None),
                     #[cfg(feature = "redis")]
                     Kind::Redis { url, prefix, .. } => ("redis", redis::identity(url, prefix)),
+                    #[cfg(feature = "gemfire")]
+                    Kind::Gemfire {
+                        endpoints, region, ..
+                    } => ("gemfire", Some(gemfire::identity(endpoints, region))),
                 };
                 (name.as_str(), kind, *name == self.default, shared)
             })
@@ -430,6 +453,20 @@ impl Stores {
                     redis.address()
                 );
                 Arc::new(redis)
+            }
+            #[cfg(feature = "gemfire")]
+            Kind::Gemfire {
+                endpoints,
+                region,
+                tls,
+                token,
+                timeout,
+            } => {
+                let label = format!("keyvalue store '{name}'");
+                let store = gemfire::Gemfire::open(&label, endpoints, region, tls, token, *timeout)
+                    .map_err(|e| format!("{label}: {e}"))?;
+                println!("{label}: gemfire {}", store.describe());
+                Arc::new(store)
             }
         };
         opened.insert(name.to_string(), backend.clone());

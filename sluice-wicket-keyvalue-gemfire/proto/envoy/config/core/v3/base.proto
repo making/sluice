@@ -1,0 +1,35 @@
+// The part of Envoy's core types (envoyproxy/data-plane-api, Apache-2.0) the discovery of
+// GemFire's servers reads or sends, the fields with their names and numbers there.
+syntax = "proto3";
+
+package envoy.config.core.v3;
+
+// Who subscribes.
+message Node {
+  string id = 1;
+  string cluster = 2;
+  string user_agent_name = 6;
+}
+
+message Address {
+  oneof address {
+    SocketAddress socket_address = 1;
+  }
+}
+
+message SocketAddress {
+  // An IP address or a host name.
+  string address = 2;
+  oneof port_specifier {
+    uint32 port_value = 3;
+  }
+}
+
+enum HealthStatus {
+  UNKNOWN = 0;
+  HEALTHY = 1;
+  UNHEALTHY = 2;
+  DRAINING = 3;
+  TIMEOUT = 4;
+  DEGRADED = 5;
+}

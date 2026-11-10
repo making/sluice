@@ -1,8 +1,8 @@
 //! Local mode: `--listen` alone (no sluice server) serves the routes over
 //! plain TCP, routed by the request's host, at most `--max-connections` at
 //! once; a keyvalue route keeps its count in the sqlite file, across a
-//! restart and shared by two wickets on the file, or in a redis store two
-//! wickets share as wickets on two hosts would. Nothing drains: SIGTERM ends
+//! restart and shared by two wickets on the file, or in a redis or a gemfire
+//! store two wickets share as wickets on two hosts would. Nothing drains: SIGTERM ends
 //! the process at once, with 0. The console deploys an uploaded component as
 //! a route at once, and moves it to another host as it is; its API serves a
 //! controller's app of hosts the same way, and deletes the data of a keyvalue
@@ -18,6 +18,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
+use sluice_wicket_keyvalue_gemfire::mock;
 use sluice_wicket_oidc::mock::MockProvider;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -221,13 +222,13 @@ async fn exchange(
     )
 }
 
-/// Two wickets counting on a.local at once, 20 increments and 20 cas.
-async fn count_at_once(a: &str, b: &str) {
+/// Two wickets counting on `host` at once, 20 increments and 20 cas.
+async fn count_at_once(a: &str, b: &str, host: &'static str) {
     let mut counting = tokio::task::JoinSet::new();
     for n in 0..40 {
         let address = if n % 2 == 0 { a } else { b }.to_string();
         let path = if n % 4 < 2 { "/" } else { "/cas" };
-        counting.spawn(async move { get(&address, "a.local", path).await.0 });
+        counting.spawn(async move { get(&address, host, path).await.0 });
     }
     while let Some(status) = counting.join_next().await {
         assert_eq!(status.unwrap(), 200);
@@ -292,7 +293,7 @@ async fn local_mode_routes_by_host_and_keeps_the_keyvalue_file() {
         "the sole route, sharing a.local's namespace"
     );
 
-    count_at_once(&address, &other).await;
+    count_at_once(&address, &other, "a.local").await;
     assert_eq!(get(&address, "a.local", "/").await.1, "hits 24\n");
     assert_eq!(get(&other, "a.local", "/kv/cas-hits").await.1, "20");
 
@@ -418,41 +419,80 @@ async fn a_client_gone_frees_its_instance_and_a_half_closed_one_is_answered() {
 }
 
 /// Two wickets sharing a redis store (over TLS, the server's certificate
-/// issued by the store's ca-cert) count right at once, by increment and by
-/// cas.
+/// issued by the store's ca-cert) and a gemfire one (its locators -- the
+/// first refusing -- naming two servers; over mTLS, the servers' certificate
+/// for a name of theirs, with a token) count right at once, by increment and
+/// by cas.
 #[tokio::test(flavor = "multi_thread")]
-async fn two_wickets_count_on_a_shared_redis_store() {
+async fn two_wickets_count_on_shared_redis_and_gemfire_stores() {
     let guests = guests();
-    let dir = std::env::temp_dir().join(format!("sluice-redis-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("sluice-shared-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let ca_key = rcgen::KeyPair::generate().unwrap();
     let mut ca = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
     ca.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-    std::fs::write(dir.join("ca.pem"), ca.self_signed(&ca_key).unwrap().pem()).unwrap();
+    let ca_pem = ca.self_signed(&ca_key).unwrap().pem();
+    std::fs::write(dir.join("ca.pem"), &ca_pem).unwrap();
     let issuer = rcgen::Issuer::new(ca, ca_key);
-    let key = rcgen::KeyPair::generate().unwrap();
-    let cert = rcgen::CertificateParams::new(vec!["127.0.0.1".to_string()])
-        .unwrap()
-        .signed_by(&key, &issuer)
-        .unwrap();
-    let (cert_file, key_file) = (dir.join("redis.pem"), dir.join("redis.key"));
-    std::fs::write(&cert_file, cert.pem()).unwrap();
-    std::fs::write(&key_file, key.serialize_pem()).unwrap();
-    let server = redis_server::RedisServer::tls(&cert_file, &key_file);
+    // the certificate for `name` and its key, in `<file>.pem` and `<file>.key`
+    let issue = |name: &str, file: &str| {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec![name.to_string()])
+            .unwrap()
+            .signed_by(&key, &issuer)
+            .unwrap();
+        let (cert_file, key_file) = (
+            dir.join(format!("{file}.pem")),
+            dir.join(format!("{file}.key")),
+        );
+        std::fs::write(&cert_file, cert.pem()).unwrap();
+        std::fs::write(&key_file, key.serialize_pem()).unwrap();
+        (cert.pem(), key.serialize_pem())
+    };
+    issue("127.0.0.1", "redis");
+    let server = redis_server::RedisServer::tls(&dir.join("redis.pem"), &dir.join("redis.key"));
+    let (cert_pem, key_pem) = issue("gemfire.test", "gemfire");
+    issue("client", "client");
+    let cluster = mock::Cluster::start(mock::Options {
+        servers: 2,
+        tls: Some(mock::MockTls {
+            cert_pem: cert_pem.into_bytes(),
+            key_pem: key_pem.into_bytes(),
+            client_ca_pem: Some(ca_pem.into_bytes()),
+        }),
+        token: Some("s3cr3t".into()),
+        ..mock::Options::default()
+    })
+    .await;
     let config = dir.join("wicket.yaml");
+    let counter = guests.join("counter.wasm");
     std::fs::write(
         &config,
         format!(
             "keyvalue:
+  default: shared
   stores:
     shared: {{type: redis, url: '{}/0', ca-cert: ca.pem, prefix: 'counter:'}}
+    grid:
+      type: gemfire
+      locators: ['grpcs://127.0.0.1:1', 'grpcs://{}']
+      region: sluice
+      ca-cert: ca.pem
+      client-cert: client.pem
+      client-key: client.key
+      server-name: gemfire.test
+      token: s3cr3t
 routes:
   - host: a.local
-    component: {}
+    component: {counter}
     sandbox: {{wasi: [keyvalue]}}
+  - host: g.local
+    component: {counter}
+    sandbox: {{wasi: [keyvalue], keyvalue: {{'': grid}}}}
 ",
             server.url,
-            guests.join("counter.wasm").display()
+            cluster.locator(),
+            counter = counter.display()
         ),
     )
     .unwrap();
@@ -463,11 +503,14 @@ routes:
     assert_eq!(
         get(&a, "b.local", "/").await.0,
         404,
-        "a config file's route, alone, takes its own host only"
+        "a config file's routes, alone, take their own hosts only"
     );
-    count_at_once(&a, &b).await;
-    assert_eq!(get(&b, "a.local", "/").await.1, "hits 21\n");
-    assert_eq!(get(&a, "a.local", "/kv/cas-hits").await.1, "20");
+    for host in ["a.local", "g.local"] {
+        count_at_once(&a, &b, host).await;
+        assert_eq!(get(&b, host, "/").await.1, "hits 21\n", "{host}");
+        assert_eq!(get(&a, host, "/kv/cas-hits").await.1, "20", "{host}");
+    }
+    assert!(cluster.calls(0) > 0 && cluster.calls(1) > 0, "round both");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

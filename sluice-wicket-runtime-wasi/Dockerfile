@@ -1,8 +1,8 @@
 # sluice-wicket-runtime-wasi on distroless cc (glibc: wasmtime's many threads allocate through
 # glibc's malloc, not musl's). The proto lives in sluice-proto, the tunnel client in
 # sluice-wicket-tunnel, the OpenID Provider client in sluice-wicket-oidc, the connections in
-# sluice-wicket-server and the console's shared parts in sluice-wicket-console, so the build
-# context is the repository root:
+# sluice-wicket-server, the console's shared parts in sluice-wicket-console and the gemfire
+# keyvalue store in sluice-wicket-keyvalue-gemfire, so the build context is the repository root:
 #   docker build -f sluice-wicket-runtime-wasi/Dockerfile --build-arg GIT_COMMIT=$(git rev-parse HEAD) .
 FROM rust:1.99-slim-trixie AS build
 RUN apt-get update -q && apt-get install -y --no-install-recommends protobuf-compiler \
@@ -19,6 +19,9 @@ COPY sluice-wicket-console/Cargo.toml sluice-wicket-console/
 COPY sluice-wicket-console/src sluice-wicket-console/src
 COPY sluice-wicket-tunnel/Cargo.toml sluice-wicket-tunnel/build.rs sluice-wicket-tunnel/
 COPY sluice-wicket-tunnel/src sluice-wicket-tunnel/src
+COPY sluice-wicket-keyvalue-gemfire/Cargo.toml sluice-wicket-keyvalue-gemfire/build.rs sluice-wicket-keyvalue-gemfire/
+COPY sluice-wicket-keyvalue-gemfire/proto sluice-wicket-keyvalue-gemfire/proto
+COPY sluice-wicket-keyvalue-gemfire/src sluice-wicket-keyvalue-gemfire/src
 COPY sluice-wicket-runtime-wasi/Cargo.toml sluice-wicket-runtime-wasi/Cargo.lock sluice-wicket-runtime-wasi/build.rs sluice-wicket-runtime-wasi/
 COPY sluice-wicket-runtime-wasi/src sluice-wicket-runtime-wasi/src
 # the keyvalue bindings are generated from it

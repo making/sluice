@@ -13,6 +13,10 @@
 !sluice-wicket-tunnel/Cargo.toml
 !sluice-wicket-tunnel/build.rs
 !sluice-wicket-tunnel/src
+!sluice-wicket-keyvalue-gemfire/Cargo.toml
+!sluice-wicket-keyvalue-gemfire/build.rs
+!sluice-wicket-keyvalue-gemfire/proto
+!sluice-wicket-keyvalue-gemfire/src
 !sluice-wicket-runtime-wasi/Cargo.toml
 !sluice-wicket-runtime-wasi/Cargo.lock
 !sluice-wicket-runtime-wasi/build.rs

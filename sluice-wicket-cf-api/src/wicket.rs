@@ -482,7 +482,7 @@ pub struct ListedLeaving {
 #[derive(Deserialize, Clone, Debug, PartialEq)]
 pub struct ListedStore {
     pub name: String,
-    /// `sqlite` or `redis`.
+    /// `sqlite`, `redis` or `gemfire`.
     #[serde(rename = "type")]
     pub kind: String,
     pub default: bool,

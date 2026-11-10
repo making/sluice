@@ -1,0 +1,33 @@
+[package]
+name = "sluice-wicket-keyvalue-gemfire"
+version = "0.0.1-SNAPSHOT"
+edition = "2024"
+publish = false
+
+# The gemfire keyvalue store of sluice-wicket-runtime-wasi (its own workspace), so it is one too.
+[workspace]
+
+[dependencies]
+# the servers' service and the locators' discovery; TLS on the ring provider, as the wickets'
+tonic = { version = "0.14", features = ["tls-ring", "tls-webpki-roots"] }
+tonic-prost = "0.14"
+prost = "0.14"
+# google.protobuf.Any: a discovery response's resources, a value of that type
+prost-types = "0.14"
+# the values: a write failed over to another server sends them again without a copy
+bytes = "1"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
+# a discovery subscription's requests; the mock's listeners
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[features]
+# the mock cluster of the tests: its servers' service and its locator's discovery
+mock = []
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "test-util"] }
+# the certificates of the mock's TLS
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
+
+[build-dependencies]
+tonic-prost-build = "0.14"
