@@ -460,6 +460,15 @@ through the image, and a sluice server on the Mac serving a booted VM and clones
 - **Touching much memory is slow, with or without a snapshot**: a request reading and copying that
   100 MiB heap took 4-14s on a clone, up to 27s on a booted VM; at 300 MiB past 30s on a clone.
 
+- **A guest of more than 1 GiB boots slowly on 4K pages** (2026-11-10, Firecracker's
+  `--no-api` boot of the sample guest, time to `Run /init as init process`): 1.5s at 1024 MiB,
+  10.6s at 1152, 14-19s at 2048, the vCPUs' count no matter; `rodata=off` and
+  `kfence.sample_interval=0` change nothing. Firecracker madvises none of a guest's memory and
+  Ubuntu's transparent huge pages are `madvise`: on `always` (or `huge_pages: 2M`), 0.9-1.0s at
+  2048 and 3072 MiB. A build's VM (2048 MiB) failed its 10s wait for the guest without it;
+  `scripts/lima.sh` sets `always`. A JVM's start stays slow with it (a CNB Spring Boot app at
+  1024 MiB, 164s), so that is another cause.
+
 On a Mac the wicket listens once every VM it restores has booted: 9.6s here with a Node.js image,
 3.7s with a Go one.
 

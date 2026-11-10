@@ -51,6 +51,13 @@ included. The jammy builds with `detector` and `builder` alone in Docker on ever
 host: Java 61s (peak 1.7 GiB with the page cache, `/layers` 786 MiB), Node 12s (484 MiB, 293 MiB),
 Go 24s (827 MiB, 389 MiB).
 
+On arm64 (2026-11-10, an M4 Max in Lima, [On a Mac](../sluice-wicket-runtime-firecracker/README.md#on-a-mac),
+the release wicket, lifecycle 0.21.28 linux.arm64), the same apps with `ubuntu-resolute-builder`'s
+arm64 image, the same egress: the builder's rootfs made in 186s (3465 MiB); built in 11s (Node,
+270 MiB), 13s (Go, 16 MiB, serving `linux/arm64`), 26s (Java, 230 MiB), each served. The Java
+app took 164s to start in its template (`Started HelloApplication in 148.481 seconds`): the
+JVM's start on a Mac, not the build's.
+
 The hosts a build connected to (each on 443, the same with both builders), what `egress` has
 to name:
 

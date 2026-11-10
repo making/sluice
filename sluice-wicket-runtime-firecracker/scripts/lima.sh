@@ -28,6 +28,10 @@ ssh_config=$HOME/.lima/$vm/ssh.config
 # and the OSS cf CLI of sluice-wicket-cf-api's test and the Compose of its README
 limactl shell --workdir / "$vm" bash -c '
   set -euo pipefail
+  # a guest of more than 1 GiB on 4K pages of this VM boots in 10-20s (nested virtualization:
+  # each page a fault of the Mac too), past the wicket'\''s waits; on THP in 1s. Firecracker
+  # madvises none of its memory, and the default is madvise; not kept across a reboot
+  echo always | sudo tee /sys/kernel/mm/transparent_hugepage/enabled >/dev/null
   command -v cf8 >/dev/null || (
     cd "$(mktemp -d)"
     curl -fsSLO https://github.com/cloudfoundry/cli/releases/download/v8.19.0/cf8-cli_8.19.0_linux_arm64.tgz

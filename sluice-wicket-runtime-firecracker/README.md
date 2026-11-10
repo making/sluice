@@ -1189,6 +1189,10 @@ listens at on the VM's loopback (`--listen`, `--console`, or Docker's `-p 127.0.
 forwarded to the Mac's. `lima.sh` starts the VM with `LIMA_SSH_PORT_FORWARDER=true`: Lima's
 default forwarder (2.1.1) leaves the VM's end of a connection open when the Mac's closes, and at
 `--max-connections` of them the listener stops answering. Starting the VM by hand, set it too.
+`lima.sh` also sets the VM's transparent huge pages to `always` at each run: on the 4K pages of
+Ubuntu's `madvise` default (Firecracker madvises none of a guest's memory), a guest of more than
+1 GiB took 10-20s to reach `/init` (1.5s at 1 GiB), past the wicket's waits; a build's VM of
+2048 MiB failed so. On huge pages: about 1s at 2 and 3 GiB.
 
 A Mac's timings say nothing of a real host (see [its findings](../.kb/wicket-firecracker-findings.md#aarch64)).
 The wicket
