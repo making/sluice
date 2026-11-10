@@ -79,8 +79,9 @@ use tokio::time::Instant;
 use crate::logs::Logs;
 use crate::placement::{Budget, Evacuated, Move};
 use crate::services::Offer;
+use crate::staging::Cnb;
 use crate::store::{
-    App, HealthCheck, Lifetime, Outcome, Purge, ReadinessCheck, Removal, State, Store,
+    App, Built, HealthCheck, Lifetime, Outcome, Purge, ReadinessCheck, Removal, State, Store,
 };
 use crate::wicket::{
     AppBody, ComponentRef, Failure, FilesRef, ListedApp, Listing, MadeImage, Runtime, Sandbox,
@@ -186,6 +187,8 @@ pub struct Controller {
     respreading: Mutex<BTreeSet<String>>,
     /// How long a wicket may not answer before it is gone: 0, never.
     away_grace: Duration,
+    /// The builder staging source; None: no source is staged.
+    pub cnb: Option<Cnb>,
     /// The wickets whose last listing failed, by name.
     down: Mutex<BTreeSet<String>>,
     /// The apps whose indices a wicket's stack, newly listed, placed again: their shares are
@@ -195,18 +198,20 @@ pub struct Controller {
 
 impl Controller {
     /// The controller of `wickets`, of which one not answering for `away_grace` is gone (0:
-    /// never).
+    /// never), source staged by `cnb`.
     pub fn new(
         store: Arc<Store>,
         wickets: Vec<Arc<Wicket>>,
         logs: Arc<Logs>,
         away_grace: Duration,
+        cnb: Option<Cnb>,
     ) -> Controller {
         Controller {
             store,
             wickets,
             logs,
             away_grace,
+            cnb,
             down: Mutex::default(),
             held: Mutex::default(),
             shares: Mutex::default(),
@@ -878,8 +883,8 @@ impl Controller {
     }
 
     /// Has `wicket` hold the droplet `sha256` of `app` (the app `guid`'s share): uploaded when the
-    /// cf-api has its bytes, else made again of the image it was pinned from (a wicket's own
-    /// rootfs), logged. A wicket of another guest makes another digest: the droplet and the
+    /// cf-api has its bytes, else made again of the image it was pinned from, or of what
+    /// buildpacks built ([`Controller::make_built`]) (a wicket's own rootfs), logged. A wicket of another guest makes another digest: the droplet and the
     /// running apps are that one's on that wicket from here on ([`crate::store::Droplet::made`]),
     /// on the others as they were; a rebuild of the same image and guest the same.
     async fn provide(
@@ -908,7 +913,7 @@ impl Controller {
             }
             Err(_) => {}
         }
-        let image = self.store.read(|state| {
+        let droplet = self.store.read(|state| {
             // the newest of that digest: an older one's package, and its credentials, may
             // be gone, the same image pushed again
             let droplet = state
@@ -916,6 +921,9 @@ impl Controller {
                 .iter()
                 .rev()
                 .find(|kept| kept.sha256_on(&wicket.name) == sha256)?;
+            if let Some(built) = &droplet.built {
+                return Some(Made::Built(built.clone()));
+            }
             let image = droplet.image.clone()?;
             let credentials = state
                 .packages
@@ -926,18 +934,30 @@ impl Controller {
                     let (username, password) = docker.credentials()?;
                     Some((username.to_string(), password.to_string()))
                 });
-            Some((image, credentials))
+            Some(Made::Image(image, credentials))
         });
-        let Some((image, credentials)) = image else {
-            let e = std::io::Error::from(std::io::ErrorKind::NotFound);
-            return Err(gone(sha256, &path, e));
+        let (made, of) = match droplet {
+            None => {
+                let e = std::io::Error::from(std::io::ErrorKind::NotFound);
+                return Err(gone(sha256, &path, e));
+            }
+            Some(Made::Image(image, credentials)) => {
+                let credentials = credentials
+                    .as_ref()
+                    .map(|(username, password)| (username.as_str(), password.as_str()));
+                (wicket.make_image(&image, credentials, None).await?, image)
+            }
+            Some(Made::Built(built)) => {
+                let of = format!(
+                    "the droplet {} on {}",
+                    &built.layer.sha256[..12],
+                    built.run_image
+                );
+                (self.make_built(wicket, &built).await?, of)
+            }
         };
-        let credentials = credentials
-            .as_ref()
-            .map(|(username, password)| (username.as_str(), password.as_str()));
-        let made = wicket.make_image(&image, credentials).await?;
         let line = format!(
-            "{} made the rootfs of {image} (sha256 {})",
+            "{} made the rootfs of {of} (sha256 {})",
             wicket.sentence(),
             made.sha256.get(..12).unwrap_or(&made.sha256)
         );
@@ -968,6 +988,18 @@ impl Controller {
         image: &str,
         credentials: Option<(&str, &str)>,
     ) -> Result<MadeImage, Failure> {
+        let mut failed = None;
+        for wicket in self.makers() {
+            match wicket.make_image(image, credentials, None).await {
+                Err(e @ Failure::Unreachable(_)) => failed = Some(e),
+                made => return made,
+            }
+        }
+        Err(failed.unwrap_or_else(no_maker))
+    }
+
+    /// The Firecracker wickets a rootfs is made on, a build run on: those as they are meant.
+    pub fn makers(&self) -> Vec<&Arc<Wicket>> {
         let makers: Vec<String> = self.store.read(|state| {
             let runtimes = state.wickets.runtimes.iter();
             runtimes
@@ -975,21 +1007,30 @@ impl Controller {
                 .map(|(name, _)| name.clone())
                 .collect()
         });
-        let mut failed = None;
-        for wicket in (self.wickets.iter())
+        (self.wickets.iter())
             .filter(|wicket| makers.contains(&wicket.name) && self.odd(wicket).is_none())
-        {
-            match wicket.make_image(image, credentials).await {
-                Err(e @ Failure::Unreachable(_)) => failed = Some(e),
-                made => return made,
+            .collect()
+    }
+
+    /// Has `wicket` make the rootfs of what buildpacks built, `built`: the run image with the
+    /// droplet over it, uploaded first where the wicket does not keep it (it built it a
+    /// while ago, or another did). So a droplet is built once, and placed on any wicket.
+    pub async fn make_built(&self, wicket: &Wicket, built: &Built) -> Result<MadeImage, Failure> {
+        let credentials = (self.cnb.as_ref()).and_then(|cnb| cnb.credentials_of(&built.run_image));
+        let layer = built.layer.sha256.as_str();
+        let make =
+            || wicket.make_image(&built.run_image, credentials, Some((layer, &built.launch)));
+        match make().await {
+            Err(Failure::Refused { missing, .. }) if !missing.is_empty() => {
+                let path = self.store.files_path(layer);
+                match tokio::fs::File::open(&path).await {
+                    Ok(tar) => wicket.upload_layer(layer, tar).await?,
+                    Err(e) => return Err(gone(layer, &path, e)),
+                }
+                make().await
             }
+            made => made,
         }
-        Err(failed.unwrap_or_else(|| {
-            Failure::Unreachable(format!(
-                "no wicket of the stack {} configured",
-                Runtime::Firecracker.stack()
-            ))
-        }))
     }
 
     /// Records the outcome of `wicket`'s share, logging it when it changed.
@@ -1803,6 +1844,21 @@ pub async fn stacks_of(wickets: &[Arc<Wicket>]) -> BTreeMap<String, Runtime> {
     listed
         .filter_map(|(wicket, listing)| Some((wicket.name.clone(), listing.ok()?.runtime())))
         .collect()
+}
+
+/// What a wicket makes a droplet's rootfs of ([`Controller::provide`]).
+enum Made {
+    /// An image, with its package's credentials.
+    Image(String, Option<(String, String)>),
+    Built(Built),
+}
+
+/// No wicket makes a rootfs, runs a build.
+pub fn no_maker() -> Failure {
+    Failure::Unreachable(format!(
+        "no wicket of the stack {} configured",
+        Runtime::Firecracker.stack()
+    ))
 }
 
 /// The lock of `key` among `locks`, made if missing.
@@ -2669,6 +2725,7 @@ mod tests {
             ],
             Arc::new(Logs::default()),
             Duration::ZERO,
+            None,
         ));
         tokio::spawn(controller.clone().watch());
         let within = Duration::from_secs(10);

@@ -9,7 +9,7 @@
 //! The guest's output travels on a stream of its own, framed alike ([`LOG_PORT`]), and
 //! so do its egress connections, after their request ([`EGRESS_PORT`]).
 //!
-//! A copy of the wicket's `src/wire.rs` (with its tests): keep them alike.
+//! The guest has a copy of this module (`guest/src/wire.rs`): keep them alike.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -113,12 +113,20 @@ pub async fn send_env<S: AsyncRead + AsyncWrite + Unpin>(
 /// Reads the env stream's JSON (the guest's half); [`answer_env`] answers it.
 #[allow(dead_code)] // the guest's half: each copy has both
 pub async fn read_env<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<Vec<u8>> {
+    read_json(reader, MAX_ENV).await
+}
+
+/// Reads `[len: u32 BE][JSON]`, `max` bytes of it at most.
+pub async fn read_json<R: AsyncRead + Unpin>(
+    reader: &mut R,
+    max: usize,
+) -> std::io::Result<Vec<u8>> {
     let mut len = [0u8; 4];
     reader.read_exact(&mut len).await?;
     let len = u32::from_be_bytes(len) as usize;
-    if len > MAX_ENV {
+    if len > max {
         return Err(std::io::Error::other(format!(
-            "an env of {len} bytes: {MAX_ENV} at most"
+            "a JSON of {len} bytes: {max} at most"
         )));
     }
     let mut json = vec![0u8; len];
@@ -130,6 +138,44 @@ pub async fn read_env<R: AsyncRead + Unpin>(reader: &mut R) -> std::io::Result<V
 #[allow(dead_code)] // the guest's half: each copy has both
 pub async fn answer_env<W: AsyncWrite + Unpin>(writer: &mut W) -> std::io::Result<()> {
     writer.write_all(b"OK\n").await
+}
+
+/// The guest kernel's command line parameter of a build VM: `sluice.stage=1`. Its rootfs is a
+/// Cloud Native Buildpacks builder's, its disk ([`STAGE_DISK`]) the build's scratch; `/init`
+/// starts no process of the image's and serves one build on the stage stream
+/// ([`STAGE_PORT`]). As [`EGRESS_PARAMETER`], no process gets it.
+pub const STAGE_PARAMETER: &str = "sluice.stage";
+
+/// The vsock port of the guest's stage stream, which the wicket dials once `/init` runs:
+///
+/// ```text
+/// wicket: [len: u32 BE][the request, JSON]             guest: OK\n
+/// wicket: [len: u64 BE][the source, a tar]
+///                                                      guest: [len: u32 BE][the result, JSON]
+///                                                      guest: [len: u64 BE][the droplet, a tar]
+/// ```
+///
+/// The request is what the build is given (its env as the env stream's: it may hold
+/// secrets), at most [`MAX_ENV`] bytes; the result ([`MAX_STAGE_RESULT`] at most) says what
+/// the droplet's processes are, or the build's `error`, no droplet following. The phases'
+/// output goes to the log stream as a process's.
+pub const STAGE_PORT: u32 = 1028;
+
+/// Where a build VM's disk is mounted: on `/init`'s tmpfs, the builder's root being
+/// read-only.
+pub const STAGE_DISK: &str = "/tmp/stage";
+
+/// The most a stage stream's result holds.
+#[allow(dead_code)] // the wicket's: each copy has it
+pub const MAX_STAGE_RESULT: usize = 64 * 1024;
+
+/// Writes `[len: u32 BE][json]`, in one write.
+#[allow(dead_code)] // the guest's half: each copy has both
+pub async fn write_json<W: AsyncWrite + Unpin>(writer: &mut W, json: &[u8]) -> std::io::Result<()> {
+    let mut frame = Vec::with_capacity(4 + json.len());
+    frame.extend_from_slice(&(json.len() as u32).to_be_bytes());
+    frame.extend_from_slice(json);
+    writer.write_all(&frame).await
 }
 
 /// The guest kernel's command line parameter naming where `/init` mounts the VM's disk, the
@@ -750,6 +796,15 @@ mod tests {
         let (mut wicket, _guest) = tokio::io::duplex(64);
         let large = vec![b' '; MAX_ENV + 1];
         assert!(send_env(&mut wicket, &large).await.is_err());
+        // a stage stream's result alike, within its own bound
+        let (mut guest, mut wicket) = tokio::io::duplex(64);
+        write_json(&mut guest, b"{}").await.unwrap();
+        assert_eq!(
+            read_json(&mut wicket, MAX_STAGE_RESULT).await.unwrap(),
+            b"{}"
+        );
+        write_json(&mut guest, b"{ }").await.unwrap();
+        assert!(read_json(&mut wicket, 2).await.is_err());
 
         for (text, printed) in [
             ("DB.Internal:5432", "db.internal:5432"),

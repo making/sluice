@@ -140,13 +140,20 @@ impl Disk {
                     failed(e)
                 })
             }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => self.make(),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => self.make(true),
             Err(e) => Err(failed(e)),
         }
     }
 
-    /// Makes the file by a rename: a crash leaves none half made.
-    fn make(&self) -> Result<(), String> {
+    /// Makes the file of a scratch disk, one that goes with its VM: its room is not taken on
+    /// the host before the guest writes (a build's is mostly never written).
+    pub fn make_scratch(&self) -> Result<(), String> {
+        self.make(false)
+    }
+
+    /// Makes the file by a rename: a crash leaves none half made. Its room taken on the host
+    /// to `allocate`.
+    fn make(&self, allocate: bool) -> Result<(), String> {
         let failed = |e: io::Error| format!("{}: {e}", self.file.display());
         let parent = self.file.parent().ok_or("a disk's file has a directory")?;
         std::fs::DirBuilder::new()
@@ -186,7 +193,9 @@ impl Disk {
                     String::from_utf8_lossy(&mkfs.stderr).trim()
                 ));
             }
-            allocate(&file, self.bytes()).map_err(failed)?;
+            if allocate {
+                self::allocate(&file, self.bytes()).map_err(failed)?;
+            }
             std::fs::rename(&partial, &self.file).map_err(failed)
         })();
         if made.is_err() {

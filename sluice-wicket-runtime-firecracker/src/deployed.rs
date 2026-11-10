@@ -52,6 +52,9 @@ const ROOTFS: &str = "rootfs";
 /// What the images being made take, in the directory.
 pub const BUILDS: &str = "builds";
 
+/// The builders' rootfs (`stage`), in the directory.
+pub const BUILDERS: &str = "builders";
+
 /// The apps' disks' directory in the directory: apart from the images', which a
 /// collection empties of what no route names.
 const DISKS: &str = "disks";

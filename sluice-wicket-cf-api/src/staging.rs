@@ -6,6 +6,13 @@
 //! names (`cf push -b`, a manifest's `buildpacks:`) are the only ones detecting, so a site
 //! holding `.wasm` files is one by `-b site`. The droplet keeps its buildpack.
 //!
+//! Where a builder is configured (`--cnb-builder`), any other zip is source its Cloud Native
+//! Buildpacks build (`cnb`, detecting last: the stack `firecracker`), in a microVM of a
+//! Firecracker wicket ([`build`]): the zip goes there as a tar, the build's output comes back
+//! as the staging log, and its droplet -- a tar of what goes over the builder's run image --
+//! is kept here with that image's pinned reference, so every wicket makes the rootfs of it
+//! and none builds it again.
+//!
 //! An image has none: one whose manifest holds a wasm component is pulled (`crate::registry`);
 //! any other is made into a rootfs by a Firecracker wicket, which keeps it (the cf-api the
 //! image's pinned reference, to have it made again). The manifest is read to tell them apart
@@ -26,11 +33,11 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::controller::Controller;
-use crate::logs::Logs;
+use crate::controller::{Controller, no_maker};
+use crate::logs::{Logs, Stream};
 use crate::registry::Registry;
-use crate::store::{DockerImage, Droplet, Files, Package, Store, guid, now};
-use crate::wicket::{Runtime, stacks_named};
+use crate::store::{Blob, Built, DockerImage, Droplet, Files, Package, Spool, Store, guid, now};
+use crate::wicket::{BuildRequest, BuildView, Failure, LayerRef, Runtime, Wicket, stacks_named};
 
 /// A rootfs's file name ends so; a droplet's kind is its file's.
 pub const ROOTFS: &str = ".ext4";
@@ -47,6 +54,37 @@ const SITE_INDEX: &str = "index.html";
 /// What a site's files may unpack to, and how many: the wicket's bounds of a tar.
 const MAX_SITE_BYTES: u64 = 1 << 30;
 const MAX_SITE_FILES: usize = 100_000;
+
+/// What a zip of source may unpack to.
+const MAX_SOURCE_BYTES: u64 = 1 << 30;
+
+/// A link's target in a zip of source at most.
+const MAX_LINK: u64 = 4096;
+
+/// How often in a row a wicket may not answer for its build before the build is given up.
+const FOLLOW_TRIES: u32 = 5;
+
+/// The builder staging source (`--cnb-builder`), and what its builds get.
+#[derive(Clone, Debug)]
+pub struct Cnb {
+    /// The builder image.
+    pub builder: String,
+    /// Its registry's `(username, password)`.
+    pub credentials: Option<(String, String)>,
+    /// The destinations a build may connect to (`--cnb-egress`); none: no network.
+    pub egress: Vec<String>,
+}
+
+impl Cnb {
+    /// The credentials `image` is pulled with: the builder's, where it is of its registry.
+    pub fn credentials_of(&self, image: &str) -> Option<(&str, &str)> {
+        use sluice_wicket_registry::Reference;
+        let registry = |image: &str| Reference::parse(image).ok().map(|image| image.registry);
+        let (username, password) = self.credentials.as_ref()?;
+        (registry(image)? == registry(&self.builder)?)
+            .then_some((username.as_str(), password.as_str()))
+    }
+}
 
 /// What a package's component may unpack to: the largest image a wicket takes. A zip takes
 /// any size down to next to nothing.
@@ -71,17 +109,31 @@ pub enum Buildpack {
     Rootfs,
     /// A static site: its files, served by sluice-wicket-site.
     Site,
+    /// Source, built by a builder's Cloud Native Buildpacks: where one is configured.
+    Cnb,
 }
 
 impl Buildpack {
-    /// All of them, as they detect: a file one stages as it is, before a site.
-    pub const ALL: [Buildpack; 3] = [Buildpack::Wasm, Buildpack::Rootfs, Buildpack::Site];
+    /// All of them, as they detect: a file one stages as it is, before a site, before source.
+    const ALL: [Buildpack; 4] = [
+        Buildpack::Wasm,
+        Buildpack::Rootfs,
+        Buildpack::Site,
+        Buildpack::Cnb,
+    ];
+
+    /// Those there are, as they detect: [`Buildpack::Cnb`] with a builder (`cnb`) alone.
+    pub fn all(cnb: bool) -> Vec<Buildpack> {
+        let there = |buildpack: &Buildpack| cnb || *buildpack != Buildpack::Cnb;
+        Buildpack::ALL.into_iter().filter(there).collect()
+    }
 
     pub fn name(self) -> &'static str {
         match self {
             Buildpack::Wasm => "wasm",
             Buildpack::Rootfs => "rootfs",
             Buildpack::Site => "site",
+            Buildpack::Cnb => "cnb",
         }
     }
 
@@ -89,7 +141,7 @@ impl Buildpack {
     pub fn stack(self) -> Runtime {
         match self {
             Buildpack::Wasm | Buildpack::Site => Runtime::Wasm,
-            Buildpack::Rootfs => Runtime::Firecracker,
+            Buildpack::Rootfs | Buildpack::Cnb => Runtime::Firecracker,
         }
     }
 
@@ -99,6 +151,7 @@ impl Buildpack {
             Buildpack::Wasm => "*.wasm",
             Buildpack::Rootfs => "*.ext4",
             Buildpack::Site => SITE_INDEX,
+            Buildpack::Cnb => "*",
         }
     }
 
@@ -108,6 +161,7 @@ impl Buildpack {
             Buildpack::Wasm => "a wasm component",
             Buildpack::Rootfs => "a rootfs",
             Buildpack::Site => "a static site",
+            Buildpack::Cnb => "source for Cloud Native Buildpacks",
         }
     }
 
@@ -117,6 +171,7 @@ impl Buildpack {
             Buildpack::Wasm => "the package's only .wasm is the component",
             Buildpack::Rootfs => "the package's only .ext4 is the rootfs",
             Buildpack::Site => "an index.html at its root makes it a static site",
+            Buildpack::Cnb => "it is source the builder's buildpacks build",
         }
     }
 
@@ -126,6 +181,7 @@ impl Buildpack {
             Buildpack::Wasm => "no .wasm component",
             Buildpack::Rootfs => "no .ext4 rootfs",
             Buildpack::Site => "no index.html at its root",
+            Buildpack::Cnb => "no file",
         }
     }
 
@@ -142,23 +198,24 @@ impl Buildpack {
         match self {
             Buildpack::Wasm => file.ends_with(".wasm"),
             Buildpack::Rootfs => file.ends_with(ROOTFS),
-            Buildpack::Site => false,
+            Buildpack::Site | Buildpack::Cnb => false,
         }
     }
 
-    /// The buildpacks detecting for an app naming `named`: those, else all of them. A name
-    /// of none fails it, naming them.
-    pub fn named(named: &[String]) -> Result<Vec<Buildpack>, String> {
+    /// The buildpacks detecting for an app naming `named`: those, else all there are
+    /// ([`Buildpack::all`] of `cnb`). A name of none fails it, naming them.
+    pub fn named(named: &[String], cnb: bool) -> Result<Vec<Buildpack>, String> {
+        let all = Buildpack::all(cnb);
         if named.is_empty() {
-            return Ok(Buildpack::ALL.to_vec());
+            return Ok(all);
         }
         let found = |name: &String| {
-            let found = Buildpack::ALL.into_iter().find(|kept| kept.name() == name);
+            let found = all.iter().copied().find(|kept| kept.name() == name);
             found.ok_or_else(|| {
                 format!(
                     "there is no buildpack '{name}' (cf push -b, a manifest's buildpacks): they \
                      are {}",
-                    names(&Buildpack::ALL)
+                    names(&all)
                 )
             })
         };
@@ -176,9 +233,9 @@ fn names(buildpacks: &[Buildpack]) -> String {
 }
 
 /// The buildpack of `detecting` staging a zip of the files `files` for the web process
-/// `command`, and the file it stages as it is (a site has none): the one the command names, by
-/// its path or its file name, else the only one any of them detects, else a site by its
-/// `index.html` at the root.
+/// `command`, and the file it stages as it is (a site and source have none): the one the command
+/// names, by its path or its file name, else the only one any of them detects, else a site by
+/// its `index.html` at the root, else source, whatever it holds.
 pub fn detect(
     files: &[String],
     command: Option<&str>,
@@ -211,6 +268,9 @@ pub fn detect(
         {
             Ok((Buildpack::Site, None))
         }
+        [] if detecting.contains(&Buildpack::Cnb) && !files.is_empty() => {
+            Ok((Buildpack::Cnb, None))
+        }
         [] => {
             let lacking: Vec<_> = detecting.iter().map(|kept| kept.lacking()).collect();
             Err(format!(
@@ -241,6 +301,8 @@ pub struct Staged {
     pub image: Option<String>,
     /// A static site's files, kept already.
     pub files: Option<Files>,
+    /// What buildpacks built, kept already: the rootfs a wicket made of it.
+    pub built: Option<Built>,
     /// What it is staged as: where it runs.
     pub stack: Runtime,
     /// What staged it; none of an image's.
@@ -298,11 +360,14 @@ impl Takes {
 /// with its droplet, or FAILED naming why. A zip is staged by the buildpack detecting it, of
 /// those its app names ([`detect`], for the web process `command`); an image's component is pulled
 /// from its registry with the package's credentials, if any, or its rootfs made by a wicket.
+/// `base` is the API's URL, which a build of source is told (`VCAP_APPLICATION`).
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     store: &Arc<Store>,
     logs: &Logs,
     registry: &Registry,
     controller: &Controller,
+    base: &str,
     build: &str,
     package: &Package,
     command: Option<&str>,
@@ -320,7 +385,7 @@ pub async fn run(
     let (wasm, rootfs) = (takes.may(Runtime::Wasm), takes.may(Runtime::Firecracker));
     let staged = match &package.docker {
         _ if !wasm && !rootfs => Err(takes.nothing()),
-        None => match Buildpack::named(&named) {
+        None => match Buildpack::named(&named, controller.cnb.is_some()) {
             Ok(detecting) => {
                 // told of those whose stack a wicket runs: one of another is refused, detected
                 let told: Vec<Buildpack> = detecting
@@ -338,7 +403,13 @@ pub async fn run(
                     );
                     logs.add(app, "STG", line);
                 }
-                unpack(store.clone(), &package.guid, command, detecting, takes).await
+                match unpack(store.clone(), &package.guid, command, detecting, takes).await {
+                    Ok(Unpacked::Staged(staged)) => Ok(staged),
+                    Ok(Unpacked::Source(source)) => {
+                        self::build(store, logs, controller, base, app, source).await
+                    }
+                    Err(e) => Err(e),
+                }
             }
             Err(e) => Err(e),
         },
@@ -359,7 +430,7 @@ pub async fn run(
                 app,
                 "STG",
                 format!(
-                    "Staged {} ({} bytes, sha256 {}, the stack {}{}){}{}",
+                    "Staged {} ({} bytes, sha256 {}, the stack {}{}){}{}{}",
                     staged.entry,
                     staged.size,
                     &staged.sha256[..12],
@@ -376,6 +447,12 @@ pub async fn run(
                         ", serving the files of a {} byte tar (sha256 {})",
                         files.bytes,
                         &files.sha256[..12]
+                    )),
+                    staged.built.as_ref().map_or(String::new(), |built| format!(
+                        ", the rootfs of a {} byte droplet (sha256 {}) on {}",
+                        built.layer.bytes,
+                        &built.layer.sha256[..12],
+                        built.run_image
                     ))
                 ),
             );
@@ -391,6 +468,7 @@ pub async fn run(
                 image: staged.image,
                 made: Default::default(),
                 files: staged.files,
+                built: staged.built,
                 created_at: at.clone(),
                 updated_at: at.clone(),
             };
@@ -419,13 +497,14 @@ pub async fn run(
 /// Stages the zip of the package `guid`, its droplet made, on a blocking thread: a VM of one
 /// vCPU has one worker, which the API and the watch run on. The buildpack is the one of
 /// `detecting` detecting it ([`detect`]); what `takes` does not is refused before it is unpacked.
+/// Source is packed for its build, not staged yet.
 async fn unpack(
     store: Arc<Store>,
     guid: &str,
     command: Option<&str>,
     detecting: Vec<Buildpack>,
     takes: Takes,
-) -> Result<Staged, String> {
+) -> Result<Unpacked, String> {
     let (guid, command) = (guid.to_string(), command.map(str::to_string));
     tokio::task::spawn_blocking(move || {
         let zip = std::fs::File::open(store.package_path(&guid))
@@ -433,17 +512,309 @@ async fn unpack(
         let mut archive = zip::ZipArchive::new(zip).map_err(|e| format!("not a zip: {e}"))?;
         let (buildpack, entry) = detect(&files(&archive), command.as_deref(), &detecting)?;
         takes.accept(buildpack.stack(), buildpack.what())?;
-        match entry {
+        let staged = match entry {
+            None if buildpack == Buildpack::Cnb => {
+                let (spool, mut tar) = store.spool()?;
+                let (sha256, bytes) = pack_source(&mut archive, &mut tar, MAX_SOURCE_BYTES)?;
+                return Ok(Unpacked::Source(Source {
+                    spool,
+                    sha256,
+                    bytes,
+                }));
+            }
             None => stage_site(&store, &mut archive),
             Some(entry) => store.make_droplet(|droplet| {
                 let staged = stage(&mut archive, buildpack, entry, droplet, MAX_DROPLET_BYTES)?;
                 let sha256 = staged.sha256.clone();
                 Ok((staged, sha256))
             }),
-        }
+        };
+        staged.map(Unpacked::Staged)
     })
     .await
     .map_err(|e| format!("staging: {e}"))?
+}
+
+/// A zip as [`unpack`] leaves it: staged, or source to build.
+enum Unpacked {
+    Staged(Staged),
+    Source(Source),
+}
+
+/// The source of a build: the zip's files as a tar, spooled until the wicket has it.
+struct Source {
+    spool: Spool,
+    sha256: String,
+    bytes: u64,
+}
+
+/// Writes the entries of the zip `archive` to `tar` as a build takes its source: each at its
+/// path below the app's directory, with its mode and time, a directory and a link as they
+/// are, `max` bytes of files at most. A name out of the root fails it. The tar's digest and
+/// size.
+pub fn pack_source<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    tar: &mut impl Write,
+    max: u64,
+) -> Result<(String, u64), String> {
+    let mut builder = tar::Builder::new(Hashed::new(Counted::new(tar)));
+    let mut left = max;
+    for index in 0..archive.len() {
+        let mut file = archive
+            .by_index(index)
+            .map_err(|e| format!("not a zip: {e}"))?;
+        let name = file
+            .name()
+            .map_err(|e| format!("not a zip: {e}"))?
+            .to_string();
+        let Some(path) = file.enclosed_name() else {
+            return Err(format!("'{name}' is no path below the app's directory"));
+        };
+        if path.as_os_str().is_empty() {
+            continue;
+        }
+        let unpacked = |e: std::io::Error| format!("cannot pack {name}: {e}");
+        let mode = file.unix_mode().map(|mode| mode & 0o7777);
+        let mut header = tar::Header::new_gnu();
+        header.set_mtime(file.last_modified().map_or(0, unix_time));
+        header.set_size(0);
+        if file.is_dir() {
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_mode(mode.unwrap_or(0o755));
+            builder
+                .append_data(&mut header, &path, std::io::empty())
+                .map_err(unpacked)?;
+        } else if file.is_symlink() {
+            let mut target = String::new();
+            (&mut file)
+                .take(MAX_LINK)
+                .read_to_string(&mut target)
+                .map_err(unpacked)?;
+            header.set_entry_type(tar::EntryType::Symlink);
+            header.set_mode(0o777);
+            builder
+                .append_link(&mut header, &path, &target)
+                .map_err(unpacked)?;
+        } else {
+            let size = file.size();
+            if size > left {
+                return Err(format!("the source is more than {} MiB", max >> 20));
+            }
+            left -= size;
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_size(size);
+            header.set_mode(mode.unwrap_or(0o644));
+            builder
+                .append_data(&mut header, &path, &mut file)
+                .map_err(unpacked)?;
+        }
+    }
+    let hashed = builder
+        .into_inner()
+        .map_err(|e| format!("cannot pack the source: {e}"))?;
+    let bytes = hashed.out.written;
+    Ok((hashed.finish(), bytes))
+}
+
+/// Builds `source`, the app `app`'s, with the builder's buildpacks on a Firecracker wicket,
+/// the first answering: the source uploaded, the build started with the app's environment
+/// (as at a start: the user's and `VCAP_*`, `base` the API's URL) and followed, each line of
+/// its output a line of the staging log as it comes, its droplet fetched and kept
+/// ([`Built`]), and its rootfs made by that wicket, as an image's is.
+async fn build(
+    store: &Arc<Store>,
+    logs: &Logs,
+    controller: &Controller,
+    base: &str,
+    app: &str,
+    source: Source,
+) -> Result<Staged, String> {
+    let Some(cnb) = &controller.cnb else {
+        return Err("no builder is configured (--cnb-builder)".into());
+    };
+    let env = store
+        .read(|state| Some(crate::env::guest(base, state, state.app(app)?)))
+        .ok_or("the app is gone")?;
+    crate::env::check_guest(&env)?;
+    let credentials = cnb.credentials_of(&cnb.builder);
+    let request = BuildRequest {
+        builder: &cnb.builder,
+        username: credentials.map(|(username, _)| username),
+        password: credentials.map(|(_, password)| password),
+        source: &source.sha256,
+        env: &env,
+        egress: &cnb.egress,
+    };
+    let mut started = Err(no_maker());
+    for wicket in controller.makers() {
+        let tar = tokio::fs::File::open(source.spool.path())
+            .await
+            .map_err(|e| format!("the source: {e}"))?;
+        let uploaded = wicket.upload_layer(&source.sha256, tar).await;
+        started = match uploaded {
+            Ok(()) => wicket.start_build(&request).await,
+            Err(e) => Err(e),
+        }
+        .map(|id| (wicket, id));
+        if !matches!(started, Err(Failure::Unreachable(_))) {
+            break;
+        }
+    }
+    drop(source.spool);
+    let (wicket, id) = started.map_err(|e| e.to_string())?;
+    let line = format!(
+        "Building {} bytes of source (sha256 {}) with {} on {}{}",
+        source.bytes,
+        &source.sha256[..12],
+        cnb.builder,
+        wicket.label,
+        match cnb.egress.as_slice() {
+            [] => String::new(),
+            egress => format!(", reaching {}", egress.join(", ")),
+        }
+    );
+    logs.add(app, "STG", line);
+    let built = follow(logs, wicket, app, &id).await;
+    let staged = match built {
+        Ok(built) => place(store, logs, controller, wicket, app, built).await,
+        Err(e) => Err(e),
+    };
+    // ended already: forgotten, its droplet the wicket's to keep as any upload
+    let _ = wicket.forget_build(&id).await;
+    staged
+}
+
+/// Follows the build `id` on `wicket` to its end, its output the app `app`'s staging log:
+/// what it built, else its error.
+async fn follow(logs: &Logs, wicket: &Wicket, app: &str, id: &str) -> Result<BuildView, String> {
+    let (mut after, mut failed) = (0, 0);
+    loop {
+        let view = match wicket.follow_build(id, after).await {
+            Ok(view) => view,
+            Err(Failure::Unreachable(e)) if failed < FOLLOW_TRIES => {
+                failed += 1;
+                println!(
+                    "[{app}] STG: {} did not answer for the build: {e}",
+                    wicket.label
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                continue;
+            }
+            Err(e) => return Err(format!("the build is lost: {e}")),
+        };
+        failed = 0;
+        after = view.next;
+        for line in &view.lines {
+            let stream = match line.stream.as_str() {
+                "stderr" => Stream::Err,
+                _ => Stream::Out,
+            };
+            logs.add_as(app, "STG", stream, line.line.as_str());
+        }
+        match view.state.as_str() {
+            "building" => {}
+            "built" => return Ok(view),
+            _ => return Err(view.error.unwrap_or_else(|| "the build failed".into())),
+        }
+    }
+}
+
+/// Keeps what the build `view` of `wicket` built, the app `app`'s, and has that wicket make
+/// its rootfs: the droplet staged.
+async fn place(
+    store: &Arc<Store>,
+    logs: &Logs,
+    controller: &Controller,
+    wicket: &Wicket,
+    app: &str,
+    view: BuildView,
+) -> Result<Staged, String> {
+    let (Some(layer), Some(run_image), Some(launch)) = (view.droplet, view.run_image, view.launch)
+    else {
+        return Err("the build answered no droplet".into());
+    };
+    fetch(store, wicket, &layer).await?;
+    let built = Built {
+        run_image,
+        layer: Files {
+            sha256: layer.sha256,
+            bytes: layer.bytes,
+        },
+        launch,
+    };
+    let line = format!(
+        "{} is making a rootfs of the droplet ({} bytes, sha256 {}) on {}",
+        wicket.sentence(),
+        built.layer.bytes,
+        &built.layer.sha256[..12],
+        built.run_image
+    );
+    logs.add(app, "STG", line);
+    match controller.make_built(wicket, &built).await {
+        Ok(made) => Ok(Staged {
+            entry: made.name,
+            bytes: Vec::new(),
+            size: made.bytes,
+            sha256: made.sha256,
+            image: None,
+            files: None,
+            built: Some(built),
+            stack: Runtime::Firecracker,
+            buildpack: Some(Buildpack::Cnb),
+        }),
+        Err(e) => {
+            // kept for nothing, unless a droplet of the same build names it
+            let layer = &built.layer.sha256;
+            let named = |kept: &Droplet| {
+                (kept.built.as_ref()).is_some_and(|kept| kept.layer.sha256 == *layer)
+            };
+            if !store.read(|state| state.droplets.iter().any(named)) {
+                store.delete(&[Blob::Files(layer.clone())]);
+            }
+            Err(format!("{}: {e}", built.run_image))
+        }
+    }
+}
+
+/// Fetches the droplet `layer` from `wicket`, which built it, a piece at a time, and keeps it
+/// under its digest, checked.
+async fn fetch(store: &Store, wicket: &Wicket, layer: &LayerRef) -> Result<(), String> {
+    use tokio::io::AsyncWriteExt as _;
+    if layer.sha256.len() != 64 || !layer.sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(format!("the droplet's digest is none: {}", layer.sha256));
+    }
+    if layer.bytes > MAX_DROPLET_BYTES {
+        return Err(format!(
+            "the droplet is more than {} MiB",
+            MAX_DROPLET_BYTES >> 20
+        ));
+    }
+    let (spool, file) = store.spool()?;
+    let mut file = tokio::fs::File::from_std(file);
+    let unwritten = |e: std::io::Error| format!("the droplet: {e}");
+    let mut hasher = Sha256::new();
+    let mut at = 0;
+    while at < layer.bytes {
+        let (bytes, piece) = wicket
+            .layer_piece(&layer.sha256, at)
+            .await
+            .map_err(|e| format!("the droplet: {e}"))?;
+        if bytes != layer.bytes || piece.is_empty() || at + piece.len() as u64 > bytes {
+            return Err(format!(
+                "the droplet is not the {} bytes the build answered",
+                layer.bytes
+            ));
+        }
+        hasher.update(&piece);
+        file.write_all(&piece).await.map_err(unwritten)?;
+        at += piece.len() as u64;
+    }
+    file.flush().await.map_err(unwritten)?;
+    drop(file);
+    if hex(&hasher.finalize()) != layer.sha256 {
+        return Err("the droplet is not of the digest the build answered".into());
+    }
+    store.keep_files(&layer.sha256, spool.path())
 }
 
 /// The files of `archive`, by name.
@@ -475,6 +846,7 @@ fn stage_site<R: Read + Seek>(
             sha256: packed.sha256,
             bytes: packed.bytes,
         }),
+        built: None,
         stack: Runtime::Wasm,
         buildpack: Some(Buildpack::Site),
     })
@@ -666,6 +1038,7 @@ async fn image(
                 sha256: pulled.sha256,
                 image: Some(pulled.image),
                 files: None,
+                built: None,
                 stack: Runtime::Wasm,
                 buildpack: None,
             });
@@ -691,6 +1064,7 @@ async fn image(
             sha256: made.sha256,
             image: Some(made.image),
             files: None,
+            built: None,
             stack: Runtime::Firecracker,
             buildpack: None,
         })
@@ -719,7 +1093,12 @@ pub fn stage<R: Read + Seek>(
     match buildpack {
         Buildpack::Rootfs => check_rootfs(&entry, &head)?,
         Buildpack::Wasm => check_component(&entry, &head)?,
-        Buildpack::Site => return Err(format!("{entry} is no file a site is staged of")),
+        Buildpack::Site | Buildpack::Cnb => {
+            return Err(format!(
+                "{entry} is no file {} is staged of",
+                buildpack.what()
+            ));
+        }
     }
     let unwritten = |e: std::io::Error| format!("writing {entry}: {e}");
     let mut hashed = Hashed::new(droplet);
@@ -745,6 +1124,7 @@ pub fn stage<R: Read + Seek>(
         bytes: Vec::new(),
         image: None,
         files: None,
+        built: None,
         stack: buildpack.stack(),
         buildpack: Some(buildpack),
     })
@@ -865,7 +1245,7 @@ mod tests {
     }
 
     fn staged(zip: &[u8], command: Option<&str>, max: u64) -> Result<(Staged, Vec<u8>), String> {
-        staged_by(zip, command, max, &Buildpack::ALL, None)
+        staged_by(zip, command, max, &Buildpack::all(false), None)
     }
 
     #[test]
@@ -950,7 +1330,7 @@ mod tests {
                 pin,
                 stacks: stacks.to_vec(),
             };
-            let staged = staged_by(zip, None, 1 << 20, &Buildpack::ALL, Some(&takes));
+            let staged = staged_by(zip, None, 1 << 20, &Buildpack::all(false), Some(&takes));
             match refused {
                 None => assert!(staged.is_ok(), "{takes:?}: {staged:?}"),
                 Some(why) => {
@@ -1003,10 +1383,13 @@ mod tests {
             ("docs/.secret", b"x"),
             ("manifest.yml", b"env: {SECRET: x}"),
         ];
-        let detected = |entries: &[(&str, &[u8])], command, named: &[&str]| {
+        let detected_with = |cnb: bool, entries: &[(&str, &[u8])], command, named: &[&str]| {
             let named: Vec<String> = named.iter().map(|name| name.to_string()).collect();
-            let detecting = Buildpack::named(&named)?;
+            let detecting = Buildpack::named(&named, cnb)?;
             detect(&files(&archive(zipped(entries))), command, &detecting)
+        };
+        let detected = |entries: &[(&str, &[u8])], command, named: &[&str]| {
+            detected_with(false, entries, command, named)
         };
         assert_eq!(detected(&entries, None, &[]), Ok((Buildpack::Site, None)));
         // the buildpacks the app names are the only ones detecting: a site holding a .wasm is
@@ -1036,6 +1419,72 @@ mod tests {
             let why = detected(&both, command, named).unwrap_err();
             assert!(why.contains(refused), "{named:?}: {why}");
         }
+        // with a builder, source is what nothing else detects: last, or by its name; its
+        // files a tar at their paths, modes and links kept
+        let source = [("pom.xml", &b"<project/>"[..]), ("src/Main.java", b"class")];
+        assert!(
+            detected(&source, None, &[])
+                .unwrap_err()
+                .contains("no index.html at its root (found: pom.xml, src/Main.java)")
+        );
+        assert!(
+            detected(&source, None, &["cnb"])
+                .unwrap_err()
+                .contains("no buildpack 'cnb'")
+        );
+        assert_eq!(
+            detected_with(true, &source, None, &[]),
+            Ok((Buildpack::Cnb, None))
+        );
+        assert_eq!(detected_with(true, &both, None, &[]), component);
+        assert_eq!(
+            detected_with(true, &entries, None, &[]),
+            Ok((Buildpack::Site, None))
+        );
+        assert_eq!(
+            detected_with(true, &entries, None, &["cnb"]),
+            Ok((Buildpack::Cnb, None))
+        );
+        assert_eq!(Buildpack::Cnb.stack(), Firecracker);
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default();
+        zip.add_directory("bin/", options).unwrap();
+        zip.start_file("bin/run", options.unix_permissions(0o755))
+            .unwrap();
+        zip.write_all(b"#!/bin/sh").unwrap();
+        zip.add_symlink("latest", "bin/run", options).unwrap();
+        let zip = zip.finish().unwrap().into_inner();
+        let mut tar = Vec::new();
+        let (digest, bytes) = pack_source(&mut archive(zip.clone()), &mut tar, 1 << 20).unwrap();
+        assert_eq!((digest, bytes), (sha256(&tar), tar.len() as u64));
+        let mut unpacked = tar::Archive::new(&tar[..]);
+        let packed: Vec<(String, u32, Option<String>)> = unpacked
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                let link = entry.link_name().unwrap();
+                (
+                    entry.path().unwrap().to_string_lossy().into_owned(),
+                    entry.header().mode().unwrap(),
+                    link.map(|link| link.to_string_lossy().into_owned()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            packed,
+            [
+                ("bin".to_string(), 0o755, None),
+                ("bin/run".into(), 0o755, None),
+                ("latest".into(), 0o777, Some("bin/run".into()))
+            ]
+        );
+        assert!(
+            pack_source(&mut archive(zip), &mut Vec::new(), 4)
+                .unwrap_err()
+                .contains("the source is more than")
+        );
+
         let pack = |entries: &[(&str, &[u8])], max| {
             let mut tar = Vec::new();
             pack_site(&mut archive(zipped(entries)), &mut tar, max).map(|packed| (packed, tar))

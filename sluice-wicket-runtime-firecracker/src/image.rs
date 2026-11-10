@@ -4,11 +4,15 @@
 //! wicket's own guest as `/init`, so it is of the wicket's version and arch. It is kept as
 //! an upload, for an app to name by its digest. The manifest's digest pins it: the same
 //! manifest and guest make the same bytes, a rebuild the digest the first build had.
+//!
+//! A droplet (`stage`) is served so too: its tar laid over the layers of its run image
+//! (`layers`), what it runs over the image's config (`launch`).
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 use sluice_wicket_console::http::Received;
@@ -34,7 +38,7 @@ const CONFIG_TYPES: &str =
 const LAYER_TYPES: &str = "application/vnd.oci.image.layer.v1.tar+gzip, application/vnd.oci.image.layer.v1.tar, application/vnd.docker.image.rootfs.diff.tar.gzip, application/vnd.docker.image.rootfs.diff.tar";
 
 /// The platform the wicket's VMs run: a VM's arch is its host's.
-const ARCHITECTURE: &str = if cfg!(target_arch = "x86_64") {
+pub const ARCHITECTURE: &str = if cfg!(target_arch = "x86_64") {
     "amd64"
 } else {
     "arm64"
@@ -53,6 +57,10 @@ pub struct Images {
     /// Below which each build has a directory of its own, on the file system the images are
     /// kept on.
     pub work: PathBuf,
+    /// Where the builders' rootfs are kept (`stage`).
+    pub builders: PathBuf,
+    /// One builder's rootfs made at a time.
+    pub making: tokio::sync::Mutex<()>,
 }
 
 /// What `PUT /api/images` asks for.
@@ -62,6 +70,62 @@ pub struct Request {
     /// The process's port; None: the one the image exposes, else [`DEFAULT_PORT`].
     pub port: Option<u16>,
     pub restore: Vec<String>,
+    /// Tars laid over the image's layers, in order, each with its sha256: a droplet's.
+    pub layers: Vec<(PathBuf, String)>,
+    /// What runs, over the image's config.
+    pub launch: Option<Over>,
+}
+
+/// What runs in an image whose layers are not all its own, over its config: a droplet's
+/// launch, as a build answers it (`stage`).
+#[derive(Deserialize, Serialize, Clone, Debug, Default, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct Over {
+    pub entrypoint: Vec<String>,
+    /// `NAME=value`, over the image's of that name.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// Directories before the image's `PATH`.
+    #[serde(default)]
+    pub path: Vec<String>,
+    /// Empty: the image's.
+    #[serde(default)]
+    pub workdir: String,
+}
+
+impl Over {
+    /// `config` with what it says over it.
+    fn over(&self, mut config: ImageConfig) -> ImageConfig {
+        config.entrypoint = self.entrypoint.clone();
+        config.cmd.clear();
+        let name = |pair: &str| pair.split('=').next().unwrap_or_default().to_string();
+        let given: Vec<String> = self.env.iter().map(|pair| name(pair)).collect();
+        config.env.retain(|pair| !given.contains(&name(pair)));
+        config.env.extend(self.env.iter().cloned());
+        if !self.path.is_empty() {
+            let mut path = self.path.join(":");
+            match config.env.iter_mut().find(|pair| pair.starts_with("PATH=")) {
+                Some(pair) => {
+                    path.push(':');
+                    pair.insert_str("PATH=".len(), &path);
+                }
+                None => config.env.push(format!("PATH={path}")),
+            }
+        }
+        if !self.workdir.is_empty() {
+            config.workdir = self.workdir.clone();
+        }
+        config
+    }
+}
+
+/// An image as its registry has it for the wicket's platform.
+pub struct Inspected {
+    /// The reference given, pinned to the manifest's digest.
+    pub image: String,
+    /// The manifest's digest.
+    pub digest: String,
+    pub config: Value,
 }
 
 /// An image made, received as an upload is.
@@ -87,6 +151,25 @@ impl Images {
             })
     }
 
+    /// What the registry has as `image`, nothing of its layers pulled.
+    pub async fn inspect(
+        &self,
+        image: &str,
+        credentials: Option<&(String, String)>,
+    ) -> Result<Inspected, String> {
+        let reference = Reference::parse(image)?;
+        let credentials =
+            credentials.map(|(username, password)| (username.as_str(), password.as_str()));
+        let mut session = self.registry.session(&reference, credentials);
+        let (digest, manifest) = manifest(&mut session, &reference).await?;
+        let config = config(&mut session, &manifest).await?;
+        Ok(Inspected {
+            image: pinned_reference(image, &reference, &digest),
+            digest,
+            config,
+        })
+    }
+
     async fn pull_and_build(&self, request: Request) -> Result<Built, String> {
         let reference = Reference::parse(&request.image)?;
         let credentials = request
@@ -95,9 +178,14 @@ impl Images {
             .map(|(username, password)| (username.as_str(), password.as_str()));
         let mut session = self.registry.session(&reference, credentials);
         let (pinned, manifest) = manifest(&mut session, &reference).await?;
+        let digest = pinned.clone();
         let config = config(&mut session, &manifest).await?;
         let port = request.port.unwrap_or_else(|| exposed(&config));
         let config = image_config(&config);
+        let config = match &request.launch {
+            Some(over) => over.over(config),
+            None => config,
+        };
 
         let work = Work::new(&self.work)?;
         let mut layers = Vec::new();
@@ -105,6 +193,16 @@ impl Images {
             let path = work.path.join(format!("layer-{n}"));
             pull_layer(&mut session, &layer, &path, self.limit).await?;
             layers.push((path, layer.gzip));
+        }
+        // what else decides the image's bytes
+        let mut pinned = pinned;
+        for (path, sha256) in request.layers {
+            layers.push((path, false));
+            pinned.push_str(&format!("+{sha256}"));
+        }
+        if let Some(over) = &request.launch {
+            let over = serde_json::to_string(over).map_err(|e| e.to_string())?;
+            pinned.push_str(&format!("+{over}"));
         }
 
         let name = format!(
@@ -124,15 +222,19 @@ impl Images {
         })
         .await
         .map_err(|e| e.to_string())??;
-        let image = match &reference.digest {
-            Some(_) => request.image,
-            None => format!("{}@{pinned}", request.image),
-        };
         Ok(Built {
-            image,
+            image: pinned_reference(&request.image, &reference, &digest),
             name,
             received: Received::adopt(received.0, received.1, received.2),
         })
+    }
+}
+
+/// `image` pinned to its manifest's `digest`, as given when it names one.
+fn pinned_reference(image: &str, reference: &Reference, digest: &str) -> String {
+    match &reference.digest {
+        Some(_) => image.to_string(),
+        None => format!("{image}@{digest}"),
     }
 }
 
@@ -424,6 +526,32 @@ mod tests {
             (&launch.user[..], &launch.workdir[..]),
             ("cnb", "/workspace")
         );
+
+        // a droplet's launch over it: its entrypoint alone, its env over the image's, its
+        // directories before the image's PATH
+        let mut image = image_config(&config);
+        image.cmd = vec!["serve".into()];
+        image.env.push("PATH=/usr/bin".into());
+        let over = Over {
+            entrypoint: vec!["/cnb/process/web".into()],
+            env: vec!["CNB_APP_DIR=/app".into(), "CNB_LAYERS_DIR=/layers".into()],
+            path: vec!["/cnb/process".into(), "/cnb/lifecycle".into()],
+            workdir: String::new(),
+        };
+        let over = over.over(image);
+        assert_eq!(
+            (&over.entrypoint[..], over.cmd.len()),
+            (&["/cnb/process/web".to_string()][..], 0)
+        );
+        assert_eq!(
+            over.env,
+            [
+                "PATH=/cnb/process:/cnb/lifecycle:/usr/bin",
+                "CNB_APP_DIR=/app",
+                "CNB_LAYERS_DIR=/layers"
+            ]
+        );
+        assert_eq!(over.workdir, "/workspace");
 
         let digest = format!("sha256:{}", "ab".repeat(32));
         let layer =

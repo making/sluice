@@ -35,6 +35,9 @@
 //! port (`wire::DISK_QUESTION`) and starts no process. A stop notice on that port
 //! (`wire::parse_stop`) ends the process and writes all out before the wicket kills the VM.
 //! Hello mode's `/disk` reads and writes it.
+//!
+//! A build's VM (`wire::STAGE_PARAMETER`) starts neither: its rootfs is a Cloud Native
+//! Buildpacks builder's, and /init runs one build of the source the wicket sends (`stage`).
 
 use std::convert::Infallible;
 use std::ffi::CString;
@@ -61,6 +64,7 @@ use wire::Stream;
 mod egress;
 mod log;
 mod reaper;
+mod stage;
 mod wire;
 
 const VSOCK_PORT: u32 = 8080;
@@ -115,7 +119,7 @@ static DISK: OnceLock<Result<String, String>> = OnceLock::new();
 /// The process to run, from the image's config.
 #[derive(Deserialize)]
 struct Launch {
-    /// Entrypoint followed by Cmd.
+    /// Entrypoint followed by Cmd; a builder's may name nothing.
     argv: Vec<String>,
     /// `NAME=value`, the image's Env.
     env: Vec<String>,
@@ -139,6 +143,8 @@ fn main() {
     egress.name();
     mount("tmpfs", "/tmp", "tmpfs", 0);
     mount("tmpfs", "/dev/shm", "tmpfs", 0);
+    // a process opening a terminal of its own (`/dev/ptmx`) needs it mounted
+    mount("devpts", "/dev/pts", "devpts", 0);
     link_standard_fds();
     let mut launch = std::fs::read(LAUNCH_CONFIG).ok().map(|json| {
         serde_json::from_slice::<Launch>(&json).unwrap_or_else(|e| {
@@ -149,6 +155,9 @@ fn main() {
     let env_given = cmdline
         .split_whitespace()
         .any(|parameter| parameter == format!("{}=1", wire::ENV_PARAMETER));
+    let staging = cmdline
+        .split_whitespace()
+        .any(|parameter| parameter == format!("{}=1", wire::STAGE_PARAMETER));
     let disk = cmdline.split_whitespace().find_map(|parameter| {
         parameter
             .strip_prefix(wire::DISK_PARAMETER)?
@@ -196,7 +205,11 @@ fn main() {
             );
         }
         // before the process starts: it may connect at once
-        let port_held = egress.listen(launch.as_ref().map(|launch| launch.port), &log);
+        let own = launch
+            .as_ref()
+            .filter(|_| !staging)
+            .map(|launch| launch.port);
+        let port_held = egress.listen(own, &log);
         let hook = launch.as_ref().map(|launch| Hook {
             argv: launch.restore.clone(),
             env: launch.env.clone(),
@@ -209,6 +222,20 @@ fn main() {
         if DISK.get().is_some_and(Result::is_err) {
             // no process without its disk: the wicket asks why
             std::future::pending::<()>().await;
+        }
+        if staging {
+            let Some(launch) = launch else {
+                return Err(std::io::Error::other(format!(
+                    "a build's VM without {LAUNCH_CONFIG}: its rootfs is no builder's"
+                )));
+            };
+            std::thread::spawn(|| REAPER.run(|_, _| {}));
+            let builder = stage::Builder {
+                uid: launch.uid,
+                gid: launch.gid,
+                env: launch.env,
+            };
+            return stage::serve(builder, log).await;
         }
         if port_held {
             // no process: the wicket would take /init's listener for it
@@ -464,11 +491,80 @@ fn loopback_up() -> std::io::Result<()> {
     }
 }
 
+/// Where a container finds its cgroup, and the image's process its own.
+const CGROUP: &str = "/sys/fs/cgroup";
+
+/// Gives the image's process a cgroup as a container has one: cgroup v2 at [`CGROUP`], the
+/// process's own as its root, its memory bound the VM's. A runtime sizing itself reads it
+/// there (`memory.max`: a buildpack's helper fails the launch without the file). The kernel's
+/// root cgroup has no such file, so the process's is bound over the mount, as a runtime
+/// without cgroup namespaces does it.
+fn cgroup() -> std::io::Result<()> {
+    let options: Option<&str> = None;
+    stage::mount("cgroup2", CGROUP, "cgroup2", options)?;
+    let root = std::path::Path::new(CGROUP);
+    // the controllers the kernel has: one missing leaves the others
+    for controller in ["+memory", "+cpu", "+pids"] {
+        let _ = std::fs::write(root.join("cgroup.subtree_control"), controller);
+    }
+    let own = root.join("app");
+    std::fs::create_dir(&own)?;
+    let total = std::fs::read_to_string("/proc/meminfo")?
+        .lines()
+        .find_map(|line| line.strip_prefix("MemTotal:")?.trim().strip_suffix("kB"))
+        .and_then(|kib| kib.trim().parse::<u64>().ok());
+    if let Some(kib) = total {
+        std::fs::write(own.join("memory.max"), (kib * 1024).to_string())?;
+    }
+    let (source, target) = (
+        CString::new(own.as_os_str().as_encoded_bytes())?,
+        CString::new(CGROUP)?,
+    );
+    // SAFETY: NUL-terminated paths, a bind of a directory over its parent's mount
+    let bound = unsafe {
+        libc::mount(
+            source.as_ptr(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    };
+    match bound {
+        0 => Ok(()),
+        _ => Err(std::io::Error::last_os_error()),
+    }
+}
+
+/// Moves the calling process into the cgroup bound at [`CGROUP`]: before it execs, in a
+/// `pre_exec`.
+fn enter_cgroup() {
+    // SAFETY: open, write and close of a NUL-terminated path are async-signal-safe; `0`
+    // names the writer
+    unsafe {
+        let fd = libc::open(c"/sys/fs/cgroup/cgroup.procs".as_ptr(), libc::O_WRONLY);
+        if fd >= 0 {
+            libc::write(fd, c"0".as_ptr().cast(), 1);
+            libc::close(fd);
+        }
+    }
+}
+
 /// Launcher mode: starts the image's process, its output to `log`.
 fn start(launch: Launch, log: &Arc<Log>) -> std::io::Result<()> {
     let hostname = c"sluice";
     // SAFETY: a NUL-terminated name and its length
     unsafe { libc::sethostname(hostname.as_ptr(), hostname.to_bytes().len()) };
+    let contained = match cgroup() {
+        Ok(()) => true,
+        Err(e) => {
+            log.line(
+                Stream::Stderr,
+                format!("guest: no cgroup for the process ({CGROUP}): {e}").as_bytes(),
+            );
+            false
+        }
+    };
     let Some((program, args)) = launch.argv.split_first() else {
         return Err(std::io::Error::other("init.json: empty argv"));
     };
@@ -492,6 +588,9 @@ fn start(launch: Launch, log: &Arc<Log>) -> std::io::Result<()> {
             // before setuid, while it may: the pipes are the process's to open by path
             chown_fd(1, uid)?;
             chown_fd(2, uid)?;
+            if contained {
+                enter_cgroup();
+            }
             if libc::setgroups(0, std::ptr::null()) != 0
                 || libc::setgid(gid) != 0
                 || libc::setuid(uid) != 0

@@ -17,7 +17,10 @@
 //! DELETE /api/routes/<host>                     removes the console's route
 //! PUT    /api/components/<sha256>               keeps the body, an ext4 image, under its digest
 //! PUT    /api/images                            makes an ext4 image of the OCI image the body
-//!                                               (JSON) names (`--guest`), kept under its digest
+//!                                               (JSON) names (`--guest`), kept under its digest;
+//!                                               with `layers` and `launch`, of a droplet on it
+//! PUT    /api/layers/<sha256>, POST /api/builds source staged by buildpacks into a droplet
+//!                                               (`stage`, `--guest`)
 //! GET    /api/apps[?after=<revision>]           the apps, as `/api/routes`
 //! PUT    /api/apps/<name>                       serves the app the body (JSON) has
 //! DELETE /api/apps/<name>?owner=<owner>         removes the app
@@ -80,6 +83,7 @@ use crate::deployed::{self, AppSpec};
 use crate::image::{self, Images};
 use crate::route::RouteSpec;
 use crate::routes::{Edit, Outcome, Refused, Request, Table};
+use crate::stage::{self, Builds};
 
 /// Largest image an upload may carry.
 pub const MAX_ROOTFS_BYTES: u64 = 4 << 30;
@@ -95,6 +99,9 @@ const MAX_APP_BYTES: usize = 1 << 20;
 
 /// What the listings say the wicket runs: what its apps' sandboxes hold.
 const RUNTIME: &str = "firecracker";
+
+/// What a wicket without `--guest` answers for what needs it.
+const NO_GUEST: &str = "this wicket makes no images: it needs --guest, /init of the images";
 
 const INDEX: &str = include_str!("console/index.html");
 const SCRIPT: &str = include_str!("console/console.js");
@@ -113,7 +120,9 @@ pub struct Console {
     /// Where an upload is received: the images' directory.
     pub intake: PathBuf,
     /// With `--guest`: what `PUT /api/images` makes images with.
-    pub images: Option<Images>,
+    pub images: Option<Arc<Images>>,
+    /// With `--guest`: the builds, and the layers they take and make.
+    pub builds: Option<Arc<Builds>>,
     /// Jail mode: a route may take `cpu`.
     pub jailed: bool,
     /// What the page shows besides the routes.
@@ -146,6 +155,23 @@ impl Service for Console {
             return match *method {
                 Method::PUT => self.make_image(parts, take()).await,
                 _ => error(StatusCode::METHOD_NOT_ALLOWED, "/api/images takes PUT"),
+            };
+        }
+        let staged = path
+            .strip_prefix("/api/builds")
+            .filter(|rest| rest.is_empty() || rest.starts_with('/'));
+        if let Some(rest) = staged {
+            return match &self.builds {
+                Some(builds) => builds.handle(rest, parts, body.take()).await,
+                None => error(StatusCode::UNPROCESSABLE_ENTITY, NO_GUEST),
+            };
+        }
+        if let Some(sha256) = path.strip_prefix("/api/layers/") {
+            return match (&self.builds, method) {
+                (None, _) => error(StatusCode::UNPROCESSABLE_ENTITY, NO_GUEST),
+                (Some(builds), &Method::PUT) => builds.put_layer(sha256, parts, take()).await,
+                (Some(builds), &Method::GET) => builds.get_layer(sha256, query).await,
+                _ => error(StatusCode::METHOD_NOT_ALLOWED, "a layer takes PUT or GET"),
             };
         }
         if let Some(host) = path.strip_prefix("/api/routes/") {
@@ -384,11 +410,8 @@ impl Console {
     /// Makes the image the body names, kept as if uploaded: its digest is what an app
     /// names. Held until it is made: minutes, for a large one.
     async fn make_image(&self, parts: &Parts, body: Body) -> Response {
-        let Some(images) = &self.images else {
-            return error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "this wicket makes no images: it needs --guest, /init of the images",
-            );
+        let (Some(images), Some(builds)) = (&self.images, &self.builds) else {
+            return error(StatusCode::UNPROCESSABLE_ENTITY, NO_GUEST);
         };
         let too_large = format!("a request is {} KiB at most", MAX_APP_BYTES >> 10);
         let body = match read(parts, body, MAX_APP_BYTES, &too_large).await {
@@ -406,11 +429,22 @@ impl Console {
                 return error(StatusCode::BAD_REQUEST, "username and password go together");
             }
         };
+        let layers = body
+            .layers
+            .iter()
+            .map(|sha256| stage::kept_layer(builds, sha256))
+            .collect::<Result<Vec<_>, _>>();
+        let layers = match layers {
+            Ok(layers) => layers,
+            Err(refused) => return refused.into(),
+        };
         let request = image::Request {
             image: body.image,
             credentials,
             port: body.port,
             restore: body.restore,
+            layers,
+            launch: body.launch,
         };
         let built = match images.build(request).await {
             Ok(built) => built,
@@ -751,6 +785,12 @@ struct ImageBody {
     /// The restore hook's argv, run in each clone before it serves.
     #[serde(default)]
     restore: Vec<String>,
+    /// The digests of the layers kept (`PUT /api/layers/<sha256>`) laid over the image's, in
+    /// order: a droplet on its run image.
+    #[serde(default)]
+    layers: Vec<String>,
+    /// What runs, over the image's config: a build's `launch`.
+    launch: Option<image::Over>,
 }
 
 /// What it answers: the reference pinned to its manifest's digest, and what an app

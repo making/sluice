@@ -26,8 +26,11 @@
 //! environment seen from the VM, its connections through the security groups, a scale keeping
 //! the VMs running, each
 //! mode and lifetime by annotation, a VM per connection warned of and finding no room, a scale
-//! to 0, a rootfs of a zip, the wicket's
-//! directory lost and the image's rootfs made again, of the digest it had; then the
+//! to 0, a rootfs of a zip, source staged by a builder's buildpacks (a sample one, with the
+//! lifecycle of `SLUICE_CNB_LIFECYCLE`, else `~/.local/cnb/lifecycle`) in a VM of the wicket,
+//! its droplet kept by the cf-api, the wicket's
+//! directory lost and the rootfs of the image and of that droplet made again, of the digest
+//! the image's had, a second wicket making its own of both; then the
 //! cf-api itself an app of that wicket, in a VM with a disk, the flume and a provider
 //! through its egress: refused with no word on who logs in, its apps and logins kept
 //! across a restart of the VM, a wicket killed right after a push and an upgrade.
@@ -2396,6 +2399,20 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     });
     let manifest = registry.push_image("private/sample", "1", &config, &[base, app]);
     let image = format!("{}/private/sample:1", registry.address);
+    // a builder of one buildpack, where there is a lifecycle
+    let builder = cnb_lifecycle().map(|lifecycle| cnb_builder(&registry, &lifecycle, &guest));
+    if builder.is_none() {
+        eprintln!(
+            "skipped: source staged by buildpacks needs the lifecycle and launcher binaries \
+             (SLUICE_CNB_LIFECYCLE, else ~/.local/cnb/lifecycle)"
+        );
+    }
+    let mut cnb = Vec::new();
+    if let Some(builder) = &builder {
+        cnb.extend_from_slice(&["--cnb-builder", builder, "--cnb-builder-username", "robot"]);
+        cnb.extend_from_slice(&["--cnb-builder-password", "p4ss"]);
+        cnb.extend_from_slice(&["--cnb-egress", "localhost:9"]);
+    }
 
     let flume = Process::spawn(
         &flume_binary(),
@@ -2459,10 +2476,14 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         &flume_url,
         &dir.join("cf"),
         &[
-            "--any-credentials",
-            "--security-group-editor",
-            "user_name=me",
-        ],
+            &[
+                "--any-credentials",
+                "--security-group-editor",
+                "user_name=me",
+            ],
+            &cnb[..],
+        ]
+        .concat(),
     );
     let cf = Cf {
         cli: cf_cli(),
@@ -3262,6 +3283,62 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     ]);
     assert!(pushed.contains(per_connection), "{pushed}");
 
+    // source: staged by the builder's buildpacks in a VM of the wicket, with the app's
+    // environment, the build's output the staging log; what it built runs on the builder's
+    // run image, as its user, the launcher starting the process the buildpack named
+    if builder.is_some() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let source = dir.join("source");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::write(source.join("sample.app"), b"an app").unwrap();
+        let mode = std::fs::Permissions::from_mode(0o750);
+        std::fs::set_permissions(source.join("sample.app"), mode).unwrap();
+        let manifest = dir.join("src.yml");
+        let staged = "applications:\n- name: src\n  env:\n    STAGED_VAR: from-the-manifest\n";
+        std::fs::write(&manifest, staged).unwrap();
+        let (manifest, source) = (manifest.to_str().unwrap(), source.to_str().unwrap());
+        let pushed = cf.ok(&["push", "-f", manifest, "-p", source]);
+        let (status, body) = get(&listen, "src.localhost", "/", None);
+        assert_eq!(status, 200, "{body}\n{pushed}");
+        for expected in [
+            "uid 2000 gid 2001\n",
+            // the launcher's doing (it takes CNB_APP_DIR for itself): the launch layer's bin
+            "PATH=/layers/sample_buildpack/runtime/bin",
+            "STAGED_VAR=from-the-manifest\n",
+            "VCAP_APPLICATION={",
+        ] {
+            assert!(body.contains(expected), "{expected}: {body}");
+        }
+        for (path, mode) in [("sample.app", " mode 750"), ("built.txt", "")] {
+            let seen = format!("/workspace/{path} uid ");
+            let line = body.lines().find(|line| line.starts_with(&seen));
+            assert!(
+                line.is_some_and(|line| line.ends_with(mode)),
+                "{path}: {body}"
+            );
+        }
+        let logs = cf.ok(&["logs", "src", "--recent"]);
+        for expected in [
+            "[STG/0] OUT sample buildpack: building as 1001:1000, STAGED_VAR=from-the-manifest",
+            "sample buildpack: a line on stderr",
+            "reaching localhost:9",
+            "the buildpack cnb",
+        ] {
+            assert!(logs.contains(expected), "{expected}: {logs}");
+        }
+        let droplet = format!(
+            "/v3/apps/{}/droplets/current",
+            cf.ok(&["app", "src", "--guid"]).trim()
+        );
+        let droplet: Value = serde_json::from_str(&cf.ok(&["curl", &droplet])).unwrap();
+        assert_eq!(
+            (&droplet["buildpacks"][0]["name"], &droplet["stack"]),
+            (&json!("cnb"), &json!("firecracker")),
+            "{droplet}"
+        );
+        assert!(cf.ok(&["buildpacks"]).contains("cnb"));
+    }
+
     // deleted while the wicket is down: removed when it is back
     cf.ok(&["push", "gone", "-p", dir.join("rootfs").to_str().unwrap()]);
     wicket.kill();
@@ -3280,7 +3357,8 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     }
 
     // the wicket's directory lost: the cf-api puts its apps back, the image's rootfs
-    // made again, of the digest it had
+    // made again, of the digest it had, and the one of the droplet buildpacks built, which
+    // the cf-api kept: nothing is built again
     wicket.kill();
     drop(wicket);
     let _ = std::fs::remove_dir_all(dir.join("deployed"));
@@ -3289,6 +3367,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     loop {
         if get(&listen, "fc.localhost", "/", None).0 == 200
             && get(&listen, "zipped.localhost", "/env", None).0 == 200
+            && (builder.is_none() || get(&listen, "src.localhost", "/", None).0 == 200)
         {
             break;
         }
@@ -3325,7 +3404,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         ],
         &flume_url,
         &dir.join("cf"),
-        &["--any-credentials"],
+        &[&["--any-credentials"], &cnb[..]].concat(),
     );
     cf.ok(&["scale", "fc", "-i", "2"]);
     let served_as = |console: &str| {
@@ -3360,6 +3439,23 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         .filter(|line| line.contains("made the rootfs of"))
         .collect();
     assert_eq!(made, Vec::<String>::new(), "made again");
+    // the droplet buildpacks built, placed on the second wicket: uploaded there, its rootfs
+    // made of it and the run image, no build
+    if builder.is_some() {
+        let builds = registry.pulls();
+        cf.ok(&["scale", "src", "-i", "2"]);
+        let made = api.line("made the rootfs of the droplet");
+        assert!(made.contains("The wicket b made the rootfs of"), "{made}");
+        eventually("the droplet served by the second wicket", || {
+            fetch(&listen_b, "src.localhost", "/", None).is_some_and(|got| got.0 == 200)
+        });
+        assert_eq!(get(&listen, "src.localhost", "/", None).0, 200);
+        let logs = cf.ok(&["logs", "src", "--recent"]);
+        // the logs are this cf-api's, started after the build: none since
+        assert!(!logs.contains("sample buildpack: building"), "{logs}");
+        assert!(registry.pulls() > builds, "the run image, pulled by b");
+        cf.ok(&["delete", "src", "-r", "-f"]);
+    }
 
     for app in ["fc", "zipped"] {
         cf.ok(&["delete", app, "-r", "-f"]);
@@ -3704,6 +3800,101 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     drop(flume);
     drop(provider);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Where the lifecycle and the launcher of Cloud Native Buildpacks are (`SLUICE_CNB_LIFECYCLE`,
+/// else `~/.local/cnb/lifecycle`); None where they are not.
+fn cnb_lifecycle() -> Option<PathBuf> {
+    let dir = std::env::var_os("SLUICE_CNB_LIFECYCLE")
+        .map(PathBuf::from)
+        .or_else(|| {
+            let home = PathBuf::from(std::env::var_os("HOME")?);
+            Some(home.join(".local/cnb/lifecycle"))
+        })?;
+    (dir.join("lifecycle").is_file() && dir.join("launcher").is_file()).then_some(dir)
+}
+
+/// A builder of one buildpack, the guest crate's sample one (beside `guest`), with the
+/// lifecycle of `lifecycle`, and its run image, a base naming a user: the builder's reference
+/// in `registry`.
+fn cnb_builder(registry: &Registry, lifecycle: &Path, guest: &Path) -> String {
+    let arch = if cfg!(target_arch = "x86_64") {
+        "amd64"
+    } else {
+        "arm64"
+    };
+    let read = |path: PathBuf| std::fs::read(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+    let entry = |tar: &mut tar::Builder<Vec<u8>>, kind, path: &str, link: Option<&str>| {
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(kind);
+        header.set_mode(0o755);
+        header.set_uid(1001);
+        header.set_gid(1000);
+        header.set_size(0);
+        match link {
+            Some(link) => tar.append_link(&mut header, path, link).unwrap(),
+            None => tar
+                .append_data(&mut header, path, std::io::empty())
+                .unwrap(),
+        }
+    };
+    let base = layer(|tar| {
+        let users = "root:x:0:0::/root:/bin/sh\ncnb:x:1001:1000::/home/cnb:/bin/sh\n";
+        layer_file(tar, "etc/passwd", 0o644, 0, users.as_bytes());
+        layer_file(tar, "etc/group", 0o644, 0, b"root:x:0:\ncnb:x:1000:\n");
+        entry(tar, tar::EntryType::Directory, "home/cnb/", None);
+    });
+    let cnb = layer(|tar| {
+        for binary in ["lifecycle", "launcher"] {
+            let path = format!("cnb/lifecycle/{binary}");
+            layer_file(tar, &path, 0o755, 0, &read(lifecycle.join(binary)));
+        }
+        for phase in ["detector", "builder"] {
+            let path = format!("cnb/lifecycle/{phase}");
+            entry(tar, tar::EntryType::Symlink, &path, Some("lifecycle"));
+        }
+        let order = "[[order]]\n  [[order.group]]\n    id = \"sample/buildpack\"\n    \
+                     version = \"0.0.1\"\n";
+        layer_file(tar, "cnb/order.toml", 0o644, 0, order.as_bytes());
+        let buildpack = "cnb/buildpacks/sample_buildpack/0.0.1";
+        let described = format!(
+            "api = \"0.10\"\n\n[buildpack]\n  id = \"sample/buildpack\"\n  version = \
+             \"0.0.1\"\n\n[[targets]]\n  os = \"linux\"\n  arch = \"{arch}\"\n"
+        );
+        let toml = format!("{buildpack}/buildpack.toml");
+        layer_file(tar, &toml, 0o644, 0, described.as_bytes());
+        let program = read(guest.with_file_name("sample-buildpack"));
+        for phase in ["detect", "build"] {
+            layer_file(tar, &format!("{buildpack}/bin/{phase}"), 0o755, 0, &program);
+        }
+        let serve = read(guest.with_file_name("sample-process"));
+        layer_file(tar, &format!("{buildpack}/serve"), 0o755, 0, &serve);
+    });
+    let run = layer(|tar| {
+        let users = "root:x:0:0::/root:/bin/sh\nrunner:x:2000:2001::/home/runner:/bin/sh\n";
+        layer_file(tar, "etc/passwd", 0o644, 0, users.as_bytes());
+    });
+    let config = json!({"architecture": arch, "os": "linux", "config": {"User": "runner"}});
+    registry.push_image("private/run", "1", &config, &[run]);
+    let metadata = json!({
+        "lifecycle": {"apis": {"platform": {"supported": ["0.13"]}}},
+        "images": [{"image": format!("{}/private/run:1", registry.address)}],
+    });
+    let config = json!({
+        "architecture": arch,
+        "os": "linux",
+        "config": {
+            "Env": [
+                "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+                "CNB_USER_ID=1001",
+                "CNB_GROUP_ID=1000",
+            ],
+            "User": "1001:1000",
+            "Labels": {"io.buildpacks.builder.metadata": metadata.to_string()},
+        },
+    });
+    registry.push_image("private/builder", "1", &config, &[base, cnb]);
+    format!("{}/private/builder:1", registry.address)
 }
 
 /// The cf-api as an image (no docker here: this binary stripped, what it links, the host's

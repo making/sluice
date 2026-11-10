@@ -43,9 +43,14 @@ pub struct Logs {
 impl Logs {
     /// Adds a line of the cf-api's own, printed to its stdout too.
     pub fn add(&self, app: &str, source: &'static str, text: impl Into<String>) {
+        self.add_as(app, source, Stream::Out, text);
+    }
+
+    /// [`Logs::add`] of a line of `stream`: a build's output, as it came.
+    pub fn add_as(&self, app: &str, source: &'static str, stream: Stream, text: impl Into<String>) {
         let text = text.into();
         println!("[{app}] {source}: {text}");
-        self.push(app, source, 0, Stream::Out, text);
+        self.push(app, source, 0, stream, text);
     }
 
     /// Adds a line of the app's own, which its wicket logs already.

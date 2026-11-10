@@ -711,7 +711,7 @@ impl Api {
                 )
             }
             (&Method::GET, ["buildpacks"]) => {
-                let mut buildpacks = views::buildpacks(base);
+                let mut buildpacks = views::buildpacks(base, self.controller.cnb.is_some());
                 for (query, field) in [("names", "name"), ("stacks", "stack")] {
                     if let Some(wanted) = req.q(query) {
                         let asked = |buildpack: &Value| {
@@ -724,7 +724,7 @@ impl Api {
                 listing(buildpacks, None)
             }
             (&Method::GET, ["buildpacks", guid]) => {
-                let mut all = views::buildpacks(base).into_iter();
+                let mut all = views::buildpacks(base, self.controller.cnb.is_some()).into_iter();
                 all.find(|buildpack| buildpack["guid"] == **guid)
                     .map_or_else(
                         || Err(ApiError::not_found("Buildpack")),
@@ -2205,12 +2205,14 @@ impl Api {
                 self.controller.clone(),
             );
             let (guid, command) = (guid.clone(), app.process.command.clone());
+            let base = req.base.clone();
             async move {
                 staging::run(
                     &store,
                     &logs,
                     &registry,
                     &controller,
+                    &base,
                     &guid,
                     &package,
                     command.as_deref(),

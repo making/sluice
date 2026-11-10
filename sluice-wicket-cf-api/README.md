@@ -15,7 +15,7 @@ and Firecracker wickets side by side under one cf-api ([Stacks](#several-wickets
 |---|---|---|
 | the stack | `wasip3` | `firecracker` |
 | the wicket | [sluice-wicket-runtime-wasi](../sluice-wicket-runtime-wasi/README.md#apps) | [sluice-wicket-runtime-firecracker](../sluice-wicket-runtime-firecracker/README.md#apps) |
-| an app | a wasm component: its bits, or an image in an OCI registry; or a [static site](#static-sites): html, css, js | a container image, a CNB image say, or a rootfs in a zip: microVMs |
+| an app | a wasm component: its bits, or an image in an OCI registry; or a [static site](#static-sites): html, css, js | a container image, a CNB image say, a rootfs in a zip, or source a builder's buildpacks build (`--cnb-builder`): microVMs |
 | the cf-api | a process or a container next to the wicket | an app of the wicket, in a VM with a disk, or next to it |
 | services | the wicket's keyvalue stores and capabilities; [user-provided](#user-provided-services); a [service broker](#service-brokers)'s | [user-provided](#user-provided-services); a [service broker](#service-brokers)'s |
 | `cf logs` | the app's output and requests | the process's output |
@@ -719,8 +719,8 @@ The wicket's listing says `runtime: firecracker`.
 | CF | wicket |
 |---|---|
 | package (docker) | any container image, `--docker-username` with `CF_DOCKER_PASSWORD` its credentials: the build has the wicket make its rootfs (`PUT /api/images`), which pulls it. Listening on `PORT`, as on CF. Spring Boot reads `SERVER_PORT`, not `PORT`: its default fits, an app with another `server.port` takes `cf set-env <app> SERVER_PORT 8080` |
-| package (bits) | a zip holding the rootfs, `.ext4` as a component's `.wasm` is picked (160 MiB at most, unpacking to 4 GiB at most: an image is the way for more) |
-| droplet | the rootfs by sha256 (stack `firecracker`, buildpack `rootfs`; an image's has no buildpack, as on CF): the wicket keeps an image's, the cf-api its reference pinned to the manifest's digest and, per wicket, the digest it made, and has it made again when the wicket lost it (the same digest, unless the wicket's guest changed) |
+| package (bits) | a zip holding the rootfs, `.ext4` as a component's `.wasm` is picked (160 MiB at most, unpacking to 4 GiB at most: an image is the way for more); with `--cnb-builder`, any other zip: source, 1 GiB unpacked at most ([Buildpacks](#buildpacks)) |
+| droplet | the rootfs by sha256 (stack `firecracker`, buildpack `rootfs`; an image's has no buildpack, as on CF): the wicket keeps an image's, the cf-api its reference pinned to the manifest's digest and, per wicket, the digest it made, and has it made again when the wicket lost it (the same digest, unless the wicket's guest changed); the rootfs of source is kept so too (buildpack `cnb`), made again of the droplet the cf-api keeps |
 | web process `instances` | `instances`, [the limit](#instances) of the app's VMs: `mode=pool`, that many VMs cloned from a snapshot, one too; [annotated](#how-long-a-vm-lives), any mode. 0 is [as on CF](#mapping): no VM and no app in the wicket |
 | web process `memory` | `memory-mib`, 1G by default as on CF: less fails a CNB Java image's memory calculator at its start. The snapshot takes what its guest wrote of it on the host's memory (`--tmpfs /run/sluice`; [measured](../.kb/wicket-firecracker-findings.md#a-snapshots-memory)), and at most all of it |
 | web process `health_check` `timeout` (`cf push -t`) | `boot-ms`, 60s by default and 180s at most as on CF: how long the process may take to listen (and with an `http` health check, to answer it), in the request that starts it. A process exiting first is refused at once |
@@ -1069,8 +1069,11 @@ docker compose up -d --force-recreate --wait wicket-b
 | `--wicket-token <token>` / `--wicket-token-file <path>` | their `--console-token`, one for all |
 | `--wicket-away-grace <secs>` | of several wickets, one not answering that long is gone: placed on no more, the indices on it started on the others, until it has answered as long again ([Several wickets](#several-wickets); default 30, 0 = never) |
 | `--domain <name>` | a shared domain; repeatable (or comma-separated): the first takes the default and random routes (default `localhost`). Through a sluice server, a suffix whose wildcard DNS reaches it |
-| `--data-dir <path>` | the state and the blobs (default `cf-api`): `state.json` (written by a rename on every change), `jwt.key` and `sessions.json` (the logins), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app) |
+| `--data-dir <path>` | the state and the blobs (default `cf-api`): `state.json` (written by a rename on every change), `jwt.key` and `sessions.json` (the logins), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app), `droplets/<sha256>.tar` (a static site's files, a droplet buildpacks built) |
 | `--org <name>` / `--space <name>` | the organization and its space the first start makes (default `sluice` / `wicket`) |
+| `--cnb-builder <image>` | the Cloud Native Buildpacks builder staging a zip of source on a Firecracker wicket with `--guest` ([Buildpacks](#buildpacks): `cnb`); none: a zip of source fails staging |
+| `--cnb-builder-username <name>` / `--cnb-builder-password <password>` / `--cnb-builder-password-file <path>` | its registry's credentials, its run image's too where that is of the same registry |
+| `--cnb-egress <host:port>` | a destination a build may connect to, as a route's `egress` of the wicket (the registries its buildpacks download from, or a proxy); repeatable (or comma-separated). None: a build has no network |
 | `--flume <url>` | the sluice-flume the wicket feeds (`grpc://host:port` / `grpcs://host:port`): the apps' output and requests reach `cf logs` from it |
 | `--flume-token <token>` / `--flume-token-file <path>` | its bearer token |
 | `--flume-ca-cert <path>` / `--flume-insecure` | a `grpcs://` flume verified against this PEM CA (default the webPKI roots), or not at all |
@@ -1130,6 +1133,15 @@ A zip is staged by the buildpack detecting it, kept on its droplet (`cf app`); a
 | `wasm` | `wasip3` | the file the web process command names (`-c hello.wasm`), else the package's only `.wasm` | that component |
 | `rootfs` | `firecracker` | the `.ext4` the command names, else the package's only `.ext4` | that rootfs |
 | `site` | `wasip3` | no command, no file of the two above, an `index.html` at the root | sluice-wicket-site and the package's files ([Static sites](#static-sites)) |
+| `cnb` | `firecracker` | with `--cnb-builder` alone: no command, none of the above, any file | the rootfs a wicket makes of what the builder's buildpacks built, over the builder's run image |
+
+`cnb` stages as CF does, in a microVM of a Firecracker wicket: the zip's files are the build's
+source, the app's environment (the user's, `VCAP_APPLICATION`, `VCAP_SERVICES`) its platform's,
+its output the staging log (`cf push`, `cf logs`), within the wicket's build timeout (15
+minutes) and VM budget. The cf-api keeps the droplet (a tar of the launch layers, the app and
+the launcher), the run image pinned to its digest and what it launches; each wicket an instance
+goes to makes its rootfs of them, as it makes an image's, and none builds it again. The
+buildpacks are the builder's, in its order: `cf push -b` names `cnb`, not one of them.
 
 A `.wasm` and an `.ext4` together, or two of one, fail staging until the command names one.
 With `cf push -b <name>` (repeated, a manifest's `buildpacks:`) only the named ones detect, in
@@ -1433,7 +1445,9 @@ flume from `../sluice-flume` (or taking `SLUICE_WICKET_RUNTIME_WASI`, `SLUICE_WI
 of the cf-api's own, and the images against a registry in the test (`tests/registry`). Where
 `/dev/kvm` is usable, with Firecracker and a guest kernel (as the wicket's VM test finds them), a
 second test runs against `../sluice-wicket-runtime-firecracker` (`sg kvm -c 'cargo test'` until
-the `kvm` group is in the login), with a wasi wicket beside it for the apps of both stacks,
+the `kvm` group is in the login), source staged by a sample buildpack where the lifecycle and
+launcher binaries of [buildpacks/lifecycle](https://github.com/buildpacks/lifecycle) are
+(`SLUICE_CNB_LIFECYCLE`, else `~/.local/cnb/lifecycle`), with a wasi wicket beside it for the apps of both stacks,
 then runs the cf-api itself on it, in a VM with a disk, the flume
 and a provider through its egress, across a restart, a wicket killed right after a push and an
 upgrade:

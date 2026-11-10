@@ -19,6 +19,8 @@ libc = "0.2"
 # launcher mode: /sluice/init.json
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+tar = { version = "0.4", default-features = false }
+toml = "1"
 
 [dev-dependencies]
 # paused time for wire.rs's idle bound

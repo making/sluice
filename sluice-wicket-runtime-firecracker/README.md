@@ -85,14 +85,15 @@ Two Cargo workspaces:
   `listener.rs` `--listen` (`head.rs` the request head routing a connection, `hpack.rs`
   an h2c one's, `exchange.rs` whether a request is in progress), `console.rs` the console (its page in `src/console/`), `deployed.rs` its
   routes and apps kept, `disk.rs` an app's disk, `image.rs` an OCI image pulled, `rootfs.rs`
-  its layers as an ext4 image, `state.rs` the state dir, `seccomp.rs` the seccomp filters;
+  its layers as an ext4 image, `stage.rs` source staged by buildpacks into a droplet, `state.rs` the state dir, `seccomp.rs` the seccomp filters;
   jail mode's `keeper.rs` (the privileged half, and the wicket's client of it) and
   `jail.rs` (one VM's jail, the VMs' cgroups)
 - `guest/` -- the VMs' `/init`, built for `x86_64-unknown-linux-musl` or
   `aarch64-unknown-linux-musl` (its `rust-toolchain.toml` has rustup add both, rust-lld
   links the other arch's): `log.rs` the processes' output, `egress.rs` their egress,
-  `reaper.rs` PID 1's reaping; `guest/src/wire.rs` is a copy of `src/wire.rs`: keep them
-  alike; `src/bin/sample-process.rs` what the tests' images run
+  `reaper.rs` PID 1's reaping, `stage.rs` a build's VM; `guest/src/wire.rs` is a copy of `src/wire.rs`: keep them
+  alike; `src/bin/sample-process.rs` what the tests' images run,
+  `src/bin/sample-buildpack.rs` what their builder builds with
 - `scripts/` -- `build-guest.sh` (the sample rootfs), `cnb-rootfs.sh` (an OCI image's),
   `guest.sh` (the guest, which both build), `try.sh` (the debug build on `--listen`),
   `lima.sh` (a command in a VM of a Mac, see [On a Mac](#on-a-mac))
@@ -577,6 +578,7 @@ digest, or made of an OCI image, first; the app names it:
 |---|---|
 | `PUT /api/components/<sha256>` | keeps the body, an ext4 image of 4 GiB at most, under its digest (400 when the body has another): `{"sha256": .., "bytes": ..}` |
 | `PUT /api/images` | makes an ext4 image of the OCI image the body names (below), kept under its digest as an upload: `{"image": <the reference pinned to its digest>, "name": .., "sha256": .., "bytes": ..}` |
+| `PUT /api/layers/<sha256>`, `GET /api/layers/<sha256>?at=<n>`, `POST /api/builds`, `GET` / `DELETE /api/builds/<id>` | source staged by buildpacks into a droplet ([below](#source-staged-by-buildpacks)) |
 | `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "wicket", "budget", "runtime": "firecracker", "capabilities": [], "keyvalue_stores": [], "apps": [..]}`; `wicket` which wicket this is: `id`, made at its first start and kept in the console directory (`wicket-id`), `node`, its flume node (`wicket:<client-id>`, null without `--flume`), `build`, `since` (its start, in seconds since the epoch); `budget` `max_instances`, `max_memory_mib` (with `--max-memory-mib`) and what the routes keep of them for good (their booted and warm VMs): `instances`, `memory_mib`. An app needing more is refused 422 with `"no_room": true` |
 | `PUT /api/apps/<name>` | serves the app of the body (JSON, below) |
 | `DELETE /api/apps/<name>?owner=<owner>` | removes the app of `owner` |
@@ -650,6 +652,49 @@ the reason). xattrs (file capabilities) are dropped.
 
 The same manifest, guest, port and hook make the same bytes: a build again has the digest it
 had, so its target and VMs stay. Another wicket's guest makes another digest.
+
+##### Source staged by buildpacks
+
+With `--guest`, the wicket is the platform of a [Cloud Native Buildpacks](https://buildpacks.io)
+build: a builder's `detector` and `builder` run on the source in a VM of the builder's image,
+and what they made comes back as a droplet, a tar of what goes over the run image's root file
+system (the launch layers, the app, the launcher). No analyzer and no exporter run: the build
+has no registry and no daemon in reach, and nothing is restored (no cache between builds yet).
+
+| request | |
+|---|---|
+| `PUT /api/layers/<sha256>` | keeps the body, a tar of 4 GiB at most, under its digest for ten minutes: a build's source (the app's files, no leading directory), a droplet built elsewhere. `{"sha256": .., "bytes": ..}` |
+| `GET /api/layers/<sha256>?at=<n>` | the kept tar from byte `n` on, 8 MiB at most a request; `sluice-layer-bytes` its size |
+| `POST /api/builds` | starts the build of the body (below): 202 `{"id": ..}`; 409 with `"missing": [<sha256>]` when the source is not kept |
+| `GET /api/builds/<id>?after=<n>` | its output from line `n` on, held up to 20s until there is more: `{"state": "building" \| "built" \| "failed", "next": <the next request's after>, "lines": [{"stream": "stdout" \| "stderr", "line": ..}]}` and, once every line was read, `"error"`, or `"droplet": {"sha256", "bytes"}`, `"run-image"` (pinned to its digest) and `"launch"` |
+| `DELETE /api/builds/<id>` | ends and forgets it; an ended build is forgotten after ten minutes |
+
+```json
+{"builder": "paketobuildpacks/builder-jammy-base", "source": "<sha256>",
+ "env": {"BP_JVM_VERSION": "21"}, "egress": ["repo.maven.apache.org:443", "github.com:443"]}
+```
+
+`builder` and `source` are required; `username` and `password` are the builder's registry's
+(the run image is asked with them when it is there too), `env` the app's environment as the
+buildpacks see it (`/platform/env`), `egress` the destinations the build may connect to, as a
+route's (none: no network; a buildpack downloading its runtime needs each host it is
+redirected to), `memory-mib` (2048), `vcpus` (2), `disk-mib` (8192: the build's scratch, which
+holds the layers, the app and the droplet) and `timeout-ms` (15 minutes, an hour at most) the
+build VM's. The VM counts in the budget as any other; a build finding no room within 30s fails.
+
+The builder's rootfs is made as an image's and kept by its manifest's digest and the guest
+(`builders/` in the console's directory; one not used for a week goes when another is made):
+the first build with a builder waits for it, minutes for a large one. The builder's label
+names its run image and the platform APIs its lifecycle speaks (0.12 to 0.15 here). In the VM
+the builder's root is read-only, so the phases run in an overlay of it on the scratch disk, as
+the builder's user: the guest kernel needs `CONFIG_OVERLAY_FS` (Firecracker's CI kernels have
+it).
+
+The droplet runs on its run image: `PUT /api/images` with the run image as `image`, the
+droplet's digest in `layers` (kept layers, laid over the image's in order) and the build's
+`launch` (what runs over the image's config: `entrypoint`, `env`, `path`, `workdir`) makes
+the rootfs, here or on any other wicket that was given the layer. 409 with `"missing"` names a
+layer not kept.
 
 #### Disks
 
@@ -1155,6 +1200,10 @@ listens once every VM it restores has booted, seconds there.
 sg kvm -c 'cargo test'
 ```
 
+A build (`stage`) is tested by sluice-wicket-cf-api's CLI test, which has the registry double
+a builder comes from; here its parts are (`stage.rs`, `image.rs`, `rootfs.rs`, the guest's
+`stage.rs`).
+
 `tests/vm.rs` boots VMs where `/dev/kvm` is usable (it is skipped elsewhere): through a tunnel
 server double, an app's disk through a restart of its VM, its process's end, its VM killed, a failed
 start, a growth, the wicket's end and its restart, a VM started again as its process keeps
@@ -1211,6 +1260,7 @@ Benchmarks and design findings: [.kb/wicket-firecracker-findings.md](../.kb/wick
 A liveness check of a VM per connection past its template (a clone goes on a failed dial), a disk on
 a route of the config file, a flag or the page, a backup of a running disk, a pool
 spreading by load rather than by connections, CPU limits without the jail, an image of the
-page rather than the API (`PUT /api/images`), a docker-archive upload, the requests on the
+page rather than the API (`PUT /api/images`), a docker-archive upload, a build's cache between
+builds and its buildpacks chosen by the request, the requests on the
 flume (the VMs' output alone: `cf logs` shows no `RTR` line here), and egress over UDP or to
 names a route does not list (`*.example.com`).

@@ -896,8 +896,25 @@ pub struct Droplet {
     /// A static site's files, the component serving them its `sha256`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<Files>,
+    /// What buildpacks built of source ([`Buildpack::Cnb`]): its `sha256` is the rootfs a
+    /// wicket made of it, as an image's is, [`Droplet::made`] the other wickets'.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub built: Option<Built>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// What a build made of source: a droplet as CF's, what goes over its stack's root file
+/// system. Kept by the cf-api, so any Firecracker wicket makes the rootfs of it, none building
+/// it again.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Built {
+    /// The builder's run image, pinned to its manifest's digest.
+    pub run_image: String,
+    /// The droplet, a tar (`droplets/<sha256>.tar`).
+    pub layer: Files,
+    /// What it runs, as the build answered it: opaque, the wicket's to read.
+    pub launch: serde_json::Value,
 }
 
 impl Droplet {
@@ -1669,16 +1686,16 @@ impl State {
             if !self.droplets.iter().any(named) && !blobs.contains(&component) {
                 blobs.push(component);
             }
-            let Some(files) = droplet.files else {
+            // a site's files, the tar buildpacks built: one of them at most
+            let tar = |droplet: &Droplet| {
+                let built = droplet.built.as_ref().map(|built| &built.layer);
+                (droplet.files.as_ref().or(built)).map(|files| files.sha256.clone())
+            };
+            let Some(files) = tar(&droplet) else {
                 continue;
             };
-            let files_named = |kept: &Droplet| {
-                kept.files
-                    .as_ref()
-                    .is_some_and(|kept| kept.sha256 == files.sha256)
-            };
-            let named = self.droplets.iter().any(files_named);
-            let files = Blob::Files(files.sha256);
+            let named = (self.droplets.iter()).any(|kept| tar(kept).as_ref() == Some(&files));
+            let files = Blob::Files(files);
             if !named && !blobs.contains(&files) {
                 blobs.push(files);
             }
@@ -1958,6 +1975,20 @@ impl Store {
         Ok(made)
     }
 
+    /// Keeps the tar spooled at `from` ([`Store::spool`]), of the digest `sha256`, as a
+    /// static site's files are: one of that digest kept stays as it is.
+    pub fn keep_files(&self, sha256: &str, from: &Path) -> Result<(), String> {
+        let path = self.files_path(sha256);
+        if path.exists() {
+            return Ok(());
+        }
+        std::fs::File::open(from)
+            .and_then(|file| file.sync_all())
+            .and_then(|()| std::fs::rename(from, &path))
+            .and_then(|()| std::fs::File::open(self.dir.join("droplets"))?.sync_all())
+            .map_err(|e| format!("{}: {e}", path.display()))
+    }
+
     /// Where an upload is received, for its owner only, gone with what is returned.
     pub fn spool(&self) -> Result<(Spool, std::fs::File), String> {
         let path = self
@@ -2097,6 +2128,7 @@ mod tests {
             image: None,
             made: BTreeMap::new(),
             files: None,
+            built: None,
             created_at: now(),
             updated_at: now(),
         };
@@ -2121,6 +2153,7 @@ mod tests {
                 sha256: files.into(),
                 bytes: 1,
             }),
+            built: None,
             ..droplet(guid, "s")
         };
         state.droplets.push(site("d5", "f"));
@@ -2267,6 +2300,7 @@ mod tests {
             image: None,
             made: BTreeMap::new(),
             files: None,
+            built: None,
             created_at: now(),
             updated_at: now(),
         };

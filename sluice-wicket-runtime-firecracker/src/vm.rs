@@ -274,6 +274,8 @@ pub struct Spec {
     pub env: Env,
     /// Its disk: a booted VM's, an app's.
     pub disk: Option<Disk>,
+    /// A build's VM (`stage`): its guest runs a build, no process of the image's.
+    pub stage: bool,
 }
 
 /// `rules` as a VM's kernel command line and a route's target name them: `,` between.
@@ -340,13 +342,14 @@ pub enum Places {
 }
 
 impl Places {
-    /// The place of the `n`th route started, of `spec`: `route-<n>` in the state dir
-    /// (0700: the snapshot is what the template wrote of its memory), or a route of the keeper's
-    /// given the spec's kernel and rootfs, opened as the wicket's user.
-    pub async fn place(&self, n: u64, spec: &Spec) -> Result<Place, BoxError> {
+    /// The place `name` (a route's `route-<n>`, a build's `build-<id>`), of `spec`: that
+    /// directory in the state dir (0700: the snapshot is what the template wrote of its
+    /// memory), or a route of the keeper's given the spec's kernel and rootfs, opened as the
+    /// wicket's user.
+    pub async fn place(&self, name: &str, spec: &Spec) -> Result<Place, BoxError> {
         match self {
             Places::Dirs(state) => {
-                let dir = state.join(format!("route-{n}"));
+                let dir = state.join(name);
                 std::fs::DirBuilder::new()
                     .mode(0o700)
                     .create(&dir)
@@ -658,6 +661,7 @@ impl Vm {
                     &spec.egress,
                     !spec.env.is_empty(),
                     spec.disk.as_ref().map(|disk| disk.mount.as_str()),
+                    spec.stage,
                 ),
             }),
         )
@@ -1038,7 +1042,7 @@ pub fn log_tail(path: &Path) -> String {
 /// `/init`'s own output then goes to the VM's log; the processes' goes to the wicket's
 /// stdout / stderr regardless): printing to it is the slowest part of a boot. The route's
 /// `egress`, if any, for `/init`, that its env is coming (`env`), and where its disk goes.
-fn boot_args(egress: &[Rule], env: bool, disk: Option<&str>) -> String {
+fn boot_args(egress: &[Rule], env: bool, disk: Option<&str>, stage: bool) -> String {
     let console = match std::env::var_os(SERIAL_CONSOLE) {
         Some(_) => "console=ttyS0",
         None => "console=none 8250.nr_uarts=0",
@@ -1060,5 +1064,9 @@ fn boot_args(egress: &[Rule], env: bool, disk: Option<&str>) -> String {
     let disk = disk.map_or(String::new(), |mount| {
         format!(" {}={mount}", wire::DISK_PARAMETER)
     });
-    format!("{console} reboot=k panic=1 quiet{arch} init=/init{egress}{env}{disk}")
+    let stage = match stage {
+        true => format!(" {}=1", wire::STAGE_PARAMETER),
+        false => String::new(),
+    };
+    format!("{console} reboot=k panic=1 quiet{arch} init=/init{egress}{env}{disk}{stage}")
 }

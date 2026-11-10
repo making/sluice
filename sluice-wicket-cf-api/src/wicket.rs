@@ -9,7 +9,16 @@
 //! PUT    /api/files/<sha256>                   a wasm wicket: unpacks the body, a tar of an
 //!                                              app's files, under its digest
 //! PUT    /api/images                           a Firecracker wicket: makes an ext4 image of
-//!                                              an OCI image, kept under its digest
+//!                                              an OCI image, kept under its digest (with
+//!                                              `layers` and `launch`: of a droplet over it)
+//! PUT    /api/layers/<sha256>                  a Firecracker wicket: keeps the body, a tar: a
+//!                                              build's source, a droplet built elsewhere
+//! GET    /api/layers/<sha256>?at=<n>           the kept tar from byte n on, a piece a request
+//! POST   /api/builds                           a Firecracker wicket: builds the source the
+//!                                              body names with a builder's buildpacks
+//! GET    /api/builds/<id>?after=<n>            its output from line n on and, ended, its
+//!                                              droplet or its error; held until there is more
+//! DELETE /api/builds/<id>                      ends and forgets it
 //! PUT    /api/apps/<name>                      serves the app of the body
 //! DELETE /api/apps/<name>?owner=<owner>        removes the app
 //! DELETE /api/keyvalue/<store>/<namespace>     deletes the data of a namespace no route maps
@@ -31,6 +40,10 @@ const EDIT_TIMEOUT: Duration = Duration::from_secs(240);
 const IMAGE_TIMEOUT: Duration = Duration::from_secs(660);
 /// A listing with `after` is held 25s at most.
 const LIST_TIMEOUT: Duration = Duration::from_secs(40);
+/// A build's output is held 20s at most.
+const FOLLOW_TIMEOUT: Duration = Duration::from_secs(40);
+/// A piece of a layer (8 MiB at most).
+const PIECE_TIMEOUT: Duration = Duration::from_secs(120);
 /// One without is answered at once: `cf app` does not wait long to show the wicket away.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -297,6 +310,60 @@ pub struct MadeImage {
     /// The reference, pinned to its manifest's digest.
     pub image: String,
     pub name: String,
+    pub sha256: String,
+    pub bytes: u64,
+}
+
+/// A build the wicket is asked for (`POST /api/builds`).
+#[derive(Serialize, Debug)]
+pub struct BuildRequest<'a> {
+    /// The builder image.
+    pub builder: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub username: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub password: Option<&'a str>,
+    /// The digest of the source, a layer kept.
+    pub source: &'a str,
+    /// The app's environment, as the buildpacks see it.
+    pub env: &'a BTreeMap<String, String>,
+    /// The destinations the build may connect to.
+    pub egress: &'a [String],
+}
+
+/// A build as the wicket tells it: its output from the line asked for on and, once every line
+/// was read, how it ended.
+#[derive(Deserialize, Debug)]
+pub struct BuildView {
+    /// `building`, `built` or `failed`.
+    pub state: String,
+    /// The next request's `after`.
+    pub next: u64,
+    #[serde(default)]
+    pub lines: Vec<BuildLine>,
+    #[serde(default)]
+    pub error: Option<String>,
+    /// The droplet, a layer the wicket keeps.
+    #[serde(default)]
+    pub droplet: Option<LayerRef>,
+    /// The run image, pinned to its digest.
+    #[serde(default, rename = "run-image")]
+    pub run_image: Option<String>,
+    /// What the droplet runs, as `PUT /api/images` takes it back.
+    #[serde(default)]
+    pub launch: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct BuildLine {
+    /// `stdout` or `stderr`.
+    pub stream: String,
+    pub line: String,
+}
+
+/// A layer the wicket keeps.
+#[derive(Deserialize, Debug)]
+pub struct LayerRef {
     pub sha256: String,
     pub bytes: u64,
 }
@@ -648,17 +715,94 @@ impl Wicket {
         Ok(())
     }
 
+    /// Uploads a layer, the tar in `file`, as [`Wicket::upload`] a component: a build's source,
+    /// a droplet built on another wicket. Kept as long as an upload no app names.
+    pub async fn upload_layer(&self, sha256: &str, file: tokio::fs::File) -> Result<(), Failure> {
+        self.upload_as("layers", "application/x-tar", sha256, file)
+            .await
+    }
+
+    /// A piece of the layer `sha256` the wicket keeps, from the byte `at` on, and the layer's
+    /// size.
+    pub async fn layer_piece(&self, sha256: &str, at: u64) -> Result<(u64, bytes::Bytes), Failure> {
+        let request = self
+            .client
+            .get(format!("{}/api/layers/{sha256}?at={at}", self.base))
+            .timeout(PIECE_TIMEOUT);
+        let (status, headers, body) = self.answer(request).await?;
+        if !status.is_success() {
+            return Err(refused(status, &body));
+        }
+        let bytes = headers
+            .get("sluice-layer-bytes")
+            .and_then(|bytes| bytes.to_str().ok()?.parse::<u64>().ok())
+            .ok_or_else(|| Failure::Unreachable("the layer: no sluice-layer-bytes".into()))?;
+        Ok((bytes, body))
+    }
+
+    /// Starts the build `build`: its id.
+    pub async fn start_build(&self, build: &BuildRequest<'_>) -> Result<String, Failure> {
+        let request = self
+            .client
+            .post(format!("{}/api/builds", self.base))
+            .timeout(EDIT_TIMEOUT)
+            .json(build);
+        let (status, body) = self.send(request).await?;
+        if !status.is_success() {
+            return Err(refused(status, &body));
+        }
+        #[derive(Deserialize)]
+        struct Started {
+            id: String,
+        }
+        serde_json::from_slice::<Started>(&body)
+            .map(|started| started.id)
+            .map_err(|e| Failure::Unreachable(format!("the answer: {e}")))
+    }
+
+    /// The build `id` from its line `after` on, once there is more of it (20s at most).
+    pub async fn follow_build(&self, id: &str, after: u64) -> Result<BuildView, Failure> {
+        let request = self
+            .client
+            .get(format!("{}/api/builds/{id}?after={after}", self.base))
+            .timeout(FOLLOW_TIMEOUT);
+        let (status, body) = self.send(request).await?;
+        if !status.is_success() {
+            return Err(refused(status, &body));
+        }
+        serde_json::from_slice(&body).map_err(|e| Failure::Unreachable(format!("the answer: {e}")))
+    }
+
+    /// Ends and forgets the build `id`.
+    pub async fn forget_build(&self, id: &str) -> Result<(), Failure> {
+        let request = self
+            .client
+            .delete(format!("{}/api/builds/{id}", self.base))
+            .timeout(READ_TIMEOUT);
+        let (status, body) = self.send(request).await?;
+        if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
+            return Err(refused(status, &body));
+        }
+        Ok(())
+    }
+
     /// Has the wicket make an ext4 image of the OCI image `image`, with the
-    /// `(username, password)` of a private one.
+    /// `(username, password)` of a private one; with `over`, of a droplet over it: the layer
+    /// of that digest, which the wicket keeps, and the launch its build answered.
     pub async fn make_image(
         &self,
         image: &str,
         credentials: Option<(&str, &str)>,
+        over: Option<(&str, &serde_json::Value)>,
     ) -> Result<MadeImage, Failure> {
         let mut body = serde_json::json!({"image": image});
         if let Some((username, password)) = credentials {
             body["username"] = username.into();
             body["password"] = password.into();
+        }
+        if let Some((layer, launch)) = over {
+            body["layers"] = serde_json::json!([layer]);
+            body["launch"] = launch.clone();
         }
         let request = self
             .client
@@ -772,8 +916,24 @@ impl Wicket {
 
     async fn send(
         &self,
-        mut request: reqwest::RequestBuilder,
+        request: reqwest::RequestBuilder,
     ) -> Result<(reqwest::StatusCode, bytes::Bytes), Failure> {
+        let (status, _, body) = self.answer(request).await?;
+        Ok((status, body))
+    }
+
+    /// The answer to `request`, sent with the token: its status, headers and body.
+    async fn answer(
+        &self,
+        mut request: reqwest::RequestBuilder,
+    ) -> Result<
+        (
+            reqwest::StatusCode,
+            reqwest::header::HeaderMap,
+            bytes::Bytes,
+        ),
+        Failure,
+    > {
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
         }
@@ -782,6 +942,7 @@ impl Wicket {
             .await
             .map_err(|e| Failure::Unreachable(e.to_string()))?;
         let status = response.status();
+        let headers = response.headers().clone();
         let body = response
             .bytes()
             .await
@@ -792,7 +953,7 @@ impl Wicket {
                 error_text(&body)
             )));
         }
-        Ok((status, body))
+        Ok((status, headers, body))
     }
 }
 

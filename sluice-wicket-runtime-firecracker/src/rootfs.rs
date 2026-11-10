@@ -171,7 +171,8 @@ impl Tree {
         }
         // anything else takes the place of what is there
         self.remove(&path, &named)?;
-        if kind.is_file() || kind.is_contiguous() {
+        // a sparse entry reads as the file it is, its holes zeros
+        if kind.is_file() || kind.is_contiguous() || kind.is_gnu_sparse() {
             let meta = meta(Kind::File)?;
             let size = entry.size();
             self.bytes += size.div_ceil(BLOCK) * BLOCK;
@@ -740,6 +741,15 @@ mod tests {
             file(tar, "app/secret", 0o000, 1000, b"secret");
             link(tar, tar::EntryType::Link, "app/same", "app/secret");
             file(tar, "app/qu\"ote \\x2d", 0o644, 1000, b"odd");
+            // a file with a hole, as a tar written from a disk has it: a sparse entry
+            let holed = root.with_extension("holed");
+            let file = std::fs::File::create(&holed).unwrap();
+            file.set_len(1 << 20).unwrap();
+            std::os::unix::fs::FileExt::write_all_at(&file, b"end", (1 << 20) - 3).unwrap();
+            file.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000))
+                .unwrap();
+            tar.append_path_with_name(&holed, "app/holed").unwrap();
+            std::fs::remove_file(&holed).unwrap();
             let mut fifo = header(tar::EntryType::Fifo, 0o600, 1000, 0);
             tar.append_data(&mut fifo, "app/pipe", std::io::empty())
                 .unwrap();
@@ -835,6 +845,10 @@ mod tests {
             assert!(stat_of(&tools, &image, gone).is_empty(), "{gone}");
         }
         assert!(!stat_of(&tools, &image, "/opaque/new").is_empty());
+        assert!(
+            stat_of(&tools, &image, "/app/holed").contains("Size: 1048576"),
+            "a sparse entry is a file"
+        );
 
         for (build, error) in [
             (

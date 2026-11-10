@@ -107,6 +107,11 @@ const RESTART_STABLE: Duration = Duration::from_secs(60);
 /// Names the routes for the budget, over every route the wicket ever started.
 static NEXT_ROUTE: AtomicU64 = AtomicU64::new(0);
 
+/// The budget's name of what is no route but takes VMs of it: a build (`stage`).
+pub fn next_route() -> u64 {
+    NEXT_ROUTE.fetch_add(1, Ordering::Relaxed)
+}
+
 /// How a connection of the route gets its VM.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -313,6 +318,7 @@ impl RouteSpec {
                 egress: Vec::new(),
                 env: Env::default(),
                 disk: None,
+                stage: false,
             },
             mode: Mode::Boot,
             port: 8080,
@@ -2521,7 +2527,7 @@ impl Route {
         }
         let place = Arc::new(
             places
-                .place(n, &spec.vm)
+                .place(&format!("route-{n}"), &spec.vm)
                 .await
                 .map_err(|e| format!("route {label}: {e}"))?,
         );
@@ -2617,7 +2623,7 @@ impl Route {
             .map_err(|e| e.of(&label))?;
         let place = Arc::new(
             places
-                .place(n, &spec.vm)
+                .place(&format!("route-{n}"), &spec.vm)
                 .await
                 .map_err(|e| format!("route {label}: {e}"))?,
         );

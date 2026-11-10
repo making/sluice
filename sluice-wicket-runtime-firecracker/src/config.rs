@@ -612,6 +612,29 @@ impl std::fmt::Display for Origin {
     }
 }
 
+/// What names the kernel and `firecracker` ([`RouteSource::binaries`]).
+#[derive(Clone)]
+pub struct Binaries {
+    config: Option<PathBuf>,
+    kernel: Option<PathBuf>,
+    firecracker: Option<PathBuf>,
+}
+
+impl Binaries {
+    /// `firecracker` and the kernel as named now, the config file read again.
+    pub fn read(&self) -> Result<(PathBuf, PathBuf), String> {
+        let source = RouteSource {
+            config: self.config.clone(),
+            flags: Vec::new(),
+            kernel: self.kernel.clone(),
+            firecracker: self.firecracker.clone(),
+            jailed: false,
+            console: None,
+        };
+        source.paths(source.file()?.as_ref())
+    }
+}
+
 /// Where the routes come from: the `--config` file's, then the `--vm` flags'.
 pub struct RouteSource {
     config: Option<PathBuf>,
@@ -692,9 +715,24 @@ impl RouteSource {
         self.config.as_deref().map(File::read).transpose()
     }
 
+    /// Where a VM that is no route's gets its kernel and `firecracker`: as the routes do.
+    pub fn binaries(&self) -> Binaries {
+        Binaries {
+            config: self.config.clone(),
+            kernel: self.kernel.clone(),
+            firecracker: self.firecracker.clone(),
+        }
+    }
+
     /// The routes: the config file `file`'s, then the flags', then the console's: a host may
     /// appear once.
     pub fn specs(&self, file: Option<&File>) -> Result<Vec<(RouteSpec, Origin)>, String> {
+        let (firecracker, kernel) = self.paths(file)?;
+        self.specs_of(file, firecracker, kernel)
+    }
+
+    /// `firecracker` and the kernel as the routes name them, with the config `file`.
+    fn paths(&self, file: Option<&File>) -> Result<(PathBuf, PathBuf), String> {
         let dir = self
             .config
             .as_ref()
@@ -710,7 +748,20 @@ impl RouteSource {
             .ok_or("--kernel is required")?;
         // absolute: each firecracker runs in its VM's directory
         let kernel = std::path::absolute(kernel).map_err(|e| format!("--kernel: {e}"))?;
-        let firecracker = self.firecracker_of(file, dir)?;
+        Ok((self.firecracker_of(file, dir)?, kernel))
+    }
+
+    fn specs_of(
+        &self,
+        file: Option<&File>,
+        firecracker: PathBuf,
+        kernel: PathBuf,
+    ) -> Result<Vec<(RouteSpec, Origin)>, String> {
+        let dir = self
+            .config
+            .as_ref()
+            .and_then(|path| path.parent())
+            .unwrap_or(Path::new("."));
         let mut specs = Vec::new();
         if let (Some(file), Some(path)) = (file, &self.config) {
             for (n, route) in file.routes.iter().enumerate() {

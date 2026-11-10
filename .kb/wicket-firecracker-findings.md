@@ -580,3 +580,33 @@ connection 647-737 (outside 623-672).
 Linux 6.1's boot time mitigations (`favordynmods`, `kvm.nx_huge_pages=never`) are not needed at the
 wicket's rates: `KVM_CREATE_VM` takes 0.26ms on the 6.8 kernel of these findings (0.34-0.51ms, 16
 at once), of a clone's 12ms restore.
+
+## A build without an analyzer and an exporter
+
+A builder's `detector` and `builder` build an app with neither `analyzer` nor `exporter` run
+(lifecycle 0.21.28, platform API 0.13, Paketo's Java, Node and Go buildpacks): the builder reads
+`<layers>/analyzed.toml` for the run image's `reference`, `image` and `target` alone, so the
+wicket writes it, pinned to the run image's digest. What an exporter puts in an image is then on
+the disk: the layers whose `<layer>.toml` has `[types] launch = true`, `config/metadata.toml`,
+`sbom/launch`, the app directory, and `/cnb/lifecycle/launcher` with a link per process type
+(`/cnb/process/<type>`). The image's config is `CNB_LAYERS_DIR`, `CNB_APP_DIR`,
+`CNB_PLATFORM_API`, `PATH` with `/cnb/process:/cnb/lifecycle` first, and the default process's
+link as the entrypoint. The run image's user (1002 on Paketo's) is not the builder's (1001): the
+droplet's files keep the builder's ids, group readable as an exporter leaves them.
+
+What a build's VM and an app's needed that a container has:
+
+- a root the buildpacks write (`$HOME/.m2`, a buildpack's tools): the builder's rootfs is
+  shared and read-only, so the phases run in an overlayfs of it on the scratch disk, chrooted
+- `/dev/pts` mounted: Paketo's Maven buildpack runs `javac -version` on a terminal of its own
+  and fails `open /dev/ptmx: no such file or directory` without it
+- a cgroup v2 at `/sys/fs/cgroup` with `memory.max`: Paketo's Node `0-optimize-memory` helper
+  fails the launch without the file. The kernel's root cgroup has none and Firecracker's CI
+  kernel no cgroup namespaces, so `/init` makes a cgroup for the process, bounds it to the
+  VM's memory and binds it over the mount
+
+The guest's droplet tar names a file with holes as a GNU sparse entry (the launcher, read
+through the overlay): `rootfs::Tree` dropped such an entry before, a registry's layer included.
+
+Unpacking 3.1 GiB of layers and hashing the image in a debug build of the wicket takes three
+times the release build's time (the builder's rootfs: 501-517s against 165s).

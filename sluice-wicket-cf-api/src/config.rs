@@ -29,6 +29,18 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
   --data-dir <path>           the state, the packages and the droplets (default cf-api)
   --org <name>                the organization made at the first start (default sluice)
   --space <name>              and its space (default wicket)
+  --cnb-builder <image>       the Cloud Native Buildpacks builder staging a zip of source on a
+                              Firecracker wicket (the buildpack cnb, detecting last); none:
+                              no source is staged
+  --cnb-builder-username <name>
+                              its registry's credentials, its run image's too where that is
+                              of the same registry
+  --cnb-builder-password <password>
+  --cnb-builder-password-file <path>
+                              read the password from a file instead
+  --cnb-egress <host:port>    a destination a build may connect to, as a route's egress of
+                              the wicket; repeatable (or comma-separated). None: a build
+                              has no network
   --flume <url>               the sluice-flume the wicket feeds: the apps' output and
                               requests reach cf logs from it; grpc://host:port or
                               grpcs://host:port
@@ -115,6 +127,11 @@ const VALUED: &[&str] = &[
     "data-dir",
     "org",
     "space",
+    "cnb-builder",
+    "cnb-builder-username",
+    "cnb-builder-password",
+    "cnb-builder-password-file",
+    "cnb-egress",
     "flume",
     "flume-token",
     "flume-token-file",
@@ -245,6 +262,42 @@ pub fn parse(
             format!("--wicket-away-grace: a number of seconds (0 = never), not '{seconds}'")
         })?,
         None => DEFAULT_WICKET_AWAY_GRACE,
+    };
+    let cnb_egress: Vec<String> = values("cnb-egress")
+        .iter()
+        .flat_map(|value| value.split(','))
+        .map(|rule| rule.trim().to_string())
+        .filter(|rule| !rule.is_empty())
+        .collect();
+    let cnb_credentials = match (
+        value("cnb-builder-username"),
+        secret("cnb-builder-password")?,
+    ) {
+        (Some(username), Some(password)) => Some((username, password)),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "--cnb-builder-username and --cnb-builder-password (or --cnb-builder-password-file) go together".into(),
+            );
+        }
+    };
+    let cnb = match value("cnb-builder") {
+        Some(builder) => {
+            sluice_wicket_registry::Reference::parse(&builder)
+                .map_err(|e| format!("--cnb-builder: {e}"))?;
+            Some(crate::staging::Cnb {
+                builder,
+                credentials: cnb_credentials,
+                egress: cnb_egress,
+            })
+        }
+        None if cnb_credentials.is_some() || !cnb_egress.is_empty() => {
+            return Err(
+                "--cnb-builder-username and --cnb-egress need --cnb-builder: they are a build's"
+                    .into(),
+            );
+        }
+        None => None,
     };
     let flume = match value("flume") {
         Some(url) => {
@@ -423,6 +476,7 @@ pub fn parse(
             data_dir: PathBuf::from(value("data-dir").unwrap_or_else(|| "cf-api".to_string())),
             org: value("org").unwrap_or_else(|| "sluice".to_string()),
             space: value("space").unwrap_or_else(|| "wicket".to_string()),
+            cnb,
             flume,
             oidc,
             clients,
@@ -621,12 +675,19 @@ mod tests {
         let config = serve(parse(
             args(
                 "--wicket http://w:1 --any-credentials --domain x.io --domain y.io,Z.io. \
-                 --wicket-away-grace 0",
+                 --wicket-away-grace 0 --cnb-builder r.io/builder:1 --cnb-builder-username u \
+                 --cnb-builder-password p --cnb-egress a.io:443,b.io:443 --cnb-egress c.io:80",
             ),
             |_| None,
         ));
         assert_eq!(config.settings.domains, ["x.io", "y.io", "z.io"]);
         assert!(config.settings.wicket_away_grace.is_zero());
+        // the builder of source, its builds' egress; its credentials its registry's alone
+        let cnb = config.settings.cnb.unwrap();
+        assert_eq!(cnb.builder, "r.io/builder:1");
+        assert_eq!(cnb.egress, ["a.io:443", "b.io:443", "c.io:80"]);
+        assert_eq!(cnb.credentials_of("r.io/run:1"), Some(("u", "p")));
+        assert_eq!(cnb.credentials_of("other.io/run:1"), None);
         // several wickets, each named, in the order given: of the options, else the environment
         let config = serve(parse(
             args("--wicket a=http://a:9090/ --wicket b-1=https://b:9090,c.2=http://c:9090"),
@@ -711,6 +772,10 @@ mod tests {
             assert!(error(line).contains(refusal), "{line}: {}", error(line));
         }
         assert!(error("--wicket http://w:1 --domain a_b").contains("--domain"));
+        for line in ["--cnb-egress a.io:443", "--cnb-builder-username u"] {
+            let line = format!("--wicket http://w:1 --any-credentials {line}");
+            assert!(error(&line).contains("--cnb-builder"), "{line}");
+        }
         assert!(
             error("--wicket http://w:1 --wicket-away-grace 30s")
                 .contains("--wicket-away-grace: a number of seconds")

@@ -63,6 +63,7 @@ pub mod rootfs;
 pub mod route;
 pub mod routes;
 pub mod seccomp;
+pub mod stage;
 pub mod state;
 pub mod vm;
 pub mod wire;
@@ -184,6 +185,7 @@ async fn serving(
         tap: tap.clone(),
     });
     let places = Arc::new(launcher.start()?);
+    let binaries = routes.binaries();
     // opened by the wicket, its user's (jail mode: not the keeper's)
     let mut intake = None;
     if let Some(console) = &mut console {
@@ -201,10 +203,10 @@ async fn serving(
     let reloader = Reloader::start(
         routes,
         capacity.clone(),
-        places,
-        sink,
+        places.clone(),
+        sink.clone(),
         workers.clone(),
-        stops,
+        stops.clone(),
     )
     .await?;
     let routes = reloader.routes().clone();
@@ -249,6 +251,23 @@ async fn serving(
     match console.zip(intake) {
         Some((console, intake)) => {
             let identity = Identity::open(&console.dir, node, describe_build())?;
+            let images = guest
+                .map(|guest| images(guest, &console.dir))
+                .transpose()?
+                .map(Arc::new);
+            let builds = images.clone().map(|images| {
+                Arc::new(stage::Builds {
+                    images,
+                    places,
+                    capacity: capacity.clone(),
+                    sink,
+                    workers: workers.clone(),
+                    stops,
+                    binaries,
+                    dir: console.dir.clone(),
+                    kept: stage::Kept::default(),
+                })
+            });
             let listener = console.bind().await?;
             println!(
                 "console on http://{} ({}); its routes kept in {}",
@@ -264,7 +283,8 @@ async fn serving(
                     status: reloader.status(),
                     requests,
                     capacity,
-                    images: guest.map(|guest| images(guest, &console.dir)).transpose()?,
+                    images,
+                    builds,
                     dir: console.dir,
                     intake,
                     jailed: jail.is_some(),
@@ -358,5 +378,7 @@ fn images(guest: std::path::PathBuf, dir: &std::path::Path) -> Result<image::Ima
         building: tokio::sync::Semaphore::new(1),
         limit: console::MAX_ROOTFS_BYTES,
         work: dir.join(deployed::BUILDS),
+        builders: dir.join(deployed::BUILDERS),
+        making: tokio::sync::Mutex::new(()),
     })
 }

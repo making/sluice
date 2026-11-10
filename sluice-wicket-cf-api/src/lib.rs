@@ -114,6 +114,8 @@ pub struct Settings {
     pub data_dir: PathBuf,
     pub org: String,
     pub space: String,
+    /// The builder staging source (`crate::staging`); None: no source is staged.
+    pub cnb: Option<staging::Cnb>,
     /// Where the apps' output and requests come from; None: the logs hold
     /// the cf-api's own lines only.
     pub flume: Option<flume::FlumeSettings>,
@@ -262,6 +264,7 @@ pub async fn serve(
         wickets(&settings),
         logs.clone(),
         settings.wicket_away_grace,
+        settings.cnb.clone(),
     ));
     let flume = settings
         .flume
@@ -327,6 +330,7 @@ mod tests {
             data_dir,
             org: "org".into(),
             space: "space".into(),
+            cnb: None,
             flume: None,
             oidc: None,
             clients: Vec::new(),

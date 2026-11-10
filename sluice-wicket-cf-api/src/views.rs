@@ -259,8 +259,8 @@ fn stack(base: &str, runtime: Runtime, default: bool) -> Value {
 }
 
 /// The buildpacks, as they detect (`cf buildpacks`): each with its stack, its file what it
-/// stages.
-pub fn buildpacks(base: &str) -> Vec<Value> {
+/// stages; `cnb` with a builder (`cnb`) alone.
+pub fn buildpacks(base: &str, cnb: bool) -> Vec<Value> {
     let buildpack = |(at, buildpack): (usize, Buildpack)| {
         let name = buildpack.name();
         json!({
@@ -272,7 +272,7 @@ pub fn buildpacks(base: &str) -> Vec<Value> {
             "links": {"self": {"href": format!("{base}/v3/buildpacks/{name}")}},
         })
     };
-    let all = Buildpack::ALL.into_iter().enumerate();
+    let all = Buildpack::all(cnb).into_iter().enumerate();
     all.map(buildpack).collect()
 }
 
