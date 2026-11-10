@@ -384,10 +384,10 @@ impl Api {
             (&Method::GET, []) => Ok(json(StatusCode::OK, &views::root(base))),
             (&Method::GET, ["v3"]) => Ok(json(StatusCode::OK, &views::v3(base))),
             (&Method::GET, ["v3", "info"]) => {
-                let runtime = self.controller.runtime().await.ok();
+                let stacks = self.controller.stacks().await;
                 Ok(json(
                     StatusCode::OK,
-                    &views::info(base, &self.build, runtime),
+                    &views::info(base, &self.build, &stacks),
                 ))
             }
             (&Method::GET, ["uaa", "login"]) | (&Method::GET, ["login"]) => Ok(json(
@@ -692,12 +692,23 @@ impl Api {
                 "the shared domains are the cf-api's --domain",
             )),
             (&Method::GET, ["stacks"]) => {
-                let runtime = self.controller.runtime().await.ok();
-                listing(vec![views::stack(base, runtime)], None)
+                let mut stacks = views::stacks(base, &self.controller.stacks().await);
+                if let Some(names) = req.q("names") {
+                    let named = |stack: &Value| {
+                        let name = stack["name"].as_str().unwrap_or_default();
+                        names.split(',').any(|wanted| wanted == name)
+                    };
+                    stacks.retain(named);
+                }
+                listing(stacks, None)
             }
-            (&Method::GET, ["stacks", _]) => {
-                let runtime = self.controller.runtime().await.ok();
-                Ok(json(StatusCode::OK, &views::stack(base, runtime)))
+            (&Method::GET, ["stacks", guid]) => {
+                let stacks = views::stacks(base, &self.controller.stacks().await);
+                let found = stacks.into_iter().find(|stack| stack["guid"] == **guid);
+                found.map_or_else(
+                    || Err(ApiError::not_found("Stack")),
+                    |stack| Ok(json(StatusCode::OK, &stack)),
+                )
             }
             (&Method::GET, ["feature_flags"]) => listing(
                 ["service_instance_sharing", "diego_docker"]
@@ -717,7 +728,9 @@ impl Api {
                     .filter(|app| reads(state, &app.space))
                     .collect();
                 listing(
-                    apps.iter().map(|app| views::app(base, app)).collect(),
+                    apps.iter()
+                        .map(|app| views::app(base, state, app))
+                        .collect(),
                     views::spaces_included(
                         base,
                         state,
@@ -1202,7 +1215,12 @@ impl Api {
 
     fn app_view(&self, req: &Req, guid: &str) -> Reply {
         let app = self.app_as(req, guid, Need::Read)?;
-        Ok(json(StatusCode::OK, &views::app(&req.base, &app)))
+        Ok(json(StatusCode::OK, &self.app_shown(req, &app)))
+    }
+
+    /// `app` as `/v3/apps` shows it.
+    fn app_shown(&self, req: &Req, app: &crate::store::App) -> Value {
+        self.store.read(|state| views::app(&req.base, state, app))
     }
 
     /// The process stats, of the instances alive as each wicket lists them at this request: its
@@ -1401,7 +1419,8 @@ impl Api {
                 );
             }
         };
-        let runtime = self.controller.runtime().await.ok();
+        // a stack it pins is one the wickets run
+        self.controller.stacks().await;
         let named: Vec<String> = self.store.read(|state| {
             let named = manifest.applications.iter();
             named
@@ -1412,7 +1431,7 @@ impl Api {
         let _apps = self.controller.hold_all(&named).await;
         let guids = {
             let mut trial = self.store.read(State::clone);
-            match manifest::apply(&mut trial, space, &manifest, runtime) {
+            match manifest::apply(&mut trial, space, &manifest) {
                 Ok(guids) => guids,
                 Err(e) => {
                     return self.job(
@@ -1428,8 +1447,7 @@ impl Api {
         let trial = || {
             // of the state as it is: a wicket refusing a share for room fills
             let mut trial = self.store.read(State::clone);
-            manifest::apply(&mut trial, space, &manifest, runtime)
-                .map_err(ApiError::unprocessable)?;
+            manifest::apply(&mut trial, space, &manifest).map_err(ApiError::unprocessable)?;
             Ok(self.shares(&trial, &guids))
         };
         let tried = match self.try_placed(trial).await {
@@ -1445,7 +1463,7 @@ impl Api {
                 return Err("the space is gone".to_string());
             }
             let mut next = state.clone();
-            let guids = manifest::apply(&mut next, space, &manifest, runtime)?;
+            let guids = manifest::apply(&mut next, space, &manifest)?;
             // the bindings `services:` made: a broker's is its broker's to make
             let bound: Vec<(String, String, Option<String>)> = next
                 .bindings
@@ -1566,9 +1584,8 @@ impl Api {
             .as_str()
             .unwrap_or_default();
         let access = req.access()?;
-        // of what the wicket runs, a wasm wicket's until it answers
-        let runtime = self.controller.runtime().await.ok();
-        let stack = runtime.map_or(crate::store::STACK, Runtime::stack);
+        // a stack it pins is one the wickets run
+        self.controller.stacks().await;
         let view = self.store.update(|state| {
             space_to_develop(access, state, space)?;
             if state.app_named(space, name).is_some() {
@@ -1579,10 +1596,14 @@ impl Api {
                     detail: format!("App with the name '{name}' already exists."),
                 });
             }
-            let guid = state.create_app(name, stack, space).guid.clone();
+            let pin = pin(state, &body)?.flatten();
+            let guid = state.create_app(name, space).guid.clone();
             let app = state.app_mut(&guid).expect("just created");
             app.env = env;
             app.lifecycle = lifecycle.unwrap_or_default();
+            app.pin = pin;
+            let runtime = state.stack_of(state.app(&guid).expect("just created"));
+            let app = state.app_mut(&guid).expect("just created");
             if let Err(refused) = apply_metadata(app, &body["metadata"], runtime) {
                 state.apps.retain(|app| app.guid != guid);
                 return Err(refused);
@@ -1595,10 +1616,8 @@ impl Api {
                     .map(String::from)
                     .collect();
             }
-            if let Some(stack) = body["lifecycle"]["data"]["stack"].as_str() {
-                app.stack = stack.to_string();
-            }
-            Ok(views::app(&req.base, app))
+            let app = state.app(&guid).expect("just created");
+            Ok(views::app(&req.base, state, app))
         })?;
         Ok(json(StatusCode::CREATED, &view))
     }
@@ -1609,7 +1628,8 @@ impl Api {
         let body: Value = req.json()?;
         let lifecycle = lifecycle(&body)?;
         let space = self.app_as(req, guid, Need::Develop)?.space;
-        let runtime = self.controller.runtime().await.ok();
+        // a stack it pins is one the wickets run
+        self.controller.stacks().await;
         let change = |state: &mut State| {
             if let Some(name) = body["name"].as_str()
                 && state
@@ -1620,11 +1640,19 @@ impl Api {
                     "App with the name '{name}' already exists."
                 )));
             }
+            let pin = pin(state, &body)?;
             let app = state
                 .app_mut(guid)
                 .ok_or_else(|| ApiError::not_found("App"))?;
+            let pinned = app.pin;
+            app.pin = pin.unwrap_or(pinned);
+            let runtime = state.stack_of(state.app(guid).expect("found above"));
+            let app = state.app_mut(guid).expect("found above");
             // first: refused, it changes nothing
-            apply_metadata(app, &body["metadata"], runtime)?;
+            if let Err(refused) = apply_metadata(app, &body["metadata"], runtime) {
+                app.pin = pinned;
+                return Err(refused);
+            }
             manifest::take_annotations(app);
             if let Some(name) = body["name"].as_str() {
                 app.name = name.to_string();
@@ -1639,9 +1667,6 @@ impl Api {
                     .map(String::from)
                     .collect();
             }
-            if let Some(stack) = body["lifecycle"]["data"]["stack"].as_str() {
-                app.stack = stack.to_string();
-            }
             app.updated_at = now();
             Ok(())
         };
@@ -1650,7 +1675,7 @@ impl Api {
         if body["metadata"]["annotations"].is_object() {
             self.annotations_waiting(&app);
         }
-        Ok(json(StatusCode::OK, &views::app(&req.base, &app)))
+        Ok(json(StatusCode::OK, &self.app_shown(req, &app)))
     }
 
     /// Logs why the running `app` takes none of its annotations until its next start.
@@ -1780,8 +1805,8 @@ impl Api {
     async fn patch_process(&self, req: &Req, process: &str) -> Reply {
         let body: Value = req.json()?;
         let app = self.app_of_process(req, process, Need::Operate)?;
-        let runtime = self.controller.runtime().await.ok();
         let view = self.store.update(|state| {
+            let runtime = state.stack_of(&app);
             let app = state
                 .app_mut(&app.guid)
                 .ok_or_else(|| ApiError::not_found("Process"))?;
@@ -1881,11 +1906,11 @@ impl Api {
         let log_rate = body
             .get("log_rate_limit_in_bytes_per_second")
             .and_then(Value::as_i64);
-        let runtime = self.controller.runtime().await.ok();
         let guid = guid.to_string();
         let change = {
             let guid = guid.clone();
             move |state: &mut State| {
+                let runtime = state.app(&guid).and_then(|app| state.stack_of(app));
                 let app = state
                     .app_mut(&guid)
                     .ok_or_else(|| ApiError::not_found("App"))?;
@@ -1986,7 +2011,7 @@ impl Api {
             ),
         );
         self.controller.sync(guid).await;
-        Ok(json(StatusCode::OK, &views::app(&req.base, &app)))
+        Ok(json(StatusCode::OK, &self.app_shown(req, &app)))
     }
 
     // --- packages, builds
@@ -2501,6 +2526,20 @@ fn deploy_on(
     let app = state.app_mut(guid).expect("found above");
     asked.scaled.apply(app).map_err(ApiError::unprocessable)?;
     let running = snapshot(state, guid, base)?;
+    // a step swaps a wicket's share in place, and a wicket runs one stack
+    if let Some(serves) = serving
+        .values()
+        .find(|serves| serves.stack() != running.stack())
+    {
+        return Err(ApiError::unprocessable(format!(
+            "a {} deployment of a droplet of the stack {} is not supported while the app runs \
+             one of the stack {}: its instances move to other wickets. cf push without \
+             --strategy stops and starts it",
+            asked.strategy,
+            running.stack().stack(),
+            serves.stack().stack()
+        )));
+    }
     let previous = previous.unwrap_or_else(|| running.droplet.clone());
     let (deployment, superseded) = state.deploy(guid, running, serving, previous, asked);
     Ok((deployment, superseded, blobs))
@@ -2519,10 +2558,16 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
     let droplet = state
         .droplet(current)
         .ok_or_else(|| ApiError::unprocessable("the current droplet is gone: push again"))?;
-    let runtime = match droplet.file.ends_with(staging::ROOTFS) {
-        true => Runtime::Firecracker,
-        false => Runtime::Wasm,
-    };
+    let runtime = droplet.stack();
+    // every wicket listed what it runs, and none this: nowhere to place it
+    let stacks = state.stacks();
+    if state.all_listed() && !stacks.contains(&runtime) {
+        return Err(ApiError::unprocessable(format!(
+            "the droplet is of the stack {}, which no wicket runs: they run {}",
+            runtime.stack(),
+            crate::wicket::stacks_named(&stacks)
+        )));
+    }
     let lifetime =
         manifest::check_annotations(&app.annotations, app.process.instances, Some(runtime))?;
     let readiness = app.process.readiness_health_check.clone();
@@ -2535,6 +2580,15 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
             .and_then(|value| value.parse::<u64>().ok())
     };
     let (wasi, keyvalue) = services::grants(state, guid);
+    if runtime == Runtime::Firecracker
+        && let Some(granted) = services::wasm_only(state, guid)
+    {
+        return Err(ApiError::unprocessable(format!(
+            "the droplet is a rootfs (the stack {}) and the app binds {granted}, which grant a \
+             component's sandbox: a VM takes none of them, unbind them (cf unbind-service)",
+            runtime.stack()
+        )));
+    }
     Ok(Running {
         droplet: droplet.guid.clone(),
         sha256: droplet.sha256.clone(),
@@ -2545,6 +2599,7 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
             .next()
             .unwrap_or(&droplet.file)
             .to_string(),
+        staged_as: Some(runtime),
         files: droplet.files.as_ref().map(|files| files.sha256.clone()),
         memory_mib: app.process.memory_mb,
         budget_ms: annotation(BUDGET_ANNOTATION),
@@ -2562,6 +2617,17 @@ fn snapshot(state: &State, guid: &str, base: &str) -> Result<Running, ApiError> 
         tag: Some(env::tag()),
         since: epoch_secs(),
     })
+}
+
+/// The pin a body's `lifecycle.data.stack` asks: a stack the wickets run pins the app to it
+/// (`cf push -s`), null lifts the pin; None when the body names none.
+fn pin(state: &State, body: &Value) -> Result<Option<Option<Runtime>>, ApiError> {
+    match body["lifecycle"]["data"].get("stack") {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(stack)) => Ok(Some(Some(state.stack_named(stack)?))),
+        Some(_) => Err(ApiError::unprocessable("Stack must be a string")),
+    }
 }
 
 /// The lifecycle a body's `lifecycle.type` names: an app is a zip's

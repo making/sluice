@@ -1270,7 +1270,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
         &dir.join("cf-lost"),
         &["--any-credentials"],
     );
-    let left = lost.line("CELL: ");
+    let left = lost.line("CELL: left");
     assert!(left.contains("left in the wicket"), "{left}");
     assert_eq!(listing(&console)["generation"], generation);
     assert_eq!(listing(&console)["apps"].as_array().unwrap().len(), 2);
@@ -3340,6 +3340,136 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     drop(wicket_b);
     assert!(listing(&console)["apps"].as_array().unwrap().is_empty());
     assert_eq!(get(&listen, "fc.localhost", "/", None).0, 404);
+    drop(api);
+
+    // a wasm wicket beside the Firecracker one, under one cf-api: what is pushed decides where
+    // it runs, each stack's apps answering on its wicket's listener
+    std::fs::create_dir_all(dir.join("component")).unwrap();
+    std::fs::copy(
+        guests().join("hello.wasm"),
+        dir.join("component/hello.wasm"),
+    )
+    .unwrap();
+    let wasi_config = dir.join("wasi.yaml");
+    let stores = "keyvalue:\n  default: local\n  stores:\n    local: {type: sqlite, path: kv.db}\n";
+    std::fs::write(&wasi_config, stores).unwrap();
+    let wasi = Process::spawn(
+        &crate::wicket_binary(),
+        &[
+            "--flume",
+            &flume_url,
+            "--flume-token",
+            FLUME_TOKEN,
+            "--listen",
+            "127.0.0.1:0",
+            "--console",
+            "127.0.0.1:0",
+            "--console-token",
+            TOKEN,
+            "--console-dir",
+            dir.join("deployed-wasi").to_str().unwrap(),
+            "--config",
+            wasi_config.to_str().unwrap(),
+            "--watch-interval",
+            "0",
+        ],
+    );
+    let listen_w = wasi.logged("listening on ");
+    let console_w = wasi.logged("console on http://");
+    let (api, _) = start_api(
+        &api_listen,
+        &[
+            format!("wicket=http://{console}"),
+            format!("wasi=http://{console_w}"),
+        ],
+        &flume_url,
+        &dir.join("cf"),
+        &["--any-credentials"],
+    );
+    eventually("both stacks listed", || {
+        let stacks = cf.ok(&["stacks"]);
+        stacks.contains("firecracker ") && stacks.contains("wasip3 ")
+    });
+    // where the app `host` answers, of the Firecracker wicket's listener and the wasm one's
+    let answers = |host: &str| {
+        let host = format!("{host}.localhost");
+        let on = |listen: &str| get(listen, &host, "/", None).0 == 200;
+        (on(&listen), on(&listen_w))
+    };
+    let component = dir.join("component");
+    let component = component.to_str().unwrap();
+    cf.ok(&["push", "comp", "-p", component]);
+    assert_eq!(answers("comp"), (false, true));
+    let (ok, output) = pushed_as("img", &[]);
+    assert!(ok, "{output}");
+    assert_eq!(answers("img"), (true, false));
+    let stack_of = |app: &str| {
+        let guid = cf.ok(&["app", app, "--guid"]);
+        let droplet = cf.ok(&[
+            "curl",
+            &format!("/v3/apps/{}/droplets/current", guid.trim()),
+        ]);
+        let droplet: Value = serde_json::from_str(&droplet).unwrap();
+        droplet["stack"].as_str().unwrap().to_string()
+    };
+    assert_eq!(
+        (stack_of("comp"), stack_of("img")),
+        ("wasip3".into(), "firecracker".into())
+    );
+    // the wasm wickets' services are a component's: a rootfs's app binds none of them
+    cf.ok(&["create-service", "keyvalue", "local", "kv"]);
+    let refused = cf.fails(&["bind-service", "img", "kv"]);
+    assert!(
+        refused.contains("grants a component's sandbox"),
+        "{refused}"
+    );
+    // a rolling deployment of a droplet of another stack is refused: the app serves on
+    let (ok, refused) = pushed_as("comp", &["--strategy", "rolling"]);
+    assert!(!ok, "{refused}");
+    assert!(
+        refused.contains(
+            "a rolling deployment of a droplet of the stack firecracker is not supported"
+        ),
+        "{refused}"
+    );
+    assert_eq!(answers("comp"), (false, true));
+    // a push of another stack moves the app: an image over a component, a stop and a start,
+    // and back
+    let (ok, output) = pushed_as("comp", &[]);
+    assert!(ok, "{output}");
+    assert_eq!(answers("comp"), (true, false));
+    assert_eq!(stack_of("comp"), "firecracker");
+    cf.ok(&["push", "comp", "-p", component]);
+    assert_eq!(answers("comp"), (false, true));
+    // bound to a keyvalue instance as a component, its start as a rootfs is refused, naming it
+    cf.ok(&["bind-service", "comp", "kv"]);
+    let (ok, refused) = pushed_as("comp", &[]);
+    assert!(!ok, "{refused}");
+    assert!(
+        refused.contains("the app binds the service instance kv (keyvalue)"),
+        "{refused}"
+    );
+    // a pin: the stack of `-s`, one the wickets run; a package of another fails staging
+    let refused = cf.fails(&["push", "pinned", "-p", component, "-s", "cflinuxfs4"]);
+    assert!(refused.contains("cflinuxfs4"), "{refused}");
+    let refused = cf.fails(&["push", "pinned", "-p", component, "-s", "firecracker"]);
+    let staging = cf.ok(&["logs", "pinned", "--recent"]);
+    assert!(
+        staging.contains(
+            "is a wasm component (the stack wasip3): the app is pinned to the stack firecracker"
+        ),
+        "{refused}\n{staging}"
+    );
+    let pinned = cf.ok(&["curl", "/v3/apps?names=pinned"]);
+    assert!(pinned.contains(r#""stack":"firecracker""#), "{pinned}");
+    for app in ["comp", "img", "pinned"] {
+        cf.ok(&["delete", app, "-r", "-f"]);
+    }
+    cf.ok(&["delete-service", "kv", "-f"]);
+    eventually("the apps removed", || {
+        listing(&console)["apps"].as_array().unwrap().is_empty()
+    });
+    drop(wasi);
     drop(api);
 
     // the cf-api as an app of the wicket, owner ops, a disk of its own at its working

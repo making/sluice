@@ -13,15 +13,15 @@ it stays as it is).
   `pull` (wasm) or the wicket's `make_image` (rootfs). The `STG` log line describing the lifecycle is per branch.
 - `unpack`: a static site first (`site && command.is_none() && is_site`, then `stage_site` / `pack_site`), else `stage`
   (the command's entry, else the only `.wasm` / `.ext4`).
-- The droplet's kind is told back later by its file name and fields, outside staging:
-  - `controller.rs` `desired`: `running.file.ends_with(ROOTFS)` picks the VM or wasm sandbox
-  - `api.rs` (start): the same, for the `Runtime`
-  - `views.rs` `droplet`: `rootfs` / `site` / `wasm` as the buildpack name, by `ROOTFS` and `droplet.files`
+- The droplet's stack is kept since the wickets of both runtimes (`Droplet::stack`, `Running::stack`: `wasip3` /
+  `firecracker`, told by the file's name for a state written before), detected in `run` (`Takes`: the stacks the
+  wickets run, the app's pin). What is still told back by fields, outside staging:
+  - `views.rs` `droplet`: `site` / `wasm` as the buildpack name, by `droplet.files`
 
 ## To weigh
 
-- A trait (detect + stage, like a buildpack's detect/build) vs. an enum of droplet kinds stored on `Droplet` (so
-  controller/api/views stop inferring the kind from `file` / `files`) vs. leaving it. Three kinds exist (component,
+- A trait (detect + stage, like a buildpack's detect/build) vs. an enum of droplet kinds stored on `Droplet` beside
+  its stack (so views stops inferring a site from `files`) vs. leaving it. Three kinds exist (component,
   rootfs, site); weigh what a fourth would cost each way.
 - Ordering and selection: CF's buildpack detection order, `cf push -b <name>` choosing one (now `app.buildpacks` is
   kept and shown back, never read by staging), the `buildpack` names `views.rs` reports, and whether

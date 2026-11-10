@@ -46,7 +46,7 @@ use crate::store::{
     Binding, Instance, Operation, OperationKind, OperationState, Purge, State, guid, now,
 };
 use crate::views;
-use crate::wicket::ListedStore;
+use crate::wicket::{ListedStore, Runtime};
 
 /// The broker the offerings are listed under.
 pub const BROKER: &str = "sluice-wicket";
@@ -121,6 +121,12 @@ impl Offer {
         Offer {
             plans: stores.chain(capabilities).collect(),
         }
+    }
+
+    /// Whether it lists the keyvalue store `name`.
+    pub fn has_store(&self, name: &str) -> bool {
+        let mut plans = self.plans.iter();
+        plans.any(|plan| plan.offering == KEYVALUE && plan.name == name)
     }
 
     /// What every one of `offers` offers, as the first describes it: an app may run on any of
@@ -240,6 +246,29 @@ pub fn grants(state: &State, app: &str) -> (Vec<String>, BTreeMap<String, String
     (wasi.into_iter().collect(), keyvalue)
 }
 
+/// Whether `instance` grants a component's sandbox: a keyvalue namespace or a capability, a wasm
+/// wicket's own. A VM takes neither; a user-provided or a broker's instance is credentials in
+/// the env, any app's.
+fn wasm_grant(instance: &Instance) -> bool {
+    !instance.brokered() && [KEYVALUE, WASI].contains(&instance.offering.as_str())
+}
+
+/// The instances the app `app` binds that grant a component's sandbox alone, as a sentence
+/// names them: `the service instances kv (keyvalue), net (wasi)`. None: it binds none.
+pub fn wasm_only(state: &State, app: &str) -> Option<String> {
+    let bound = state.bindings_of(app);
+    let named: Vec<String> = bound
+        .filter_map(|binding| state.instance(&binding.instance))
+        .filter(|instance| wasm_grant(instance))
+        .map(|instance| format!("{} ({})", instance.name, instance.offering))
+        .collect();
+    match named.len() {
+        0 => None,
+        1 => Some(format!("the service instance {}", named[0])),
+        _ => Some(format!("the service instances {}", named.join(", "))),
+    }
+}
+
 /// The home of `instance`'s data, a namespace of a store of each wicket's host
 /// (`crate::placement`), when an instance `app` binds already has its data on another wicket:
 /// that one's name, the home and its wicket.
@@ -303,6 +332,19 @@ pub fn bind(
         .any(|binding| binding.instance == instance)
     {
         return Err(Unbound::Already);
+    }
+    let rootfs =
+        state.app(app).and_then(|app| state.shown_stack(app)) == Some(Runtime::Firecracker);
+    if rootfs && wasm_grant(&found) {
+        let app_name = state.app(app).map_or(app, |app| app.name.as_str());
+        return Err(Unbound::Refused(format!(
+            "{app_name} is of the stack {}, a rootfs in a VM: {} ({} {}) grants a component's \
+             sandbox, which a VM takes none of",
+            Runtime::Firecracker.stack(),
+            found.name,
+            found.offering,
+            found.plan
+        )));
     }
     let operation = match found.brokered() {
         true => Some(brokered_binding(state, &found, parameters)?),
@@ -2063,7 +2105,7 @@ fn bindings(req: &Req, state: &State, access: &Access) -> Reply {
                 .apps
                 .iter()
                 .filter(|app| named.contains(app.guid.as_str()))
-                .map(|app| views::app(base, app))
+                .map(|app| views::app(base, state, app))
                 .collect();
             included.insert("apps".into(), json!(apps));
         }

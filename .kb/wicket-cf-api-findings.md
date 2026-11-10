@@ -118,6 +118,15 @@ each), an app of `-i 1` on the first wicket, killed (SIGKILL):
   answered. Without the hold (seen through a server the same day): the deleted app served 8s,
   until the cf-api's next listing, whose pause grew to 30s then
 
+## Stacks and the CLI
+
+What the OSS CLI (8.19.0) does with a stack, seen 2026-11-10 against wickets of both runtimes:
+
+- `cf push -s <stack>` with `--docker-image` is refused by the CLI itself (`cannot be used
+  together`): an image's app is pinned by a manifest, whose `docker:` with `stack:` passes it
+- `cf push -s <stack>` with a zip reaches the app's `lifecycle.data.stack`
+- `cf app` shows the stack of the current droplet: empty before staging
+
 ## The demo's GIF
 
 2.5MB ([demo/README.md](../sluice-wicket-cf-api/demo/README.md)).

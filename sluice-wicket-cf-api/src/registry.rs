@@ -4,7 +4,11 @@
 //! image index is followed to its one `wasm` entry), and the manifest's one
 //! `application/wasm` layer -- the wasm OCI artifact `wkg oci push` makes, or
 //! `oras push <reference> hello.wasm:application/wasm` -- is the component,
-//! checked against its digest. Any other image fails, saying what it holds.
+//! checked against its digest. Any other image fails, saying what it holds, or,
+//! where a Firecracker wicket makes a rootfs of it, is told apart ([`Registry::pull`]):
+//! the manifest is how an image's stack is detected. An index of a wasm entry
+//! and others is a component; the manifest of one of its others, by digest, is
+//! not.
 
 use std::time::Duration;
 
@@ -48,15 +52,17 @@ impl Registry {
     }
 
     /// Pulls the component of `image`, with the `(username, password)` of a
-    /// private one.
+    /// private one. With `others`, an image holding no component is None, not
+    /// pulled: a rootfs is made of it.
     pub async fn pull(
         &self,
         image: &str,
         credentials: Option<(&str, &str)>,
-    ) -> Result<Pulled, String> {
+        others: bool,
+    ) -> Result<Option<Pulled>, String> {
         let reference = Reference::parse(image)?;
         let session = self.registry.session(&reference, credentials);
-        tokio::time::timeout(PULL_TIMEOUT, pull(session, &reference, image))
+        tokio::time::timeout(PULL_TIMEOUT, pull(session, &reference, image, others))
             .await
             .unwrap_or_else(|_| {
                 Err(format!(
@@ -82,7 +88,8 @@ async fn pull(
     mut session: Session<'_>,
     reference: &Reference,
     image: &str,
-) -> Result<Pulled, String> {
+    others: bool,
+) -> Result<Option<Pulled>, String> {
     let (digest, manifest) = session.manifest(reference.by()).await?;
     if let Some(pinned) = &reference.digest
         && *pinned != digest
@@ -91,6 +98,8 @@ async fn pull(
     }
     let layer = match component(&manifest)? {
         Found::Layer(layer) => layer,
+        Found::Other(_) if others => return Ok(None),
+        Found::Other(holds) => return Err(holds),
         Found::Entry(entry) => {
             let (got, manifest) = session.manifest(&entry).await?;
             match component(&manifest)? {
@@ -100,6 +109,7 @@ async fn pull(
                         "the registry answered the manifest {got} for {entry}"
                     ));
                 }
+                Found::Other(holds) => return Err(holds),
                 Found::Entry(_) => return Err("an index in the index's wasm entry".into()),
             }
         }
@@ -112,7 +122,7 @@ async fn pull(
         reference.repository.rsplit('/').next().unwrap_or_default()
     );
     crate::staging::check_component(&file, &bytes)?;
-    Ok(Pulled {
+    Ok(Some(Pulled {
         image: match &reference.digest {
             Some(_) => image.to_string(),
             None => format!("{image}@{digest}"),
@@ -120,7 +130,7 @@ async fn pull(
         file,
         sha256: sha256(&bytes),
         bytes,
-    })
+    }))
 }
 
 /// A layer: its digest and size.
@@ -137,10 +147,12 @@ enum Found {
     Layer(Layer),
     /// The digest of an index's wasm entry.
     Entry(String),
+    /// No component: what the image holds instead.
+    Other(String),
 }
 
 /// The component's layer of `manifest`, or the `wasm` entry of an index;
-/// else what the image holds instead.
+/// else what the image holds instead: more than one component is an error.
 fn component(manifest: &Value) -> Result<Found, String> {
     let media_type = manifest["mediaType"].as_str().unwrap_or_default();
     if INDEX_TYPES.contains(&media_type) || manifest["manifests"].is_array() {
@@ -157,10 +169,10 @@ fn component(manifest: &Value) -> Result<Found, String> {
             .collect();
         return match wasm.as_slice() {
             [entry] => Ok(Found::Entry(digest(entry)?)),
-            [] => Err(format!(
+            [] => Ok(Found::Other(format!(
                 "the image is an index of {}, no wasm among them: it holds no wasm component",
                 listed(entries.iter().map(platform))
-            )),
+            ))),
             several => Err(format!(
                 "the image is an index of {} wasm entries ({}): name one by its digest",
                 several.len(),
@@ -187,7 +199,7 @@ fn component(manifest: &Value) -> Result<Found, String> {
                 size,
             }))
         }
-        [] => Err(format!(
+        [] => Ok(Found::Other(format!(
             "the image holds no wasm component (a layer of {WASM_LAYER}): its config is {} and its layers {}; push one with wkg oci push, or oras push <reference> <file>.wasm:{WASM_LAYER}",
             manifest["config"]["mediaType"].as_str().unwrap_or("none"),
             listed(
@@ -195,7 +207,7 @@ fn component(manifest: &Value) -> Result<Found, String> {
                     .iter()
                     .map(|layer| layer["mediaType"].as_str().unwrap_or("?").to_string())
             )
-        )),
+        ))),
         several => Err(format!(
             "the image holds {} wasm layers: one component is deployed",
             several.len()
@@ -262,7 +274,12 @@ mod tests {
             "application/vnd.oci.image.config.v1+json",
             vec![layer(tar, 1), layer(tar, 2), layer(tar, 3)],
         );
-        let error = component(&image).unwrap_err();
+        // no component: told apart, a rootfs where a Firecracker wicket makes one
+        let other = |manifest: &Value| match component(manifest) {
+            Ok(Found::Other(holds)) => holds,
+            found => panic!("{found:?}"),
+        };
+        let error = other(&image);
         assert!(
             error.contains(&format!(
                 "its config is application/vnd.oci.image.config.v1+json and its layers {tar} (3)"
@@ -289,11 +306,10 @@ mod tests {
             .unwrap(),
             Found::Entry(digest(2))
         );
-        let error = component(&index(vec![
+        let error = other(&index(vec![
             entry("linux", "amd64", 1),
             entry("linux", "arm64", 2),
-        ]))
-        .unwrap_err();
+        ]));
         assert!(
             error.contains("an index of linux/amd64, linux/arm64, no wasm among them"),
             "{error}"

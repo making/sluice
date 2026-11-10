@@ -702,7 +702,7 @@ mod tests {
         state.follow_wickets(&["a".into(), "b".into(), "c".into()]);
         let space = state.spaces[0].guid.clone();
         let domain = state.domains[0].guid.clone();
-        let app = state.create_app("app", crate::store::STACK, &space);
+        let app = state.create_app("app", &space);
         app.process.instances = 3;
         app.started = true;
         app.running = Some(snapshot("d1"));

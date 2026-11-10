@@ -16,7 +16,7 @@ use crate::services::{self, Unbound};
 use crate::store::{
     App, BUDGET_ANNOTATION, CONCURRENCY_ANNOTATION, HealthCheck, INSTANCES_ANNOTATION,
     KEEP_ANNOTATION, LIFETIME_ANNOTATION, Lifecycle, Lifetime, MODE_ANNOTATION, ReadinessCheck,
-    STACK, State, USES_ANNOTATION, WARM_ANNOTATION, now,
+    State, USES_ANNOTATION, WARM_ANNOTATION, now,
 };
 use crate::wicket::Runtime;
 
@@ -162,29 +162,18 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
     serde_saphyr::from_str(text).map_err(|e| format!("the manifest: {e}"))
 }
 
-/// Applies `manifest` to the space `space` of `state`: the guids of the apps it names.
-/// `runtime` is what the wicket runs, None until it answers: a new app's stack then a wasm
-/// wicket's.
-pub fn apply(
-    state: &mut State,
-    space: &str,
-    manifest: &Manifest,
-    runtime: Option<Runtime>,
-) -> Result<Vec<String>, String> {
+/// Applies `manifest` to the space `space` of `state`: the guids of the apps it names. An
+/// app's `stack:` pins it, one the wickets run; its annotations and checks are those its stack
+/// takes ([`State::stack_of`]).
+pub fn apply(state: &mut State, space: &str, manifest: &Manifest) -> Result<Vec<String>, String> {
     let mut guids = Vec::new();
     for spec in &manifest.applications {
-        guids.push(apply_app(state, space, spec, runtime)?);
+        guids.push(apply_app(state, space, spec)?);
     }
     Ok(guids)
 }
 
-fn apply_app(
-    state: &mut State,
-    space: &str,
-    spec: &AppManifest,
-    runtime: Option<Runtime>,
-) -> Result<String, String> {
-    let stack = runtime.map_or(STACK, Runtime::stack);
+fn apply_app(state: &mut State, space: &str, spec: &AppManifest) -> Result<String, String> {
     let name = spec.name.trim();
     if name.is_empty() {
         return Err("an application needs a name".into());
@@ -204,8 +193,20 @@ fn apply_app(
     }
     let guid = match state.app_named(space, name) {
         Some(app) => app.guid.clone(),
-        None => state.create_app(name, stack, space).guid.clone(),
+        None => state.create_app(name, space).guid.clone(),
     };
+    let pin = match &spec.stack {
+        Some(stack) => Some(
+            state
+                .stack_named(stack)
+                .map_err(|e| format!("{name}: {e}"))?,
+        ),
+        None => None,
+    };
+    let app = state.app_mut(&guid).expect("just found or created");
+    app.pin = pin.or(app.pin);
+    let app = state.app(&guid).expect("just found or created");
+    let runtime = state.stack_of(app);
     let app = state.app_mut(&guid).expect("just found or created");
     // the CLI reads this back: a docker app's bits it does not gather
     app.lifecycle = match spec
@@ -220,9 +221,6 @@ fn apply_app(
         app.buildpacks = buildpacks.clone();
     } else if let Some(buildpack) = &spec.buildpack {
         app.buildpacks = vec![buildpack.clone()];
-    }
-    if let Some(stack) = &spec.stack {
-        app.stack = stack.clone();
     }
     if let Some(metadata) = &spec.metadata {
         merge(&mut app.labels, metadata.labels.as_ref());
@@ -545,7 +543,7 @@ fn merge(into: &mut BTreeMap<String, String>, from: Option<&BTreeMap<String, Opt
     }
 }
 
-/// What the wicket's annotations ask of an app of `instances`, on a wicket of `runtime` (None
+/// What the wicket's annotations ask of an app of `instances`, of the stack `runtime` (None
 /// until it answers: what either refuses is left to the start, which knows the droplet). What
 /// does not apply is refused, not ignored: a wicket's option the other has, an option its mode
 /// does not take, more kept warm than the app may have. At 0 instances nothing is kept: the
@@ -592,13 +590,15 @@ pub fn check_annotations(
             let vm = [MODE_ANNOTATION, USES_ANNOTATION, LIFETIME_ANNOTATION];
             if let Some(key) = vm.iter().find(|key| annotations.contains_key(**key)) {
                 return Err(format!(
-                    "annotation {key}: this wicket runs components, it has no VMs"
+                    "annotation {key}: the stack {} runs components, it has no VMs",
+                    Runtime::Wasm.stack()
                 ));
             }
         }
         Some(Runtime::Firecracker) if annotations.contains_key(BUDGET_ANNOTATION) => {
             return Err(format!(
-                "annotation {BUDGET_ANNOTATION}: this wicket runs VMs, it has no components"
+                "annotation {BUDGET_ANNOTATION}: the stack {} runs VMs, it has no components",
+                Runtime::Firecracker.stack()
             ));
         }
         _ => {}
@@ -674,8 +674,9 @@ pub fn check_readiness(
     }
     if runtime == Some(Runtime::Wasm) {
         return Err(format!(
-            "{TYPE} {kind}: this wicket runs components, whose instances take requests as they \
-             come: process alone"
+            "{TYPE} {kind}: the stack {} runs components, whose instances take requests as they \
+             come: process alone",
+            Runtime::Wasm.stack()
         ));
     }
     match lifetime.mode.as_deref() {
@@ -721,8 +722,9 @@ pub fn check_liveness(
     }
     if runtime == Some(Runtime::Wasm) {
         return Err(format!(
-            "{TYPE} http: this wicket runs components, whose instances take requests as they \
-             come: port or process"
+            "{TYPE} http: the stack {} runs components, whose instances take requests as they \
+             come: port or process",
+            Runtime::Wasm.stack()
         ));
     }
     match lifetime.mode.as_deref() {
@@ -792,10 +794,7 @@ fn check_count(lifetime: &Lifetime, instances: u64) -> Result<(), String> {
 /// them. None for an app that runs nothing.
 pub fn live_lifetime(app: &App) -> Option<Result<Lifetime, String>> {
     let running = app.running.as_ref().filter(|_| app.started)?;
-    let runtime = match running.file.ends_with(crate::staging::ROOTFS) {
-        true => Runtime::Firecracker,
-        false => Runtime::Wasm,
-    };
+    let runtime = running.stack();
     let mode = |lifetime: &Lifetime| lifetime.mode.clone().unwrap_or_else(|| "pool".into());
     Some(
         check_annotations(&app.annotations, app.process.instances, Some(runtime)).and_then(
@@ -888,14 +887,20 @@ mod tests {
         State::new("o", "s", &["localhost".into(), "example.com".into()])
     }
 
-    /// [`super::apply`] in the state's first space.
+    /// [`super::apply`] in the state's first space, its one wicket listing `runtime` (None: yet
+    /// to list).
     fn apply(
         state: &mut State,
         manifest: &Manifest,
         runtime: Option<Runtime>,
     ) -> Result<Vec<String>, String> {
         let space = state.spaces[0].guid.clone();
-        super::apply(state, &space, manifest, runtime)
+        state.wickets.configured = vec!["w".into()];
+        state.wickets.runtimes = runtime
+            .map(|runs| ("w".to_string(), runs))
+            .into_iter()
+            .collect();
+        super::apply(state, &space, manifest)
     }
 
     /// Adds the service instance `name`: its guid.
@@ -1005,10 +1010,10 @@ mod tests {
         // an app of another space: the same name is its own, a route of the first is not
         let org = state.orgs[0].guid.clone();
         let elsewhere = state.create_space("elsewhere", &org).guid.clone();
-        let there = super::apply(&mut state, &elsewhere, &taken, None);
+        let there = super::apply(&mut state, &elsewhere, &taken);
         assert!(there.unwrap_err().contains("in use by another space"));
         let named = parse("applications:\n- name: other\n").unwrap();
-        let there = super::apply(&mut state, &elsewhere, &named, None).unwrap();
+        let there = super::apply(&mut state, &elsewhere, &named).unwrap();
         assert_ne!(there[0], other);
 
         // no-route unmaps; random-route names one
@@ -1198,6 +1203,11 @@ mod tests {
         assert!(
             refused("applications:\n- name: a\n  instances: 1001\n")
                 .contains("a: instances: 1001 is past the 1000 an app has at most")
+        );
+        // a stack pins the app: one the wickets run, as CC takes a stack it has
+        assert!(
+            refused("applications:\n- name: a\n  stack: cflinuxfs4\n")
+                .contains("a: Stack \"cflinuxfs4\" must be an existing stack: the wickets run")
         );
         let services = [
             ("- nope", "service instance 'nope' not found"),

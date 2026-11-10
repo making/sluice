@@ -243,12 +243,15 @@ impl Sandbox {
     }
 }
 
-/// What a wicket runs apps as.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// What a wicket runs apps as, and so the stack of a droplet: what is pushed decides where it
+/// runs.
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Runtime {
     /// wasm components: a wicket whose listing names none is one.
+    #[serde(rename = "wasip3")]
     Wasm,
     /// ext4 images in microVMs.
+    #[serde(rename = "firecracker")]
     Firecracker,
 }
 
@@ -258,6 +261,32 @@ impl Runtime {
         match self {
             Runtime::Wasm => crate::store::STACK,
             Runtime::Firecracker => crate::store::ROOTFS_STACK,
+        }
+    }
+
+    /// The runtime of the stack `stack`, if it names one.
+    pub fn named(stack: &str) -> Option<Runtime> {
+        [Runtime::Wasm, Runtime::Firecracker]
+            .into_iter()
+            .find(|runtime| runtime.stack() == stack)
+    }
+
+    /// The runtime of a droplet whose file is `file`: a rootfs's name ends so.
+    pub fn of_file(file: &str) -> Runtime {
+        match file.ends_with(crate::staging::ROOTFS) {
+            true => Runtime::Firecracker,
+            false => Runtime::Wasm,
+        }
+    }
+}
+
+/// `stacks` as a sentence names them: `wasip3, firecracker`; none known, so.
+pub fn stacks_named(stacks: &[Runtime]) -> String {
+    match stacks {
+        [] => "none known yet".into(),
+        stacks => {
+            let names: Vec<&str> = stacks.iter().map(|stack| stack.stack()).collect();
+            names.join(", ")
         }
     }
 }

@@ -8,8 +8,8 @@ use serde_json::{Value, json};
 use crate::controller::Controller;
 use crate::placement::MAX_INSTANCES;
 use crate::store::{
-    App, Build, Deployment, Droplet, Job, Lifecycle, Named, Outcome, Package, ROOTFS_STACK, Route,
-    STACK, SecurityGroup, Space, State, epoch_secs, now,
+    App, Build, Deployment, Droplet, Job, Lifecycle, Named, Outcome, Package, Route, SecurityGroup,
+    Space, State, epoch_secs, now,
 };
 use crate::wicket::{ListedApp, Runtime};
 
@@ -67,16 +67,22 @@ pub fn v3(base: &str) -> Value {
     json!({"links": links})
 }
 
-/// `/v3/info`: the description names what the wicket runs, when it answers.
-pub fn info(base: &str, build: &str, runtime: Option<Runtime>) -> Value {
-    let description = match runtime {
-        Some(Runtime::Wasm) => {
-            "sluice-wicket-cf-api: deploys wasm components to a sluice-wicket-runtime-wasi with the cf CLI"
-        }
-        Some(Runtime::Firecracker) => {
-            "sluice-wicket-cf-api: deploys container images and rootfs images to a sluice-wicket-runtime-firecracker with the cf CLI"
-        }
-        None => "sluice-wicket-cf-api: deploys apps to a sluice wicket with the cf CLI",
+/// `/v3/info`: the description names what the wickets run (`stacks`), once one answered.
+pub fn info(base: &str, build: &str, stacks: &[Runtime]) -> Value {
+    let deploys: Vec<&str> = (stacks.iter())
+        .map(|stack| match stack {
+            Runtime::Wasm => "wasm components to sluice-wicket-runtime-wasi",
+            Runtime::Firecracker => {
+                "container images and rootfs images to sluice-wicket-runtime-firecracker"
+            }
+        })
+        .collect();
+    let description = match deploys.is_empty() {
+        true => "sluice-wicket-cf-api: deploys apps to sluice wickets with the cf CLI".into(),
+        false => format!(
+            "sluice-wicket-cf-api: deploys {} with the cf CLI",
+            deploys.join(" and ")
+        ),
     };
     json!({
         "build": build,
@@ -97,10 +103,12 @@ fn metadata(app: Option<&App>) -> Value {
     }
 }
 
-/// A lifecycle as CC shows it: a docker one holds no data.
-fn lifecycle(lifecycle: Lifecycle, buildpacks: &[String], stack: &str) -> Value {
+/// A lifecycle as CC shows it: a docker one holds no data. `stack` is the app's
+/// ([`State::shown_stack`]), none before it is staged unless pinned.
+fn lifecycle(lifecycle: Lifecycle, buildpacks: &[String], stack: Option<Runtime>) -> Value {
     match lifecycle {
         Lifecycle::Buildpack => {
+            let stack = stack.map(Runtime::stack);
             json!({"type": "buildpack", "data": {"buildpacks": buildpacks, "stack": stack}})
         }
         Lifecycle::Docker => json!({"type": "docker", "data": {}}),
@@ -219,34 +227,43 @@ pub fn security_group(base: &str, group: &SecurityGroup) -> Value {
     })
 }
 
-/// The one stack, of what the wicket runs (a wasm wicket's until it answers).
-pub fn stack(base: &str, runtime: Option<Runtime>) -> Value {
-    let (name, description) = match runtime {
-        Some(Runtime::Firecracker) => (
-            ROOTFS_STACK,
-            "root filesystems in microVMs, served by sluice-wicket-runtime-firecracker",
-        ),
-        _ => (
-            STACK,
-            "WASI 0.3 components, served by sluice-wicket-runtime-wasi",
-        ),
+/// The stacks the wickets run (`stacks`: a wasm wicket's until one answers), the first the
+/// default: what is pushed decides an app's, `cf push -s` pins it.
+pub fn stacks(base: &str, stacks: &[Runtime]) -> Vec<Value> {
+    let stacks = match stacks {
+        [] => &[Runtime::Wasm],
+        stacks => stacks,
+    };
+    let stacks = stacks.iter().enumerate();
+    stacks
+        .map(|(at, runtime)| stack(base, *runtime, at == 0))
+        .collect()
+}
+
+fn stack(base: &str, runtime: Runtime, default: bool) -> Value {
+    let name = runtime.stack();
+    let description = match runtime {
+        Runtime::Firecracker => {
+            "root filesystems in microVMs, served by sluice-wicket-runtime-firecracker"
+        }
+        Runtime::Wasm => "WASI 0.3 components, served by sluice-wicket-runtime-wasi",
     };
     json!({
         "guid": name, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
         "name": name, "description": description,
-        "build_rootfs_image": name, "run_rootfs_image": name, "default": true,
+        "build_rootfs_image": name, "run_rootfs_image": name, "default": default,
         "metadata": metadata(None),
         "links": {"self": {"href": format!("{base}/v3/stacks/{name}")}},
     })
 }
 
-pub fn app(base: &str, app: &App) -> Value {
+pub fn app(base: &str, state: &State, app: &App) -> Value {
     let guid = &app.guid;
     json!({
         "guid": guid, "created_at": app.created_at, "updated_at": app.updated_at,
         "name": app.name,
         "state": if app.started { "STARTED" } else { "STOPPED" },
-        "lifecycle": lifecycle(app.lifecycle, &app.buildpacks, &app.stack),
+        "lifecycle": lifecycle(app.lifecycle, &app.buildpacks, state.shown_stack(app)),
         "relationships": {"space": rel(Some(&app.space))},
         "metadata": metadata(Some(app)),
         "links": {
@@ -554,7 +571,7 @@ pub fn build(base: &str, state: &State, build: &Build) -> Value {
         "lifecycle": lifecycle(
             build.lifecycle,
             app.map_or(&[][..], |app| &app.buildpacks),
-            app.map_or(STACK, |app| &app.stack),
+            app.and_then(|app| state.shown_stack(app)),
         ),
         "package": {"guid": build.package},
         "droplet": build.droplet.as_ref().map(|guid| json!({"guid": guid})),
@@ -568,19 +585,20 @@ pub fn build(base: &str, state: &State, build: &Build) -> Value {
 }
 
 /// A droplet: an image's shows the image, pinned to its digest (what `cf
-/// app` shows of a docker app), and no buildpack.
+/// app` shows of a docker app), and no buildpack; its stack is where it runs, an image's too.
 pub fn droplet(base: &str, droplet: &Droplet) -> Value {
-    let (buildpack, stack) = match droplet.file.ends_with(crate::staging::ROOTFS) {
-        true => ("rootfs", ROOTFS_STACK),
-        false if droplet.files.is_some() => ("site", STACK),
-        false => ("wasm", STACK),
+    let stack = droplet.stack();
+    let buildpack = match stack {
+        Runtime::Firecracker => "rootfs",
+        Runtime::Wasm if droplet.files.is_some() => "site",
+        Runtime::Wasm => "wasm",
     };
-    let (kind, buildpacks, stack) = match droplet.image {
-        Some(_) => ("docker", json!([]), Value::Null),
+    let stack = stack.stack();
+    let (kind, buildpacks) = match droplet.image {
+        Some(_) => ("docker", json!([])),
         None => (
             "buildpack",
             json!([{"name": buildpack, "detect_output": buildpack, "buildpack_name": buildpack, "version": "0.0.1"}]),
-            json!(stack),
         ),
     };
     json!({
@@ -702,8 +720,8 @@ pub fn environment_variables(base: &str, app: &App) -> Value {
 }
 
 /// The app's manifest, as `cf create-app-manifest` writes it: a docker
-/// app's names the image of its newest package (and its username), and no
-/// stack.
+/// app's names the image of its newest package (and its username); the stack
+/// when it is pinned, as pushing the manifest back would pin it.
 pub fn manifest(state: &State, app: &App) -> String {
     // a JSON string is a YAML scalar
     let quoted = |text: &str| serde_json::to_string(text).expect("a string");
@@ -718,17 +736,17 @@ pub fn manifest(state: &State, app: &App) -> String {
         .rev()
         .filter(|package| package.app == app.guid)
         .find_map(|package| package.docker.as_ref());
-    match (app.lifecycle, image) {
-        (Lifecycle::Docker, Some(docker)) => {
-            text.push_str(&format!(
-                "  docker:\n    image: {}\n",
-                quoted(&docker.image)
-            ));
-            if let Some(username) = &docker.username {
-                text.push_str(&format!("    username: {}\n", quoted(username)));
-            }
+    if let (Lifecycle::Docker, Some(docker)) = (app.lifecycle, image) {
+        text.push_str(&format!(
+            "  docker:\n    image: {}\n",
+            quoted(&docker.image)
+        ));
+        if let Some(username) = &docker.username {
+            text.push_str(&format!("    username: {}\n", quoted(username)));
         }
-        _ => text.push_str(&format!("  stack: {}\n", app.stack)),
+    }
+    if let Some(pin) = app.pin {
+        text.push_str(&format!("  stack: {}\n", pin.stack()));
     }
     if let Some(command) = &app.process.command {
         text.push_str(&format!("  command: {command}\n"));
@@ -1002,12 +1020,9 @@ mod tests {
     #[test]
     fn the_stats_list_what_is_alive() {
         let mut state = State::new("o", "s", &["localhost".into()]);
-        state.follow_wickets(&["w".into()]);
+        state.follow_listed(&["w"], Runtime::Wasm);
         let space = state.spaces[0].guid.clone();
-        let guid = state
-            .create_app("a", crate::store::STACK, &space)
-            .guid
-            .clone();
+        let guid = state.create_app("a", &space).guid.clone();
         let domain = state.domains[0].guid.clone();
         let app = state.app_mut(&guid).unwrap();
         app.process.instances = 2;
@@ -1058,6 +1073,7 @@ mod tests {
             sha256: "ab".repeat(32),
             made: Default::default(),
             file: "a.wasm".into(),
+            staged_as: None,
             files: None,
             memory_mib: 64,
             budget_ms: None,

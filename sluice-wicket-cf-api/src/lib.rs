@@ -229,12 +229,16 @@ pub async fn serve(
     // rustls-no-provider): ring, as tonic's TLS and the listener's
     let _ = rustls::crypto::ring::default_provider().install_default();
     let names: Vec<String> = settings.wickets.iter().map(|w| w.name.clone()).collect();
+    // what the wickets answering run: an index on a wicket no --wicket names any more is
+    // placed again by it at once
+    let runs = controller::stacks_of(&wickets(&settings)).await;
     let store = Arc::new(store::Store::open(
         &settings.data_dir,
         &settings.org,
         &settings.space,
         &settings.domains,
         &names,
+        &runs,
     )?);
     let mode = match &settings.oidc {
         Some(oidc) => uaa::Mode::Provider {

@@ -13,8 +13,15 @@
 //!
 //! A state of one wicket has its indices on the first wicket configured, and an index on a wicket
 //! no longer configured is placed again at the start ([`State::follow_wickets`]). None is placed
-//! on a wicket running apps another way than the first, nor on a second name of one: an index
-//! there stays.
+//! on a second name of a wicket: an index there stays.
+//!
+//! The wickets run one stack each, what each last listed ([`Wickets::runtimes`]), and an app's
+//! indices are on wickets of its stack, its last start's droplet's: as Diego places an LRP on the
+//! cells of its stack. A new index, one passed, one moving off a wicket leaving or gone and one
+//! spreading an app again go to wickets of that stack; an index on a wicket of another is placed
+//! again, so a start of a droplet of another stack moves the app. A wicket that never listed
+//! what it runs takes no new index and keeps what it has; with no wicket of its stack, an index
+//! is not placed.
 //!
 //! A keyvalue namespace of a store of each wicket's host (`sqlite`) has its data on one wicket,
 //! its home ([`State::homes`]): the wicket of index 0 of the first app whose start maps it. An
@@ -37,7 +44,10 @@ use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::store::{App, State};
+use serde::{Deserialize, Serialize};
+
+use crate::store::{App, Running, State};
+use crate::wicket::Runtime;
 
 /// An index of an app and the wicket it moves to.
 pub type Move = (u64, String);
@@ -59,9 +69,10 @@ pub const MAX_INSTANCES: u64 = 1000;
 pub struct Wickets {
     /// As configured: the first takes a state of one wicket.
     pub configured: Vec<String>,
-    /// None placed on: those running apps another way than the first wicket listed, a second
-    /// name of a wicket.
+    /// None placed on: a second name of a wicket.
     pub odd: BTreeSet<String>,
+    /// What each runs, as it last listed it, by name: kept with the state.
+    pub runtimes: BTreeMap<String, Runtime>,
     /// What each wicket's budget leaves the apps placed on it, as it last listed it.
     pub budgets: BTreeMap<String, Budget>,
     /// Those that refused a share for room, by the revision they listed then: no room until it
@@ -78,6 +89,50 @@ pub struct Wickets {
     /// Each keyvalue store the wickets list, by name: whether it is one store of them all, else
     /// each wicket's host's own (`crate::services::Offer::stores`).
     pub stores: BTreeMap<String, bool>,
+}
+
+impl Wickets {
+    /// Whether none listed what it runs.
+    pub fn none_listed(&self) -> bool {
+        self.runtimes.is_empty()
+    }
+
+    /// Writes what is kept of them with the state: what each runs.
+    pub fn write_runtimes<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.runtimes.serialize(serializer)
+    }
+
+    /// Reads what [`Wickets::write_runtimes`] wrote.
+    pub fn read_runtimes<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Wickets, D::Error> {
+        Ok(Wickets {
+            runtimes: BTreeMap::deserialize(deserializer)?,
+            ..Wickets::default()
+        })
+    }
+
+    /// Whether an index of an app of `stack` placed on `wicket` stays there: not on one that
+    /// lists another stack.
+    fn keeps(&self, wicket: &str, stack: Option<Runtime>) -> bool {
+        match (stack, self.runtimes.get(wicket)) {
+            (Some(stack), Some(runs)) => stack == *runs,
+            _ => true,
+        }
+    }
+
+    /// Whether a new index of an app of `stack` may go to `wicket`: one listing that stack, no
+    /// second name of a wicket. An app never started has no stack, and its indices go anywhere
+    /// until it has.
+    fn takes(&self, wicket: &str, stack: Option<Runtime>) -> bool {
+        !self.odd.contains(wicket)
+            && stack.is_none_or(|stack| self.runtimes.get(wicket) == Some(&stack))
+    }
+}
+
+/// The stack of `app`: its last start's droplet's.
+fn stack(app: &App) -> Option<Runtime> {
+    app.running.as_ref().map(Running::stack)
 }
 
 /// Where all the indices of an app go: a namespace of a store of each wicket's host has its
@@ -122,22 +177,23 @@ fn need(app: &App) -> u64 {
     app.running.as_ref().map_or(0, |running| running.memory_mib)
 }
 
-/// `placement` of `count` indices: the highest dropped; an index on a wicket not configured, and
-/// each new one, on a wicket with room for it holding the fewest of the others, of them the one
-/// with the most room, the first configured of those. `rooms` is the room for the app's indices
-/// on the wickets of a known budget, its own aside: the others have room enough. Pinned, every
-/// index on the one wicket, room or not.
+/// `placement` of `count` indices of an app of `stack`: the highest dropped; an index on a wicket
+/// not configured or of another stack, and each new one, on a wicket of its stack with room for
+/// it holding the fewest of the others, of them the one with the most room, the first configured
+/// of those. `rooms` is the room for the app's indices on the wickets of a known budget, its own
+/// aside: the others have room enough. Pinned, every index on the one wicket, room or not.
 fn placed(
     placement: &[String],
     count: usize,
     wickets: &Wickets,
     rooms: &BTreeMap<String, i64>,
     pin: Option<&Pin>,
+    stack: Option<Runtime>,
 ) -> Vec<String> {
     // the one wicket of them all: index 0's, unpinned, without a home
     let home = pin.map(|pin| match pin {
         Pin::To(home) => Some(home.clone()),
-        Pin::Together => placed(placement, count, wickets, rooms, None)
+        Pin::Together => placed(placement, count, wickets, rooms, None, stack)
             .into_iter()
             .next(),
     });
@@ -149,13 +205,13 @@ fn placed(
         .iter()
         .take(count)
         .map(|wicket| wickets.configured.iter().find(|kept| *kept == wicket))
-        .map(|wicket| wicket.filter(|wicket| allowed(wicket)))
+        .map(|wicket| wicket.filter(|wicket| allowed(wicket) && wickets.keeps(wicket, stack)))
         .collect();
     placed.resize(count, None);
     let candidates: Vec<&String> = wickets
         .configured
         .iter()
-        .filter(|wicket| !wickets.odd.contains(*wicket) && allowed(wicket))
+        .filter(|wicket| wickets.takes(wicket, stack) && allowed(wicket))
         .collect();
     let mut held: Vec<usize> = candidates
         .iter()
@@ -173,7 +229,7 @@ fn placed(
             let room = left[*at].unwrap_or(i64::MAX);
             (room < 1, held[*at], Reverse(room))
         };
-        // none configured: none placed
+        // none configured, or none of its stack: none placed
         let Some(at) = (0..candidates.len()).min_by_key(key) else {
             break;
         };
@@ -196,17 +252,18 @@ fn held(app: &App, placement: &[String], wicket: &str) -> usize {
 }
 
 /// The moves of `app`, placed as `placement` has it, that still are: of a started app, of an
-/// index it has, to a configured wicket other than the one it is on.
+/// index it has, to a configured wicket of its stack other than the one it is on.
 fn moving<'a>(
     app: &'a App,
     placement: &'a [String],
-    configured: &'a [String],
+    wickets: &'a Wickets,
 ) -> impl Iterator<Item = (u64, &'a String)> + 'a {
     let running = takes_room(app);
+    let stack = stack(app);
     (app.moving.iter())
         .filter(move |_| running)
         .filter(|(index, to)| (placement.get(**index as usize)).is_some_and(|on| on != *to))
-        .filter(|(_, to)| configured.contains(to))
+        .filter(move |(_, to)| wickets.configured.contains(to) && wickets.takes(to, stack))
         .map(|(index, to)| (*index, to))
 }
 
@@ -227,7 +284,10 @@ impl State {
     pub fn placement<'a>(&self, app: &'a App) -> Cow<'a, [String]> {
         let count = count(app);
         let pin = self.pin(app);
-        let configured = |wicket: &String| self.wickets.configured.contains(wicket);
+        let stack = stack(app);
+        let configured = |wicket: &String| {
+            self.wickets.configured.contains(wicket) && self.wickets.keeps(wicket, stack)
+        };
         let pinned = |wicket: &String| match &pin {
             Some(Pin::To(home)) => wicket == home,
             Some(Pin::Together) => app.placement.first() == Some(wicket),
@@ -247,6 +307,7 @@ impl State {
             &self.wickets,
             &self.rooms(app),
             pin.as_ref(),
+            stack,
         ))
     }
 
@@ -310,8 +371,27 @@ impl State {
         rooms
     }
 
+    /// The stacks the wickets configured run, as each last listed, in the order configured: the
+    /// first is the default.
+    pub fn stacks(&self) -> Vec<Runtime> {
+        let mut stacks = Vec::new();
+        let listed = self.wickets.configured.iter();
+        for runs in listed.filter_map(|wicket| self.wickets.runtimes.get(wicket)) {
+            if !stacks.contains(runs) {
+                stacks.push(*runs);
+            }
+        }
+        stacks
+    }
+
+    /// Whether every wicket configured listed what it runs: [`State::stacks`] is all there is.
+    pub fn all_listed(&self) -> bool {
+        let mut configured = self.wickets.configured.iter();
+        configured.all(|wicket| self.wickets.runtimes.contains_key(wicket))
+    }
+
     /// Passes the highest index of the app `guid` on `wicket`, which refused its share for room,
-    /// to a wicket with room for it: the line saying so; none without one.
+    /// to a wicket of its stack with room for it: the line saying so; none without one.
     pub fn pass(&mut self, guid: &str, wicket: &str) -> Option<String> {
         let app = self.app(guid)?;
         if self.pin(app).is_some() {
@@ -323,7 +403,7 @@ impl State {
         let at = placement.iter().rposition(|on| on == wicket)?;
         let held = |other: &String| placement.iter().filter(|on| *on == other).count() as i64;
         let elsewhere = (self.wickets.configured.iter())
-            .filter(|other| *other != wicket && !self.wickets.odd.contains(*other))
+            .filter(|other| *other != wicket && self.wickets.takes(other, stack(app)))
             .any(|other| rooms.get(other).is_none_or(|room| room - held(other) >= 1));
         if !elsewhere {
             return None;
@@ -363,7 +443,7 @@ impl State {
                 .or_default()
                 .push(index as u64);
         }
-        for (index, to) in moving(app, &placement, &self.wickets.configured) {
+        for (index, to) in moving(app, &placement, &self.wickets) {
             let held = indices.entry(to.clone()).or_default();
             held.push(index);
             held.sort();
@@ -372,7 +452,7 @@ impl State {
     }
 
     /// Moves the indices of the app `guid` placed on `from`, a wicket leaving or gone, each to a
-    /// wicket with room for it, neither leaving nor gone, holding the fewest of the app's, of them
+    /// wicket of its stack with room for it, neither leaving nor gone, holding the fewest of the app's, of them
     /// the one with the most room, the first configured of those ([`App::moving`]): those with
     /// nowhere to go stay, as they all do with its keyvalue data there. Of a started app only, its
     /// indices moving already moving on.
@@ -393,9 +473,15 @@ impl State {
             };
         }
         let rooms = self.rooms(app);
-        let candidates: Vec<&String> = (self.wickets.configured.iter())
+        let mut candidates: Vec<&String> = (self.wickets.configured.iter())
             .filter(|wicket| *wicket != from && self.takes_more(wicket))
             .collect();
+        let others = candidates.len();
+        candidates.retain(|wicket| self.wickets.takes(wicket, stack(app)));
+        let why = match others > 0 && candidates.is_empty() {
+            true => "no other wicket runs its stack",
+            false => "no other wicket has room for it",
+        };
         let mut held: Vec<i64> = (candidates.iter())
             .map(|wicket| held(app, &placement, wicket) as i64)
             .collect();
@@ -415,24 +501,21 @@ impl State {
         }
         let app = self.app_mut(guid).expect("read above");
         app.moving.extend(moves.iter().cloned());
-        Evacuated {
-            moves,
-            stay,
-            why: "no other wicket has room for it",
-        }
+        Evacuated { moves, stay, why }
     }
 
     /// The next index to move to `to`, a wicket back or new, for an app's spread
     /// ([`App::moving`]): of a started app but those `skipped`, not pinned to a keyvalue home,
-    /// none of its indices moving, `to` with room for one more of it and holding two fewer of
-    /// its indices than the wicket holding the most (neither leaving nor gone, the first
-    /// configured of those), the highest index there. None: no spread is better for one.
+    /// none of its indices moving, `to` of its stack with room for one more of it and holding two
+    /// fewer of its indices than the wicket holding the most (neither leaving nor gone, the
+    /// first configured of those), the highest index there. None: no spread is better for one.
     pub fn respread(&mut self, to: &str, skipped: &BTreeSet<String>) -> Option<(String, Move)> {
         if !self.wickets.configured.iter().any(|wicket| wicket == to) || !self.takes_more(to) {
             return None;
         }
         let found = self.apps.iter().find_map(|app| {
             let movable = takes_room(app) && app.moving.is_empty() && self.pin(app).is_none();
+            let movable = movable && self.wickets.takes(to, stack(app));
             if skipped.contains(&app.guid) || !movable {
                 return None;
             }
@@ -490,8 +573,7 @@ impl State {
         self.placement(app).get(index as usize).cloned()
     }
 
-    /// Whether `wicket` takes indices: of the wickets' runtime, a second name of none, neither
-    /// leaving nor gone.
+    /// Whether `wicket` takes indices: a second name of none, neither leaving nor gone.
     fn takes_more(&self, wicket: &str) -> bool {
         !self.wickets.odd.contains(wicket)
             && !self.wickets.leaving.contains_key(wicket)
@@ -508,10 +590,9 @@ impl State {
             }
             let app = &self.apps[at];
             if !app.moving.is_empty() {
-                let still: BTreeMap<u64, String> =
-                    moving(app, &app.placement, &self.wickets.configured)
-                        .map(|(index, to)| (index, to.clone()))
-                        .collect();
+                let still: BTreeMap<u64, String> = moving(app, &app.placement, &self.wickets)
+                    .map(|(index, to)| (index, to.clone()))
+                    .collect();
                 self.apps[at].moving = still;
             }
             let app = &self.apps[at];
@@ -533,6 +614,7 @@ impl State {
     /// one dropped. The lines saying so.
     pub fn follow_wickets(&mut self, configured: &[String]) -> Vec<String> {
         self.wickets.configured = configured.to_vec();
+        (self.wickets.runtimes).retain(|wicket, _| configured.contains(wicket));
         let Some(first) = configured.first() else {
             return Vec::new();
         };
@@ -596,35 +678,70 @@ impl State {
 }
 
 #[cfg(test)]
+impl State {
+    /// [`State::follow_wickets`] of `configured`, each having listed that it runs `runs`.
+    pub fn follow_listed(&mut self, configured: &[&str], runs: Runtime) -> Vec<String> {
+        let configured: Vec<String> = configured.iter().map(|name| name.to_string()).collect();
+        self.wickets.runtimes = (configured.iter().cloned().map(|name| (name, runs))).collect();
+        self.follow_wickets(&configured)
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::store::Running;
+    use Runtime::{Firecracker, Wasm};
 
     fn names(list: &[&str]) -> Vec<String> {
         list.iter().map(|name| name.to_string()).collect()
     }
 
-    fn wickets(configured: &[&str], odd: &[&str]) -> Wickets {
+    /// The wickets `configured`, each listing the stack `runs` names it by (`w`: wasm, `f`:
+    /// Firecracker, `?`: none yet), of them `odd` second names.
+    fn wickets(configured: &[&str], runs: &str, odd: &[&str]) -> Wickets {
+        let runtimes = configured.iter().zip(runs.chars());
         Wickets {
             configured: names(configured),
             odd: odd.iter().map(|name| name.to_string()).collect(),
+            runtimes: runtimes
+                .filter_map(|(name, runs)| {
+                    let runs = match runs {
+                        'w' => Wasm,
+                        'f' => Firecracker,
+                        _ => return None,
+                    };
+                    Some((name.to_string(), runs))
+                })
+                .collect(),
             ..Wickets::default()
         }
     }
 
-    /// Each new index on a wicket with room holding the fewest of the app's, of them the one
-    /// with the most room, the first configured of those: distinct wickets while there are some.
-    /// Stable: a scale down drops the highest, a scale up after it places as before, what is
-    /// placed stays. No room anywhere: placed as if all had.
+    /// Each new index on a wicket of the app's stack with room holding the fewest of the app's,
+    /// of them the one with the most room, the first configured of those: distinct wickets while
+    /// there are some. Stable: a scale down drops the highest, a scale up after it places as
+    /// before, what is placed stays. No room anywhere: placed as if all had. An index on a
+    /// wicket of another stack is placed again; with no wicket of its stack, it is not placed.
     #[test]
     fn an_index_goes_where_there_is_room_and_the_app_has_the_fewest() {
-        let ab = wickets(&["a", "b"], &[]);
-        let abc = wickets(&["a", "b", "c"], &[]);
-        // a runs apps another way than the first wicket listed
-        let odd = wickets(&["a", "b"], &["a"]);
-        let none = wickets(&[], &[]);
+        let ab = wickets(&["a", "b"], "ww", &[]);
+        let abc = wickets(&["a", "b", "c"], "www", &[]);
+        // a is a second name of a wicket
+        let odd = wickets(&["a", "b"], "ww", &["a"]);
+        let none = wickets(&[], "", &[]);
+        // wickets of both stacks, c yet to list what it runs
+        let mixed = wickets(&["a", "f", "b", "g", "c"], "wfwf?", &[]);
+        let vms = wickets(&["f", "g"], "ff", &[]);
         for (placement, count, wickets, rooms, expected) in [
-            (&[][..], 1, &ab, &[][..], &["a"][..]),
+            // an app's indices on the wickets of its stack: a component's here, a rootfs's below
+            (&[][..], 3, &mixed, &[][..], &["a", "b", "a"][..]),
+            // on a wicket of another stack (the app started with a component, a rootfs before),
+            // placed again; on one yet to list, it stays, and none new goes there
+            (&["f", "g", "c"], 4, &mixed, &[], &["a", "b", "c", "a"]),
+            // no wicket of its stack: not placed
+            (&["f"], 2, &vms, &[], &[]),
+            (&[], 1, &ab, &[], &["a"]),
             (&[], 2, &ab, &[], &["a", "b"]),
             (&[], 3, &ab, &[], &["a", "b", "a"]),
             (&[], 3, &abc, &[], &["a", "b", "c"]),
@@ -654,11 +771,31 @@ mod tests {
                 .map(|(wicket, room)| (wicket.to_string(), *room))
                 .collect();
             assert_eq!(
-                placed(&names(placement), count, wickets, &rooms, None),
+                placed(&names(placement), count, wickets, &rooms, None, Some(Wasm)),
                 names(expected),
                 "{placement:?} at {count} on {wickets:?}, {rooms:?}"
             );
         }
+        let rootfs = |placement: &[&str], count| {
+            let none = BTreeMap::new();
+            placed(
+                &names(placement),
+                count,
+                &mixed,
+                &none,
+                None,
+                Some(Firecracker),
+            )
+        };
+        assert_eq!(rootfs(&[], 3), ["f", "g", "f"]);
+        assert_eq!(
+            rootfs(&["a", "g"], 2),
+            ["f", "g"],
+            "a start of another stack"
+        );
+        // an app never started has no stack: anywhere, until it has
+        let unstaged = placed(&[], 2, &mixed, &BTreeMap::new(), None, None);
+        assert_eq!(unstaged, ["a", "f"]);
         // pinned: every index on the namespace's home, room or not; without one, where index 0
         // is or goes
         let to = |home: &str| Pin::To(home.into());
@@ -672,7 +809,7 @@ mod tests {
             (&[], 2, Pin::Together, &full_a, &["b", "b"]),
         ] {
             assert_eq!(
-                placed(&names(placement), count, &ab, rooms, Some(&pin)),
+                placed(&names(placement), count, &ab, rooms, Some(&pin), Some(Wasm)),
                 names(expected),
                 "{placement:?} at {count} pinned {pin:?}, {rooms:?}"
             );
@@ -688,10 +825,10 @@ mod tests {
     #[test]
     fn the_room_is_what_the_budget_leaves_and_a_refusal_passes_an_index() {
         let mut state = State::new("o", "s", &["localhost".into()]);
-        state.follow_wickets(&names(&["a", "b"]));
+        state.follow_listed(&["a", "b"], Wasm);
         let space = state.spaces[0].guid.clone();
         let mut started = |name: &str, instances: u64, memory_mib: u64| {
-            let app = state.create_app(name, crate::store::STACK, &space);
+            let app = state.create_app(name, &space);
             app.started = true;
             app.process.instances = instances;
             app.running = Some(Running {
@@ -793,7 +930,7 @@ mod tests {
         );
         state.wickets.leaving.clear();
         // its home no longer named: the data stays there, the apps run on another without it
-        let said = state.follow_wickets(&names(&["b"]));
+        let said = state.follow_listed(&["b"], Wasm);
         assert!(
             said.iter()
                 .any(|line| line.contains("local/cf/l stays on the wicket a")),
@@ -806,10 +943,10 @@ mod tests {
         // room holding the fewest of the app's (two's 1 to c, which holds none of it), the room
         // of the one it moves to taken (one's 0 to a: c is full); with none, it stays
         let mut state = State::new("o", "s", &["localhost".into()]);
-        state.follow_wickets(&names(&["a", "b", "c"]));
+        state.follow_listed(&["a", "b", "c"], Wasm);
         let space = state.spaces[0].guid.clone();
         let mut started = |name: &str, placement: &[&str]| {
-            let app = state.create_app(name, crate::store::STACK, &space);
+            let app = state.create_app(name, &space);
             app.started = true;
             app.process.instances = placement.len() as u64;
             app.running = Some(Running::default());
@@ -899,5 +1036,49 @@ mod tests {
         assert_eq!(state.respread("b", &none), None, "from a wicket gone");
         state.wickets.gone.clear();
         assert!(state.respread("b", &none).is_some());
+
+        // wickets of two stacks: a component's index is passed to a wicket of its stack and
+        // spreads to one alone; a rootfs's on the one Firecracker wicket, leaving, stays
+        let mut state = State::new("o", "s", &["localhost".into()]);
+        state.wickets = wickets(&["a", "f", "b"], "wfw", &[]);
+        let space = state.spaces[0].guid.clone();
+        let mut started = |name: &str, file: &str, placement: &[&str]| {
+            let app = state.create_app(name, &space);
+            app.started = true;
+            app.process.instances = placement.len() as u64;
+            app.running = Some(Running {
+                file: file.into(),
+                ..Running::default()
+            });
+            app.placement = names(placement);
+            app.guid.clone()
+        };
+        let component = started("component", "c.wasm", &["a", "a"]);
+        let rootfs = started("rootfs", "r.ext4", &["f"]);
+        assert_eq!(state.respread("f", &none), None, "of another stack");
+        state.wickets.full.insert("a".into(), 1);
+        assert_eq!(
+            state.pass(&component, "a").as_deref(),
+            Some("Index 1 placed on the wicket b: the wicket a has no room for it")
+        );
+        state.wickets.leaving.insert("f".into(), 60);
+        assert_eq!(
+            state.evacuate(&rootfs, "f"),
+            Evacuated {
+                moves: Vec::new(),
+                stay: vec![0],
+                why: "no other wicket runs its stack"
+            }
+        );
+        // started as a component: placed again, on the wickets of that stack
+        state
+            .app_mut(&rootfs)
+            .unwrap()
+            .running
+            .as_mut()
+            .unwrap()
+            .file = "c.wasm".into();
+        state.place();
+        assert_eq!(state.app(&rootfs).unwrap().placement, ["b"]);
     }
 }

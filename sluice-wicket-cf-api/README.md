@@ -8,10 +8,12 @@ updates, stop and start and `cf logs` work as the CLI expects. Users log in thro
 Provider (`cf login --sso`; see [Login](#login)), or, with `--any-credentials`, on the loopback
 with any credentials.
 
-What `cf push` deploys depends on the wicket, whose listing names its runtime:
+What `cf push` deploys depends on what is pushed: its stack decides the wickets it runs on, wasi
+and Firecracker wickets side by side under one cf-api ([Stacks](#several-wickets)):
 
 | | [On a wasi wicket](#on-a-wasi-wicket) | [On a Firecracker wicket](#on-a-firecracker-wicket) |
 |---|---|---|
+| the stack | `wasip3` | `firecracker` |
 | the wicket | [sluice-wicket-runtime-wasi](../sluice-wicket-runtime-wasi/README.md#apps) | [sluice-wicket-runtime-firecracker](../sluice-wicket-runtime-firecracker/README.md#apps) |
 | an app | a wasm component: its bits, or an image in an OCI registry; or a [static site](#static-sites): html, css, js | a container image, a CNB image say, or a rootfs in a zip: microVMs |
 | the cf-api | a process or a container next to the wicket | an app of the wicket, in a VM with a disk, or next to it |
@@ -305,7 +307,8 @@ Staging pulls the image itself: the wicket gets the component as from a zip and 
 the registry. A registry on the loopback is reached over plain HTTP, any other over HTTPS (the
 webPKI roots; a registry's own CA is not taken); asked to authenticate, a pull gets a token from
 the registry's realm, anonymous or with the credentials, or answers a basic challenge with them.
-An image holds a wasm component, not a container: any other fails the build.
+An image holds a wasm component, not a container: any other fails the build, unless a
+Firecracker wicket is there to run it ([Stacks](#several-wickets)).
 
 ### Services
 
@@ -716,7 +719,7 @@ The wicket's listing says `runtime: firecracker`.
 |---|---|
 | package (docker) | any container image, `--docker-username` with `CF_DOCKER_PASSWORD` its credentials: the build has the wicket make its rootfs (`PUT /api/images`), which pulls it. Listening on `PORT`, as on CF. Spring Boot reads `SERVER_PORT`, not `PORT`: its default fits, an app with another `server.port` takes `cf set-env <app> SERVER_PORT 8080` |
 | package (bits) | a zip holding the rootfs, `.ext4` as a component's `.wasm` is picked (160 MiB at most, unpacking to 4 GiB at most: an image is the way for more) |
-| droplet | the rootfs by sha256 (stack `firecracker`, buildpack `rootfs`; an image's has neither, as on CF): the wicket keeps an image's, the cf-api its reference pinned to the manifest's digest and, per wicket, the digest it made, and has it made again when the wicket lost it (the same digest, unless the wicket's guest changed) |
+| droplet | the rootfs by sha256 (stack `firecracker`, buildpack `rootfs`; an image's has no buildpack, as on CF): the wicket keeps an image's, the cf-api its reference pinned to the manifest's digest and, per wicket, the digest it made, and has it made again when the wicket lost it (the same digest, unless the wicket's guest changed) |
 | web process `instances` | `instances`, [the limit](#instances) of the app's VMs: `mode=pool`, that many VMs cloned from a snapshot, one too; [annotated](#how-long-a-vm-lives), any mode. 0 is [as on CF](#mapping): no VM and no app in the wicket |
 | web process `memory` | `memory-mib`, 1G by default as on CF: less fails a CNB Java image's memory calculator at its start. The snapshot takes what its guest wrote of it on the host's memory (`--tmpfs /run/sluice`; [measured](../.kb/wicket-firecracker-findings.md#a-snapshots-memory)), and at most all of it |
 | web process `health_check` `timeout` (`cf push -t`) | `boot-ms`, 60s by default and 180s at most as on CF: how long the process may take to listen (and with an `http` health check, to answer it), in the request that starts it. A process exiting first is refused at once |
@@ -831,7 +834,8 @@ weight (its [Scale-out](../README.md#scale-out)): `-i 3` over two wickets, 2 of 
 wicket of two while each ends before the next, and the next to the other while a wicket's
 instances are busy.
 A wicket's `--listen` serves its own apps only and drains nothing (a signal ends it once
-evacuated): local mode stays one wicket.
+evacuated): local mode stays one wicket, or one of each stack, each stack's apps answering on
+its wicket's `--listen` (one entry point for both takes a sluice server).
 
 - **Placement.** Each index of an app's web process is on a wicket, kept in the state: a new
   index goes to a wicket with room for it holding none of the app's while there is one, else to
@@ -853,6 +857,22 @@ evacuated): local mode stays one wicket.
   first wicket named, and the indices of a wicket no name gives any more are placed again at the
   start (logged): a wicket keeps its apps while it keeps its name, and the one wicket of
   `--wicket <url>` is `wicket` (`--wicket wicket=<url>`)
+- **Stacks.** A wicket runs one stack, the one its listing names (`wasip3`, a wasi wicket's;
+  `firecracker`), kept in `state.json`: a wicket down is still of its stack. `cf stacks` lists
+  those the wickets run. What is pushed decides an app's, as a buildpack's detection: a zip's
+  `.wasm`, or a static site, `wasip3`, its `.ext4` `firecracker`; an image holding a wasm
+  component `wasip3`, any other `firecracker` (the cf-api reads its manifest where wickets of
+  both stacks run; of an index with a `wasm` entry, another platform's manifest by its digest is
+  a rootfs). A stack no wicket runs fails staging, naming theirs. `cf push -s <stack>`, or a
+  manifest's `stack:`, pins the app to one the wickets run (else 422): staging then fails a
+  package of another stack. The CLI refuses `-s` with `--docker-image`; a manifest's `docker:`
+  takes `stack:`. A `lifecycle.data.stack` of `null` (`cf curl -X PATCH /v3/apps/<guid>`) lifts
+  the pin. An app's indices are on the wickets of its stack, as Diego places an LRP on the cells
+  of its stack, a new one, one passed and one moving alike; with none of its stack, a start is
+  refused. A push of another stack moves the app, a stop and a start; as a rolling or canary
+  deployment it is refused (422). The annotations and the checks are an app's stack's: its pin,
+  else its current droplet's, else the one stack the wickets run; with none of them, the start
+  checks. A wicket that never listed takes no new index
 - **Which wicket.** A wicket's apps listing names it: an id made at its first start and kept in
   its console directory (`wicket-id`), its flume node, its build, and its budget. Two names of one
   id (two URLs reaching one console) are refused at the start; one coming to another's id later
@@ -871,10 +891,11 @@ evacuated): local mode stays one wicket.
   first instance of an app of `-i 2`. A request's `RTR` index is its wicket's place among the
   `--wicket`s (each a router of its share), its `app_index` the instance. The lines a wicket
   dropped (`LGR`) are in the logs of the apps it holds indices of
-- **What they share.** The wickets run apps one way: one listing another runtime than the first
-  is logged, and none placed or put on it. They share one `--wicket-token`, not a console
-  directory (a volume each; a StatefulSet on Kubernetes). The marketplace is what every wicket
-  offers. Firecracker
+- **What they share.** They share one `--wicket-token`, not a console
+  directory (a volume each; a StatefulSet on Kubernetes). The marketplace is what every wasi
+  wicket offers: a rootfs's app binds none of its keyvalue and wasi instances (`cf bind-service`
+  refused, as is the start of an app bound to one before), any app a user-provided or a
+  broker's. Firecracker
   wickets make an image's rootfs each, one at staging, the others at their first put of it, the
   cf-api keeping the digest each made: wickets of two guests, as during an update of the wickets
   changing the guest, serve one image as two digests. The cf-api runs beside the wickets, not as
@@ -1093,7 +1114,8 @@ What holds on both wickets; a component's and a VM's are in
 | org / space | the cf-api's own ([Organizations, spaces and roles](#organizations-spaces-and-roles)): the wicket knows none, its hosts are every space's |
 | readiness check (`readiness-health-check-*`, a manifest's alone, as on CF) | kept and shown (`cf get-readiness-health-check`, the process's `readiness_health_check`); `process`, the default, on both wickets; `port` and `http` on a Firecracker wicket ([Mapping to VMs](#mapping-to-vms)), refused on a wasm wicket, where an instance takes requests as they come |
 | health check (`cf push -u`, `cf set-health-check`, `health-check-*`) | kept and shown (`cf get-health-check`, the process's `health_check`); on a Firecracker wicket the route's liveness check and `timeout` its start's ([Mapping to VMs](#mapping-to-vms)); on a wasm wicket `port` and `process` ask nothing, `http` is refused: an instance takes requests as they come |
-| log rate, stack, buildpacks | accepted and shown, no effect |
+| stack (`cf push -s`, `stack:`) | pins the app's ([Stacks](#several-wickets)). `lifecycle.data.stack` shows the pin, else the current droplet's; a droplet's `stack` is where it runs |
+| log rate, buildpacks | accepted and shown, no effect |
 
 ### Instances
 
@@ -1364,7 +1386,7 @@ state written before there were more takes its apps, routes and service instance
   instances (a keyvalue one's data, as `cf delete-service`), space-scoped brokers and roles;
   refused while it holds a broker's instance (`cf delete-service` it first). `cf delete-org`
   deletes its spaces so, and takes it off the plans visible to it
-- **What is shared.** The shared domains, the stack and the wicket's offerings are every
+- **What is shared.** The shared domains, the stacks and the wickets' offerings are every
   space's. A host is one route's, of one space: a route taken in another is refused. A broker's
   plan is visible as `cf enable-service-access` says: to everyone, to the organizations named
   (`-o`), or, a space-scoped broker's, to its space
@@ -1375,8 +1397,9 @@ Refused with why (422): route paths, ports and wildcards, private and internal d
 ssh, sidecars, process types but `web`, route services, syslog drains, environment variable
 groups, service keys, sharing a service instance with another space, an organization made by
 other than an admin, more than 1000 instances of an app, a deployment of a revision (there are
-none: `cf rollback` finds none). One quota, of no limit. One owner (`cf`) per wicket: two cf-apis
-must not share one. The wickets of one cf-api run apps one way, and are told apart by their names
+none: `cf rollback` finds none), a rolling or canary deployment of a droplet of another stack
+than the app runs. One quota, of no limit. One owner (`cf`) per wicket: two cf-apis
+must not share one. The wickets of one cf-api are told apart by their names
 alone: two names of one console behind two URLs defeat the spread. No session affinity (the
 gorouter's `JSESSIONID` / `__VCAP_ID__`): a request goes to any instance of its app, so what a
 session holds belongs in a service.
@@ -1391,7 +1414,8 @@ flume from `../sluice-flume` (or taking `SLUICE_WICKET_RUNTIME_WASI`, `SLUICE_WI
 of the cf-api's own, and the images against a registry in the test (`tests/registry`). Where
 `/dev/kvm` is usable, with Firecracker and a guest kernel (as the wicket's VM test finds them), a
 second test runs against `../sluice-wicket-runtime-firecracker` (`sg kvm -c 'cargo test'` until
-the `kvm` group is in the login), then runs the cf-api itself on it, in a VM with a disk, the flume
+the `kvm` group is in the login), with a wasi wicket beside it for the apps of both stacks,
+then runs the cf-api itself on it, in a VM with a disk, the flume
 and a provider through its egress, across a restart, a wicket killed right after a push and an
 upgrade:
 

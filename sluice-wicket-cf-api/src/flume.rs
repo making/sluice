@@ -464,14 +464,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let localhost = ["localhost".to_string()];
         let wickets = ["a".to_string(), "b".to_string()];
-        let store = Store::open(&dir, "o", "s", &localhost, &wickets).unwrap();
+        let store = Store::open(&dir, "o", "s", &localhost, &wickets, &BTreeMap::new()).unwrap();
         store.update(|state| {
             state.flume = Some(FlumeCursor { epoch: 1, seq: 9 });
         });
         // its index 0 on a, 1 on b
         let scaled = store.update(|state| {
             let space = state.spaces[0].guid.clone();
-            let app = state.create_app("scaled", crate::store::STACK, &space);
+            let app = state.create_app("scaled", &space);
             app.process.instances = 2;
             app.guid.clone()
         });

@@ -1,17 +1,19 @@
-//! A build: the package's zip is read and the component picked -- the one the
-//! web process command names, else the package's only `.wasm` -- or a docker
-//! package's image pulled (`crate::registry`), and it must be a component
-//! (`\0asm`, layer 1). Anything else fails the build, naming what was found.
-//! The droplet is the component, by its digest. On a Firecracker wicket the
-//! droplet is a rootfs: an `.ext4` of the zip, or the wicket's make of the
-//! image, which it keeps (the cf-api the image's pinned reference, to have it
-//! made again).
+//! A build: what is pushed decides the droplet's stack, as a buildpack's detection, and so the
+//! wickets it runs on. A zip's file is the one the web process command names, else its only
+//! `.wasm`, a component (`\0asm`, layer 1: the stack `wasip3`), or its only `.ext4`, a rootfs
+//! (the stack `firecracker`); a zip of neither with an `index.html` at its root is a static site
+//! (`wasip3`). An image whose manifest holds a wasm component is pulled (`crate::registry`);
+//! any other is made into a rootfs by a Firecracker wicket, which keeps it (the cf-api the
+//! image's pinned reference, to have it made again). The manifest is read to tell them apart
+//! only where wickets of both stacks run.
 //!
-//! A zip of no component with an `index.html` at its root is a static site on a
-//! wasm wicket: the droplet is the component of sluice-wicket-site ([`SITE`],
-//! embedded at the build) and a tar of the zip's files, the
-//! wicket's read-only at `/` for it ([`pack_site`]): dot files (but
-//! `.well-known/`) and the manifest are left out, so a `.git`, a `.env` or the
+//! A stack no wicket runs fails the build, naming those they run, as does a package of another
+//! stack than the app's pin (`cf push -s`, a manifest's `stack:`). Anything else fails it too,
+//! naming what was found. The droplet is the component or the rootfs, by its digest.
+//!
+//! A static site's droplet is the component of sluice-wicket-site ([`SITE`], embedded at the
+//! build) and a tar of the zip's files, the wicket's read-only at `/` for it ([`pack_site`]):
+//! dot files (but `.well-known/`) and the manifest are left out, so a `.git`, a `.env` or the
 //! env of a `manifest.yml` never reaches the wicket.
 
 use std::io::{Read, Seek, Write};
@@ -23,7 +25,7 @@ use crate::controller::Controller;
 use crate::logs::Logs;
 use crate::registry::Registry;
 use crate::store::{DockerImage, Droplet, Files, Package, Store, guid, now};
-use crate::wicket::Runtime;
+use crate::wicket::{Runtime, stacks_named};
 
 /// A rootfs's file name ends so; a droplet's kind is its file's.
 pub const ROOTFS: &str = ".ext4";
@@ -66,12 +68,61 @@ pub struct Staged {
     pub image: Option<String>,
     /// A static site's files, kept already.
     pub files: Option<Files>,
+    /// What it is staged as: where it runs.
+    pub stack: Runtime,
+}
+
+/// The stacks a package may be staged as: those the wickets run, the app's pin alone of them.
+#[derive(Clone, Debug)]
+pub struct Takes {
+    /// The app's pin (`cf push -s`, a manifest's `stack:`).
+    pub pin: Option<Runtime>,
+    /// What the wickets run.
+    pub stacks: Vec<Runtime>,
+}
+
+impl Takes {
+    /// Whether a package that is `what` ("a wasm component"), of the stack `stack`, is staged:
+    /// else why not.
+    pub fn accept(&self, stack: Runtime, what: &str) -> Result<(), String> {
+        let found = format!("the package is {what} (the stack {})", stack.stack());
+        if let Some(pin) = self.pin.filter(|pin| *pin != stack) {
+            return Err(format!(
+                "{found}: the app is pinned to the stack {} (cf push -s, a manifest's stack)",
+                pin.stack()
+            ));
+        }
+        if !self.stacks.contains(&stack) {
+            return Err(format!(
+                "{found}: no wicket runs it, they run {}",
+                stacks_named(&self.stacks)
+            ));
+        }
+        Ok(())
+    }
+
+    fn may(&self, stack: Runtime) -> bool {
+        self.accept(stack, "").is_ok()
+    }
+
+    /// Why nothing is staged: the pin is of a stack no wicket runs, or none ever answered.
+    fn nothing(&self) -> String {
+        match self.pin {
+            Some(pin) => format!(
+                "the app is pinned to the stack {} (cf push -s, a manifest's stack): no wicket \
+                 runs it, they run {}",
+                pin.stack(),
+                stacks_named(&self.stacks)
+            ),
+            None => "no wicket has answered yet: the stacks they run are not known".into(),
+        }
+    }
 }
 
 /// Stages the build `build` of `package` and records how it went: STAGED
-/// with its droplet, or FAILED naming why. A zip's component is the one
-/// `command` names, else its only `.wasm` ([`stage`]); an image's is pulled
-/// from its registry with the package's credentials, if any.
+/// with its droplet, or FAILED naming why. A zip's file is the one
+/// `command` names, else its only `.wasm` or `.ext4` ([`stage`]); an image's component is pulled
+/// from its registry with the package's credentials, if any, or its rootfs made by a wicket.
 pub async fn run(
     store: &Arc<Store>,
     logs: &Logs,
@@ -82,47 +133,29 @@ pub async fn run(
     command: Option<&str>,
 ) {
     let app = package.app.as_str();
+    let takes = Takes {
+        pin: store.read(|state| state.app(app).and_then(|app| app.pin)),
+        stacks: controller.stacks().await,
+    };
+    let (wasm, rootfs) = (takes.may(Runtime::Wasm), takes.may(Runtime::Firecracker));
     let staged = match &package.docker {
+        _ if !wasm && !rootfs => Err(takes.nothing()),
         None => {
-            let runtime = controller.runtime().await;
-            logs.add(
-                app,
-                "STG",
-                match runtime {
-                    Ok(Runtime::Firecracker) => {
-                        "Staging a rootfs: the web process command names the image, else the package's only .ext4"
-                    }
-                    _ => {
-                        "Staging with the wasm lifecycle: the web process command names the component, else the package's only .wasm, else an index.html makes it a static site"
-                    }
-                },
-            );
-            let site = !matches!(runtime, Ok(Runtime::Firecracker));
-            unpack(store.clone(), &package.guid, command, site).await
+            let line = match (wasm, rootfs) {
+                (true, false) => {
+                    "Staging with the wasm lifecycle: the web process command names the component, else the package's only .wasm, else an index.html makes it a static site"
+                }
+                (false, _) => {
+                    "Staging a rootfs: the web process command names the image, else the package's only .ext4"
+                }
+                (true, true) => {
+                    "Staging what the package holds: the web process command names the component or the rootfs, else its only .wasm or .ext4, else an index.html makes it a static site"
+                }
+            };
+            logs.add(app, "STG", line);
+            unpack(store.clone(), &package.guid, command, takes).await
         }
-        Some(docker) => match controller.runtime().await {
-            Ok(Runtime::Wasm) => pull(logs, registry, app, docker).await,
-            Ok(Runtime::Firecracker) => {
-                logs.add(
-                    app,
-                    "STG",
-                    format!("The wicket is making a rootfs of {}", docker.image),
-                );
-                controller
-                    .make_image(&docker.image, docker.credentials())
-                    .await
-                    .map(|made| Staged {
-                        entry: made.name,
-                        bytes: Vec::new(),
-                        size: made.bytes,
-                        sha256: made.sha256,
-                        image: Some(made.image),
-                        files: None,
-                    })
-                    .map_err(|e| format!("{}: {e}", docker.image))
-            }
-            Err(e) => Err(format!("what the image is staged as: {e}")),
-        },
+        Some(docker) => image(logs, registry, controller, app, docker, (wasm, rootfs)).await,
     };
     let staged = staged.and_then(|staged| {
         if staged.bytes.is_empty() {
@@ -139,10 +172,11 @@ pub async fn run(
                 app,
                 "STG",
                 format!(
-                    "Staged {} ({} bytes, sha256 {}){}{}",
+                    "Staged {} ({} bytes, sha256 {}, the stack {}){}{}",
                     staged.entry,
                     staged.size,
                     &staged.sha256[..12],
+                    staged.stack.stack(),
                     staged
                         .image
                         .as_ref()
@@ -160,6 +194,7 @@ pub async fn run(
                 package: package.guid.clone(),
                 sha256: staged.sha256,
                 file: staged.entry,
+                staged_as: Some(staged.stack),
                 bytes: staged.size,
                 image: staged.image,
                 made: Default::default(),
@@ -190,13 +225,13 @@ pub async fn run(
 }
 
 /// Stages the zip of the package `guid`, its droplet made, on a blocking thread: a VM of one
-/// vCPU has one worker, which the API and the watch run on. With `site`, a zip of a static
-/// site is one ([`is_site`]).
+/// vCPU has one worker, which the API and the watch run on. A zip of a static site is one
+/// ([`is_site`]); what `takes` does not is refused before it is unpacked.
 async fn unpack(
     store: Arc<Store>,
     guid: &str,
     command: Option<&str>,
-    site: bool,
+    takes: Takes,
 ) -> Result<Staged, String> {
     let (guid, command) = (guid.to_string(), command.map(str::to_string));
     tokio::task::spawn_blocking(move || {
@@ -204,16 +239,21 @@ async fn unpack(
             std::fs::File::open(store.package_path(&guid))
                 .map_err(|e| format!("the package is gone: {e}"))
         };
-        if site && command.is_none() {
+        if command.is_none() {
             let mut archive =
                 zip::ZipArchive::new(open()?).map_err(|e| format!("not a zip: {e}"))?;
             if is_site(&archive) {
+                takes.accept(Runtime::Wasm, "a static site")?;
                 return stage_site(&store, &mut archive);
             }
         }
         let zip = open()?;
+        let accept = |stack| match stack {
+            Runtime::Wasm => takes.accept(stack, "a wasm component"),
+            Runtime::Firecracker => takes.accept(stack, "a rootfs"),
+        };
         store.make_droplet(|droplet| {
-            let staged = stage(zip, command.as_deref(), droplet, MAX_DROPLET_BYTES)?;
+            let staged = stage(zip, command.as_deref(), droplet, MAX_DROPLET_BYTES, accept)?;
             let sha256 = staged.sha256.clone();
             Ok((staged, sha256))
         })
@@ -250,6 +290,7 @@ fn stage_site<R: Read + Seek>(
             sha256: packed.sha256,
             bytes: packed.bytes,
         }),
+        stack: Runtime::Wasm,
     })
 }
 
@@ -401,49 +442,82 @@ impl<W: Write> Write for Counted<W> {
     }
 }
 
-/// The component of `docker`'s image, pulled from its registry with the package's
-/// credentials, if any.
-async fn pull(
+/// Stages `docker`'s image, with the package's credentials, if any: its component pulled from
+/// its registry (`wasm`: a wasm wicket takes one), else its rootfs made by a Firecracker wicket
+/// (`rootfs`: one takes it). Where both do, the image's manifest tells which it is.
+async fn image(
     logs: &Logs,
     registry: &Registry,
+    controller: &Controller,
     app: &str,
     docker: &DockerImage,
+    (wasm, rootfs): (bool, bool),
 ) -> Result<Staged, String> {
     let credentials = docker.credentials();
+    if wasm {
+        logs.add(
+            app,
+            "STG",
+            format!(
+                "Staging with the wasm lifecycle: pulling {}{}",
+                docker.image,
+                if credentials.is_some() {
+                    " with the package's credentials"
+                } else {
+                    ""
+                }
+            ),
+        );
+        let pulled = registry
+            .pull(&docker.image, credentials, rootfs)
+            .await
+            .map_err(|e| format!("{}: {e}", docker.image))?;
+        if let Some(pulled) = pulled {
+            return Ok(Staged {
+                entry: pulled.file,
+                size: pulled.bytes.len() as u64,
+                bytes: pulled.bytes,
+                sha256: pulled.sha256,
+                image: Some(pulled.image),
+                files: None,
+                stack: Runtime::Wasm,
+            });
+        }
+        logs.add(
+            app,
+            "STG",
+            "The image holds no wasm component: a rootfs is made of it",
+        );
+    }
     logs.add(
         app,
         "STG",
-        format!(
-            "Staging with the wasm lifecycle: pulling {}{}",
-            docker.image,
-            if credentials.is_some() {
-                " with the package's credentials"
-            } else {
-                ""
-            }
-        ),
+        format!("The wicket is making a rootfs of {}", docker.image),
     );
-    registry
-        .pull(&docker.image, credentials)
+    controller
+        .make_image(&docker.image, credentials)
         .await
-        .map(|pulled| Staged {
-            entry: pulled.file,
-            size: pulled.bytes.len() as u64,
-            bytes: pulled.bytes,
-            sha256: pulled.sha256,
-            image: Some(pulled.image),
+        .map(|made| Staged {
+            entry: made.name,
+            bytes: Vec::new(),
+            size: made.bytes,
+            sha256: made.sha256,
+            image: Some(made.image),
             files: None,
+            stack: Runtime::Firecracker,
         })
         .map_err(|e| format!("{}: {e}", docker.image))
 }
 
-/// Stages `package` (a zip) for the web process `command`: the component unpacked to
-/// `droplet` as it comes, `max` bytes at most, not a process's memory.
+/// Stages `package` (a zip) for the web process `command`: the component, or the rootfs,
+/// unpacked to `droplet` as it comes, `max` bytes at most, not a process's memory. Its stack is
+/// its file's (a rootfs's name ends [`ROOTFS`]), which `accept` may refuse before it is read.
 pub fn stage(
     package: impl Read + Seek,
     command: Option<&str>,
     droplet: &mut impl Write,
     max: u64,
+    accept: impl Fn(Runtime) -> Result<(), String>,
 ) -> Result<Staged, String> {
     let mut archive = zip::ZipArchive::new(package).map_err(|e| format!("not a zip: {e}"))?;
     let names: Vec<String> = archive
@@ -484,6 +558,8 @@ pub fn stage(
             }
         },
     };
+    let stack = Runtime::of_file(&entry);
+    accept(stack)?;
     let unread = |e: std::io::Error| format!("cannot read {entry}: {e}");
     let mut file = archive
         .by_name(&entry)
@@ -493,9 +569,9 @@ pub fn stage(
         .take(HEAD as u64)
         .read_to_end(&mut head)
         .map_err(unread)?;
-    match entry.ends_with(ROOTFS) {
-        true => check_rootfs(&entry, &head)?,
-        false => check_component(&entry, &head)?,
+    match stack {
+        Runtime::Firecracker => check_rootfs(&entry, &head)?,
+        Runtime::Wasm => check_component(&entry, &head)?,
     }
     let unwritten = |e: std::io::Error| format!("writing {entry}: {e}");
     let mut hashed = Hashed::new(droplet);
@@ -521,6 +597,7 @@ pub fn stage(
         bytes: Vec::new(),
         image: None,
         files: None,
+        stack,
     })
 }
 
@@ -621,7 +698,8 @@ mod tests {
     /// [`stage`] of `zip`, the droplet in memory; within `max` bytes.
     fn staged(zip: &[u8], command: Option<&str>, max: u64) -> Result<(Staged, Vec<u8>), String> {
         let mut droplet = Vec::new();
-        stage(Cursor::new(zip), command, &mut droplet, max).map(|staged| (staged, droplet))
+        stage(Cursor::new(zip), command, &mut droplet, max, |_| Ok(()))
+            .map(|staged| (staged, droplet))
     }
 
     #[test]
@@ -632,7 +710,10 @@ mod tests {
             1 << 20,
         )
         .unwrap();
-        assert_eq!(hello.entry, "hello.wasm");
+        assert_eq!(
+            (hello.entry.as_str(), hello.stack),
+            ("hello.wasm", Runtime::Wasm)
+        );
         assert_eq!(droplet, COMPONENT);
         assert_eq!(hello.sha256, sha256(COMPONENT));
         assert_eq!(hello.size, COMPONENT.len() as u64);
@@ -663,7 +744,62 @@ mod tests {
         let rootfs_zip = zipped(&[("app/r.ext4", &rootfs)]);
         let (picked_rootfs, unpacked) = staged(&rootfs_zip, None, 1 << 20).unwrap();
         assert_eq!(picked_rootfs.entry, "app/r.ext4");
+        assert_eq!(picked_rootfs.stack, Runtime::Firecracker);
         assert_eq!(unpacked, rootfs);
+        // what is pushed decides the stack, of those the wickets run, the app's pin alone of
+        // them: another is refused before it is unpacked, naming what it is and theirs
+        use Runtime::{Firecracker, Wasm};
+        let hello_zip = zipped(&[("hello.wasm", COMPONENT)]);
+        for (pin, stacks, zip, refused) in [
+            (None, &[Wasm, Firecracker][..], &rootfs_zip, None),
+            (None, &[Wasm, Firecracker], &hello_zip, None),
+            (Some(Firecracker), &[Wasm, Firecracker], &rootfs_zip, None),
+            (
+                None,
+                &[Wasm],
+                &rootfs_zip,
+                Some("is a rootfs (the stack firecracker): no wicket runs it, they run wasip3"),
+            ),
+            (
+                Some(Firecracker),
+                &[Wasm, Firecracker],
+                &hello_zip,
+                Some(
+                    "is a wasm component (the stack wasip3): the app is pinned to the stack firecracker",
+                ),
+            ),
+            (
+                Some(Firecracker),
+                &[Wasm],
+                &rootfs_zip,
+                Some("no wicket runs it, they run wasip3"),
+            ),
+            (None, &[], &hello_zip, Some("they run none known yet")),
+        ] {
+            let takes = Takes {
+                pin,
+                stacks: stacks.to_vec(),
+            };
+            let accept = |stack| match stack {
+                Wasm => takes.accept(stack, "a wasm component"),
+                Firecracker => takes.accept(stack, "a rootfs"),
+            };
+            let mut droplet = Vec::new();
+            let staged = stage(Cursor::new(zip), None, &mut droplet, 1 << 20, accept);
+            match refused {
+                None => assert!(staged.is_ok(), "{takes:?}: {staged:?}"),
+                Some(why) => {
+                    let refused = staged.unwrap_err();
+                    assert!(refused.contains(why), "{takes:?}: {refused}");
+                    assert!(droplet.is_empty(), "unpacked: {takes:?}");
+                }
+            }
+        }
+        let pinned = Takes {
+            pin: Some(Firecracker),
+            stacks: vec![Wasm],
+        };
+        assert!(pinned.nothing().contains("pinned to the stack firecracker"));
         // what unpacks past the bound, however small its zip
         assert!(
             staged(&rootfs_zip, None, 2047)

@@ -18,6 +18,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::wicket::Runtime;
+
 /// The annotation of an app setting its routes' `budget-ms`.
 pub const BUDGET_ANNOTATION: &str = "wicket.sluice.ik.am/budget-ms";
 /// The annotation that set its routes' `instances` cap, refused: `cf scale -i` and
@@ -105,8 +107,16 @@ pub struct State {
     /// lists the wickets.
     #[serde(skip)]
     pub outcomes: BTreeMap<String, BTreeMap<String, Outcome>>,
-    /// The wickets the apps are placed on (`crate::placement`): the configuration's.
-    #[serde(skip)]
+    /// The wickets the apps are placed on (`crate::placement`): the configuration's. Kept of
+    /// them, as `wicket_stacks`: what each last listed it runs, by name, so that a wicket down
+    /// since the start is still one of its stack.
+    #[serde(
+        default,
+        rename = "wicket_stacks",
+        skip_serializing_if = "crate::placement::Wickets::none_listed",
+        serialize_with = "crate::placement::Wickets::write_runtimes",
+        deserialize_with = "crate::placement::Wickets::read_runtimes"
+    )]
     pub wickets: crate::placement::Wickets,
 }
 
@@ -203,7 +213,10 @@ pub struct App {
     #[serde(default)]
     pub lifecycle: Lifecycle,
     pub buildpacks: Vec<String>,
-    pub stack: String,
+    /// The stack `cf push -s` or a manifest's `stack:` pins: staging fails a package of another.
+    /// None: what is pushed decides (the `stack` of a state written before named none).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pin: Option<Runtime>,
     pub labels: BTreeMap<String, String>,
     pub annotations: BTreeMap<String, String>,
     pub process: Process,
@@ -371,6 +384,9 @@ pub struct Running {
     /// The component's file name in the wicket (the droplet's web process,
     /// less its directories).
     pub file: String,
+    /// The droplet's stack; none in a snapshot taken before it was kept ([`Running::stack`]).
+    #[serde(default, rename = "stack", skip_serializing_if = "Option::is_none")]
+    pub staged_as: Option<Runtime>,
     /// The digest of a static site's files (`Files`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub files: Option<String>,
@@ -857,6 +873,10 @@ pub struct Droplet {
     pub sha256: String,
     /// The component's path in the package; its file name for an image.
     pub file: String,
+    /// Its stack, as staging detected it; none in a droplet staged before it was kept
+    /// ([`Droplet::stack`]).
+    #[serde(default, rename = "stack", skip_serializing_if = "Option::is_none")]
+    pub staged_as: Option<Runtime>,
     pub bytes: u64,
     /// The image it was pulled from, pinned to its manifest's digest; None
     /// for a zip's.
@@ -876,6 +896,11 @@ pub struct Droplet {
 }
 
 impl Droplet {
+    /// Its stack: where it runs. Of one staged before it was kept, what its file's name tells.
+    pub fn stack(&self) -> Runtime {
+        (self.staged_as).unwrap_or_else(|| Runtime::of_file(&self.file))
+    }
+
     /// What the wicket `wicket` serves it as ([`Droplet::made`]).
     pub fn sha256_on(&self, wicket: &str) -> &str {
         made_on(&self.sha256, &self.made, wicket)
@@ -888,6 +913,11 @@ impl Droplet {
 }
 
 impl Running {
+    /// Its droplet's stack ([`Droplet::stack`]).
+    pub fn stack(&self) -> Runtime {
+        (self.staged_as).unwrap_or_else(|| Runtime::of_file(&self.file))
+    }
+
     /// What the wicket `wicket` serves it as ([`Droplet::made`]).
     pub fn sha256_on(&self, wicket: &str) -> &str {
         made_on(&self.sha256, &self.made, wicket)
@@ -1380,8 +1410,42 @@ impl State {
         format!("{}.{domain}", route.host)
     }
 
+    /// The stack of the current droplet of `app`.
+    fn staged_stack(&self, app: &App) -> Option<Runtime> {
+        let droplet = self.droplet(app.current_droplet.as_deref()?)?;
+        Some(droplet.stack())
+    }
+
+    /// The stack `app` shows: its pin, else its current droplet's. None before it is staged.
+    pub fn shown_stack(&self, app: &App) -> Option<Runtime> {
+        app.pin.or_else(|| self.staged_stack(app))
+    }
+
+    /// The stack an edit checks `app` against: its pin, else its current droplet's, else the
+    /// one stack the wickets run. With several and neither, none: the start checks, knowing
+    /// the droplet.
+    pub fn stack_of(&self, app: &App) -> Option<Runtime> {
+        self.shown_stack(app).or_else(|| match self.stacks()[..] {
+            [only] => Some(only),
+            _ => None,
+        })
+    }
+
+    /// The stack named `name`, to pin an app to: one the wickets run, as CC takes a stack it
+    /// has; while a wicket has yet to list what it runs, any there is.
+    pub fn stack_named(&self, name: &str) -> Result<Runtime, String> {
+        let stacks = self.stacks();
+        match Runtime::named(name) {
+            Some(stack) if stacks.contains(&stack) || !self.all_listed() => Ok(stack),
+            _ => Err(format!(
+                "Stack \"{name}\" must be an existing stack: the wickets run {}",
+                crate::wicket::stacks_named(&stacks)
+            )),
+        }
+    }
+
     /// Adds the app `name` to the space `space`, stopped, with its web process.
-    pub fn create_app(&mut self, name: &str, stack: &str, space: &str) -> &mut App {
+    pub fn create_app(&mut self, name: &str, space: &str) -> &mut App {
         let at = now();
         self.apps.push(App {
             guid: guid(),
@@ -1392,7 +1456,7 @@ impl State {
             updated_at: at.clone(),
             lifecycle: Lifecycle::Buildpack,
             buildpacks: Vec::new(),
-            stack: stack.into(),
+            pin: None,
             labels: BTreeMap::new(),
             annotations: BTreeMap::new(),
             process: Process {
@@ -1716,13 +1780,15 @@ pub struct Store {
 
 impl Store {
     /// Opens the data directory: the state kept there, else a new one, its apps placed on the
-    /// `wickets` configured (`State::follow_wickets`, logged).
+    /// `wickets` configured (`State::follow_wickets`, logged), of which those answering now run
+    /// `runs`, by name: an index is placed on a wicket of its app's stack.
     pub fn open(
         dir: &Path,
         org: &str,
         space: &str,
         domains: &[String],
         wickets: &[String],
+        runs: &BTreeMap<String, Runtime>,
     ) -> Result<Store, String> {
         for sub in ["packages", "droplets"] {
             std::fs::create_dir_all(dir.join(sub))
@@ -1756,6 +1822,7 @@ impl Store {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::new(org, space, domains),
             Err(e) => return Err(format!("{}: {e}", file.display())),
         };
+        state.wickets.runtimes.extend(runs.clone());
         for line in state.follow_wickets(wickets) {
             println!("{line}");
         }
@@ -1791,7 +1858,7 @@ impl Store {
         self.changes.notified().await;
     }
 
-    /// Changes what is not kept (the wickets' outcomes, those of another runtime).
+    /// Changes what is not kept (the wickets' outcomes, their budgets).
     pub fn note<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         f(&mut self.state.lock().expect("no panic under the lock"))
     }
@@ -1999,13 +2066,14 @@ mod tests {
      {
         let mut state = State::new("o", "s", &["localhost".into()]);
         let space = state.spaces[0].guid.clone();
-        let app = state.create_app("hello", STACK, &space).guid.clone();
+        let app = state.create_app("hello", &space).guid.clone();
         let droplet = |guid: &str, sha256: &str| Droplet {
             guid: guid.into(),
             app: app.clone(),
             package: "p".into(),
             sha256: sha256.into(),
             file: "hello.wasm".into(),
+            staged_as: None,
             bytes: 1,
             image: None,
             made: BTreeMap::new(),
@@ -2155,7 +2223,7 @@ mod tests {
         let mut written = State::new("o", "s", &["localhost".into()]);
         let space = written.spaces[0].clone();
         let org = written.orgs[0].clone();
-        let hello = written.create_app("hello", STACK, &space.guid).guid.clone();
+        let hello = written.create_app("hello", &space.guid).guid.clone();
         written.app_mut(&hello).unwrap().process.instances = 2;
         let mut legacy = serde_json::to_value(&written).unwrap();
         legacy["org"] = json!(org);
@@ -2165,8 +2233,39 @@ mod tests {
         legacy["spaces"] = json!([]);
         legacy["apps"][0]["space"] = json!("");
         legacy["removals"] = json!(["gone"]);
+        // the stack an app had before what is pushed decided: the wicket's, or a CF manifest's,
+        // no pin; a droplet's and a snapshot's are what their files tell
+        legacy["apps"][0]["stack"] = json!("cflinuxfs4");
+        let staged = Droplet {
+            guid: "d".into(),
+            app: hello.clone(),
+            package: "p".into(),
+            sha256: "ab".repeat(32),
+            file: "app/r.ext4".into(),
+            staged_as: Some(Runtime::Firecracker),
+            bytes: 1,
+            image: None,
+            made: BTreeMap::new(),
+            files: None,
+            created_at: now(),
+            updated_at: now(),
+        };
+        legacy["droplets"] = json!([staged]);
+        legacy["droplets"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("stack");
+        legacy["apps"][0]["current_droplet"] = json!("d");
         let mut state: State = serde_json::from_value(legacy).unwrap();
         state.migrate();
+        assert_eq!(state.apps[0].pin, None);
+        assert_eq!(state.droplets[0].staged_as, None);
+        assert_eq!(state.droplets[0].stack(), Runtime::Firecracker);
+        assert_eq!(
+            state.shown_stack(&state.apps[0]),
+            Some(Runtime::Firecracker)
+        );
+        state.apps[0].current_droplet = None;
         assert_eq!(state.orgs, [org]);
         assert_eq!(state.spaces, std::slice::from_ref(&space));
         assert_eq!(state.apps[0].space, space.guid);
@@ -2185,9 +2284,14 @@ mod tests {
         // written again, none of the one organization or space is kept apart; an index moving
         // kept
         state.apps[0].moving.insert(1, "b".into());
+        // what each wicket listed it runs is kept: one down since the start is of its stack
+        state.wickets.runtimes = [("b".to_string(), Runtime::Firecracker)].into();
         let again = serde_json::to_value(&state).unwrap();
         assert!(again.get("org").is_none() && again.get("space").is_none());
+        assert_eq!(again["wicket_stacks"], json!({"b": "firecracker"}));
         let mut again: State = serde_json::from_value(again).unwrap();
+        assert_eq!(again.stacks(), [], "b is not configured yet");
+        assert_eq!(std::mem::take(&mut again.wickets.runtimes).len(), 1);
         assert_eq!(
             (&again.apps[0].placement, &again.removals),
             (&names(&["a", "a"]), &vec![gone("a")])

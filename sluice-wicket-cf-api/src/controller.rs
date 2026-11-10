@@ -25,14 +25,15 @@
 //! removed from it. What the state deletes it removes itself, at once or, a wicket not taking it,
 //! from `State::removals`.
 //!
-//! The wickets run apps one way, the first listed's: one listing another is logged, and none
-//! placed or put on it. What they offer is what every one of them does.
+//! Each wicket runs apps one way, the stack it lists, kept with the state: an app's share is on
+//! the wickets of its droplet's stack (`crate::placement`), wasm and Firecracker wickets side by
+//! side. The services they offer are what every wasm wicket does.
 //!
 //! A wicket lists which it is: its id, made at its first start and kept in its console's
 //! directory, its flume node and its build. Two names of one id are refused at the start
-//! ([`distinct`]); one coming to another's id later is logged and placed on no more, as a wicket
-//! of another runtime. An id changed behind a name, kept with the state, is logged and its apps
-//! put again, as on a lost directory. A wicket listing no id (one predating it) is taken as it
+//! ([`distinct`]); one coming to another's id later is logged and placed on no more. An id
+//! changed behind a name, kept with the state, is logged and its apps put again, as on a lost
+//! directory. A wicket listing no id (one predating it) is taken as it
 //! is: logged once, its lines' instances told as of one wicket's. Its budget leaves the apps placed
 //! on it what the routes that are not theirs do not keep (`crate::placement`): those beyond what
 //! its apps of the owner list. A share it refuses for room has an index passed to a wicket with
@@ -187,6 +188,9 @@ pub struct Controller {
     away_grace: Duration,
     /// The wickets whose last listing failed, by name.
     down: Mutex<BTreeSet<String>>,
+    /// The apps whose indices a wicket's stack, newly listed, placed again: their shares are
+    /// to apply ([`Controller::apply_placed`]).
+    placed_again: Mutex<BTreeSet<String>>,
 }
 
 impl Controller {
@@ -212,6 +216,7 @@ impl Controller {
             purging: tokio::sync::Mutex::default(),
             evacuations: Mutex::default(),
             respreading: Mutex::default(),
+            placed_again: Mutex::default(),
         }
     }
 
@@ -309,7 +314,7 @@ impl Controller {
             .unwrap_or(DEFAULT_HEALTH_CHECK_TIMEOUT);
         let share = |wicket: &str, indices: &[u64]| {
             let running = app.running_on(wicket)?;
-            let rootfs = running.file.ends_with(crate::staging::ROOTFS);
+            let rootfs = running.stack() == Runtime::Firecracker;
             // the lowest indices are the warm ones: of a component all unless annotated, of a VM
             // those its wicket keeps unless annotated
             let warm = match rootfs {
@@ -374,23 +379,25 @@ impl Controller {
         Controller::desired(state, app, self.owner()).remove(wicket)
     }
 
-    /// What every wicket offers, as each last listed it; none listed yet, the first answering now.
+    /// What every wasm wicket offers, as each last listed it; none listed yet, the first
+    /// answering now.
     pub async fn offer(&self) -> Result<Offer, Failure> {
-        if self.runtimes().0.is_none() {
+        let none = (self.listed.lock().expect("no panic under the lock")).is_empty();
+        if none {
             self.list_any().await?;
         }
         Ok(self.offered().unwrap_or_default())
     }
 
-    /// What the wickets run apps as: the first listed's, in the order configured; none listed
-    /// yet, the first answering now.
-    pub async fn runtime(&self) -> Result<Runtime, Failure> {
-        if let (Some(runtime), _) = self.runtimes() {
-            return Ok(runtime);
+    /// The stacks the wickets run, the first configured's first ([`State::stacks`]); none known
+    /// yet, that of the first answering now. None: no wicket ever answered.
+    pub async fn stacks(&self) -> Vec<Runtime> {
+        let known = self.store.read(State::stacks);
+        if !known.is_empty() {
+            return known;
         }
-        self.list_any().await?;
-        let noted = self.runtimes().0;
-        noted.ok_or_else(|| Failure::Unreachable("no wicket listed".into()))
+        let _ = self.list_any().await;
+        self.store.read(State::stacks)
     }
 
     /// Lists the wickets in turn until one answers, noting what it lists.
@@ -408,19 +415,6 @@ impl Controller {
         Err(failed.unwrap_or_else(|| Failure::Unreachable("no wicket configured".into())))
     }
 
-    /// The wickets' runtime, the first listed's in the order configured, and the wickets listing
-    /// another, by name.
-    fn runtimes(&self) -> (Option<Runtime>, BTreeSet<String>) {
-        let listed = self.listed.lock().expect("no panic under the lock");
-        let noted = self.wickets.iter().filter_map(|wicket| {
-            let noted = listed.get(&wicket.name)?;
-            Some((&wicket.name, noted.runtime))
-        });
-        let runtime = noted.clone().next().map(|(_, runtime)| runtime);
-        let odd = noted.filter(|(_, its)| Some(*its) != runtime);
-        (runtime, odd.map(|(name, _)| name.clone()).collect())
-    }
-
     /// The wicket configured before `wicket` that listed the id it lists: it is a second name.
     fn first_of(&self, wicket: &Wicket) -> Option<(&Wicket, String)> {
         let listed = self.listed.lock().expect("no panic under the lock");
@@ -436,28 +430,82 @@ impl Controller {
         Some((first, its))
     }
 
-    /// What every wicket listed of the wickets' runtime offers.
+    /// What every wasm wicket listed offers: the apps of the others take none of it.
     fn offered(&self) -> Option<Offer> {
         self.with_offers(Offer::common)
     }
 
-    /// What `f` makes of the offers of the wickets listed of the wickets' runtime.
+    /// What `f` makes of the offers of the wasm wickets listed.
     fn with_offers<R>(&self, f: impl FnOnce(&[&Offer]) -> R) -> R {
-        let (runtime, _) = self.runtimes();
         let listed = self.listed.lock().expect("no panic under the lock");
         let offers: Vec<&Offer> = (self.wickets.iter())
             .filter_map(|wicket| listed.get(&wicket.name))
-            .filter(|noted| Some(noted.runtime) == runtime)
+            .filter(|noted| noted.runtime == Runtime::Wasm)
             .map(|noted| &noted.offer)
             .collect();
         f(&offers)
     }
 
+    /// Whether `wicket` lists the keyvalue store `store`: None before it listed anything.
+    fn lists_store(&self, wicket: &Wicket, store: &str) -> Option<bool> {
+        let listed = self.listed.lock().expect("no panic under the lock");
+        Some(listed.get(&wicket.name)?.offer.has_store(store))
+    }
+
+    /// Keeps what `wicket` listed it runs: the apps are placed by it. Another stack than the
+    /// name had, or its first, places the apps' indices again, logged; their shares are to
+    /// apply ([`Controller::apply_placed`]).
+    fn note_stack(&self, wicket: &Wicket, runs: Runtime) {
+        let name = &wicket.name;
+        let was = self
+            .store
+            .read(|state| state.wickets.runtimes.get(name).copied());
+        if was == Some(runs) {
+            return;
+        }
+        let placements = |state: &State| -> Vec<(String, Vec<String>)> {
+            let apps = state.apps.iter();
+            apps.map(|app| (app.guid.clone(), app.placement.clone()))
+                .collect()
+        };
+        let before = self.store.update(|state| {
+            let before = placements(state);
+            state.wickets.runtimes.insert(name.clone(), runs);
+            before
+        });
+        let after = self.store.read(placements);
+        let placed: Vec<String> = (after.into_iter())
+            .filter(|placement| !before.contains(placement))
+            .map(|(guid, _)| guid)
+            .collect();
+        match was {
+            Some(was) => println!(
+                "CELL: {} runs the stack {} (it ran {}): the indices on it are placed again",
+                wicket.label,
+                runs.stack(),
+                was.stack()
+            ),
+            None => println!("CELL: {} runs the stack {}", wicket.label, runs.stack()),
+        }
+        (self.placed_again.lock().expect("no panic under the lock")).extend(placed);
+    }
+
+    /// Applies the shares of the apps whose indices a wicket's stack placed again
+    /// ([`Controller::note_stack`]), each in a task.
+    fn apply_placed(self: &Arc<Self>) {
+        let placed =
+            std::mem::take(&mut *self.placed_again.lock().expect("no panic under the lock"));
+        for guid in placed {
+            let controller = self.clone();
+            tokio::spawn(async move { controller.sync(&guid).await });
+        }
+    }
+
     /// Notes what `wicket` listed: what it offers and runs apps as, which wicket it is, its
-    /// budget. One placed on no more (of another runtime than the wickets', a second name of
-    /// one) or again is logged. Whether it is another wicket than the name had: its apps are put
-    /// again.
+    /// budget. One placed on no more (a second name of one) or again is logged. Whether it is
+    /// another wicket than the name had: its apps are put again.
     fn note(&self, wicket: &Wicket, listing: &Listing) -> bool {
+        self.note_stack(wicket, listing.runtime());
         let id = listing.wicket.as_ref().map(|listed| listed.id.clone());
         let noted = Noted {
             offer: Offer::new(&listing.capabilities, &listing.keyvalue_stores),
@@ -566,29 +614,13 @@ impl Controller {
         true
     }
 
-    /// Why nothing is put on `wicket`: it is a second name of a wicket, or runs apps another way
-    /// than the wickets.
+    /// Why nothing is put on `wicket`: it is a second name of a wicket.
     fn odd(&self, wicket: &Wicket) -> Option<String> {
-        if let Some((first, id)) = self.first_of(wicket) {
-            return Some(format!(
-                "{} lists the id {id} of {}: a second name of one wicket",
-                wicket.label, first.label
-            ));
-        }
-        let listed = self.listed.lock().expect("no panic under the lock");
-        let runtime = |wicket: &Wicket| listed.get(&wicket.name).map(|noted| noted.runtime);
-        let its = runtime(wicket)?;
-        let first = self.wickets.iter().find(|first| runtime(first).is_some())?;
-        let theirs = runtime(first)?;
-        (its != theirs).then(|| {
-            format!(
-                "{} runs the stack {}, {} {}: --wicket names wickets of one runtime",
-                wicket.label,
-                its.stack(),
-                first.label,
-                theirs.stack()
-            )
-        })
+        let (first, id) = self.first_of(wicket)?;
+        Some(format!(
+            "{} lists the id {id} of {}: a second name of one wicket",
+            wicket.label, first.label
+        ))
     }
 
     /// Deletes through every wicket at once the data of the deleted instances no started app
@@ -600,7 +632,8 @@ impl Controller {
     /// Deletes through `wicket` the data of the deleted instances no started app's snapshot maps
     /// any more (a deployment's under way, or the one before), as far as it lets it: one a route
     /// of it still maps (409) waits, as does an unreachable wicket; one it cannot delete (a store
-    /// gone: 404) is dropped there. Of a store of each wicket's host, gone through every wicket, a
+    /// gone: 404) is dropped there, and one of a store it does not list (a Firecracker wicket
+    /// lists none) is none of its. Of a store of each wicket's host, gone through every wicket, a
     /// deletion is done; of a store they share, gone through this one once no wicket maps it
     /// ([`Controller::unmapped`]).
     async fn purge_on(&self, wicket: &Wicket) {
@@ -622,6 +655,30 @@ impl Controller {
         for purge in due {
             let same =
                 |kept: &Purge| kept.store == purge.store && kept.namespace == purge.namespace;
+            // through this wicket: gone, or none of its; of a store they share, deleted once
+            let done = |all: bool| {
+                self.store.update(|state| {
+                    let configured = &state.wickets.configured;
+                    if let Some(kept) = state.purges.iter_mut().find(|kept| same(kept)) {
+                        match all {
+                            true => kept.purged.clone_from(configured),
+                            false => kept.purged.push(wicket.name.clone()),
+                        }
+                    }
+                    let homes = &mut state.homes;
+                    state.purges.retain(|kept| {
+                        let done = configured.iter().all(|name| kept.purged.contains(name));
+                        if done {
+                            homes.remove(&format!("{}/{}", kept.store, kept.namespace));
+                        }
+                        !done
+                    });
+                });
+            };
+            if self.lists_store(wicket, &purge.store) == Some(false) {
+                done(false);
+                continue;
+            }
             let shared = self
                 .store
                 .read(|state| state.wickets.stores.get(&purge.store) == Some(&true));
@@ -658,30 +715,15 @@ impl Controller {
                 }
                 Err(_) => continue,
             };
-            self.store.update(|state| {
-                let configured = &state.wickets.configured;
-                if let Some(kept) = state.purges.iter_mut().find(|kept| same(kept)) {
-                    match shared && deleted {
-                        true => kept.purged.clone_from(configured),
-                        false => kept.purged.push(wicket.name.clone()),
-                    }
-                }
-                let homes = &mut state.homes;
-                state.purges.retain(|kept| {
-                    let done = configured.iter().all(|name| kept.purged.contains(name));
-                    if done {
-                        homes.remove(&format!("{}/{}", kept.store, kept.namespace));
-                    }
-                    !done
-                });
-            });
+            done(shared && deleted);
         }
     }
 
     /// Whether no wicket's route maps the namespace of `purge`, one being drained included: every
-    /// wicket answers so, or has no such store.
+    /// wicket listing the store answers so, or has no such store.
     async fn unmapped(&self, purge: &Purge) -> bool {
-        let wickets = self.wickets.iter();
+        let wickets = (self.wickets.iter())
+            .filter(|wicket| self.lists_store(wicket, &purge.store) != Some(false));
         let mappings =
             join_all(wickets.map(|wicket| wicket.mapping(&purge.store, &purge.namespace))).await;
         mappings.into_iter().all(|mapping| match mapping {
@@ -919,25 +961,35 @@ impl Controller {
     }
 
     /// Has a wicket make an ext4 image of the OCI image `image`, with the `(username, password)`
-    /// of a private one: the first answering of the wickets' runtime. The others make it at their
-    /// first put of an app of it.
+    /// of a private one: the first answering of the Firecracker wickets. The others make it at
+    /// their first put of an app of it.
     pub async fn make_image(
         &self,
         image: &str,
         credentials: Option<(&str, &str)>,
     ) -> Result<MadeImage, Failure> {
+        let makers: Vec<String> = self.store.read(|state| {
+            let runtimes = state.wickets.runtimes.iter();
+            runtimes
+                .filter(|(_, runs)| **runs == Runtime::Firecracker)
+                .map(|(name, _)| name.clone())
+                .collect()
+        });
         let mut failed = None;
-        for wicket in self
-            .wickets
-            .iter()
-            .filter(|wicket| self.odd(wicket).is_none())
+        for wicket in (self.wickets.iter())
+            .filter(|wicket| makers.contains(&wicket.name) && self.odd(wicket).is_none())
         {
             match wicket.make_image(image, credentials).await {
                 Err(e @ Failure::Unreachable(_)) => failed = Some(e),
                 made => return made,
             }
         }
-        Err(failed.unwrap_or_else(|| Failure::Unreachable("no wicket configured".into())))
+        Err(failed.unwrap_or_else(|| {
+            Failure::Unreachable(format!(
+                "no wicket of the stack {} configured",
+                Runtime::Firecracker.stack()
+            ))
+        }))
     }
 
     /// Records the outcome of `wicket`'s share, logging it when it changed.
@@ -1211,6 +1263,7 @@ impl Controller {
                 );
             }
             let another = self.note(&wicket, &listing);
+            self.apply_placed();
             let moved = another || after != Some(listing.revision);
             after = Some(listing.revision);
             let pending = self.store.read(|state| {
@@ -1743,6 +1796,15 @@ pub async fn distinct(wickets: &[Arc<Wicket>]) -> Result<(), String> {
     Ok(())
 }
 
+/// What each of `wickets` answering now lists it runs, by name.
+pub async fn stacks_of(wickets: &[Arc<Wicket>]) -> BTreeMap<String, Runtime> {
+    let listed = join_all(wickets.iter().map(|wicket| wicket.list(None))).await;
+    let listed = wickets.iter().zip(listed);
+    listed
+        .filter_map(|(wicket, listing)| Some((wicket.name.clone(), listing.ok()?.runtime())))
+        .collect()
+}
+
 /// The lock of `key` among `locks`, made if missing.
 fn lock_of<K: Eq + std::hash::Hash>(locks: &Locks<K>, key: K) -> Arc<tokio::sync::Mutex<()>> {
     let mut locks = locks.lock().expect("no panic under the lock");
@@ -1940,9 +2002,15 @@ mod tests {
     use super::*;
     use crate::store::Running;
 
-    /// The share of `app` on the one wicket `w`.
+    /// The share of `app` on the one wicket `w`, of the stack the app is started as.
     fn on_w(state: &State, app: &App) -> Option<AppBody> {
-        let mut shares = Controller::desired(state, app, "cf");
+        let mut state = state.clone();
+        let stack = app.running.as_ref().map(Running::stack);
+        state.wickets.runtimes = stack
+            .map(|stack| ("w".to_string(), stack))
+            .into_iter()
+            .collect();
+        let mut shares = Controller::desired(&state, app, "cf");
         let share = shares.remove("w");
         assert!(shares.is_empty(), "on another wicket: {shares:?}");
         share
@@ -1953,10 +2021,7 @@ mod tests {
         let mut state = State::new("o", "s", &["localhost".into()]);
         state.follow_wickets(&["w".into()]);
         let space = state.spaces[0].guid.clone();
-        let guid = state
-            .create_app("hello", crate::store::STACK, &space)
-            .guid
-            .clone();
+        let guid = state.create_app("hello", &space).guid.clone();
         let domain = state.domains[0].guid.clone();
         let app = state.app(&guid).unwrap().clone();
         assert_eq!(on_w(&state, &app), None);
@@ -1965,6 +2030,7 @@ mod tests {
             sha256: "ab".repeat(32),
             made: BTreeMap::new(),
             file: "hello.wasm".into(),
+            staged_as: None,
             files: Some("cd".repeat(32)),
             memory_mib: 64,
             budget_ms: Some(5000),
@@ -2570,11 +2636,13 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let dir = std::env::temp_dir().join(format!("cf-api-removal-{}", crate::store::guid()));
         let wickets = ["a".to_string(), "b".to_string()];
-        let store = Store::open(&dir, "o", "s", &["localhost".into()], &wickets).unwrap();
+        let runs = wickets.iter().cloned().map(|name| (name, Runtime::Wasm));
+        let localhost = ["localhost".into()];
+        let store = Store::open(&dir, "o", "s", &localhost, &wickets, &runs.collect()).unwrap();
         let guid = store.update(|state| {
             let space = state.spaces[0].guid.clone();
             let domain = state.domains[0].guid.clone();
-            let app = state.create_app("hello", crate::store::STACK, &space);
+            let app = state.create_app("hello", &space);
             app.process.instances = 2;
             app.started = true;
             app.running = Some(Running {
