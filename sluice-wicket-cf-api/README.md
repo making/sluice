@@ -1148,6 +1148,19 @@ the launcher), the run image pinned to its digest and what it launches; each wic
 goes to makes its rootfs of them, as it makes an image's, and none builds it again. The
 buildpacks are the builder's, in its order: `cf push -b` names `cnb`, not one of them.
 
+A buildpack's setting is an environment variable of the app, a manifest's `env:` or `cf set-env`
+before the push (after it, `cf restage` builds again): the Java version of Paketo's, say.
+
+```yaml
+applications:
+- name: java
+  memory: 1G
+  env:
+    BP_JVM_VERSION: 25
+```
+
+The build and the running app see the same variables: none is the build's alone.
+
 A `.wasm` and an `.ext4` together, or two of one, fail staging until the command names one.
 With `cf push -b <name>` (repeated, a manifest's `buildpacks:`) only the named ones detect, in
 the table's order; with `-b null` all of them again. They are the cf-api's own: none is created,

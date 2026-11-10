@@ -40,7 +40,7 @@ builder's rootfs made by a push before the recording, and records the `cf` CLI, 
 sluice-wicket-cf-api/demo/record-cnb.sh
 ```
 
-It needs `vhs` (with `ttyd`, `ffmpeg` and a Chromium on the PATH), `curl`, `nc`, `firecracker`,
+It needs `vhs` (with `ttyd` and `ffmpeg`; it fetches a Chromium on its first run), `curl`, `nc`, `firecracker`,
 a guest kernel (the wicket's [Setup](../../sluice-wicket-runtime-firecracker/README.md#setup)),
 the OSS cf CLI v8 below, and the network: the builder's image and what its buildpacks download.
 The logs are in `../target/demo-cnb/logs`.

@@ -23,3 +23,7 @@ Difficulty: Medium
   build's env with the proxy as the one rule was not tried
 - a buildpack's stderr reaches the staging log as `OUT`: the lifecycle writes it to its own
   stdout. Nothing to fix here unless the lifecycle tells them apart
+- a failed build's last lines are not in `cf push`'s output: the CLI stops following the log once
+  the build is failed, the lines still on their way (Maven's `[ERROR]` lines of a compile
+  failing, seen with `BP_JVM_VERSION: 17` on a Java 21 pom). The cf-api has them (its stdout,
+  the app's log); only "the builder failed (exit status: 51)" is shown
