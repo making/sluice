@@ -1135,6 +1135,11 @@ A zip is staged by the buildpack detecting it, kept on its droplet (`cf app`); a
 | `site` | `wasip3` | no command, no file of the two above, an `index.html` at the root | sluice-wicket-site and the package's files ([Static sites](#static-sites)) |
 | `cnb` | `firecracker` | with `--cnb-builder` alone: no command, none of the above, any file | the rootfs a wicket makes of what the builder's buildpacks built, over the builder's run image |
 
+[![cf push of a Node.js and a Spring Boot app's source, built by the buildpacks of paketobuildpacks/ubuntu-resolute-builder in a microVM of a Firecracker wicket and served](demo/sluice-cf-cnb-demo.gif)](demo/sluice-cf-cnb-demo.mp4)
+
+The GIF links to the [MP4](demo/sluice-cf-cnb-demo.mp4); both are recorded on Linux by
+`demo/record-cnb.sh` ([demo/README.md](demo/README.md#source-staged-by-buildpacks)).
+
 `cnb` stages as CF does, in a microVM of a Firecracker wicket: the zip's files are the build's
 source, the app's environment (the user's, `VCAP_APPLICATION`, `VCAP_SERVICES`) its platform's,
 its output the staging log (`cf push`, `cf logs`), within the wicket's build timeout (15

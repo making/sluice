@@ -26,6 +26,25 @@ sluice-wicket-cf-api/demo/record-firecracker.sh
 It needs `vhs`, `ffmpeg`, `jq`, `curl`, `nc`, `limactl` and the OSS cf CLI v8 below. The wicket's log
 is in `../target/demo-firecracker/wicket.log`.
 
+## Source staged by buildpacks
+
+`sluice-cf-cnb-demo.mp4` (and `.gif`) is `cf push` of source on a Firecracker wicket: a Node.js
+and a Spring Boot app (`cnb/`) built by the buildpacks of
+`paketobuildpacks/ubuntu-resolute-builder` in a microVM, served, their staging log. `cnb.tape`
+is its script. On Linux with a usable `/dev/kvm`, `record-cnb.sh` builds the flume, the wicket
+and the cf-api from the work tree, runs them here (`--any-credentials`: no provider), has the
+builder's rootfs made by a push before the recording, and records the `cf` CLI, on the ports
+8002, 8080, 9090 and 9091:
+
+```text
+sluice-wicket-cf-api/demo/record-cnb.sh
+```
+
+It needs `vhs` (with `ttyd`, `ffmpeg` and a Chromium on the PATH), `curl`, `nc`, `firecracker`,
+a guest kernel (the wicket's [Setup](../../sluice-wicket-runtime-firecracker/README.md#setup)),
+the OSS cf CLI v8 below, and the network: the builder's image and what its buildpacks download.
+The logs are in `../target/demo-cnb/logs`.
+
 The rest of this page is the wasi wicket's demo.
 
 ## Prerequisites
