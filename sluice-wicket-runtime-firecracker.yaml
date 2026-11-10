@@ -1,8 +1,8 @@
-image: ghcr.io/making/sluice/sluice-wicket-runtime-firecracker@sha256:8bdc3931e03db5f5af692e8165389c7358ae92fcc4869d4f58a09ab9772423b6
-git_revision: 5d24c63f4fd319b056a448e4e8913127ebf19851
+image: ghcr.io/making/sluice/sluice-wicket-runtime-firecracker@sha256:c5895d223c9fe31fbc2f7c707c76958d1ef614a43781f1bad4ebb37ccac60f9d
+git_revision: caecd21f6ee80d93ccdf2e536f9d2922f1fd7f8c
 deployment:
   image:
     repository: ghcr.io/making/sluice/sluice-wicket-runtime-firecracker
-    digest: sha256:8bdc3931e03db5f5af692e8165389c7358ae92fcc4869d4f58a09ab9772423b6
+    digest: sha256:c5895d223c9fe31fbc2f7c707c76958d1ef614a43781f1bad4ebb37ccac60f9d
   podLabels:
-    github.com/revision: 5d24c63f4fd319b056a448e4e8913127ebf19851
+    github.com/revision: caecd21f6ee80d93ccdf2e536f9d2922f1fd7f8c
