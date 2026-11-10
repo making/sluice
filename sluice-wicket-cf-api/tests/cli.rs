@@ -745,6 +745,10 @@ fn the_cf_cli_deploys_to_the_wicket() {
             .contains("Staged hello.wasm")
     );
     assert!(cf.ok(&["stacks"]).contains("wasip3 "));
+    let buildpacks = cf.ok(&["buildpacks"]);
+    for buildpack in ["wasm", "rootfs", "site"] {
+        assert!(buildpacks.contains(buildpack), "{buildpacks}");
+    }
 
     // organizations and spaces: without --admin whoever logs in is an admin; a space holds
     // its own apps, and its maker manages and develops in it (the CLI gives the roles)
@@ -2207,10 +2211,33 @@ fn the_cf_cli_deploys_to_the_wicket() {
         staged.contains("Staged site.wasm") && staged.contains("serving the files of a"),
         "{staged}"
     );
-    // pushed again with a page changed: the new files served
+    // pushed again with a page changed, and a .wasm it serves: a site by the buildpack named,
+    // one of the name of none refused
     std::fs::write(site.join("index.html"), "<h1>home, again</h1>").unwrap();
-    cf.ok(&["push", "site", "-p", site.to_str().unwrap()]);
+    std::fs::write(site.join("lib.wasm"), "for the browser").unwrap();
+    let site_path = site.to_str().unwrap();
+    cf.fails(&[
+        "push",
+        "site",
+        "-p",
+        site_path,
+        "-b",
+        "staticfile_buildpack",
+    ]);
+    let refused = cf.ok(&["logs", "site", "--recent"]);
+    assert!(
+        refused.contains("there is no buildpack 'staticfile_buildpack'"),
+        "{refused}"
+    );
+    assert_eq!(page("/"), (200, "<h1>home</h1>".into()));
+    cf.ok(&["push", "site", "-p", site_path, "-b", "site"]);
     assert_eq!(page("/"), (200, "<h1>home, again</h1>".into()));
+    assert_eq!(page("/lib.wasm"), (200, "for the browser".into()));
+    let shown = cf.ok(&["app", "site"]);
+    assert!(
+        shown.contains("buildpacks:") && shown.contains("site "),
+        "{shown}"
+    );
 
     // gone from the wickets; their instances stay, unbound
     for app in ["hello", "counter", "relay", "img", "site"] {

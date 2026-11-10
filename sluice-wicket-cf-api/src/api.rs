@@ -710,6 +710,27 @@ impl Api {
                     |stack| Ok(json(StatusCode::OK, &stack)),
                 )
             }
+            (&Method::GET, ["buildpacks"]) => {
+                let mut buildpacks = views::buildpacks(base);
+                for (query, field) in [("names", "name"), ("stacks", "stack")] {
+                    if let Some(wanted) = req.q(query) {
+                        let asked = |buildpack: &Value| {
+                            let value = buildpack[field].as_str().unwrap_or_default();
+                            wanted.split(',').any(|wanted| wanted == value)
+                        };
+                        buildpacks.retain(asked);
+                    }
+                }
+                listing(buildpacks, None)
+            }
+            (&Method::GET, ["buildpacks", guid]) => {
+                let mut all = views::buildpacks(base).into_iter();
+                all.find(|buildpack| buildpack["guid"] == **guid)
+                    .map_or_else(
+                        || Err(ApiError::not_found("Buildpack")),
+                        |buildpack| Ok(json(StatusCode::OK, &buildpack)),
+                    )
+            }
             (&Method::GET, ["feature_flags"]) => listing(
                 ["service_instance_sharing", "diego_docker"]
                     .iter()
@@ -1115,8 +1136,7 @@ impl Api {
                 Err(ApiError::unprocessable("route services are not supported"))
             }
             // --- what there is none of
-            (&Method::GET, ["buildpacks"])
-            | (&Method::GET, ["service_route_bindings"])
+            (&Method::GET, ["service_route_bindings"])
             | (&Method::GET, ["audit_events"])
             | (&Method::GET, ["isolation_segments"])
             | (&Method::GET, ["space_quotas"])

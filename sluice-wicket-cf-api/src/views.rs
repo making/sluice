@@ -7,6 +7,7 @@ use serde_json::{Value, json};
 
 use crate::controller::Controller;
 use crate::placement::MAX_INSTANCES;
+use crate::staging::Buildpack;
 use crate::store::{
     App, Build, Deployment, Droplet, Job, Lifecycle, Named, Outcome, Package, Route, SecurityGroup,
     Space, State, epoch_secs, now,
@@ -255,6 +256,24 @@ fn stack(base: &str, runtime: Runtime, default: bool) -> Value {
         "metadata": metadata(None),
         "links": {"self": {"href": format!("{base}/v3/stacks/{name}")}},
     })
+}
+
+/// The buildpacks, as they detect (`cf buildpacks`): each with its stack, its file what it
+/// stages.
+pub fn buildpacks(base: &str) -> Vec<Value> {
+    let buildpack = |(at, buildpack): (usize, Buildpack)| {
+        let name = buildpack.name();
+        json!({
+            "guid": name, "created_at": "2026-01-01T00:00:00Z", "updated_at": "2026-01-01T00:00:00Z",
+            "name": name, "state": "READY", "stack": buildpack.stack().stack(),
+            "filename": buildpack.takes(), "position": at + 1,
+            "enabled": true, "locked": true, "lifecycle": "buildpack",
+            "metadata": metadata(None),
+            "links": {"self": {"href": format!("{base}/v3/buildpacks/{name}")}},
+        })
+    };
+    let all = Buildpack::ALL.into_iter().enumerate();
+    all.map(buildpack).collect()
 }
 
 pub fn app(base: &str, state: &State, app: &App) -> Value {
@@ -587,18 +606,12 @@ pub fn build(base: &str, state: &State, build: &Build) -> Value {
 /// A droplet: an image's shows the image, pinned to its digest (what `cf
 /// app` shows of a docker app), and no buildpack; its stack is where it runs, an image's too.
 pub fn droplet(base: &str, droplet: &Droplet) -> Value {
-    let stack = droplet.stack();
-    let buildpack = match stack {
-        Runtime::Firecracker => "rootfs",
-        Runtime::Wasm if droplet.files.is_some() => "site",
-        Runtime::Wasm => "wasm",
-    };
-    let stack = stack.stack();
-    let (kind, buildpacks) = match droplet.image {
-        Some(_) => ("docker", json!([])),
-        None => (
+    let stack = droplet.stack().stack();
+    let (kind, buildpacks) = match droplet.buildpack().map(Buildpack::name) {
+        None => ("docker", json!([])),
+        Some(name) => (
             "buildpack",
-            json!([{"name": buildpack, "detect_output": buildpack, "buildpack_name": buildpack, "version": "0.0.1"}]),
+            json!([{"name": name, "detect_output": name, "buildpack_name": name, "version": "0.0.1"}]),
         ),
     };
     json!({

@@ -18,6 +18,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::staging::Buildpack;
 use crate::wicket::Runtime;
 
 /// The annotation of an app setting its routes' `budget-ms`.
@@ -877,6 +878,10 @@ pub struct Droplet {
     /// ([`Droplet::stack`]).
     #[serde(default, rename = "stack", skip_serializing_if = "Option::is_none")]
     pub staged_as: Option<Runtime>,
+    /// The buildpack that staged it; none of an image's, nor in a droplet staged before it was
+    /// kept ([`Droplet::buildpack`]).
+    #[serde(default, rename = "buildpack", skip_serializing_if = "Option::is_none")]
+    pub staged_by: Option<Buildpack>,
     pub bytes: u64,
     /// The image it was pulled from, pinned to its manifest's digest; None
     /// for a zip's.
@@ -899,6 +904,19 @@ impl Droplet {
     /// Its stack: where it runs. Of one staged before it was kept, what its file's name tells.
     pub fn stack(&self) -> Runtime {
         (self.staged_as).unwrap_or_else(|| Runtime::of_file(&self.file))
+    }
+
+    /// The buildpack that staged it, an image's none. Of one staged before it was kept, what
+    /// it holds tells: a site by its files, else by its stack.
+    pub fn buildpack(&self) -> Option<Buildpack> {
+        if self.image.is_some() {
+            return None;
+        }
+        Some(self.staged_by.unwrap_or(match self.stack() {
+            Runtime::Firecracker => Buildpack::Rootfs,
+            Runtime::Wasm if self.files.is_some() => Buildpack::Site,
+            Runtime::Wasm => Buildpack::Wasm,
+        }))
     }
 
     /// What the wicket `wicket` serves it as ([`Droplet::made`]).
@@ -2074,6 +2092,7 @@ mod tests {
             sha256: sha256.into(),
             file: "hello.wasm".into(),
             staged_as: None,
+            staged_by: None,
             bytes: 1,
             image: None,
             made: BTreeMap::new(),
@@ -2243,6 +2262,7 @@ mod tests {
             sha256: "ab".repeat(32),
             file: "app/r.ext4".into(),
             staged_as: Some(Runtime::Firecracker),
+            staged_by: Some(Buildpack::Rootfs),
             bytes: 1,
             image: None,
             made: BTreeMap::new(),
@@ -2251,16 +2271,16 @@ mod tests {
             updated_at: now(),
         };
         legacy["droplets"] = json!([staged]);
-        legacy["droplets"][0]
-            .as_object_mut()
-            .unwrap()
-            .remove("stack");
+        let kept = legacy["droplets"][0].as_object_mut().unwrap();
+        assert_eq!(kept.remove("buildpack"), Some(json!("rootfs")));
+        kept.remove("stack");
         legacy["apps"][0]["current_droplet"] = json!("d");
         let mut state: State = serde_json::from_value(legacy).unwrap();
         state.migrate();
         assert_eq!(state.apps[0].pin, None);
         assert_eq!(state.droplets[0].staged_as, None);
         assert_eq!(state.droplets[0].stack(), Runtime::Firecracker);
+        assert_eq!(state.droplets[0].buildpack(), Some(Buildpack::Rootfs));
         assert_eq!(
             state.shown_stack(&state.apps[0]),
             Some(Runtime::Firecracker)

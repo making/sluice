@@ -281,7 +281,8 @@ the capabilities it is bound, what its first start and a page take, in
 ### Static sites
 
 A package of no component, nor a rootfs, with an `index.html` at its root is a static site:
-`cf push site -p public/`. Its droplet is the site's component
+`cf push site -p public/`; one holding `.wasm` files is a site by its buildpack's name
+(`cf push site -p public/ -b site`). Its droplet is the site's component
 ([sluice-wicket-site](../sluice-wicket-site/README.md),
 embedded in the cf-api at its build) and a tar of the package's files, which the wicket
 preopens read-only at `/` for it ([the app's `files`](../sluice-wicket-runtime-wasi/README.md#apps)):
@@ -859,8 +860,9 @@ its wicket's `--listen` (one entry point for both takes a sluice server).
   `--wicket <url>` is `wicket` (`--wicket wicket=<url>`)
 - **Stacks.** A wicket runs one stack, the one its listing names (`wasip3`, a wasi wicket's;
   `firecracker`), kept in `state.json`: a wicket down is still of its stack. `cf stacks` lists
-  those the wickets run. What is pushed decides an app's, as a buildpack's detection: a zip's
-  `.wasm`, or a static site, `wasip3`, its `.ext4` `firecracker`; an image holding a wasm
+  those the wickets run. What is pushed decides an app's, by the buildpack detecting a zip
+  ([Buildpacks](#buildpacks)): its `.wasm`, or a static site, `wasip3`, its `.ext4`
+  `firecracker`; an image holding a wasm
   component `wasip3`, any other `firecracker` (the cf-api reads its manifest where wickets of
   both stacks run; of an index with a `wasm` entry, another platform's manifest by its digest is
   a rootfs). A stack no wicket runs fails staging, naming theirs. `cf push -s <stack>`, or a
@@ -1115,7 +1117,24 @@ What holds on both wickets; a component's and a VM's are in
 | readiness check (`readiness-health-check-*`, a manifest's alone, as on CF) | kept and shown (`cf get-readiness-health-check`, the process's `readiness_health_check`); `process`, the default, on both wickets; `port` and `http` on a Firecracker wicket ([Mapping to VMs](#mapping-to-vms)), refused on a wasm wicket, where an instance takes requests as they come |
 | health check (`cf push -u`, `cf set-health-check`, `health-check-*`) | kept and shown (`cf get-health-check`, the process's `health_check`); on a Firecracker wicket the route's liveness check and `timeout` its start's ([Mapping to VMs](#mapping-to-vms)); on a wasm wicket `port` and `process` ask nothing, `http` is refused: an instance takes requests as they come |
 | stack (`cf push -s`, `stack:`) | pins the app's ([Stacks](#several-wickets)). `lifecycle.data.stack` shows the pin, else the current droplet's; a droplet's `stack` is where it runs |
-| log rate, buildpacks | accepted and shown, no effect |
+| buildpacks (`cf push -b`, `buildpacks:`) | the only ones detecting the package ([Buildpacks](#buildpacks)); a name of none fails staging |
+| log rate | accepted and shown, no effect |
+
+### Buildpacks
+
+A zip is staged by the buildpack detecting it, kept on its droplet (`cf app`); an image has none.
+`cf buildpacks` lists them:
+
+| buildpack | stack | detects | droplet |
+|---|---|---|---|
+| `wasm` | `wasip3` | the file the web process command names (`-c hello.wasm`), else the package's only `.wasm` | that component |
+| `rootfs` | `firecracker` | the `.ext4` the command names, else the package's only `.ext4` | that rootfs |
+| `site` | `wasip3` | no command, no file of the two above, an `index.html` at the root | sluice-wicket-site and the package's files ([Static sites](#static-sites)) |
+
+A `.wasm` and an `.ext4` together, or two of one, fail staging until the command names one.
+With `cf push -b <name>` (repeated, a manifest's `buildpacks:`) only the named ones detect, in
+the table's order; with `-b null` all of them again. They are the cf-api's own: none is created,
+updated or deleted.
 
 ### Instances
 

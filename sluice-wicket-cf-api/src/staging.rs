@@ -1,8 +1,12 @@
-//! A build: what is pushed decides the droplet's stack, as a buildpack's detection, and so the
-//! wickets it runs on. A zip's file is the one the web process command names, else its only
-//! `.wasm`, a component (`\0asm`, layer 1: the stack `wasip3`), or its only `.ext4`, a rootfs
-//! (the stack `firecracker`); a zip of neither with an `index.html` at its root is a static site
-//! (`wasip3`). An image whose manifest holds a wasm component is pulled (`crate::registry`);
+//! A build: what is pushed decides the droplet's stack, and so the wickets it runs on. A zip is
+//! staged by a [`Buildpack`], the one detecting it ([`detect`]): its file is the one the web
+//! process command names, else its only `.wasm`, a component (`wasm`: `\0asm`, layer 1; the stack
+//! `wasip3`), or its only `.ext4`, a rootfs (`rootfs`: the stack `firecracker`); a zip of neither
+//! with an `index.html` at its root is a static site (`site`: `wasip3`). The buildpacks an app
+//! names (`cf push -b`, a manifest's `buildpacks:`) are the only ones detecting, so a site
+//! holding `.wasm` files is one by `-b site`. The droplet keeps its buildpack.
+//!
+//! An image has none: one whose manifest holds a wasm component is pulled (`crate::registry`);
 //! any other is made into a rootfs by a Firecracker wicket, which keeps it (the cf-api the
 //! image's pinned reference, to have it made again). The manifest is read to tell them apart
 //! only where wickets of both stacks run.
@@ -19,6 +23,7 @@
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
 
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::controller::Controller;
@@ -54,6 +59,174 @@ const HEAD: usize = MAGIC_AT + MAGIC.len();
 const MAGIC_AT: usize = 1024 + 56;
 const MAGIC: [u8; 2] = [0x53, 0xEF];
 
+/// What makes a droplet of a zip, as a buildpack of CF: what it detects, and the stack of what
+/// it stages. One more is a variant here, what it detects ([`detect`]) and how it stages
+/// ([`unpack`]).
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Buildpack {
+    /// A wasm component, as it is.
+    Wasm,
+    /// A rootfs (an ext4 image), as it is.
+    Rootfs,
+    /// A static site: its files, served by sluice-wicket-site.
+    Site,
+}
+
+impl Buildpack {
+    /// All of them, as they detect: a file one stages as it is, before a site.
+    pub const ALL: [Buildpack; 3] = [Buildpack::Wasm, Buildpack::Rootfs, Buildpack::Site];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Buildpack::Wasm => "wasm",
+            Buildpack::Rootfs => "rootfs",
+            Buildpack::Site => "site",
+        }
+    }
+
+    /// The stack of what it stages.
+    pub fn stack(self) -> Runtime {
+        match self {
+            Buildpack::Wasm | Buildpack::Site => Runtime::Wasm,
+            Buildpack::Rootfs => Runtime::Firecracker,
+        }
+    }
+
+    /// What it stages, as the `cf buildpacks` listing names its file.
+    pub fn takes(self) -> &'static str {
+        match self {
+            Buildpack::Wasm => "*.wasm",
+            Buildpack::Rootfs => "*.ext4",
+            Buildpack::Site => SITE_INDEX,
+        }
+    }
+
+    /// What a package it stages is.
+    fn what(self) -> &'static str {
+        match self {
+            Buildpack::Wasm => "a wasm component",
+            Buildpack::Rootfs => "a rootfs",
+            Buildpack::Site => "a static site",
+        }
+    }
+
+    /// What it detects, as the staging log tells it.
+    fn detects(self) -> &'static str {
+        match self {
+            Buildpack::Wasm => "the package's only .wasm is the component",
+            Buildpack::Rootfs => "the package's only .ext4 is the rootfs",
+            Buildpack::Site => "an index.html at its root makes it a static site",
+        }
+    }
+
+    /// What a package it does not detect lacks.
+    fn lacking(self) -> &'static str {
+        match self {
+            Buildpack::Wasm => "no .wasm component",
+            Buildpack::Rootfs => "no .ext4 rootfs",
+            Buildpack::Site => "no index.html at its root",
+        }
+    }
+
+    /// The one staging the file `file` as it is: a rootfs by its name, else a component.
+    fn of_file(file: &str) -> Buildpack {
+        match file.ends_with(ROOTFS) {
+            true => Buildpack::Rootfs,
+            false => Buildpack::Wasm,
+        }
+    }
+
+    /// Whether `file` is one it detects, to stage as it is.
+    fn detects_file(self, file: &str) -> bool {
+        match self {
+            Buildpack::Wasm => file.ends_with(".wasm"),
+            Buildpack::Rootfs => file.ends_with(ROOTFS),
+            Buildpack::Site => false,
+        }
+    }
+
+    /// The buildpacks detecting for an app naming `named`: those, else all of them. A name
+    /// of none fails it, naming them.
+    pub fn named(named: &[String]) -> Result<Vec<Buildpack>, String> {
+        if named.is_empty() {
+            return Ok(Buildpack::ALL.to_vec());
+        }
+        let found = |name: &String| {
+            let found = Buildpack::ALL.into_iter().find(|kept| kept.name() == name);
+            found.ok_or_else(|| {
+                format!(
+                    "there is no buildpack '{name}' (cf push -b, a manifest's buildpacks): they \
+                     are {}",
+                    names(&Buildpack::ALL)
+                )
+            })
+        };
+        named.iter().map(found).collect()
+    }
+}
+
+/// The names of `buildpacks`, listed.
+fn names(buildpacks: &[Buildpack]) -> String {
+    let names: Vec<_> = buildpacks
+        .iter()
+        .map(|buildpack| buildpack.name())
+        .collect();
+    names.join(", ")
+}
+
+/// The buildpack of `detecting` staging a zip of the files `files` for the web process
+/// `command`, and the file it stages as it is (a site has none): the one the command names, by
+/// its path or its file name, else the only one any of them detects, else a site by its
+/// `index.html` at the root.
+pub fn detect(
+    files: &[String],
+    command: Option<&str>,
+    detecting: &[Buildpack],
+) -> Result<(Buildpack, Option<String>), String> {
+    if let Some(command) = command.map(str::trim).filter(|command| !command.is_empty()) {
+        let named = |name: &&String| *name == command || name.rsplit('/').next() == Some(command);
+        let Some(entry) = files.iter().find(named) else {
+            return Err(format!(
+                "the command names '{command}', which the package does not hold (found: {})",
+                listed(files)
+            ));
+        };
+        let buildpack = Buildpack::of_file(entry);
+        if !detecting.contains(&buildpack) {
+            return Err(format!(
+                "the command names '{entry}', {}: the app's buildpacks are {} (cf push -b)",
+                buildpack.what(),
+                names(detecting)
+            ));
+        }
+        return Ok((buildpack, Some(entry.clone())));
+    }
+    let detected = |file: &&String| detecting.iter().any(|kept| kept.detects_file(file));
+    let entries: Vec<&String> = files.iter().filter(detected).collect();
+    match entries.as_slice() {
+        [only] => Ok((Buildpack::of_file(only), Some((*only).clone()))),
+        [] if detecting.contains(&Buildpack::Site)
+            && files.iter().any(|file| file == SITE_INDEX) =>
+        {
+            Ok((Buildpack::Site, None))
+        }
+        [] => {
+            let lacking: Vec<_> = detecting.iter().map(|kept| kept.lacking()).collect();
+            Err(format!(
+                "the package holds {} (found: {})",
+                lacking.join(", "),
+                listed(files)
+            ))
+        }
+        several => Err(format!(
+            "the package holds {} components ({}): name one with -c (the web process command)",
+            several.len(),
+            listed(several)
+        )),
+    }
+}
+
 /// The component a build picked.
 #[derive(Debug)]
 pub struct Staged {
@@ -70,6 +243,8 @@ pub struct Staged {
     pub files: Option<Files>,
     /// What it is staged as: where it runs.
     pub stack: Runtime,
+    /// What staged it; none of an image's.
+    pub buildpack: Option<Buildpack>,
 }
 
 /// The stacks a package may be staged as: those the wickets run, the app's pin alone of them.
@@ -120,8 +295,8 @@ impl Takes {
 }
 
 /// Stages the build `build` of `package` and records how it went: STAGED
-/// with its droplet, or FAILED naming why. A zip's file is the one
-/// `command` names, else its only `.wasm` or `.ext4` ([`stage`]); an image's component is pulled
+/// with its droplet, or FAILED naming why. A zip is staged by the buildpack detecting it, of
+/// those its app names ([`detect`], for the web process `command`); an image's component is pulled
 /// from its registry with the package's credentials, if any, or its rootfs made by a wicket.
 pub async fn run(
     store: &Arc<Store>,
@@ -133,28 +308,40 @@ pub async fn run(
     command: Option<&str>,
 ) {
     let app = package.app.as_str();
+    let (pin, named) = store.read(|state| {
+        let app = state.app(app);
+        let named = app.map(|app| app.buildpacks.clone());
+        (app.and_then(|app| app.pin), named.unwrap_or_default())
+    });
     let takes = Takes {
-        pin: store.read(|state| state.app(app).and_then(|app| app.pin)),
+        pin,
         stacks: controller.stacks().await,
     };
     let (wasm, rootfs) = (takes.may(Runtime::Wasm), takes.may(Runtime::Firecracker));
     let staged = match &package.docker {
         _ if !wasm && !rootfs => Err(takes.nothing()),
-        None => {
-            let line = match (wasm, rootfs) {
-                (true, false) => {
-                    "Staging with the wasm lifecycle: the web process command names the component, else the package's only .wasm, else an index.html makes it a static site"
+        None => match Buildpack::named(&named) {
+            Ok(detecting) => {
+                // told of those whose stack a wicket runs: one of another is refused, detected
+                let told: Vec<Buildpack> = detecting
+                    .iter()
+                    .copied()
+                    .filter(|buildpack| takes.may(buildpack.stack()))
+                    .collect();
+                if !told.is_empty() {
+                    let detects: Vec<_> = told.iter().map(|kept| kept.detects()).collect();
+                    let line = format!(
+                        "Staging with the buildpack{} {}: the web process command names the file, else {}",
+                        if told.len() == 1 { "" } else { "s" },
+                        names(&told),
+                        detects.join(", else ")
+                    );
+                    logs.add(app, "STG", line);
                 }
-                (false, _) => {
-                    "Staging a rootfs: the web process command names the image, else the package's only .ext4"
-                }
-                (true, true) => {
-                    "Staging what the package holds: the web process command names the component or the rootfs, else its only .wasm or .ext4, else an index.html makes it a static site"
-                }
-            };
-            logs.add(app, "STG", line);
-            unpack(store.clone(), &package.guid, command, takes).await
-        }
+                unpack(store.clone(), &package.guid, command, detecting, takes).await
+            }
+            Err(e) => Err(e),
+        },
         Some(docker) => image(logs, registry, controller, app, docker, (wasm, rootfs)).await,
     };
     let staged = staged.and_then(|staged| {
@@ -172,11 +359,15 @@ pub async fn run(
                 app,
                 "STG",
                 format!(
-                    "Staged {} ({} bytes, sha256 {}, the stack {}){}{}",
+                    "Staged {} ({} bytes, sha256 {}, the stack {}{}){}{}",
                     staged.entry,
                     staged.size,
                     &staged.sha256[..12],
                     staged.stack.stack(),
+                    staged.buildpack.map_or(String::new(), |buildpack| format!(
+                        ", the buildpack {}",
+                        buildpack.name()
+                    )),
                     staged
                         .image
                         .as_ref()
@@ -195,6 +386,7 @@ pub async fn run(
                 sha256: staged.sha256,
                 file: staged.entry,
                 staged_as: Some(staged.stack),
+                staged_by: staged.buildpack,
                 bytes: staged.size,
                 image: staged.image,
                 made: Default::default(),
@@ -225,49 +417,42 @@ pub async fn run(
 }
 
 /// Stages the zip of the package `guid`, its droplet made, on a blocking thread: a VM of one
-/// vCPU has one worker, which the API and the watch run on. A zip of a static site is one
-/// ([`is_site`]); what `takes` does not is refused before it is unpacked.
+/// vCPU has one worker, which the API and the watch run on. The buildpack is the one of
+/// `detecting` detecting it ([`detect`]); what `takes` does not is refused before it is unpacked.
 async fn unpack(
     store: Arc<Store>,
     guid: &str,
     command: Option<&str>,
+    detecting: Vec<Buildpack>,
     takes: Takes,
 ) -> Result<Staged, String> {
     let (guid, command) = (guid.to_string(), command.map(str::to_string));
     tokio::task::spawn_blocking(move || {
-        let open = || {
-            std::fs::File::open(store.package_path(&guid))
-                .map_err(|e| format!("the package is gone: {e}"))
-        };
-        if command.is_none() {
-            let mut archive =
-                zip::ZipArchive::new(open()?).map_err(|e| format!("not a zip: {e}"))?;
-            if is_site(&archive) {
-                takes.accept(Runtime::Wasm, "a static site")?;
-                return stage_site(&store, &mut archive);
-            }
+        let zip = std::fs::File::open(store.package_path(&guid))
+            .map_err(|e| format!("the package is gone: {e}"))?;
+        let mut archive = zip::ZipArchive::new(zip).map_err(|e| format!("not a zip: {e}"))?;
+        let (buildpack, entry) = detect(&files(&archive), command.as_deref(), &detecting)?;
+        takes.accept(buildpack.stack(), buildpack.what())?;
+        match entry {
+            None => stage_site(&store, &mut archive),
+            Some(entry) => store.make_droplet(|droplet| {
+                let staged = stage(&mut archive, buildpack, entry, droplet, MAX_DROPLET_BYTES)?;
+                let sha256 = staged.sha256.clone();
+                Ok((staged, sha256))
+            }),
         }
-        let zip = open()?;
-        let accept = |stack| match stack {
-            Runtime::Wasm => takes.accept(stack, "a wasm component"),
-            Runtime::Firecracker => takes.accept(stack, "a rootfs"),
-        };
-        store.make_droplet(|droplet| {
-            let staged = stage(zip, command.as_deref(), droplet, MAX_DROPLET_BYTES, accept)?;
-            let sha256 = staged.sha256.clone();
-            Ok((staged, sha256))
-        })
     })
     .await
     .map_err(|e| format!("staging: {e}"))?
 }
 
-/// Whether `archive` is a static site: no component, nor a rootfs, an `index.html` at its
-/// root.
-fn is_site<R: Read + Seek>(archive: &zip::ZipArchive<R>) -> bool {
-    let names: Vec<_> = archive.file_names().filter_map(|name| name.ok()).collect();
-    let component = |name: &str| name.ends_with(".wasm") || name.ends_with(ROOTFS);
-    !names.iter().any(|name| component(name)) && names.iter().any(|name| name == SITE_INDEX)
+/// The files of `archive`, by name.
+fn files<R: Read + Seek>(archive: &zip::ZipArchive<R>) -> Vec<String> {
+    let names = archive.file_names().filter_map(|name| name.ok());
+    names
+        .filter(|name| !name.ends_with('/'))
+        .map(String::from)
+        .collect()
 }
 
 /// Stages the static site `archive`: its files packed, sluice-wicket-site its component.
@@ -291,6 +476,7 @@ fn stage_site<R: Read + Seek>(
             bytes: packed.bytes,
         }),
         stack: Runtime::Wasm,
+        buildpack: Some(Buildpack::Site),
     })
 }
 
@@ -481,6 +667,7 @@ async fn image(
                 image: Some(pulled.image),
                 files: None,
                 stack: Runtime::Wasm,
+                buildpack: None,
             });
         }
         logs.add(
@@ -505,61 +692,21 @@ async fn image(
             image: Some(made.image),
             files: None,
             stack: Runtime::Firecracker,
+            buildpack: None,
         })
         .map_err(|e| format!("{}: {e}", docker.image))
 }
 
-/// Stages `package` (a zip) for the web process `command`: the component, or the rootfs,
-/// unpacked to `droplet` as it comes, `max` bytes at most, not a process's memory. Its stack is
-/// its file's (a rootfs's name ends [`ROOTFS`]), which `accept` may refuse before it is read.
-pub fn stage(
-    package: impl Read + Seek,
-    command: Option<&str>,
+/// Stages the file `entry` of the zip `archive`, which `buildpack` detected: the component, or
+/// the rootfs, checked to be one and unpacked to `droplet` as it comes, `max` bytes at most, not
+/// a process's memory.
+pub fn stage<R: Read + Seek>(
+    archive: &mut zip::ZipArchive<R>,
+    buildpack: Buildpack,
+    entry: String,
     droplet: &mut impl Write,
     max: u64,
-    accept: impl Fn(Runtime) -> Result<(), String>,
 ) -> Result<Staged, String> {
-    let mut archive = zip::ZipArchive::new(package).map_err(|e| format!("not a zip: {e}"))?;
-    let names: Vec<String> = archive
-        .file_names()
-        .filter_map(|name| name.ok())
-        .filter(|name| !name.ends_with('/'))
-        .map(String::from)
-        .collect();
-    let components: Vec<&String> = names
-        .iter()
-        .filter(|name| name.ends_with(".wasm") || name.ends_with(ROOTFS))
-        .collect();
-    let entry = match command.map(str::trim).filter(|command| !command.is_empty()) {
-        Some(command) => names
-            .iter()
-            .find(|name| *name == command || name.rsplit('/').next() == Some(command))
-            .ok_or_else(|| {
-                format!(
-                    "the command names '{command}', which the package does not hold (found: {})",
-                    listed(&names)
-                )
-            })?
-            .clone(),
-        None => match components.as_slice() {
-            [only] => (*only).clone(),
-            [] => {
-                return Err(format!(
-                    "the package holds no .wasm component, nor an .ext4 rootfs (found: {})",
-                    listed(&names)
-                ));
-            }
-            several => {
-                return Err(format!(
-                    "the package holds {} components ({}): name one with -c (the web process command)",
-                    several.len(),
-                    listed(several)
-                ));
-            }
-        },
-    };
-    let stack = Runtime::of_file(&entry);
-    accept(stack)?;
     let unread = |e: std::io::Error| format!("cannot read {entry}: {e}");
     let mut file = archive
         .by_name(&entry)
@@ -569,9 +716,10 @@ pub fn stage(
         .take(HEAD as u64)
         .read_to_end(&mut head)
         .map_err(unread)?;
-    match stack {
-        Runtime::Firecracker => check_rootfs(&entry, &head)?,
-        Runtime::Wasm => check_component(&entry, &head)?,
+    match buildpack {
+        Buildpack::Rootfs => check_rootfs(&entry, &head)?,
+        Buildpack::Wasm => check_component(&entry, &head)?,
+        Buildpack::Site => return Err(format!("{entry} is no file a site is staged of")),
     }
     let unwritten = |e: std::io::Error| format!("writing {entry}: {e}");
     let mut hashed = Hashed::new(droplet);
@@ -597,7 +745,8 @@ pub fn stage(
         bytes: Vec::new(),
         image: None,
         files: None,
-        stack,
+        stack: buildpack.stack(),
+        buildpack: Some(buildpack),
     })
 }
 
@@ -695,11 +844,28 @@ mod tests {
         zip.finish().unwrap().into_inner()
     }
 
-    /// [`stage`] of `zip`, the droplet in memory; within `max` bytes.
-    fn staged(zip: &[u8], command: Option<&str>, max: u64) -> Result<(Staged, Vec<u8>), String> {
+    /// `zip` staged as [`unpack`] does, by the buildpack of `detecting` detecting it, where
+    /// `takes` does it; the droplet in memory, within `max` bytes. A site is told, not packed.
+    fn staged_by(
+        zip: &[u8],
+        command: Option<&str>,
+        max: u64,
+        detecting: &[Buildpack],
+        takes: Option<&Takes>,
+    ) -> Result<(Staged, Vec<u8>), String> {
+        let mut archive =
+            zip::ZipArchive::new(Cursor::new(zip)).map_err(|e| format!("not a zip: {e}"))?;
+        let (buildpack, entry) = detect(&files(&archive), command, detecting)?;
+        if let Some(takes) = takes {
+            takes.accept(buildpack.stack(), buildpack.what())?;
+        }
+        let entry = entry.ok_or("a static site")?;
         let mut droplet = Vec::new();
-        stage(Cursor::new(zip), command, &mut droplet, max, |_| Ok(()))
-            .map(|staged| (staged, droplet))
+        stage(&mut archive, buildpack, entry, &mut droplet, max).map(|staged| (staged, droplet))
+    }
+
+    fn staged(zip: &[u8], command: Option<&str>, max: u64) -> Result<(Staged, Vec<u8>), String> {
+        staged_by(zip, command, max, &Buildpack::ALL, None)
     }
 
     #[test]
@@ -711,8 +877,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            (hello.entry.as_str(), hello.stack),
-            ("hello.wasm", Runtime::Wasm)
+            (hello.entry.as_str(), hello.stack, hello.buildpack),
+            ("hello.wasm", Runtime::Wasm, Some(Buildpack::Wasm))
         );
         assert_eq!(droplet, COMPONENT);
         assert_eq!(hello.sha256, sha256(COMPONENT));
@@ -735,9 +901,12 @@ mod tests {
                 .contains("names 'c.wasm'")
         );
         assert!(
-            picked(&zipped(&[("index.html", b"<p>")]), None)
+            picked(&zipped(&[("docs/index.html", b"<p>")]), None)
                 .unwrap_err()
-                .contains("no .wasm component, nor an .ext4 rootfs (found: index.html)")
+                .contains(
+                    "no .wasm component, no .ext4 rootfs, no index.html at its root (found: \
+                     docs/index.html)"
+                )
         );
         let mut rootfs = vec![0; 2048];
         rootfs[MAGIC_AT..MAGIC_AT + 2].copy_from_slice(&MAGIC);
@@ -745,6 +914,7 @@ mod tests {
         let (picked_rootfs, unpacked) = staged(&rootfs_zip, None, 1 << 20).unwrap();
         assert_eq!(picked_rootfs.entry, "app/r.ext4");
         assert_eq!(picked_rootfs.stack, Runtime::Firecracker);
+        assert_eq!(picked_rootfs.buildpack, Some(Buildpack::Rootfs));
         assert_eq!(unpacked, rootfs);
         // what is pushed decides the stack, of those the wickets run, the app's pin alone of
         // them: another is refused before it is unpacked, naming what it is and theirs
@@ -780,18 +950,12 @@ mod tests {
                 pin,
                 stacks: stacks.to_vec(),
             };
-            let accept = |stack| match stack {
-                Wasm => takes.accept(stack, "a wasm component"),
-                Firecracker => takes.accept(stack, "a rootfs"),
-            };
-            let mut droplet = Vec::new();
-            let staged = stage(Cursor::new(zip), None, &mut droplet, 1 << 20, accept);
+            let staged = staged_by(zip, None, 1 << 20, &Buildpack::ALL, Some(&takes));
             match refused {
                 None => assert!(staged.is_ok(), "{takes:?}: {staged:?}"),
                 Some(why) => {
                     let refused = staged.unwrap_err();
                     assert!(refused.contains(why), "{takes:?}: {refused}");
-                    assert!(droplet.is_empty(), "unpacked: {takes:?}");
                 }
             }
         }
@@ -839,13 +1003,39 @@ mod tests {
             ("docs/.secret", b"x"),
             ("manifest.yml", b"env: {SECRET: x}"),
         ];
-        let site = archive(zipped(&entries));
-        assert!(is_site(&site));
-        assert!(!is_site(&archive(zipped(&[
-            ("index.html", b"<p>"),
-            ("a.wasm", COMPONENT)
-        ]))));
-        assert!(!is_site(&archive(zipped(&[("docs/index.html", b"<p>")]))));
+        let detected = |entries: &[(&str, &[u8])], command, named: &[&str]| {
+            let named: Vec<String> = named.iter().map(|name| name.to_string()).collect();
+            let detecting = Buildpack::named(&named)?;
+            detect(&files(&archive(zipped(entries))), command, &detecting)
+        };
+        assert_eq!(detected(&entries, None, &[]), Ok((Buildpack::Site, None)));
+        // the buildpacks the app names are the only ones detecting: a site holding a .wasm is
+        // one by its name, a component else
+        let both = [("index.html", &b"<p>"[..]), ("a.wasm", COMPONENT)];
+        let component = Ok((Buildpack::Wasm, Some("a.wasm".to_string())));
+        assert_eq!(detected(&both, None, &[]), component);
+        assert_eq!(detected(&both, None, &["site", "wasm"]), component);
+        assert_eq!(
+            detected(&both, None, &["site"]),
+            Ok((Buildpack::Site, None))
+        );
+        for (command, named, refused) in [
+            (None, &["rootfs"][..], "the package holds no .ext4 rootfs"),
+            (
+                Some("a.wasm"),
+                &["site"],
+                "names 'a.wasm', a wasm component: the app's buildpacks are site",
+            ),
+            (
+                None,
+                &["staticfile_buildpack"],
+                "no buildpack 'staticfile_buildpack' (cf push -b, a manifest's buildpacks): \
+                 they are wasm, rootfs, site",
+            ),
+        ] {
+            let why = detected(&both, command, named).unwrap_err();
+            assert!(why.contains(refused), "{named:?}: {why}");
+        }
         let pack = |entries: &[(&str, &[u8])], max| {
             let mut tar = Vec::new();
             pack_site(&mut archive(zipped(entries)), &mut tar, max).map(|packed| (packed, tar))
