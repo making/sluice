@@ -259,7 +259,7 @@ keyvalue:                       # optional: one sqlite store, keyvalue.db next t
       # ca-cert: redis-ca.pem   # the CA of a rediss:// certificate; default: the webPKI roots
       # prefix: ""              # the defaults
       # timeout: 5s
-    grid:
+    gemfire:
       type: gemfire
       locators: [grpcs://locator-a.example:50051, grpcs://locator-b.example:50051]
       # servers: [grpcs://server-a.example:50052]  # instead: the servers themselves

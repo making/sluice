@@ -28,7 +28,7 @@ stay out of the repository.
 ```yaml
 keyvalue:
   stores:
-    grid:
+    gemfire:
       type: gemfire
       locators: [grpcs://192.0.2.20:50051, grpcs://192.0.2.30:50051, grpcs://192.0.2.40:50051]
       region: sluice
@@ -42,7 +42,7 @@ routes:
     sandbox:
       wasi: [keyvalue]
       keyvalue:
-        "": grid                # the namespace defaults to the host
+        "": gemfire             # the namespace defaults to the host
 ```
 
 - `locators`: all three, the next asked when one fails; the store follows the servers they name.
@@ -66,7 +66,7 @@ routes:
 
 Two wickets count on a namespace no earlier check used, then a third with no route purges it (a
 console refuses a namespace one of its routes maps). `counter.wasm` is the wicket's
-`examples/counter`; `check.yaml` the config above with `"": grid/${NS}`, `purge.yaml` its store
+`examples/counter`; `check.yaml` the config above with `"": gemfire/${NS}`, `purge.yaml` its store
 alone with `routes: []`.
 
 ```bash
@@ -77,8 +77,8 @@ curl -H 'host: counter.example' http://127.0.0.1:18080/   # hits 1
 curl -H 'host: counter.example' http://127.0.0.1:18081/   # hits 2
 sluice-wicket-runtime-wasi --listen 127.0.0.1:18082 --config purge.yaml \
   --console 127.0.0.1:19090 --console-token t0ken &
-curl -X DELETE -H 'authorization: Bearer t0ken' http://127.0.0.1:19090/api/keyvalue/grid/$NS
-# {"store":"grid","namespace":"check-...","keys":1}; a second time "keys":0
+curl -X DELETE -H 'authorization: Bearer t0ken' http://127.0.0.1:19090/api/keyvalue/gemfire/$NS
+# {"store":"gemfire","namespace":"check-...","keys":1}; a second time "keys":0
 ```
 
 ## What the cluster does
