@@ -689,8 +689,16 @@ redirected to), `memory-mib` (2048), `vcpus` (2), `disk-mib` (8192: the build's 
 holds the layers, the app, the droplet and the cache) and `timeout-ms` (15 minutes, an hour at
 most) the build VM's. The VM counts in the budget as any other; a build finding no room within
 30s fails. `buildpacks` (`<id>[@<version>]`, of the builder's: a version left out is the latest
-it has) are the only ones detecting, in one group, the order the detector is given; none, the
-builder's order. `command` is what the droplet runs, a shell's command line: the launcher runs
+it has; or `docker://<image>`, a buildpack image) are the only ones detecting, in one group, the
+order the detector is given; none, the builder's order. A buildpack image is pulled as `pack
+build --buildpack docker://<image>` takes one: its buildpack is its
+`io.buildpacks.buildpackage.metadata`'s, its layers those `io.buildpacks.buildpack.layers` names
+(the buildpack and those of its order, a layer of the builder's buildpacks alone left out),
+checked against their diff IDs and laid over the builder's `/cnb/buildpacks` in the VM, each
+writing its buildpacks' directories alone; the detector checks their targets as the builder's.
+It is asked with the builder's credentials when it is on the builder's registry. The layers are
+kept by their diff IDs (`buildpacks/` in the console's directory; one not used for a week goes
+when another is kept): the next build pulls none of them again. `command` is what the droplet runs, a shell's command line: the launcher runs
 it with bash (the run image's, as CF runs a command), in place of the default process. A run
 image without `/bin/bash` (Paketo's tiny) takes none: its rootfs is refused.
 

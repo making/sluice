@@ -134,6 +134,26 @@ Paketo's images name their distribution in `io.buildpacks.stack.distro.*`, not t
 `io.buildpacks.base.distro.*` the lifecycle reads; with neither, the detector reads the build
 image's `/etc/os-release`.
 
+### A buildpack by its image
+
+Measured 2026-11-10 on the same host, a release build, the same builder and run images as
+above: `cf push -b docker://paketocommunity/rust:latest` (`paketo-community/rust` 0.92.2
+`@sha256:02e7da45...`, in no Paketo builder) of a Cargo app with one dependency (`itoa`), a
+plain `TcpListener` on `$PORT`. The image is flattened: one layer of 35 MiB (pulled in 2s, kept
+for the next build) holds the composite and the six buildpacks of its order, of which the
+builder has `paketo-buildpacks/procfile` and `syft` too. The builder's rootfs was made the same
+session (148s).
+
+| run image | build | droplet | rootfs | listening after the rootfs |
+|---|---|---|---|---|
+| tiny | 38s cold, 8s warm (722 MiB cached: rustup, the toolchain, Cargo's) | 3 MiB | 2s to make 72 MiB | 5.2s |
+| resolute-run | 8s warm | 3 MiB | 12s to make 275 MiB | 5.8s |
+
+The binary, linked against glibc, runs on tiny (no shell) with no command. The hosts a cold build
+connected to: `static.rust-lang.org` (rustup and the toolchain), `index.crates.io`,
+`static.crates.io`, `github.com` and `release-assets.githubusercontent.com` (syft, and tini,
+which the cargo buildpack downloads warm too).
+
 ### An egress by proxy
 
 `--cnb-egress` naming a forward proxy alone (a CONNECT proxy on the host), `HTTPS_PROXY` and

@@ -22,6 +22,13 @@
 //! and the `launch` it runs with. `PUT /api/images` of the run image with that layer and
 //! launch makes the rootfs, on this wicket or any other: a droplet is built once.
 //!
+//! A buildpack a build names by its image (`docker://<image>`, as `pack build --buildpack`
+//! takes it: a buildpackage) is its labels' (`io.buildpacks.buildpackage.metadata`), its layers
+//! those of its buildpack and of the buildpacks its order names, which `/init` lays over the
+//! builder's `/cnb/buildpacks` before the detector runs (a layer of the builder's buildpacks
+//! alone is not). They are kept by their diff IDs (`buildpacks/<sha256>.tar`) for the next
+//! build; one not used for a week goes when another is kept.
+//!
 //! A build naming a cache (an app's) gets the `cache = true` layers its last build of that
 //! name left on this wicket, kept here as a tar between them (`caches/<name>.tar`), and leaves
 //! its own once built: a build is warm on the wicket that built it before. A cache not used
@@ -111,6 +118,13 @@ const BUILDER_KEPT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 /// Where the caches are kept, in the console's directory.
 const CACHES: &str = "caches";
 
+/// Where the layers of the buildpacks named by their images are kept, in the console's
+/// directory.
+const BUILDPACKS: &str = "buildpacks";
+
+/// How a buildpack is named by its image, as `pack build --buildpack` takes it.
+const BUILDPACK_IMAGE: &str = "docker://";
+
 /// A cache's name at most.
 const MAX_CACHE_NAME: usize = 128;
 
@@ -170,8 +184,8 @@ struct Request {
     disk_mib: Option<u32>,
     #[serde(rename = "timeout-ms")]
     timeout_ms: Option<u64>,
-    /// The buildpacks detecting, `<id>[@<version>]`, in one group: none, the builder's
-    /// order. Of the builder's, a version left out its latest.
+    /// The buildpacks detecting, `<id>[@<version>]` or `docker://<image>`, in one group: none,
+    /// the builder's order. Of the builder's, a version left out its latest.
     #[serde(default)]
     buildpacks: Vec<String>,
     /// What the droplet runs: a shell's command line, which the launcher runs in place of
@@ -544,6 +558,11 @@ impl Builds {
             .map_or(TIMEOUT, Duration::from_millis)
             .min(MAX_TIMEOUT);
         for buildpack in &request.buildpacks {
+            if let Some(image) = buildpack.strip_prefix(BUILDPACK_IMAGE) {
+                sluice_wicket_registry::Reference::parse(image)
+                    .map_err(|e| invalid(format!("buildpacks: '{buildpack}': {e}")))?;
+                continue;
+            }
             let (id, version) = split_buildpack(buildpack);
             if id.is_empty() || version == Some("") || buildpack.contains(char::is_whitespace) {
                 return Err(invalid(format!(
@@ -616,7 +635,7 @@ impl Builds {
     /// Runs the build `asked` for, within its timeout once its builder is ready (a rootfs
     /// being made has a bound of its own): its droplet kept as a layer.
     async fn run(&self, build: &Arc<Build>, id: &str, asked: Asked) -> Result<Built, String> {
-        let builder = self.builder(build, &asked).await?;
+        let builder = self.builder(build, id, &asked).await?;
         let timeout = asked.timeout;
         let staged = self.staged(build, id, builder, asked);
         match tokio::time::timeout(timeout, staged).await {
@@ -730,8 +749,9 @@ impl Builds {
         })
     }
 
-    /// The builder of `asked`, its rootfs made unless kept, and the run image it names.
-    async fn builder(&self, build: &Build, asked: &Asked) -> Result<Builder, String> {
+    /// The builder of `asked`, its rootfs made unless kept, the run image it names, and the
+    /// layers of the buildpacks named by their images.
+    async fn builder(&self, build: &Build, id: &str, asked: &Asked) -> Result<Builder, String> {
         let credentials = asked.credentials.as_ref();
         let inspected = self.images.inspect(&asked.builder, credentials).await?;
         let metadata = inspected.config["config"]["Labels"]["io.buildpacks.builder.metadata"]
@@ -759,11 +779,44 @@ impl Builds {
                     PLATFORM_APIS.join(", ")
                 )
             })?;
+        // the builder's credentials go to its own registry alone
+        let registry = |image: &str| {
+            sluice_wicket_registry::Reference::parse(image).map(|reference| reference.registry)
+        };
+        let builder_registry = registry(&asked.builder)?;
+        let listed = listed(&metadata);
+        let images: Vec<(&str, sluice_wicket_registry::Reference)> = (asked.buildpacks.iter())
+            .filter_map(|buildpack| buildpack.strip_prefix(BUILDPACK_IMAGE))
+            .map(|image| Ok((image, sluice_wicket_registry::Reference::parse(image)?)))
+            .collect::<Result<_, String>>()?;
+        // their labels first: the order checked before a layer is pulled
+        let mut pulls = Vec::new();
+        for (image, reference) in &images {
+            let same = reference.registry == builder_registry;
+            let pull = self
+                .images
+                .open(image, reference, credentials.filter(|_| same))
+                .await
+                .map_err(|e| format!("the buildpack {image}: {e}"))?;
+            let package = package(&pull.inspected.config, &listed)
+                .map_err(|e| format!("the buildpack {}: {e}", pull.inspected.image))?;
+            pulls.push((pull, package));
+        }
+        let packages: Vec<&Package> = pulls.iter().map(|(_, package)| package).collect();
         let order = order(
             &metadata,
             inspected.config["config"]["Labels"]["io.buildpacks.buildpack.order"].as_str(),
             &asked.buildpacks,
+            &packages,
         )?;
+        let added = tokio::time::timeout(asked.timeout, self.added(build, id, pulls))
+            .await
+            .map_err(|_| {
+                format!(
+                    "the buildpacks' layers took more than {}s",
+                    asked.timeout.as_secs()
+                )
+            })??;
         let run_image_name = match &asked.run_image {
             Some(named) => named.clone(),
             None => metadata["images"][0]["image"]
@@ -772,11 +825,7 @@ impl Builds {
                 .ok_or("the builder names no run image")?
                 .to_string(),
         };
-        // the builder's credentials go to its own registry alone
-        let registry = |image: &str| {
-            sluice_wicket_registry::Reference::parse(image).map(|reference| reference.registry)
-        };
-        let same = registry(&run_image_name)? == registry(&asked.builder)?;
+        let same = registry(&run_image_name)? == builder_registry;
         let run = self
             .images
             .inspect(&run_image_name, credentials.filter(|_| same))
@@ -806,7 +855,65 @@ impl Builds {
             target,
             platform_api: platform_api.to_string(),
             order,
+            added,
         })
+    }
+
+    /// The layers of the buildpack images `pulls` the builder lacks, each kept unless it was:
+    /// once each, with the buildpacks it holds.
+    async fn added(
+        &self,
+        build: &Build,
+        id: &str,
+        pulls: Vec<(image::Pull<'_>, Package)>,
+    ) -> Result<Vec<Added>, String> {
+        let dir = self.dir.join(BUILDPACKS);
+        std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+        let mut added: Vec<Added> = Vec::new();
+        for (mut pull, package) in pulls {
+            build.note(format!(
+                "Buildpack {} {} of {}",
+                package.id, package.version, pull.inspected.image
+            ));
+            for (diff_id, held) in package.layers {
+                if let Some(known) = added.iter_mut().find(|known| known.diff_id == diff_id) {
+                    known.buildpacks.extend(held);
+                    known.buildpacks.sort();
+                    known.buildpacks.dedup();
+                    continue;
+                }
+                let sha256 = diff_id.trim_start_matches("sha256:");
+                let path = dir.join(format!("{sha256}{TAR}"));
+                if regular(&path) {
+                    // used: kept longer
+                    if let Ok(file) = std::fs::File::options().append(true).open(&path) {
+                        let _ = file.set_modified(std::time::SystemTime::now());
+                    }
+                } else {
+                    let started = Instant::now();
+                    let received = self
+                        .images
+                        .work
+                        .join(format!(".buildpack-{id}-{sha256}.tar"));
+                    let bytes = pull.layer(&diff_id, &received, self.images.limit).await?;
+                    keep(&received, &path)?;
+                    build.note(format!(
+                        "Pulled its layer {} in {}s: {}",
+                        &sha256[..12],
+                        started.elapsed().as_secs(),
+                        sized(bytes)
+                    ));
+                }
+                let file =
+                    std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                added.push(Added {
+                    diff_id,
+                    file,
+                    buildpacks: held,
+                });
+            }
+        }
+        Ok(added)
     }
 
     /// One build on the stage stream of its VM: the result, and when it has no error, the
@@ -835,6 +942,12 @@ impl Builds {
             "arch_variant": builder.target.variant,
             "distro": builder.target.distro,
             "order": order,
+            "layers": builder.added.iter().map(|added| {
+                let held: Vec<Value> = (added.buildpacks.iter())
+                    .map(|(id, version)| serde_json::json!({"id": id, "version": version}))
+                    .collect();
+                serde_json::json!({"buildpacks": held})
+            }).collect::<Vec<_>>(),
             "cache": cache.is_some(),
             "restore": kept.is_some(),
         });
@@ -845,6 +958,11 @@ impl Builds {
         let mut source = tokio::fs::File::from_std(asked.source);
         stream.write_u64(source.metadata().await?.len()).await?;
         tokio::io::copy(&mut source, stream).await?;
+        for added in &builder.added {
+            let mut layer = tokio::fs::File::from_std(added.file.try_clone()?);
+            stream.write_u64(layer.metadata().await?.len()).await?;
+            tokio::io::copy(&mut layer, stream).await?;
+        }
         let mut kept = kept.map(tokio::fs::File::from_std);
         let outcome = loop {
             let said = wire::read_json(stream, wire::MAX_STAGE_RESULT)
@@ -888,7 +1006,7 @@ impl Builds {
                     }
                 }
                 Some(bytes) => {
-                    keep_cache(&received, &cache).map_err(std::io::Error::other)?;
+                    keep(&received, &cache).map_err(std::io::Error::other)?;
                     build.note(format!(
                         "Kept a cache of {} for the next build in {}s",
                         sized(bytes),
@@ -990,10 +1108,10 @@ impl Builds {
     }
 }
 
-/// Keeps the cache received at `received` as `path`, by a rename; the caches not used for a
-/// while removed.
-fn keep_cache(received: &Path, path: &Path) -> Result<(), String> {
-    let dir = path.parent().expect("in the caches' directory");
+/// Keeps the file received at `received` as `path`, by a rename; the files of its directory
+/// not used for a while removed (the caches, the buildpacks' layers).
+fn keep(received: &Path, path: &Path) -> Result<(), String> {
+    let dir = path.parent().expect("in a directory");
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     for other in std::fs::read_dir(dir).into_iter().flatten().flatten() {
         let stale = other.metadata().is_ok_and(|file| {
@@ -1042,22 +1160,41 @@ fn split_buildpack(buildpack: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The order of the buildpacks `asked` for, as `(id, version)`, of those the builder's
-/// `metadata` lists: a version left out the latest of that id. One it lacks fails it,
-/// naming those of the builder's order (its `order` label).
+/// The buildpacks the builder's `metadata` lists, `(id, version)`.
+fn listed(metadata: &Value) -> Vec<(String, String)> {
+    metadata["buildpacks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|buildpack| {
+            let field = |name: &str| buildpack[name].as_str().map(String::from);
+            Some((field("id")?, field("version")?))
+        })
+        .collect()
+}
+
+/// The order of the buildpacks `asked` for, as `(id, version)`: one named by its image that
+/// of the next of `packages`, any other of those the builder's `metadata` lists, a version left
+/// out the latest of that id. One it lacks fails it, naming those of the builder's order (its
+/// `order` label).
 fn order(
     metadata: &Value,
     order_label: Option<&str>,
     asked: &[String],
+    packages: &[&Package],
 ) -> Result<Vec<(String, String)>, String> {
-    let listed: Vec<(&str, &str)> = metadata["buildpacks"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|buildpack| Some((buildpack["id"].as_str()?, buildpack["version"].as_str()?)))
+    let listed = listed(metadata);
+    let listed: Vec<(&str, &str)> = (listed.iter())
+        .map(|(id, version)| (id.as_str(), version.as_str()))
         .collect();
+    let mut packages = packages.iter();
     let mut order = Vec::new();
     for buildpack in asked {
+        if buildpack.starts_with(BUILDPACK_IMAGE) {
+            let package = packages.next().expect("a package per image");
+            order.push((package.id.clone(), package.version.clone()));
+            continue;
+        }
         let (id, version) = split_buildpack(buildpack);
         let versions = listed
             .iter()
@@ -1124,6 +1261,111 @@ struct Builder {
     platform_api: String,
     /// The buildpacks asked for, `(id, version)`: none, the builder's order.
     order: Vec<(String, String)>,
+    /// The layers of the buildpacks named by their images, laid over the builder's.
+    added: Vec<Added>,
+}
+
+/// A layer of buildpacks a build lays over the builder's: of an image it named.
+struct Added {
+    diff_id: String,
+    /// The tar, kept.
+    file: std::fs::File,
+    /// The buildpacks it holds, `(id, version)`: `/init` unpacks their directories alone.
+    buildpacks: Vec<(String, String)>,
+}
+
+/// A buildpack image's buildpack (a buildpackage's), and the layers to lay over the builder's:
+/// those holding it and the buildpacks its order names, by their diff IDs in the image's
+/// order, each with the buildpacks it holds.
+#[derive(Debug, PartialEq)]
+struct Package {
+    id: String,
+    version: String,
+    layers: Vec<(String, Vec<(String, String)>)>,
+}
+
+/// Whether `id` and `version` are a buildpack's, naming its directory
+/// (`/cnb/buildpacks/<id, '/' as '_'>/<version>`): an id of letters, digits, `.`, `/` and `-`,
+/// as the spec has it, a version of no `/`; neither empty nor starting with `.`.
+fn directory_named(id: &str, version: &str) -> bool {
+    let id_char = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'/' | b'-');
+    let version_char = |b: u8| b.is_ascii_graphic() && !matches!(b, b'/' | b'\\');
+    !id.is_empty()
+        && !version.is_empty()
+        && !id.starts_with('.')
+        && !version.starts_with('.')
+        && id.bytes().all(id_char)
+        && version.bytes().all(version_char)
+}
+
+/// The [`Package`] of the image whose config is `config`, as pack reads one: its buildpack of
+/// `io.buildpacks.buildpackage.metadata`, its buildpacks' layers of
+/// `io.buildpacks.buildpack.layers` (`{<id>: {<version>: {"layerDiffID": ..}}}`); a layer
+/// holding only buildpacks the builder `listed` is left out.
+fn package(config: &Value, listed: &[(String, String)]) -> Result<Package, String> {
+    let labels = &config["config"]["Labels"];
+    let label = |key: &str| {
+        labels[key]
+            .as_str()
+            .and_then(|label| serde_json::from_str::<Value>(label).ok())
+            .ok_or_else(|| format!("no buildpack image (no {key})"))
+    };
+    let metadata = label("io.buildpacks.buildpackage.metadata")?;
+    let field = |name: &str| {
+        metadata[name]
+            .as_str()
+            .map(String::from)
+            .ok_or_else(|| format!("its io.buildpacks.buildpackage.metadata names no {name}"))
+    };
+    let (id, version) = (field("id")?, field("version")?);
+    let mut held: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
+    let layers = label("io.buildpacks.buildpack.layers")?;
+    for (named, versions) in layers.as_object().into_iter().flatten() {
+        for (numbered, described) in versions.as_object().into_iter().flatten() {
+            if !directory_named(named, numbered) {
+                return Err(format!(
+                    "a buildpack '{named}' '{numbered}': no id and version"
+                ));
+            }
+            let diff_id = described["layerDiffID"]
+                .as_str()
+                .filter(|diff_id| {
+                    diff_id
+                        .strip_prefix("sha256:")
+                        .is_some_and(|sha256| check_digest(sha256).is_ok())
+                })
+                .ok_or_else(|| format!("the buildpack {named} {numbered} names no layerDiffID"))?;
+            held.entry(diff_id)
+                .or_default()
+                .push((named.clone(), numbered.clone()));
+        }
+    }
+    if !held
+        .values()
+        .flatten()
+        .any(|held| *held == (id.clone(), version.clone()))
+    {
+        return Err(format!("its layers hold no buildpack {id} {version}"));
+    }
+    let diff_ids: Vec<&str> = config["rootfs"]["diff_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    if let Some(missing) = held.keys().find(|diff_id| !diff_ids.contains(diff_id)) {
+        return Err(format!("its labels name a layer {missing} it has not"));
+    }
+    let layers = diff_ids
+        .into_iter()
+        .filter_map(|diff_id| Some((diff_id.to_string(), held.remove(diff_id)?)))
+        .filter(|(_, held)| !held.iter().all(|held| listed.contains(held)))
+        .collect();
+    Ok(Package {
+        id,
+        version,
+        layers,
+    })
 }
 
 /// An image's target, as the lifecycle reads a run image's: its config's platform, the
@@ -1405,7 +1647,8 @@ mod tests {
     /// A build's output is read from any line on, its end told once the lines before it were;
     /// only the last lines are kept. A droplet runs its default process, else `web`, else
     /// its only one, else the launcher; a command, by the launcher. The buildpacks asked for
-    /// are the builder's, of the version named, else the latest. A run image named is of the
+    /// are the builder's, of the version named, else the latest, or an image's, by its labels,
+    /// with the layers holding it and its order the builder lacks. A run image named is of the
     /// builder's target.
     #[test]
     fn a_build_tells_its_lines_then_its_end_and_what_its_droplet_runs() {
@@ -1462,7 +1705,7 @@ mod tests {
         let label = r#"[{"group":[{"id":"paketo-buildpacks/java","version":"22.8.0"}]}]"#;
         let asked = |asked: &[&str]| {
             let asked: Vec<String> = asked.iter().map(|asked| asked.to_string()).collect();
-            order(&metadata, Some(label), &asked)
+            order(&metadata, Some(label), &asked, &[])
         };
         let named = |id: &str, version: &str| (id.to_string(), version.to_string());
         assert_eq!(
@@ -1480,6 +1723,62 @@ mod tests {
                 ))
             );
         }
+        // a buildpack image, as pack writes one: a composite in one layer with those of its
+        // order, a layer of the builder's buildpack alone left out
+        let diff_id = |n: u8| format!("sha256:{}", format!("{n:02x}").repeat(32));
+        let held = serde_json::json!({
+            "paketo-community/rust": {"0.92.2": {"layerDiffID": diff_id(1), "order": []}},
+            "paketo-community/cargo": {"0.16.1": {"layerDiffID": diff_id(1)}},
+            "paketo-buildpacks/maven": {"6.26.0": {"layerDiffID": diff_id(2)}},
+        });
+        let image = |held: &Value, diff_ids: &[String]| {
+            serde_json::json!({"rootfs": {"diff_ids": diff_ids}, "config": {"Labels": {
+                "io.buildpacks.buildpackage.metadata":
+                    r#"{"id":"paketo-community/rust","version":"0.92.2"}"#,
+                "io.buildpacks.buildpack.layers": held.to_string(),
+            }}})
+        };
+        let listed = listed(&metadata);
+        let rust = package(&image(&held, &[diff_id(2), diff_id(1)]), &listed).unwrap();
+        assert_eq!(
+            rust,
+            Package {
+                id: "paketo-community/rust".into(),
+                version: "0.92.2".into(),
+                layers: vec![(
+                    diff_id(1),
+                    vec![
+                        named("paketo-community/cargo", "0.16.1"),
+                        named("paketo-community/rust", "0.92.2")
+                    ]
+                )],
+            }
+        );
+        let asked: Vec<String> = ["paketo-buildpacks/maven", "docker://r.io/rust:1"]
+            .map(String::from)
+            .into();
+        assert_eq!(
+            order(&metadata, Some(label), &asked, &[&rust]),
+            Ok(vec![
+                named("paketo-buildpacks/maven", "6.26.0"),
+                named("paketo-community/rust", "0.92.2")
+            ])
+        );
+        let mut escaping = held.clone();
+        escaping["../up"] = serde_json::json!({"1": {"layerDiffID": diff_id(1)}});
+        for (config, error) in [
+            (serde_json::json!({}), "no buildpack image"),
+            (image(&held, &[diff_id(1)]), "a layer"),
+            (
+                image(&escaping, &[diff_id(1), diff_id(2)]),
+                "no id and version",
+            ),
+            (image(&serde_json::json!({}), &[]), "hold no buildpack"),
+        ] {
+            let refused = package(&config, &listed).unwrap_err();
+            assert!(refused.contains(error), "{refused}");
+        }
+
         // a run image named in the builder's place: of its OS, architecture and distribution
         let config = |arch: &str, labels: Value| serde_json::json!({"os": "linux", "architecture": arch, "config": {"Labels": labels}});
         let stack = |version: &str| {

@@ -1124,7 +1124,7 @@ What holds on both wickets; a component's and a VM's are in
 | readiness check (`readiness-health-check-*`, a manifest's alone, as on CF) | kept and shown (`cf get-readiness-health-check`, the process's `readiness_health_check`); `process`, the default, on both wickets; `port` and `http` on a Firecracker wicket ([Mapping to VMs](#mapping-to-vms)), refused on a wasm wicket, where an instance takes requests as they come |
 | health check (`cf push -u`, `cf set-health-check`, `health-check-*`) | kept and shown (`cf get-health-check`, the process's `health_check`); on a Firecracker wicket the route's liveness check and `timeout` its start's ([Mapping to VMs](#mapping-to-vms)); on a wasm wicket `port` and `process` ask nothing, `http` is refused: an instance takes requests as they come |
 | stack (`cf push -s`, `stack:`) | pins the app's ([Stacks](#several-wickets)). `lifecycle.data.stack` shows the pin, else the current droplet's; a droplet's `stack` is where it runs |
-| buildpacks (`cf push -b`, `buildpacks:`) | the only ones detecting the package ([Buildpacks](#buildpacks)), with `--cnb-builder` a builder's buildpack by its id; a name of none fails staging |
+| buildpacks (`cf push -b`, `buildpacks:`) | the only ones detecting the package ([Buildpacks](#buildpacks)), with `--cnb-builder` a builder's buildpack by its id, or one by its image (`docker://<image>`); a name of none fails staging |
 | log rate | accepted and shown, no effect |
 
 ### Buildpacks
@@ -1156,8 +1156,12 @@ makes an image's, and none builds it again.
 The buildpacks are the builder's, in its order. `cf push -b <id>` (repeated, a manifest's
 `buildpacks:`) names those of the builder's that detect, in one group: `-b
 paketo-buildpacks/java`, `-b paketo-buildpacks/nodejs@10.15.0` (a version left out is the
-latest the builder has); one it lacks fails staging, naming its order. `-b cnb` is the builder's
-order again. A web process command naming no file of the package (`cf push -c 'java -jar
+latest the builder has); one it lacks fails staging, naming its order. `-b docker://<image>`
+names a buildpack by its image, as `pack build --buildpack`: one in no builder, the community's
+Rust buildpack, say (`-b docker://paketocommunity/rust` builds a Cargo app and serves it on
+`--cnb-run-image` tiny, [tried](../.kb/cnb-java-on-firecracker.md#a-buildpack-by-its-image));
+the wicket lays its layers over the builder's, and its egress needs the hosts they download
+from. `-b cnb` is the builder's order again. A web process command naming no file of the package (`cf push -c 'java -jar
 app.jar'`, a manifest's `command:`) is what the droplet runs in place of the default process:
 the launcher runs it with bash, the run image's, as CF runs a command: on a run image without
 one (Paketo's `tiny` and `static`) staging fails, the app running the droplet it had. It is the

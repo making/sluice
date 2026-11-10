@@ -12,8 +12,8 @@
 //! as the staging log, and its droplet -- a tar of what goes over the builder's run image --
 //! is kept here with that image's pinned reference and the credentials it is pulled with, so
 //! every wicket makes the rootfs of it and none builds it again. A name of an app's buildpacks
-//! that is none of these is a buildpack of the builder's (`paketo-buildpacks/java`), the ones
-//! named the build's order; a web process command that names no file of the package is what
+//! that is none of these is a buildpack of the builder's (`paketo-buildpacks/java`), or one by
+//! its image (`docker://<image>`, as `pack build --buildpack`), the ones named the build's order; a web process command that names no file of the package is what
 //! the droplet runs. The wicket keeps the build's cache under the app's guid: the next build
 //! there restores it.
 //!
@@ -229,7 +229,8 @@ impl Buildpack {
 
     /// The buildpacks detecting for an app naming `named`: those, else all there are
     /// ([`Buildpack::all`] of `cnb`); and the builder's buildpacks named, `<id>[@<version>]`,
-    /// which stage source alone. A name of none fails it, naming them.
+    /// and those by their images, `docker://<image>`, which stage source alone. A name of none
+    /// fails it, naming them.
     pub fn named(named: &[String], cnb: bool) -> Result<(Vec<Buildpack>, Vec<String>), String> {
         let all = Buildpack::all(cnb);
         if named.is_empty() {
@@ -239,13 +240,19 @@ impl Buildpack {
         for name in named {
             match all.iter().copied().find(|kept| kept.name() == name) {
                 Some(buildpack) => detecting.push(buildpack),
-                None if cnb && is_buildpack_id(name) => ids.push(name.clone()),
+                None if cnb && (is_buildpack_id(name) || is_buildpack_image(name)) => {
+                    ids.push(name.clone())
+                }
                 None => {
                     return Err(format!(
                         "there is no buildpack '{name}' (cf push -b, a manifest's buildpacks): \
                          they are {}{}",
                         names(&all),
-                        if cnb { ", and the builder's by id" } else { "" }
+                        if cnb {
+                            ", the builder's by id, and others by their images (docker://<image>)"
+                        } else {
+                            ""
+                        }
                     ));
                 }
             }
@@ -263,6 +270,12 @@ fn is_buildpack_id(name: &str) -> bool {
         && !name.contains("://")
         && name.bytes().all(|b| b.is_ascii_graphic())
         && !name.starts_with(['@', '/', '.'])
+}
+
+/// Whether `name` is a buildpack's image, `docker://<image>`.
+fn is_buildpack_image(name: &str) -> bool {
+    name.strip_prefix("docker://")
+        .is_some_and(|image| sluice_wicket_registry::Reference::parse(image).is_ok())
 }
 
 /// The names of `buildpacks`, listed.
@@ -1558,6 +1571,12 @@ mod tests {
             named(&["paketo-buildpacks/java@22.8.0"], true),
             Ok((vec![Buildpack::Cnb], vec![java.clone()]))
         );
+        // and one by its image
+        let rust = "docker://paketocommunity/rust:0.92.2".to_string();
+        assert_eq!(
+            named(&[&java, &rust], true),
+            Ok((vec![Buildpack::Cnb], vec![java.clone(), rust]))
+        );
         assert_eq!(
             named(&["cnb", "paketo-buildpacks/java@22.8.0"], true),
             Ok((vec![Buildpack::Cnb], vec![java]))
@@ -1565,6 +1584,8 @@ mod tests {
         for (names, cnb) in [
             (&["paketo-buildpacks/java"][..], false),
             (&["https://github.com/cloudfoundry/java-buildpack"], true),
+            (&["docker://No Image"], true),
+            (&["docker://paketocommunity/rust"], false),
         ] {
             assert!(
                 named(names, cnb)

@@ -134,6 +134,77 @@ pub struct Inspected {
     pub config: Value,
 }
 
+/// An image being pulled: its manifest and config read ([`Images::open`]).
+pub struct Pull<'a> {
+    session: Session<'a>,
+    manifest: Value,
+    pub inspected: Inspected,
+}
+
+impl Pull<'_> {
+    /// Writes the layer whose uncompressed digest (of the config's `rootfs.diff_ids`) is
+    /// `diff_id` to `path` as a tar, checked against its blob's size and digest and against
+    /// `diff_id`, `limit` bytes at most each: its size.
+    pub async fn layer(&mut self, diff_id: &str, path: &Path, limit: u64) -> Result<u64, String> {
+        let at = self.inspected.config["rootfs"]["diff_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .position(|id| id.as_str() == Some(diff_id))
+            .ok_or_else(|| format!("the image has no layer {diff_id}"))?;
+        let layer = layers_of(&self.manifest)?
+            .into_iter()
+            .nth(at)
+            .ok_or_else(|| format!("the manifest has no layer {diff_id}"))?;
+        let blob = path.with_extension("blob");
+        pull_layer(&mut self.session, &layer, &blob, limit).await?;
+        let (diff_id, path) = (diff_id.to_string(), path.to_path_buf());
+        tokio::task::spawn_blocking(move || {
+            let failed = |e: std::io::Error| format!("{}: {e}", path.display());
+            let file = std::fs::File::open(&blob).map_err(failed)?;
+            let mut read: Box<dyn std::io::Read> = match layer.gzip {
+                true => Box::new(flate2::read::GzDecoder::new(file)),
+                false => Box::new(file),
+            };
+            let mut out = std::fs::File::create(&path).map_err(failed)?;
+            let mut hasher = Sha256::new();
+            let mut piece = vec![0u8; 64 * 1024];
+            let mut bytes = 0u64;
+            let copied = loop {
+                let n = match std::io::Read::read(&mut read, &mut piece) {
+                    Ok(0) => break Ok(()),
+                    Ok(n) => n,
+                    Err(e) => break Err(format!("the layer {diff_id}: {e}")),
+                };
+                bytes += n as u64;
+                if bytes > limit {
+                    break Err(format!(
+                        "the layer {diff_id} unpacks to more than {} MiB",
+                        limit >> 20
+                    ));
+                }
+                hasher.update(&piece[..n]);
+                if let Err(e) = out.write_all(&piece[..n]) {
+                    break Err(failed(e));
+                }
+            };
+            let _ = std::fs::remove_file(&blob);
+            let checked = copied.and_then(|()| {
+                match format!("sha256:{}", hex(&hasher.finalize())) == diff_id {
+                    true => Ok(bytes),
+                    false => Err(format!("the layer {diff_id} is not what its diff ID says")),
+                }
+            });
+            if checked.is_err() {
+                let _ = std::fs::remove_file(&path);
+            }
+            checked
+        })
+        .await
+        .map_err(|e| e.to_string())?
+    }
+}
+
 /// An image made, received as an upload is.
 pub struct Built {
     /// The reference given, pinned to the manifest's digest.
@@ -164,15 +235,29 @@ impl Images {
         credentials: Option<&(String, String)>,
     ) -> Result<Inspected, String> {
         let reference = Reference::parse(image)?;
+        Ok(self.open(image, &reference, credentials).await?.inspected)
+    }
+
+    /// The pull of `image` (`reference`): its manifest and config read, its layers to pull.
+    pub async fn open<'a>(
+        &'a self,
+        image: &str,
+        reference: &'a Reference,
+        credentials: Option<&'a (String, String)>,
+    ) -> Result<Pull<'a>, String> {
         let credentials =
             credentials.map(|(username, password)| (username.as_str(), password.as_str()));
-        let mut session = self.registry.session(&reference, credentials);
-        let (digest, manifest) = manifest(&mut session, &reference).await?;
+        let mut session = self.registry.session(reference, credentials);
+        let (digest, manifest) = manifest(&mut session, reference).await?;
         let config = config(&mut session, &manifest).await?;
-        Ok(Inspected {
-            image: pinned_reference(image, &reference, &digest),
-            digest,
-            config,
+        Ok(Pull {
+            session,
+            manifest,
+            inspected: Inspected {
+                image: pinned_reference(image, reference, &digest),
+                digest,
+                config,
+            },
         })
     }
 

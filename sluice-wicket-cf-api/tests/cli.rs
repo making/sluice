@@ -28,7 +28,7 @@
 //! mode and lifetime by annotation, a VM per connection warned of and finding no room, a scale
 //! to 0, a rootfs of a zip, source staged by a builder's buildpacks (a sample one, with the
 //! lifecycle of `SLUICE_CNB_LIFECYCLE`, else `~/.local/cnb/lifecycle`) in a VM of the wicket,
-//! its droplet kept by the cf-api, the wicket's
+//! and by one given by its image, its droplet kept by the cf-api, the wicket's
 //! directory lost and the rootfs of the image and of that droplet made again, of the digest
 //! the image's had, a second wicket making its own of both; then the
 //! cf-api itself an app of that wicket, in a VM with a disk, the flume and a provider
@@ -2409,7 +2409,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         );
     }
     let (mut cnb, mut uncredentialed) = (Vec::new(), Vec::new());
-    if let Some((builder, run_image)) = &builder {
+    if let Some((builder, run_image, _)) = &builder {
         uncredentialed.extend_from_slice(&["--cnb-builder", builder]);
         uncredentialed.extend_from_slice(&["--cnb-egress", "localhost:9"]);
         cnb.extend_from_slice(&uncredentialed);
@@ -3291,7 +3291,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     // environment, the build's output the staging log; what it built runs on the run image
     // named in the builder's (--cnb-run-image), as its user, the launcher starting the process
     // the buildpack named
-    if builder.is_some() {
+    if let Some((_, run_image, image)) = &builder {
         use std::os::unix::fs::PermissionsExt as _;
         let source = dir.join("source");
         std::fs::create_dir_all(&source).unwrap();
@@ -3357,6 +3357,29 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         let cache = dir.join(format!("deployed/caches/{guid}.tar"));
         assert!(cache.is_file());
         assert_eq!(get(&listen, "src.localhost", "/", None).0, 200);
+        // a buildpack by its image (pulled with the builder's credentials: of its registry),
+        // laid over the builder's; an image of no buildpack fails the build
+        let by_image = format!("docker://{image}");
+        let pushed = cf.ok(&["push", "-f", manifest, "-p", source, "-b", &by_image]);
+        for expected in [
+            format!("Buildpack image/buildpack 0.0.2 of {image}@sha256:"),
+            "Pulled its layer ".into(),
+            "sample buildpack: build 1 of the cache".into(),
+        ] {
+            assert!(pushed.contains(&expected), "{expected}: {pushed}");
+        }
+        let (status, body) = get(&listen, "src.localhost", "/", None);
+        assert_eq!(status, 200, "{body}");
+        assert!(
+            body.contains("PATH=/layers/image_buildpack/runtime/bin"),
+            "{body}"
+        );
+        let by_image = format!("docker://{run_image}");
+        let refused = cf.fails(&["push", "-f", manifest, "-p", source, "-b", &by_image]);
+        assert!(
+            refused.contains(": no buildpack image (no io.buildpacks.buildpackage.metadata)"),
+            "{refused}"
+        );
         // one the builder lacks fails the build, why in cf push's output
         let refused = cf.fails(&[
             "push",
@@ -3877,8 +3900,9 @@ fn cnb_lifecycle() -> Option<PathBuf> {
 
 /// A builder of one buildpack, the guest crate's sample one (beside `guest`), with the
 /// lifecycle of `lifecycle`, and its run image, a base naming a user; another run image of its
-/// target, naming another: their references in `registry`, the builder's first.
-fn cnb_builder(registry: &Registry, lifecycle: &Path, guest: &Path) -> (String, String) {
+/// target, naming another; a buildpack image of the sample buildpack by another id: their
+/// references in `registry`, the builder's first.
+fn cnb_builder(registry: &Registry, lifecycle: &Path, guest: &Path) -> (String, String, String) {
     let arch = if cfg!(target_arch = "x86_64") {
         "amd64"
     } else {
@@ -3905,6 +3929,22 @@ fn cnb_builder(registry: &Registry, lifecycle: &Path, guest: &Path) -> (String, 
         layer_file(tar, "etc/group", 0o644, 0, b"root:x:0:\ncnb:x:1000:\n");
         entry(tar, tar::EntryType::Directory, "home/cnb/", None);
     });
+    // the sample buildpack as `id` of `version`, in its directory, as a builder has it
+    let buildpack = |tar: &mut tar::Builder<Vec<u8>>, id: &str, version: &str| {
+        let dir = format!("cnb/buildpacks/{}/{version}", id.replace('/', "_"));
+        let described = format!(
+            "api = \"0.10\"\n\n[buildpack]\n  id = \"{id}\"\n  version = \"{version}\"\n\n\
+             [[targets]]\n  os = \"linux\"\n  arch = \"{arch}\"\n"
+        );
+        let toml = format!("{dir}/buildpack.toml");
+        layer_file(tar, &toml, 0o644, 0, described.as_bytes());
+        let program = read(guest.with_file_name("sample-buildpack"));
+        for phase in ["detect", "build"] {
+            layer_file(tar, &format!("{dir}/bin/{phase}"), 0o755, 0, &program);
+        }
+        let serve = read(guest.with_file_name("sample-process"));
+        layer_file(tar, &format!("{dir}/serve"), 0o755, 0, &serve);
+    };
     let cnb = layer(|tar| {
         for binary in ["lifecycle", "launcher"] {
             let path = format!("cnb/lifecycle/{binary}");
@@ -3917,20 +3957,27 @@ fn cnb_builder(registry: &Registry, lifecycle: &Path, guest: &Path) -> (String, 
         let order = "[[order]]\n  [[order.group]]\n    id = \"sample/buildpack\"\n    \
                      version = \"0.0.1\"\n";
         layer_file(tar, "cnb/order.toml", 0o644, 0, order.as_bytes());
-        let buildpack = "cnb/buildpacks/sample_buildpack/0.0.1";
-        let described = format!(
-            "api = \"0.10\"\n\n[buildpack]\n  id = \"sample/buildpack\"\n  version = \
-             \"0.0.1\"\n\n[[targets]]\n  os = \"linux\"\n  arch = \"{arch}\"\n"
-        );
-        let toml = format!("{buildpack}/buildpack.toml");
-        layer_file(tar, &toml, 0o644, 0, described.as_bytes());
-        let program = read(guest.with_file_name("sample-buildpack"));
-        for phase in ["detect", "build"] {
-            layer_file(tar, &format!("{buildpack}/bin/{phase}"), 0o755, 0, &program);
-        }
-        let serve = read(guest.with_file_name("sample-process"));
-        layer_file(tar, &format!("{buildpack}/serve"), 0o755, 0, &serve);
+        buildpack(tar, "sample/buildpack", "0.0.1");
     });
+    // a buildpack image, as pack makes one: its layer's diff ID in its labels
+    let mut tar = tar::Builder::new(Vec::new());
+    buildpack(&mut tar, "image/buildpack", "0.0.2");
+    let tar = tar.into_inner().unwrap();
+    let diff_id = format!("sha256:{:x}", Sha256::digest(&tar));
+    let mut gzip = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+    gzip.write_all(&tar).unwrap();
+    let held = json!({"image/buildpack": {"0.0.2": {"api": "0.10", "layerDiffID": diff_id}}});
+    let config = json!({
+        "architecture": arch,
+        "os": "linux",
+        "rootfs": {"type": "layers", "diff_ids": [diff_id]},
+        "config": {"Labels": {
+            "io.buildpacks.buildpackage.metadata":
+                json!({"id": "image/buildpack", "version": "0.0.2"}).to_string(),
+            "io.buildpacks.buildpack.layers": held.to_string(),
+        }},
+    });
+    registry.push_image("private/buildpack", "1", &config, &[gzip.finish().unwrap()]);
     for (repository, user) in [
         ("private/run", "runner:x:2000:2001"),
         ("private/tiny", "tiny:x:3000:3001"),
@@ -3966,6 +4013,7 @@ fn cnb_builder(registry: &Registry, lifecycle: &Path, guest: &Path) -> (String, 
     (
         format!("{address}/private/builder:1"),
         format!("{address}/private/tiny:1"),
+        format!("{address}/private/buildpack:1"),
     )
 }
 

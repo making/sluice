@@ -4,6 +4,7 @@
 //!
 //! ```text
 //! the source (a tar) -> /workspace
+//! the layers of buildpacks named by their images (tars) -> /cnb/buildpacks
 //! /cnb/lifecycle/detector, as the builder's user, of the order asked for, else the builder's
 //! the cache (a tar, asked for once detected) -> /layers, the layers of the buildpacks detected
 //! /cnb/lifecycle/builder, as the builder's user
@@ -54,6 +55,8 @@ const PLATFORM_ENV: &str = "platform/env";
 /// The order asked for, which the detector is pointed at (`CNB_ORDER_PATH`).
 const ORDER: &str = "platform/order.toml";
 const LIFECYCLE: &str = "/cnb/lifecycle";
+/// Where the buildpacks are, in that root (`CNB_BUILDPACKS_DIR`'s default).
+const BUILDPACKS: &str = "cnb/buildpacks";
 
 /// A piece of the source or the droplet relayed at once.
 const PIECE: usize = 64 * 1024;
@@ -85,6 +88,9 @@ struct Request {
     /// The buildpacks detecting, in one group: none, the builder's order.
     #[serde(default)]
     order: Vec<Buildpack>,
+    /// The layers of buildpacks sent after the source, laid over the builder's.
+    #[serde(default)]
+    layers: Vec<Layer>,
     /// Whether the cache=true layers are sent back after the droplet.
     #[serde(default)]
     cache: bool,
@@ -105,6 +111,13 @@ struct Distro {
 struct Buildpack {
     id: String,
     version: String,
+}
+
+/// A layer of buildpacks: a tar of their directories.
+#[derive(Deserialize)]
+struct Layer {
+    /// The buildpacks it holds: the directories it may write.
+    buildpacks: Vec<Buildpack>,
 }
 
 /// What a build answers: its error, or what the droplet following runs.
@@ -163,6 +176,16 @@ async fn build(
     blocking(move || root(uid, gid)).await?;
     let source = Path::new(wire::STAGE_DISK).join("source.tar");
     receive(stream, &source).await?;
+    // each received before any is unpacked: the wicket sends them all
+    let mut layers = Vec::new();
+    for (n, layer) in request.layers.iter().enumerate() {
+        let tar = Path::new(wire::STAGE_DISK).join(format!("buildpacks-{n}.tar"));
+        receive(stream, &tar).await?;
+        let dirs: Vec<PathBuf> = (layer.buildpacks.iter())
+            .map(|buildpack| buildpack_dir(&buildpack.id, &buildpack.version))
+            .collect();
+        layers.push((tar, dirs));
+    }
     let root = Path::new(ROOT);
     blocking(move || {
         let workspace = root.join(WORKSPACE);
@@ -170,7 +193,12 @@ async fn build(
         archive.set_preserve_permissions(true);
         archive.unpack(&workspace)?;
         std::fs::remove_file(&source)?;
-        own(&workspace, uid, gid)
+        own(&workspace, uid, gid)?;
+        for (tar, dirs) in layers {
+            add_buildpacks(std::fs::File::open(&tar)?, root, &dirs)?;
+            std::fs::remove_file(&tar)?;
+        }
+        Ok(())
     })
     .await?;
     let layers = root.join(LAYERS);
@@ -227,6 +255,55 @@ async fn build(
     }
     let droplet = droplet.to_path_buf();
     blocking(move || pack(root, &droplet)).await
+}
+
+/// The directory of the buildpack `id` of `version`, below the root: `/cnb/buildpacks/<id,
+/// '/' as '_'>/<version>`, as the lifecycle has it.
+fn buildpack_dir(id: &str, version: &str) -> PathBuf {
+    Path::new(BUILDPACKS)
+        .join(id.replace('/', "_"))
+        .join(version)
+}
+
+/// Lays the buildpacks' layer `tar` over the builder's in `root`: the entries in the
+/// directories `dirs` (below the root), and the directories above them; any other fails it.
+fn add_buildpacks(tar: impl io::Read, root: &Path, dirs: &[PathBuf]) -> io::Result<()> {
+    let mut archive = tar::Archive::new(tar);
+    archive.set_preserve_permissions(true);
+    archive.set_preserve_mtime(true);
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        // as unpacking takes it: below the root, whether it starts with `/` or not
+        let mut named = PathBuf::new();
+        for part in path.components() {
+            match part {
+                std::path::Component::Normal(part) => named.push(part),
+                std::path::Component::RootDir | std::path::Component::CurDir => {}
+                _ => {
+                    return Err(io::Error::other(format!(
+                        "{}: out of the root",
+                        path.display()
+                    )));
+                }
+            }
+        }
+        let directory = entry.header().entry_type().is_dir();
+        if dirs.iter().any(|dir| named.starts_with(dir)) {
+            entry.unpack_in(root)?;
+        } else if directory && dirs.iter().any(|dir| dir.starts_with(&named)) {
+            // above them: the builder's where it has it
+            if !root.join(&named).is_dir() {
+                entry.unpack_in(root)?;
+            }
+        } else {
+            return Err(io::Error::other(format!(
+                "a buildpacks' layer holds /{}, in none of their directories",
+                named.display()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// A [`std::io::Read`] of the pieces a task receives: a blocking thread's.
@@ -922,6 +999,7 @@ mod tests {
                 version: "26.04".into(),
             }),
             order: Vec::new(),
+            layers: Vec::new(),
             cache: false,
             restore: false,
         };
@@ -945,7 +1023,8 @@ mod tests {
 
     /// The cache holds the cache=true layers alone, their `.toml` the metadata alone, their
     /// SBOM files; restored, of the buildpacks detected alone, given to the builder's user;
-    /// one failing tells the layers to remove.
+    /// one failing tells the layers to remove. A buildpacks' layer is unpacked in their
+    /// directories alone.
     #[test]
     fn the_cache_keeps_the_cache_layers_and_restores_those_detected() {
         let dir = std::env::temp_dir().join(format!("sluice-cache-{}", std::process::id()));
@@ -1004,6 +1083,49 @@ mod tests {
         let mut tar = Vec::new();
         assert_eq!(pack_cache(&layers, &mut tar).unwrap(), 0);
         assert!(tar.is_empty());
+
+        // a buildpacks' layer, as pack writes one: absolute paths, no /cnb/buildpacks
+        let layer = |paths: &[(&str, tar::EntryType)]| {
+            let mut tar = tar::Builder::new(Vec::new());
+            for (path, kind) in paths {
+                let mut header = header(*kind, 0o755);
+                // its own name: `append_data` refuses an absolute one
+                header.as_gnu_mut().unwrap().name[..path.len()].copy_from_slice(path.as_bytes());
+                if *kind == tar::EntryType::Symlink {
+                    header.set_link_name("main").unwrap();
+                }
+                header.set_cksum();
+                tar.append(&header, io::empty()).unwrap();
+            }
+            tar.into_inner().unwrap()
+        };
+        let root = dir.join("root");
+        std::fs::create_dir_all(root.join(BUILDPACKS)).unwrap();
+        let dirs = [buildpack_dir("a/bp", "1.0"), buildpack_dir("b", "2")];
+        let added = layer(&[
+            ("/cnb/buildpacks/a_bp", tar::EntryType::Directory),
+            ("/cnb/buildpacks/a_bp/1.0/bin/main", tar::EntryType::Regular),
+            (
+                "/cnb/buildpacks/a_bp/1.0/bin/detect",
+                tar::EntryType::Symlink,
+            ),
+            ("cnb/buildpacks/b/2/buildpack.toml", tar::EntryType::Regular),
+        ]);
+        add_buildpacks(&added[..], &root, &dirs).unwrap();
+        let main = root.join("cnb/buildpacks/a_bp/1.0/bin/main");
+        assert_eq!(std::fs::metadata(&main).unwrap().mode() & 0o777, 0o755);
+        let detect = std::fs::read_link(root.join("cnb/buildpacks/a_bp/1.0/bin/detect"));
+        assert_eq!(detect.unwrap(), Path::new("main"));
+        assert!(root.join("cnb/buildpacks/b/2/buildpack.toml").is_file());
+        for out in [
+            "/etc/passwd",
+            "/cnb/buildpacks/a_bp/2.0/bin/main",
+            "/cnb/lifecycle/detector",
+        ] {
+            let refused =
+                add_buildpacks(&layer(&[(out, tar::EntryType::Regular)])[..], &root, &dirs);
+            assert!(refused.unwrap_err().to_string().contains(out), "{out}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }
