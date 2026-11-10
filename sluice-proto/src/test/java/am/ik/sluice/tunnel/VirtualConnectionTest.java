@@ -376,10 +376,11 @@ class VirtualConnectionTest {
 	}
 
 	/**
-	 * The reader grants at every half window it took. A remote that spent its window and
-	 * said it was blocked also gets back what was taken short of the half once the buffer
-	 * is empty, if a quarter of the window: else a burst ending short of the half holds
-	 * that back for a round trip, and the remote moves half the window per round trip.
+	 * The reader grants at every half window it took since its latest decision. A remote
+	 * that spent its window and said it was blocked also gets back what was taken short
+	 * of the half once the buffer is empty, if a quarter of the window: else a burst
+	 * ending short of the half holds that back for a round trip, and the remote moves
+	 * half the window per round trip. That grant leaves the next decision where it was.
 	 */
 	@Test
 	void windowedReaderGrantsOnceHalfTheWindowIsConsumed() throws Exception {
@@ -410,23 +411,29 @@ class VirtualConnectionTest {
 		assertThat(writer.frames).as("the buffer emptied: what was taken goes back")
 			.containsExactly("window:22:600", "window:22:400");
 
-		// blocked at an empty buffer: granted at once
+		// 400 taken since the latest decision, though granted back: 100 more make the
+		// half
 		connection.acceptData(new byte[1000]);
-		assertThat(source.readNBytes(300)).hasSize(300);
+		assertThat(source.readNBytes(100)).hasSize(100);
+		assertThat(writer.frames).containsExactly("window:22:600", "window:22:400", "window:22:100");
+		assertThat(source.readNBytes(500)).hasSize(500);
 		assertThat(source.readNBytes(400)).hasSize(400);
-		assertThat(source.readNBytes(300)).hasSize(300);
-		assertThat(writer.frames).containsExactly("window:22:600", "window:22:400", "window:22:700");
+		assertThat(writer.frames).containsExactly("window:22:600", "window:22:400", "window:22:100", "window:22:500");
+
+		// blocked at an empty buffer: granted at once
 		connection.remoteBlocked();
-		assertThat(writer.frames).containsExactly("window:22:600", "window:22:400", "window:22:700", "window:22:300");
+		assertThat(writer.frames).containsExactly("window:22:600", "window:22:400", "window:22:100", "window:22:500",
+				"window:22:400");
 
 		// less than a quarter of the window taken: kept for the half window
 		connection.acceptData(new byte[1000]);
-		assertThat(source.readNBytes(300)).hasSize(300);
-		assertThat(source.readNBytes(500)).hasSize(500);
+		assertThat(source.readNBytes(100)).hasSize(100);
+		assertThat(source.readNBytes(700)).hasSize(700);
 		assertThat(source.readNBytes(200)).hasSize(200);
 		connection.remoteBlocked();
 		assertThat(writer.frames).as("200 taken, under a quarter")
-			.containsExactly("window:22:600", "window:22:400", "window:22:700", "window:22:300", "window:22:800");
+			.containsExactly("window:22:600", "window:22:400", "window:22:100", "window:22:500", "window:22:400",
+					"window:22:100", "window:22:700");
 	}
 
 	@Test

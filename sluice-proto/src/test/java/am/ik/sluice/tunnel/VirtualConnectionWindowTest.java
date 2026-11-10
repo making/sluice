@@ -151,6 +151,32 @@ class VirtualConnectionWindowTest {
 	}
 
 	/**
+	 * A remote blocked behind every burst, each a quarter to a half of the window and
+	 * drained by the reader at once: every other burst goes back at the empty buffer, and
+	 * the window still doubles at every half of it the reader took, up to the maximum.
+	 * The remote's frames are handed over in order, by hand, so nothing depends on the
+	 * timing.
+	 */
+	@Test
+	void aRemoteBlockedBehindEveryShortBurstGrowsTheWindow() throws Exception {
+		TunnelBudget budget = new TunnelBudget(16L * MIB);
+		try (TunnelLink link = link(budget, Duration.ofMinutes(1))) {
+			VirtualConnection b = link.b;
+			while (b.receiveWindow() < MAX) {
+				long window = b.receiveWindow();
+				byte[] burst = new byte[(int) (window * 3 / 8)];
+				for (int i = 0; i < 2; i++) {
+					b.acceptData(burst);
+					b.remoteBlocked();
+					assertThat(b.source().read(new byte[burst.length])).isEqualTo(burst.length);
+				}
+				assertThat(b.receiveWindow()).as("doubled from %d", window).isEqualTo(2 * window);
+			}
+			assertThat(b.charged()).isEqualTo(MAX - INITIAL).isEqualTo(budget.used());
+		}
+	}
+
+	/**
 	 * A reader that falls behind -- it never finds the buffer empty -- halves the window
 	 * at each decision, granting back less than it read, down to the announced window:
 	 * the charge goes back while the transfer goes on.

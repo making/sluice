@@ -197,6 +197,12 @@ public final class VirtualConnection implements AutoCloseable {
 	/** The payload read and not granted back yet. */
 	private long pending;
 
+	/**
+	 * The payload read since the latest decision, granted back or not: the reader decides
+	 * at every half window of it.
+	 */
+	private long taken;
+
 	/** The remote said it was blocked since the latest decision. */
 	private boolean remoteBlocked;
 
@@ -612,7 +618,9 @@ public final class VirtualConnection implements AutoCloseable {
 	/**
 	 * With the remote waiting and the buffer empty, the remote sent everything it could
 	 * before it said it was blocked: grants what the reader took since the latest grant,
-	 * if a quarter of the window, keeping the window. The increment to send; with the
+	 * if a quarter of the window, keeping the window and leaving the next decision where
+	 * it was: a remote blocked behind every burst, each drained short of half the window,
+	 * still has its window decided at every half of it. The increment to send; with the
 	 * inbound lock.
 	 */
 	private long grantToWaitingRemoteLocked() {
@@ -1152,6 +1160,7 @@ public final class VirtualConnection implements AutoCloseable {
 						outer.buffered -= n;
 						outer.budget.addBuffered(-n);
 						outer.pending += n;
+						outer.taken += n;
 						decideLocked();
 						this.grantDue += outer.grantToWaitingRemoteLocked();
 						return n;
@@ -1213,11 +1222,12 @@ public final class VirtualConnection implements AutoCloseable {
 			VirtualConnection outer = VirtualConnection.this;
 			if (outer.closed || outer.end != null) {
 				outer.pending = 0;
+				outer.taken = 0;
 				settleLocked();
 				return;
 			}
 			long window = outer.window;
-			if (outer.pending < window / 2) {
+			if (outer.taken < window / 2) {
 				return;
 			}
 			long target;
@@ -1278,6 +1288,7 @@ public final class VirtualConnection implements AutoCloseable {
 			long increment = window - outstanding;
 			outer.credit += increment;
 			outer.pending = 0;
+			outer.taken = 0;
 			outer.window = window;
 			outer.peakWindow = Math.max(outer.peakWindow, window);
 			outer.account.resize(window - outer.initialWindow);
