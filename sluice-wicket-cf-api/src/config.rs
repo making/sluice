@@ -41,6 +41,10 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
   --cnb-egress <host:port>    a destination a build may connect to, as a route's egress of
                               the wicket; repeatable (or comma-separated). None: a build
                               has no network
+  --cnb-memory-mib <MiB>      a build VM's memory: the app's if larger (default 2048)
+  --cnb-disk-mib <MiB>        its scratch disk: the app's if larger (default 8192)
+  --cnb-vcpus <n>             its vCPUs (default 2)
+  --cnb-timeout <secs>        how long a build may take (default 900)
   --flume <url>               the sluice-flume the wicket feeds: the apps' output and
                               requests reach cf logs from it; grpc://host:port or
                               grpcs://host:port
@@ -132,6 +136,10 @@ const VALUED: &[&str] = &[
     "cnb-builder-password",
     "cnb-builder-password-file",
     "cnb-egress",
+    "cnb-memory-mib",
+    "cnb-disk-mib",
+    "cnb-vcpus",
+    "cnb-timeout",
     "flume",
     "flume-token",
     "flume-token-file",
@@ -281,19 +289,48 @@ pub fn parse(
             );
         }
     };
+    let number = |name: &str, default: u64, range: std::ops::RangeInclusive<u64>| {
+        let Some(given) = value(name) else {
+            return Ok(None);
+        };
+        match given.trim().parse::<u64>() {
+            Ok(number) if range.contains(&number) => Ok(Some(number)),
+            _ => Err(format!(
+                "--{name}: a number from {} to {} (default {default}), not '{given}'",
+                range.start(),
+                range.end()
+            )),
+        }
+    };
+    use crate::staging::Cnb;
+    let sized = [
+        number("cnb-memory-mib", Cnb::MEMORY_MIB, 128..=1 << 20)?,
+        number("cnb-disk-mib", Cnb::DISK_MIB, 64..=1 << 20)?,
+        number("cnb-vcpus", u64::from(Cnb::VCPUS), 1..=32)?,
+        number("cnb-timeout", Cnb::TIMEOUT.as_secs(), 1..=60 * 60)?,
+    ];
     let cnb = match value("cnb-builder") {
         Some(builder) => {
             sluice_wicket_registry::Reference::parse(&builder)
                 .map_err(|e| format!("--cnb-builder: {e}"))?;
-            Some(crate::staging::Cnb {
+            let [memory_mib, disk_mib, vcpus, timeout] = sized;
+            Some(Cnb {
                 builder,
                 credentials: cnb_credentials,
                 egress: cnb_egress,
+                memory_mib: memory_mib.unwrap_or(Cnb::MEMORY_MIB),
+                disk_mib: disk_mib.unwrap_or(Cnb::DISK_MIB),
+                vcpus: vcpus.map_or(Cnb::VCPUS, |vcpus| vcpus as u32),
+                timeout: timeout.map_or(Cnb::TIMEOUT, std::time::Duration::from_secs),
             })
         }
-        None if cnb_credentials.is_some() || !cnb_egress.is_empty() => {
+        None if cnb_credentials.is_some()
+            || !cnb_egress.is_empty()
+            || sized.iter().any(Option::is_some) =>
+        {
             return Err(
-                "--cnb-builder-username and --cnb-egress need --cnb-builder: they are a build's"
+                "--cnb-builder-username, --cnb-egress and the build's size need --cnb-builder: \
+                 they are a build's"
                     .into(),
             );
         }
@@ -676,7 +713,8 @@ mod tests {
             args(
                 "--wicket http://w:1 --any-credentials --domain x.io --domain y.io,Z.io. \
                  --wicket-away-grace 0 --cnb-builder r.io/builder:1 --cnb-builder-username u \
-                 --cnb-builder-password p --cnb-egress a.io:443,b.io:443 --cnb-egress c.io:80",
+                 --cnb-builder-password p --cnb-egress a.io:443,b.io:443 --cnb-egress c.io:80 \
+                 --cnb-memory-mib 4096 --cnb-timeout 1800",
             ),
             |_| None,
         ));
@@ -688,6 +726,16 @@ mod tests {
         assert_eq!(cnb.egress, ["a.io:443", "b.io:443", "c.io:80"]);
         assert_eq!(cnb.credentials_of("r.io/run:1"), Some(("u", "p")));
         assert_eq!(cnb.credentials_of("other.io/run:1"), None);
+        // its VMs' size and time: those given, else the defaults
+        assert_eq!(
+            (
+                cnb.memory_mib,
+                cnb.disk_mib,
+                cnb.vcpus,
+                cnb.timeout.as_secs()
+            ),
+            (4096, 8192, 2, 1800)
+        );
         // several wickets, each named, in the order given: of the options, else the environment
         let config = serve(parse(
             args("--wicket a=http://a:9090/ --wicket b-1=https://b:9090,c.2=http://c:9090"),
@@ -772,7 +820,11 @@ mod tests {
             assert!(error(line).contains(refusal), "{line}: {}", error(line));
         }
         assert!(error("--wicket http://w:1 --domain a_b").contains("--domain"));
-        for line in ["--cnb-egress a.io:443", "--cnb-builder-username u"] {
+        for line in [
+            "--cnb-egress a.io:443",
+            "--cnb-builder-username u",
+            "--cnb-vcpus 4",
+        ] {
             let line = format!("--wicket http://w:1 --any-credentials {line}");
             assert!(error(&line).contains("--cnb-builder"), "{line}");
         }

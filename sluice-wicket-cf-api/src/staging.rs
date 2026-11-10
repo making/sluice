@@ -10,8 +10,12 @@
 //! Buildpacks build (`cnb`, detecting last: the stack `firecracker`), in a microVM of a
 //! Firecracker wicket ([`build`]): the zip goes there as a tar, the build's output comes back
 //! as the staging log, and its droplet -- a tar of what goes over the builder's run image --
-//! is kept here with that image's pinned reference, so every wicket makes the rootfs of it
-//! and none builds it again.
+//! is kept here with that image's pinned reference and the credentials it is pulled with, so
+//! every wicket makes the rootfs of it and none builds it again. A name of an app's buildpacks
+//! that is none of these is a buildpack of the builder's (`paketo-buildpacks/java`), the ones
+//! named the build's order; a web process command that names no file of the package is what
+//! the droplet runs. The wicket keeps the build's cache under the app's guid: the next build
+//! there restores it.
 //!
 //! An image has none: one whose manifest holds a wasm component is pulled (`crate::registry`);
 //! any other is made into a rootfs by a Firecracker wicket, which keeps it (the cf-api the
@@ -64,6 +68,11 @@ const MAX_LINK: u64 = 4096;
 /// How often in a row a wicket may not answer for its build before the build is given up.
 const FOLLOW_TRIES: u32 = 5;
 
+/// How long after its last line a build is recorded failed: the CLI reads the staging log
+/// 2s behind (log-cache's walk delay) and stops at the failure, which would cut the lines
+/// telling why.
+const FAILED_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+
 /// The builder staging source (`--cnb-builder`), and what its builds get.
 #[derive(Clone, Debug)]
 pub struct Cnb {
@@ -73,6 +82,21 @@ pub struct Cnb {
     pub credentials: Option<(String, String)>,
     /// The destinations a build may connect to (`--cnb-egress`); none: no network.
     pub egress: Vec<String>,
+    /// A build VM's size (`--cnb-memory-mib`, `--cnb-disk-mib`: an app's own if larger, as
+    /// CF stages; `--cnb-vcpus`) and time (`--cnb-timeout`).
+    pub memory_mib: u64,
+    pub disk_mib: u64,
+    pub vcpus: u32,
+    pub timeout: std::time::Duration,
+}
+
+impl Cnb {
+    /// A build VM's defaults: what a Maven build of a Spring Boot app takes, as long as CF's
+    /// staging may take.
+    pub const MEMORY_MIB: u64 = 2048;
+    pub const DISK_MIB: u64 = 8192;
+    pub const VCPUS: u32 = 2;
+    pub const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 }
 
 impl Cnb {
@@ -203,24 +227,41 @@ impl Buildpack {
     }
 
     /// The buildpacks detecting for an app naming `named`: those, else all there are
-    /// ([`Buildpack::all`] of `cnb`). A name of none fails it, naming them.
-    pub fn named(named: &[String], cnb: bool) -> Result<Vec<Buildpack>, String> {
+    /// ([`Buildpack::all`] of `cnb`); and the builder's buildpacks named, `<id>[@<version>]`,
+    /// which stage source alone. A name of none fails it, naming them.
+    pub fn named(named: &[String], cnb: bool) -> Result<(Vec<Buildpack>, Vec<String>), String> {
         let all = Buildpack::all(cnb);
         if named.is_empty() {
-            return Ok(all);
+            return Ok((all, Vec::new()));
         }
-        let found = |name: &String| {
-            let found = all.iter().copied().find(|kept| kept.name() == name);
-            found.ok_or_else(|| {
-                format!(
-                    "there is no buildpack '{name}' (cf push -b, a manifest's buildpacks): they \
-                     are {}",
-                    names(&all)
-                )
-            })
-        };
-        named.iter().map(found).collect()
+        let (mut detecting, mut ids) = (Vec::new(), Vec::new());
+        for name in named {
+            match all.iter().copied().find(|kept| kept.name() == name) {
+                Some(buildpack) => detecting.push(buildpack),
+                None if cnb && is_buildpack_id(name) => ids.push(name.clone()),
+                None => {
+                    return Err(format!(
+                        "there is no buildpack '{name}' (cf push -b, a manifest's buildpacks): \
+                         they are {}{}",
+                        names(&all),
+                        if cnb { ", and the builder's by id" } else { "" }
+                    ));
+                }
+            }
+        }
+        if !ids.is_empty() && !detecting.contains(&Buildpack::Cnb) {
+            detecting.push(Buildpack::Cnb);
+        }
+        Ok((detecting, ids))
     }
+}
+
+/// Whether `name` is a builder's buildpack's `<id>[@<version>]`: no URL, no space.
+fn is_buildpack_id(name: &str) -> bool {
+    !name.is_empty()
+        && !name.contains("://")
+        && name.bytes().all(|b| b.is_ascii_graphic())
+        && !name.starts_with(['@', '/', '.'])
 }
 
 /// The names of `buildpacks`, listed.
@@ -235,7 +276,8 @@ fn names(buildpacks: &[Buildpack]) -> String {
 /// The buildpack of `detecting` staging a zip of the files `files` for the web process
 /// `command`, and the file it stages as it is (a site and source have none): the one the command
 /// names, by its path or its file name, else the only one any of them detects, else a site by
-/// its `index.html` at the root, else source, whatever it holds.
+/// its `index.html` at the root, else source, whatever it holds. A command naming no
+/// component is source's to run, where source is staged.
 pub fn detect(
     files: &[String],
     command: Option<&str>,
@@ -243,7 +285,15 @@ pub fn detect(
 ) -> Result<(Buildpack, Option<String>), String> {
     if let Some(command) = command.map(str::trim).filter(|command| !command.is_empty()) {
         let named = |name: &&String| *name == command || name.rsplit('/').next() == Some(command);
-        let Some(entry) = files.iter().find(named) else {
+        let entry = files.iter().find(named);
+        let component = entry.filter(|entry| {
+            let detected = |kept: &Buildpack| kept.detects_file(entry);
+            Buildpack::ALL.iter().any(detected)
+        });
+        if component.is_none() && detecting.contains(&Buildpack::Cnb) && !files.is_empty() {
+            return Ok((Buildpack::Cnb, None));
+        }
+        let Some(entry) = entry else {
             return Err(format!(
                 "the command names '{command}', which the package does not hold (found: {})",
                 listed(files)
@@ -386,7 +436,7 @@ pub async fn run(
     let staged = match &package.docker {
         _ if !wasm && !rootfs => Err(takes.nothing()),
         None => match Buildpack::named(&named, controller.cnb.is_some()) {
-            Ok(detecting) => {
+            Ok((detecting, ids)) => {
                 // told of those whose stack a wicket runs: one of another is refused, detected
                 let told: Vec<Buildpack> = detecting
                     .iter()
@@ -404,9 +454,10 @@ pub async fn run(
                     logs.add(app, "STG", line);
                 }
                 match unpack(store.clone(), &package.guid, command, detecting, takes).await {
-                    Ok(Unpacked::Staged(staged)) => Ok(staged),
+                    Ok(Unpacked::Staged(staged)) => Ok(*staged),
                     Ok(Unpacked::Source(source)) => {
-                        self::build(store, logs, controller, base, app, source).await
+                        let asked = Asked { ids, command };
+                        self::build(store, logs, controller, base, app, source, asked).await
                     }
                     Err(e) => Err(e),
                 }
@@ -483,6 +534,7 @@ pub async fn run(
         }
         Err(e) => {
             logs.add(app, "STG", format!("Staging failed: {e}"));
+            tokio::time::sleep(FAILED_AFTER).await;
             store.update(|state| {
                 if let Some(staging) = state.builds.iter_mut().find(|kept| kept.guid == build) {
                     staging.state = "FAILED".into();
@@ -529,7 +581,7 @@ async fn unpack(
                 Ok((staged, sha256))
             }),
         };
-        staged.map(Unpacked::Staged)
+        staged.map(|staged| Unpacked::Staged(Box::new(staged)))
     })
     .await
     .map_err(|e| format!("staging: {e}"))?
@@ -537,8 +589,15 @@ async fn unpack(
 
 /// A zip as [`unpack`] leaves it: staged, or source to build.
 enum Unpacked {
-    Staged(Staged),
+    Staged(Box<Staged>),
     Source(Source),
+}
+
+/// What the app asks of its build of source: the builder's buildpacks it names, and its web
+/// process command.
+struct Asked<'a> {
+    ids: Vec<String>,
+    command: Option<&'a str>,
 }
 
 /// The source of a build: the zip's files as a tar, spooled until the wicket has it.
@@ -618,8 +677,9 @@ pub fn pack_source<R: Read + Seek>(
 
 /// Builds `source`, the app `app`'s, with the builder's buildpacks on a Firecracker wicket,
 /// the first answering: the source uploaded, the build started with the app's environment
-/// (as at a start: the user's and `VCAP_*`, `base` the API's URL) and followed, each line of
-/// its output a line of the staging log as it comes, its droplet fetched and kept
+/// (as at a start: the user's and `VCAP_*`, `base` the API's URL), the buildpacks and the
+/// command `asked` for, in a VM of the app's memory and disk at least, and followed, each line
+/// of its output a line of the staging log as it comes, its droplet fetched and kept
 /// ([`Built`]), and its rootfs made by that wicket, as an image's is.
 async fn build(
     store: &Arc<Store>,
@@ -628,12 +688,17 @@ async fn build(
     base: &str,
     app: &str,
     source: Source,
+    asked: Asked<'_>,
 ) -> Result<Staged, String> {
     let Some(cnb) = &controller.cnb else {
         return Err("no builder is configured (--cnb-builder)".into());
     };
-    let env = store
-        .read(|state| Some(crate::env::guest(base, state, state.app(app)?)))
+    let (env, memory_mb, disk_mb) = store
+        .read(|state| {
+            let app = state.app(app)?;
+            let env = crate::env::guest(base, state, app);
+            Some((env, app.process.memory_mb, app.process.disk_mb))
+        })
         .ok_or("the app is gone")?;
     crate::env::check_guest(&env)?;
     let credentials = cnb.credentials_of(&cnb.builder);
@@ -644,6 +709,13 @@ async fn build(
         source: &source.sha256,
         env: &env,
         egress: &cnb.egress,
+        memory_mib: cnb.memory_mib.max(memory_mb),
+        disk_mib: cnb.disk_mib.max(disk_mb),
+        vcpus: cnb.vcpus,
+        timeout_ms: cnb.timeout.as_millis() as u64,
+        buildpacks: &asked.ids,
+        command: asked.command,
+        cache: app,
     };
     let mut started = Err(no_maker());
     for wicket in controller.makers() {
@@ -663,11 +735,19 @@ async fn build(
     drop(source.spool);
     let (wicket, id) = started.map_err(|e| e.to_string())?;
     let line = format!(
-        "Building {} bytes of source (sha256 {}) with {} on {}{}",
+        "Building {} bytes of source (sha256 {}) with {}{} on {}, {} MiB, {} MiB of disk, {} vCPU{}{}",
         source.bytes,
         &source.sha256[..12],
         cnb.builder,
+        match asked.ids.as_slice() {
+            [] => String::new(),
+            ids => format!(" (its buildpacks {})", ids.join(", ")),
+        },
         wicket.label,
+        request.memory_mib,
+        request.disk_mib,
+        request.vcpus,
+        if request.vcpus == 1 { "" } else { "s" },
         match cnb.egress.as_slice() {
             [] => String::new(),
             egress => format!(", reaching {}", egress.join(", ")),
@@ -676,7 +756,7 @@ async fn build(
     logs.add(app, "STG", line);
     let built = follow(logs, wicket, app, &id).await;
     let staged = match built {
-        Ok(built) => place(store, logs, controller, wicket, app, built).await,
+        Ok(built) => place(store, logs, controller, wicket, app, built, cnb).await,
         Err(e) => Err(e),
     };
     // ended already: forgotten, its droplet the wicket's to keep as any upload
@@ -719,8 +799,8 @@ async fn follow(logs: &Logs, wicket: &Wicket, app: &str, id: &str) -> Result<Bui
     }
 }
 
-/// Keeps what the build `view` of `wicket` built, the app `app`'s, and has that wicket make
-/// its rootfs: the droplet staged.
+/// Keeps what the build `view` of `wicket` built, the app `app`'s, with the credentials of
+/// `cnb` its run image is pulled with, and has that wicket make its rootfs: the droplet staged.
 async fn place(
     store: &Arc<Store>,
     logs: &Logs,
@@ -728,19 +808,23 @@ async fn place(
     wicket: &Wicket,
     app: &str,
     view: BuildView,
+    cnb: &Cnb,
 ) -> Result<Staged, String> {
     let (Some(layer), Some(run_image), Some(launch)) = (view.droplet, view.run_image, view.launch)
     else {
         return Err("the build answered no droplet".into());
     };
     fetch(store, wicket, &layer).await?;
+    let credentials = cnb.credentials_of(&run_image);
     let built = Built {
-        run_image,
         layer: Files {
             sha256: layer.sha256,
             bytes: layer.bytes,
         },
         launch,
+        username: credentials.map(|(username, _)| username.to_string()),
+        password: credentials.map(|(_, password)| password.to_string()),
+        run_image,
     };
     let line = format!(
         "{} is making a rootfs of the droplet ({} bytes, sha256 {}) on {}",
@@ -1385,7 +1469,7 @@ mod tests {
         ];
         let detected_with = |cnb: bool, entries: &[(&str, &[u8])], command, named: &[&str]| {
             let named: Vec<String> = named.iter().map(|name| name.to_string()).collect();
-            let detecting = Buildpack::named(&named, cnb)?;
+            let (detecting, _) = Buildpack::named(&named, cnb)?;
             detect(&files(&archive(zipped(entries))), command, &detecting)
         };
         let detected = |entries: &[(&str, &[u8])], command, named: &[&str]| {
@@ -1445,6 +1529,43 @@ mod tests {
             detected_with(true, &entries, None, &["cnb"]),
             Ok((Buildpack::Cnb, None))
         );
+        // a command naming no component is what source runs; one naming a component stages it
+        let command = Some("java -jar target/app.jar");
+        assert_eq!(
+            detected_with(true, &source, command, &[]),
+            Ok((Buildpack::Cnb, None))
+        );
+        assert_eq!(detected_with(true, &both, Some("a.wasm"), &[]), component);
+        assert!(
+            detected_with(false, &source, command, &[])
+                .unwrap_err()
+                .contains("which the package does not hold")
+        );
+        // a builder's buildpack by its id: source alone, the ids the build's order
+        let named = |names: &[&str], cnb| {
+            let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+            Buildpack::named(&names, cnb)
+        };
+        let java = "paketo-buildpacks/java@22.8.0".to_string();
+        assert_eq!(
+            named(&["paketo-buildpacks/java@22.8.0"], true),
+            Ok((vec![Buildpack::Cnb], vec![java.clone()]))
+        );
+        assert_eq!(
+            named(&["cnb", "paketo-buildpacks/java@22.8.0"], true),
+            Ok((vec![Buildpack::Cnb], vec![java]))
+        );
+        for (names, cnb) in [
+            (&["paketo-buildpacks/java"][..], false),
+            (&["https://github.com/cloudfoundry/java-buildpack"], true),
+        ] {
+            assert!(
+                named(names, cnb)
+                    .unwrap_err()
+                    .contains("there is no buildpack"),
+                "{names:?}"
+            );
+        }
         assert_eq!(Buildpack::Cnb.stack(), Firecracker);
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let options = zip::write::SimpleFileOptions::default();

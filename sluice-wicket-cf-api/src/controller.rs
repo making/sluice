@@ -262,9 +262,24 @@ impl Controller {
 
     /// Deletes the app `guid` (`name`): gone from every wicket first; one not taking that
     /// removes it when it does. Each share is held until the state no longer has the app: a
-    /// listing of a wicket that answered first does not put it back meanwhile.
+    /// listing of a wicket that answered first does not put it back meanwhile. The cache of
+    /// its builds of source is forgotten where a wicket keeps one.
     pub async fn remove(&self, guid: &str, name: &str) {
         let _app = self.hold(guid).await;
+        let built = self.store.read(|state| {
+            (state.droplets.iter()).any(|droplet| droplet.app == guid && droplet.built.is_some())
+        });
+        if built {
+            join_all(self.makers().into_iter().map(|wicket| async move {
+                if let Err(e) = wicket.forget_cache(guid).await {
+                    println!(
+                        "[{guid}] API: {} kept the cache of its builds: {e}",
+                        wicket.label
+                    );
+                }
+            }))
+            .await;
+        }
         let removed = join_all(self.wickets.iter().map(|wicket| async move {
             let share = self.hold_share(guid, &wicket.name).await;
             let removed = self.apply(wicket, guid, None).await;
@@ -1014,9 +1029,12 @@ impl Controller {
 
     /// Has `wicket` make the rootfs of what buildpacks built, `built`: the run image with the
     /// droplet over it, uploaded first where the wicket does not keep it (it built it a
-    /// while ago, or another did). So a droplet is built once, and placed on any wicket.
+    /// while ago, or another did). So a droplet is built once, and placed on any wicket. The
+    /// run image is pulled with the credentials kept with the droplet, else the builder's.
     pub async fn make_built(&self, wicket: &Wicket, built: &Built) -> Result<MadeImage, Failure> {
-        let credentials = (self.cnb.as_ref()).and_then(|cnb| cnb.credentials_of(&built.run_image));
+        let credentials = built
+            .credentials()
+            .or_else(|| (self.cnb.as_ref()).and_then(|cnb| cnb.credentials_of(&built.run_image)));
         let layer = built.layer.sha256.as_str();
         let make =
             || wicket.make_image(&built.run_image, credentials, Some((layer, &built.launch)));

@@ -47,9 +47,10 @@ a build VM of 2 vCPUs, 2048 MiB and an 8 GiB scratch disk, no cache. The apps: S
 | Go: build, droplet, rootfs | 35s, 17 MiB, 12s to make 293 MiB | 34s, 17 MiB, 10s to make 251 MiB |
 
 A cold build is well within `CF_STAGING_TIMEOUT` (15 minutes), the first one with a builder
-included. The jammy builds with `detector` and `builder` alone in Docker on every core of the
-host: Java 61s (peak 1.7 GiB with the page cache, `/layers` 786 MiB), Node 12s (484 MiB, 293 MiB),
-Go 24s (827 MiB, 389 MiB).
+included. These are cold builds, before the wicket kept a cache. The jammy builds with
+`detector` and `builder` alone in Docker on every core of the host: Java 61s (peak 1.7 GiB
+with the page cache, `/layers` 786 MiB), Node 12s (484 MiB, 293 MiB), Go 24s (827 MiB,
+389 MiB).
 
 On arm64 (2026-11-10, an M4 Max in Lima, [On a Mac](../sluice-wicket-runtime-firecracker/README.md#on-a-mac),
 the release wicket, lifecycle 0.21.28 linux.arm64), the same apps with `ubuntu-resolute-builder`'s
@@ -66,6 +67,36 @@ to name:
 | Java (Maven) | `github.com`, `release-assets.githubusercontent.com` (the JDK, Maven, the helpers), `repo.maven.apache.org`, `repo1.maven.org` |
 | Node (npm) | `nodejs.org`, `registry.npmjs.org` |
 | Go | `go.dev`, `dl.google.com`, `proxy.golang.org` |
+
+### With the cache
+
+Measured 2026-11-10 on the same host, a release build, the resolute builder, the cache streamed
+over vsock as it is unpacked and packed (written to the build's disk first, the restore took 18s
+of a warm Java build of 67s):
+
+| app | cache | cold build | warm build | what the warm one did again |
+|---|---|---|---|---|
+| Java | 566 MiB (the JDK, Maven, its repository, the compiled app, syft) | 69s | 38-41s | the JRE (a launch layer: downloaded) |
+| Node | 203 MiB (Node.js, the npm cache) | 20s | 12-17s | `npm install` from its cache |
+
+The cache restored in 2.5s (566 MiB), kept in 1-14s after the droplet. A build in jail mode
+restores and keeps it the same (Node, 15s).
+
+### An egress by proxy
+
+`--cnb-egress` naming a forward proxy alone (a CONNECT proxy on the host), `HTTPS_PROXY` and
+`HTTP_PROXY` the app's env: Node and Go build, every download through it (the buildpacks' and
+npm's, Go's); a Java build's buildpacks download the JDK and Maven through it, Maven itself does
+not read `HTTPS_PROXY`: a `settings.xml` naming the proxy in the app, `BP_MAVEN_SETTINGS_PATH`
+`/workspace/settings.xml`, and it builds. The hosts the proxy was asked for:
+
+| app | hosts |
+|---|---|
+| Java (Maven) | `github.com`, `release-assets.githubusercontent.com`, `repo1.maven.org`, `repo.maven.apache.org`, `central.sonatype.com`, `oss.sonatype.org`, `repository.apache.org`, `repository.ow2.org` |
+| Node (npm) | `nodejs.org`, `registry.npmjs.org` |
+| Go (no dependency) | `go.dev`, `dl.google.com` |
+
+The app's env is its process's too: the running app has `HTTPS_PROXY` as well.
 
 ## `docker compose down` and `up`
 

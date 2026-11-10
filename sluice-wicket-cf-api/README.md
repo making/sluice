@@ -1074,6 +1074,8 @@ docker compose up -d --force-recreate --wait wicket-b
 | `--cnb-builder <image>` | the Cloud Native Buildpacks builder staging a zip of source on a Firecracker wicket with `--guest` ([Buildpacks](#buildpacks): `cnb`); none: a zip of source fails staging |
 | `--cnb-builder-username <name>` / `--cnb-builder-password <password>` / `--cnb-builder-password-file <path>` | its registry's credentials, its run image's too where that is of the same registry |
 | `--cnb-egress <host:port>` | a destination a build may connect to, as a route's `egress` of the wicket (the registries its buildpacks download from, or a proxy); repeatable (or comma-separated). None: a build has no network |
+| `--cnb-memory-mib <MiB>` / `--cnb-disk-mib <MiB>` | a build VM's memory (default 2048) and scratch disk (default 8192), the app's own where larger, as CF stages |
+| `--cnb-vcpus <n>` / `--cnb-timeout <secs>` | its vCPUs (default 2) and how long a build may take (default 900) |
 | `--flume <url>` | the sluice-flume the wicket feeds (`grpc://host:port` / `grpcs://host:port`): the apps' output and requests reach `cf logs` from it |
 | `--flume-token <token>` / `--flume-token-file <path>` | its bearer token |
 | `--flume-ca-cert <path>` / `--flume-insecure` | a `grpcs://` flume verified against this PEM CA (default the webPKI roots), or not at all |
@@ -1120,7 +1122,7 @@ What holds on both wickets; a component's and a VM's are in
 | readiness check (`readiness-health-check-*`, a manifest's alone, as on CF) | kept and shown (`cf get-readiness-health-check`, the process's `readiness_health_check`); `process`, the default, on both wickets; `port` and `http` on a Firecracker wicket ([Mapping to VMs](#mapping-to-vms)), refused on a wasm wicket, where an instance takes requests as they come |
 | health check (`cf push -u`, `cf set-health-check`, `health-check-*`) | kept and shown (`cf get-health-check`, the process's `health_check`); on a Firecracker wicket the route's liveness check and `timeout` its start's ([Mapping to VMs](#mapping-to-vms)); on a wasm wicket `port` and `process` ask nothing, `http` is refused: an instance takes requests as they come |
 | stack (`cf push -s`, `stack:`) | pins the app's ([Stacks](#several-wickets)). `lifecycle.data.stack` shows the pin, else the current droplet's; a droplet's `stack` is where it runs |
-| buildpacks (`cf push -b`, `buildpacks:`) | the only ones detecting the package ([Buildpacks](#buildpacks)); a name of none fails staging |
+| buildpacks (`cf push -b`, `buildpacks:`) | the only ones detecting the package ([Buildpacks](#buildpacks)), with `--cnb-builder` a builder's buildpack by its id; a name of none fails staging |
 | log rate | accepted and shown, no effect |
 
 ### Buildpacks
@@ -1133,7 +1135,7 @@ A zip is staged by the buildpack detecting it, kept on its droplet (`cf app`); a
 | `wasm` | `wasip3` | the file the web process command names (`-c hello.wasm`), else the package's only `.wasm` | that component |
 | `rootfs` | `firecracker` | the `.ext4` the command names, else the package's only `.ext4` | that rootfs |
 | `site` | `wasip3` | no command, no file of the two above, an `index.html` at the root | sluice-wicket-site and the package's files ([Static sites](#static-sites)) |
-| `cnb` | `firecracker` | with `--cnb-builder` alone: no command, none of the above, any file | the rootfs a wicket makes of what the builder's buildpacks built, over the builder's run image |
+| `cnb` | `firecracker` | with `--cnb-builder` alone: no command naming a file of the above, none of them, any file | the rootfs a wicket makes of what the builder's buildpacks built, over the builder's run image |
 
 [![cf push of a Node.js and a Spring Boot app's source, built by the buildpacks of paketobuildpacks/ubuntu-resolute-builder in a microVM of a Firecracker wicket and served](demo/sluice-cf-cnb-demo.gif)](demo/sluice-cf-cnb-demo.mp4)
 
@@ -1142,11 +1144,33 @@ The GIF links to the [MP4](demo/sluice-cf-cnb-demo.mp4); both are recorded on Li
 
 `cnb` stages as CF does, in a microVM of a Firecracker wicket: the zip's files are the build's
 source, the app's environment (the user's, `VCAP_APPLICATION`, `VCAP_SERVICES`) its platform's,
-its output the staging log (`cf push`, `cf logs`), within the wicket's build timeout (15
-minutes) and VM budget. The cf-api keeps the droplet (a tar of the launch layers, the app and
-the launcher), the run image pinned to its digest and what it launches; each wicket an instance
-goes to makes its rootfs of them, as it makes an image's, and none builds it again. The
-buildpacks are the builder's, in its order: `cf push -b` names `cnb`, not one of them.
+its output the staging log (`cf push`, `cf logs`), within `--cnb-timeout` and the wicket's VM
+budget, the VM of `--cnb-memory-mib` and `--cnb-disk-mib`, the app's memory and disk where
+larger. The cf-api keeps the droplet (a tar of the launch layers, the app and the launcher), the
+run image pinned to its digest, the credentials it is pulled with (the builder's, of its
+registry) and what it launches; each wicket an instance goes to makes its rootfs of them, as it
+makes an image's, and none builds it again.
+
+The buildpacks are the builder's, in its order. `cf push -b <id>` (repeated, a manifest's
+`buildpacks:`) names those of the builder's that detect, in one group: `-b
+paketo-buildpacks/java`, `-b paketo-buildpacks/nodejs@10.15.0` (a version left out is the
+latest the builder has); one it lacks fails staging, naming its order. `-b cnb` is the builder's
+order again. A web process command naming no file of the package (`cf push -c 'java -jar
+app.jar'`, a manifest's `command:`) is what the droplet runs in place of the default process:
+the launcher runs it with bash, the run image's (Paketo's `tiny` and `static` have none), as
+CF runs a command. It is the droplet's: a command changed takes a `cf restage`.
+
+A build restores the cache of the app's last build on that wicket (the layers its buildpacks
+cache: Maven's repository, the JDK they built with), and leaves its own: the next build there
+downloads none of it again: a Java build 69s cold, 38s warm
+([measured](../.kb/cnb-java-on-firecracker.md#with-the-cache)). A build on another wicket starts
+cold; a deleted app's cache is forgotten.
+
+`--cnb-egress` may name a forward proxy alone, the app's env `HTTPS_PROXY` (and `HTTP_PROXY`):
+Node and Go build so; Maven reads a `settings.xml` naming the proxy instead (in the app,
+`BP_MAVEN_SETTINGS_PATH: /workspace/settings.xml`)
+([tried](../.kb/cnb-java-on-firecracker.md#an-egress-by-proxy)). The running app has the same
+env.
 
 A buildpack's setting is an environment variable of the app, a manifest's `env:` or `cf set-env`
 before the push (after it, `cf restage` builds again): the Java version of Paketo's, say.

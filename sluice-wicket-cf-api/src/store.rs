@@ -907,7 +907,7 @@ pub struct Droplet {
 /// What a build made of source: a droplet as CF's, what goes over its stack's root file
 /// system. Kept by the cf-api, so any Firecracker wicket makes the rootfs of it, none building
 /// it again.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct Built {
     /// The builder's run image, pinned to its manifest's digest.
     pub run_image: String,
@@ -915,6 +915,32 @@ pub struct Built {
     pub layer: Files,
     /// What it runs, as the build answered it: opaque, the wicket's to read.
     pub launch: serde_json::Value,
+    /// The credentials the run image is pulled with, as at the build (the builder's, of its
+    /// registry): the droplet is placed when the cf-api has others, or none. A droplet built
+    /// before they were kept has none: the builder's now.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub username: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub password: Option<String>,
+}
+
+impl Built {
+    /// The username and the password, both kept.
+    pub fn credentials(&self) -> Option<(&str, &str)> {
+        Some((self.username.as_deref()?, self.password.as_deref()?))
+    }
+}
+
+impl std::fmt::Debug for Built {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Built")
+            .field("run_image", &self.run_image)
+            .field("layer", &self.layer)
+            .field("launch", &self.launch)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .finish()
+    }
 }
 
 impl Droplet {

@@ -151,14 +151,21 @@ pub const STAGE_PARAMETER: &str = "sluice.stage";
 /// ```text
 /// wicket: [len: u32 BE][the request, JSON]             guest: OK\n
 /// wicket: [len: u64 BE][the source, a tar]
+///                                                      guest: [len: u32 BE]{"restore":true}
+/// wicket: [len: u64 BE][the cache, a tar]
 ///                                                      guest: [len: u32 BE][the result, JSON]
 ///                                                      guest: [len: u64 BE][the droplet, a tar]
+///                                                      guest: [len: u32 BE][a piece of the
+///                                                             cache, a tar]..., [0]
 /// ```
 ///
 /// The request is what the build is given (its env as the env stream's: it may hold
 /// secrets), at most [`MAX_ENV`] bytes; the result ([`MAX_STAGE_RESULT`] at most) says what
 /// the droplet's processes are, or the build's `error`, no droplet following. The phases'
-/// output goes to the log stream as a process's.
+/// output goes to the log stream as a process's. The cache the wicket keeps (`restore` in the
+/// request) is asked for once the buildpacks are detected; the one the build leaves (`cache`
+/// in the request) follows the droplet in pieces as it is packed, its end a piece of 0 bytes
+/// (`u32::MAX`: it failed, the cache the wicket keeps stays).
 pub const STAGE_PORT: u32 = 1028;
 
 /// Where a build VM's disk is mounted: on `/init`'s tmpfs, the builder's root being

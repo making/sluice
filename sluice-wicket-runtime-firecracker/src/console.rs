@@ -20,6 +20,7 @@
 //!                                               (JSON) names (`--guest`), kept under its digest;
 //!                                               with `layers` and `launch`, of a droplet on it
 //! PUT    /api/layers/<sha256>, POST /api/builds source staged by buildpacks into a droplet
+//! DELETE /api/caches/<name>                     the cache of an app's builds forgotten
 //!                                               (`stage`, `--guest`)
 //! GET    /api/apps[?after=<revision>]           the apps, as `/api/routes`
 //! PUT    /api/apps/<name>                       serves the app the body (JSON) has
@@ -164,6 +165,13 @@ impl Service for Console {
             return match &self.builds {
                 Some(builds) => builds.handle(rest, parts, body.take()).await,
                 None => error(StatusCode::UNPROCESSABLE_ENTITY, NO_GUEST),
+            };
+        }
+        if let Some(name) = path.strip_prefix("/api/caches/") {
+            return match (&self.builds, method) {
+                (None, _) => error(StatusCode::UNPROCESSABLE_ENTITY, NO_GUEST),
+                (Some(builds), &Method::DELETE) => builds.delete_cache(name),
+                _ => error(StatusCode::METHOD_NOT_ALLOWED, "a cache takes DELETE"),
             };
         }
         if let Some(sha256) = path.strip_prefix("/api/layers/") {

@@ -619,3 +619,17 @@ through the overlay): `rootfs::Tree` dropped such an entry before, a registry's 
 
 Unpacking 3.1 GiB of layers and hashing the image in a debug build of the wicket takes three
 times the release build's time (the builder's rootfs: 501-517s against 165s).
+
+## A build's cache
+
+What the lifecycle's restorer (0.21.28) leaves of a cache, which the wicket does in its place:
+each `cache = true` layer of a buildpack of `group.toml` (the detector's), its directory and
+`<layer>.toml` holding its `metadata` alone (`EncodeLayerMetadataFile`: the types are not
+persisted, the buildpack sets them again to keep the layer), its SBOM files as
+`<layer>.sbom.<ext>`. A layer `launch = true` too is restored from the cache alone with platform
+API 0.14 on, or when the previous image has it (`internal/layer/metadata_restorer.go`); the
+wicket restores every cached layer, as 0.14 does without a previous image.
+
+The lifecycle runs a buildpack's `bin/detect` and `bin/build` with stdout and stderr one writer
+(`buildpack/build.go`, `buildpack/detect.go`), its own stdout: the build's lines are all
+`stdout`, a buildpack's errors among them.

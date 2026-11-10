@@ -578,7 +578,7 @@ digest, or made of an OCI image, first; the app names it:
 |---|---|
 | `PUT /api/components/<sha256>` | keeps the body, an ext4 image of 4 GiB at most, under its digest (400 when the body has another): `{"sha256": .., "bytes": ..}` |
 | `PUT /api/images` | makes an ext4 image of the OCI image the body names (below), kept under its digest as an upload: `{"image": <the reference pinned to its digest>, "name": .., "sha256": .., "bytes": ..}` |
-| `PUT /api/layers/<sha256>`, `GET /api/layers/<sha256>?at=<n>`, `POST /api/builds`, `GET` / `DELETE /api/builds/<id>` | source staged by buildpacks into a droplet ([below](#source-staged-by-buildpacks)) |
+| `PUT /api/layers/<sha256>`, `GET /api/layers/<sha256>?at=<n>`, `POST /api/builds`, `GET` / `DELETE /api/builds/<id>`, `DELETE /api/caches/<name>` | source staged by buildpacks into a droplet ([below](#source-staged-by-buildpacks)) |
 | `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "wicket", "budget", "runtime": "firecracker", "capabilities": [], "keyvalue_stores": [], "apps": [..]}`; `wicket` which wicket this is: `id`, made at its first start and kept in the console directory (`wicket-id`), `node`, its flume node (`wicket:<client-id>`, null without `--flume`), `build`, `since` (its start, in seconds since the epoch); `budget` `max_instances`, `max_memory_mib` (with `--max-memory-mib`) and what the routes keep of them for good (their booted and warm VMs): `instances`, `memory_mib`. An app needing more is refused 422 with `"no_room": true` |
 | `PUT /api/apps/<name>` | serves the app of the body (JSON, below) |
 | `DELETE /api/apps/<name>?owner=<owner>` | removes the app of `owner` |
@@ -658,8 +658,8 @@ had, so its target and VMs stay. Another wicket's guest makes another digest.
 With `--guest`, the wicket is the platform of a [Cloud Native Buildpacks](https://buildpacks.io)
 build: a builder's `detector` and `builder` run on the source in a VM of the builder's image,
 and what they made comes back as a droplet, a tar of what goes over the run image's root file
-system (the launch layers, the app, the launcher). No analyzer and no exporter run: the build
-has no registry and no daemon in reach, and nothing is restored (no cache between builds yet).
+system (the launch layers, the app, the launcher). No analyzer, restorer or exporter runs: the
+build has no registry and no daemon in reach, and the wicket keeps the cache itself (below).
 
 | request | |
 |---|---|
@@ -668,10 +668,12 @@ has no registry and no daemon in reach, and nothing is restored (no cache betwee
 | `POST /api/builds` | starts the build of the body (below): 202 `{"id": ..}`; 409 with `"missing": [<sha256>]` when the source is not kept |
 | `GET /api/builds/<id>?after=<n>` | its output from line `n` on, held up to 20s until there is more: `{"state": "building" \| "built" \| "failed", "next": <the next request's after>, "lines": [{"stream": "stdout" \| "stderr", "line": ..}]}` and, once every line was read, `"error"`, or `"droplet": {"sha256", "bytes"}`, `"run-image"` (pinned to its digest) and `"launch"` |
 | `DELETE /api/builds/<id>` | ends and forgets it; an ended build is forgotten after ten minutes |
+| `DELETE /api/caches/<name>` | forgets the cache of that name (an app deleted); 404 when none is kept |
 
 ```json
 {"builder": "paketobuildpacks/ubuntu-resolute-builder", "source": "<sha256>",
- "env": {"BP_JVM_VERSION": "21"}, "egress": ["repo.maven.apache.org:443", "github.com:443"]}
+ "env": {"BP_JVM_VERSION": "21"}, "egress": ["repo.maven.apache.org:443", "github.com:443"],
+ "buildpacks": ["paketo-buildpacks/java"], "cache": "<an app's guid>"}
 ```
 
 `builder` and `source` are required; `username` and `password` are the builder's registry's
@@ -679,8 +681,20 @@ has no registry and no daemon in reach, and nothing is restored (no cache betwee
 buildpacks see it (`/platform/env`), `egress` the destinations the build may connect to, as a
 route's (none: no network; a buildpack downloading its runtime needs each host it is
 redirected to), `memory-mib` (2048), `vcpus` (2), `disk-mib` (8192: the build's scratch, which
-holds the layers, the app and the droplet) and `timeout-ms` (15 minutes, an hour at most) the
-build VM's. The VM counts in the budget as any other; a build finding no room within 30s fails.
+holds the layers, the app, the droplet and the cache) and `timeout-ms` (15 minutes, an hour at
+most) the build VM's. The VM counts in the budget as any other; a build finding no room within
+30s fails. `buildpacks` (`<id>[@<version>]`, of the builder's: a version left out is the latest
+it has) are the only ones detecting, in one group, the order the detector is given; none, the
+builder's order. `command` is what the droplet runs, a shell's command line: the launcher runs
+it with bash (the run image's, as CF runs a command), in place of the default process.
+
+`cache` names the cache the build restores and leaves (an app's guid, say): the `cache = true`
+layers of the last build of that name, a tar kept in `caches/` of the console's directory,
+are laid over `/layers` once the detector ran, those of the buildpacks detected, each
+`<layer>.toml` holding its `metadata` alone, as the lifecycle's restorer leaves them (the
+buildpack sets the types again), with its SBOM files; a built build leaves its own in their
+place, a failed one the last. A cache is this wicket's: a build on another starts cold. One not
+used for a week goes when another is kept.
 
 The builder's rootfs is made as an image's and kept by its manifest's digest and the guest
 (`builders/` in the console's directory; one not used for a week goes when another is made):

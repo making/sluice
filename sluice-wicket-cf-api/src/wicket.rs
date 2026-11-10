@@ -329,6 +329,22 @@ pub struct BuildRequest<'a> {
     pub env: &'a BTreeMap<String, String>,
     /// The destinations the build may connect to.
     pub egress: &'a [String],
+    /// The build VM's size and time.
+    #[serde(rename = "memory-mib")]
+    pub memory_mib: u64,
+    #[serde(rename = "disk-mib")]
+    pub disk_mib: u64,
+    pub vcpus: u32,
+    #[serde(rename = "timeout-ms")]
+    pub timeout_ms: u64,
+    /// The builder's buildpacks detecting, `<id>[@<version>]`: none, the builder's order.
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    pub buildpacks: &'a [String],
+    /// What the droplet runs, a shell's command line: none, the default process.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub command: Option<&'a str>,
+    /// The name of the cache the wicket keeps between the builds: the app's guid.
+    pub cache: &'a str,
 }
 
 /// A build as the wicket tells it: its output from the line asked for on and, once every line
@@ -771,6 +787,19 @@ impl Wicket {
             return Err(refused(status, &body));
         }
         serde_json::from_slice(&body).map_err(|e| Failure::Unreachable(format!("the answer: {e}")))
+    }
+
+    /// Forgets the cache of the builds `name` (an app's guid), if the wicket keeps one.
+    pub async fn forget_cache(&self, name: &str) -> Result<(), Failure> {
+        let request = self
+            .client
+            .delete(format!("{}/api/caches/{name}", self.base))
+            .timeout(READ_TIMEOUT);
+        let (status, body) = self.send(request).await?;
+        if !status.is_success() && status != reqwest::StatusCode::NOT_FOUND {
+            return Err(refused(status, &body));
+        }
+        Ok(())
     }
 
     /// Ends and forgets the build `id`.

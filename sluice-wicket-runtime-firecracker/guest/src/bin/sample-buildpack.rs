@@ -4,7 +4,7 @@
 //! It detects an app holding `sample.app`. Its build says what it sees (the app's
 //! `STAGED_VAR`, as `/platform/env` gave it; its user), puts the buildpack's `serve` -- the
 //! sample process -- in a launch layer and names it the `web` process, and keeps a cache
-//! layer no droplet holds.
+//! layer no droplet holds, counting the builds it was restored to.
 
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
@@ -55,9 +55,23 @@ fn build() -> std::io::Result<()> {
     std::fs::copy(buildpack.join("serve"), bin.join("serve"))?;
     std::fs::set_permissions(bin.join("serve"), std::fs::Permissions::from_mode(0o755))?;
     std::fs::write(layers.join("runtime.toml"), "[types]\n  launch = true\n")?;
+    // restored: the metadata alone, the types this build's to set again
+    let restored = std::fs::read_to_string(layers.join("cache.toml")).unwrap_or_default();
+    let builds = restored
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("builds = "))
+        .and_then(|builds| builds.parse::<u32>().ok())
+        .filter(|_| !restored.contains("[types]"))
+        .unwrap_or(0)
+        + 1;
+    let kept = std::fs::read_to_string(layers.join("cache/kept")).unwrap_or_default();
+    println!("sample buildpack: build {builds} of the cache, which kept '{kept}'");
     std::fs::create_dir_all(layers.join("cache"))?;
     std::fs::write(layers.join("cache/kept"), b"not the droplet's")?;
-    std::fs::write(layers.join("cache.toml"), "[types]\n  cache = true\n")?;
+    std::fs::write(
+        layers.join("cache.toml"),
+        format!("[types]\n  cache = true\n[metadata]\n  builds = {builds}\n"),
+    )?;
     std::fs::write(Path::new("built.txt"), b"built by the sample buildpack\n")?;
     std::fs::write(
         layers.join("launch.toml"),

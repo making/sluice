@@ -10,6 +10,7 @@
 //! GET    /api/builds/<id>?after=<n>      its output from line n on and, once it ended, its
 //!                                        droplet or its error; held until there is more
 //! DELETE /api/builds/<id>                ends and forgets it
+//! DELETE /api/caches/<name>              forgets the cache of that name
 //! ```
 //!
 //! A build names a builder image and a source kept before. The builder's rootfs is made as
@@ -20,6 +21,11 @@
 //! run image's root file system: the launch layers, the app, the launcher -- kept as a layer,
 //! and the `launch` it runs with. `PUT /api/images` of the run image with that layer and
 //! launch makes the rootfs, on this wicket or any other: a droplet is built once.
+//!
+//! A build naming a cache (an app's) gets the `cache = true` layers its last build of that
+//! name left on this wicket, kept here as a tar between them (`caches/<name>.tar`), and leaves
+//! its own once built: a build is warm on the wicket that built it before. A cache not used
+//! for a week goes when another is kept.
 //!
 //! Nothing the guest sends is taken on trust: its lines and its result are bounded, the
 //! droplet is `limit` bytes at most and unpacked later as a registry's layer is
@@ -99,8 +105,14 @@ const HELD: Duration = Duration::from_secs(20);
 /// The builds kept at once, ended or not.
 const MAX_BUILDS: usize = 64;
 
-/// A builder's rootfs not used for this long goes when another is made.
+/// A builder's rootfs, or a cache, not used for this long goes when another is made.
 const BUILDER_KEPT: Duration = Duration::from_secs(7 * 24 * 60 * 60);
+
+/// Where the caches are kept, in the console's directory.
+const CACHES: &str = "caches";
+
+/// A cache's name at most.
+const MAX_CACHE_NAME: usize = 128;
 
 /// The platform APIs the wicket speaks, the one preferred first: what `/init` writes in the
 /// analyzer's place (`analyzed.toml` with the run image's target) is 0.12's.
@@ -155,6 +167,15 @@ struct Request {
     disk_mib: Option<u32>,
     #[serde(rename = "timeout-ms")]
     timeout_ms: Option<u64>,
+    /// The buildpacks detecting, `<id>[@<version>]`, in one group: none, the builder's
+    /// order. Of the builder's, a version left out its latest.
+    #[serde(default)]
+    buildpacks: Vec<String>,
+    /// What the droplet runs: a shell's command line, which the launcher runs in place of
+    /// the default process.
+    command: Option<String>,
+    /// The name of the cache the build restores and leaves: none, no cache.
+    cache: Option<String>,
 }
 
 /// A build as asked for, checked.
@@ -168,6 +189,10 @@ struct Asked {
     vcpus: u32,
     disk_mib: u32,
     timeout: Duration,
+    buildpacks: Vec<String>,
+    command: Option<String>,
+    /// Where the cache is kept, and the last build's, open.
+    cache: Option<(PathBuf, Option<std::fs::File>)>,
 }
 
 /// What a build made.
@@ -373,6 +398,25 @@ impl Builds {
         }
     }
 
+    /// Where the cache `name` is kept.
+    fn cache(&self, name: &str) -> PathBuf {
+        self.dir.join(CACHES).join(format!("{name}{TAR}"))
+    }
+
+    /// `DELETE /api/caches/<name>`.
+    pub fn delete_cache(&self, name: &str) -> Response {
+        if let Err(e) = check_cache_name(name) {
+            return error(StatusCode::BAD_REQUEST, e);
+        }
+        match std::fs::remove_file(self.cache(name)) {
+            Ok(()) => json(StatusCode::OK, &serde_json::json!({"cache": name})),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                error(StatusCode::NOT_FOUND, format!("no cache {name}"))
+            }
+            Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+        }
+    }
+
     /// `/api/builds` and what is below it (`rest`: empty, or `/<id>`).
     pub async fn handle(
         self: &Arc<Self>,
@@ -491,6 +535,33 @@ impl Builds {
             .timeout_ms
             .map_or(TIMEOUT, Duration::from_millis)
             .min(MAX_TIMEOUT);
+        for buildpack in &request.buildpacks {
+            let (id, version) = split_buildpack(buildpack);
+            if id.is_empty() || version == Some("") || buildpack.contains(char::is_whitespace) {
+                return Err(invalid(format!(
+                    "buildpacks: '{buildpack}' is no <id>[@<version>]"
+                )));
+            }
+        }
+        let command = request
+            .command
+            .map(|command| command.trim().to_string())
+            .filter(|command| !command.is_empty());
+        if command
+            .as_ref()
+            .is_some_and(|command| command.contains('\0'))
+        {
+            return Err(invalid("command: a NUL in it".into()));
+        }
+        let cache = match request.cache {
+            Some(name) => {
+                check_cache_name(&name).map_err(|e| invalid(format!("cache: {e}")))?;
+                let path = self.cache(&name);
+                let kept = std::fs::File::open(&path).ok();
+                Some((path, kept))
+            }
+            None => None,
+        };
         Ok(Asked {
             builder: request.builder,
             credentials,
@@ -509,6 +580,9 @@ impl Builds {
                 64..=1 << 20,
             )?,
             timeout,
+            buildpacks: request.buildpacks,
+            command,
+            cache,
         })
     }
 
@@ -615,8 +689,9 @@ impl Builds {
             .map_err(|e| {
                 format!("the builder's /init stages nothing: it predates builds, or {e}")
             })?;
+        let command = asked.command.clone();
         let staged = self
-            .stage(&mut stream, id, &builder, asked)
+            .stage(&mut stream, id, build, &builder, asked)
             .await
             .map_err(|e| e.to_string());
         // the lines the phases wrote before the result
@@ -642,7 +717,7 @@ impl Builds {
         Ok(Built {
             droplet: layer,
             run_image: builder.run_image,
-            launch: launch(&outcome, &builder.platform_api),
+            launch: launch(&outcome, &builder.platform_api, command.as_deref()),
         })
     }
 
@@ -675,6 +750,11 @@ impl Builds {
                     PLATFORM_APIS.join(", ")
                 )
             })?;
+        let order = order(
+            &metadata,
+            inspected.config["config"]["Labels"]["io.buildpacks.buildpack.order"].as_str(),
+            &asked.buildpacks,
+        )?;
         let run_image_name = metadata["images"][0]["image"]
             .as_str()
             .or(metadata["stack"]["runImage"]["image"].as_str())
@@ -709,18 +789,26 @@ impl Builds {
             os: text("os", "linux"),
             arch: text("architecture", image::ARCHITECTURE),
             platform_api: platform_api.to_string(),
+            order,
         })
     }
 
-    /// One build on the stage stream of its VM: the result, and the droplet received when
-    /// it has no error.
+    /// One build on the stage stream of its VM: the result, and when it has no error, the
+    /// droplet received and the cache kept (its file and size), if one was asked for.
+    #[allow(clippy::type_complexity)]
     async fn stage(
         &self,
         stream: &mut UnixStream,
         id: &str,
+        build: &Build,
         builder: &Builder,
         asked: Asked,
     ) -> std::io::Result<(Outcome, Option<Received>)> {
+        let order: Vec<Value> = (builder.order.iter())
+            .map(|(id, version)| serde_json::json!({"id": id, "version": version}))
+            .collect();
+        let (cache, kept) = asked.cache.unzip();
+        let kept = kept.flatten();
         let request = serde_json::json!({
             "env": asked.env.map(),
             "platform_api": builder.platform_api,
@@ -728,6 +816,9 @@ impl Builds {
             "run_image_name": builder.run_image_name,
             "os": builder.os,
             "arch": builder.arch,
+            "order": order,
+            "cache": cache.is_some(),
+            "restore": kept.is_some(),
         });
         let request = serde_json::to_vec(&request).map_err(std::io::Error::other)?;
         tokio::time::timeout(GUEST_TIMEOUT, wire::send_env(stream, &request))
@@ -736,29 +827,117 @@ impl Builds {
         let mut source = tokio::fs::File::from_std(asked.source);
         stream.write_u64(source.metadata().await?.len()).await?;
         tokio::io::copy(&mut source, stream).await?;
-        let outcome = wire::read_json(stream, wire::MAX_STAGE_RESULT)
-            .await
-            .map_err(|e| {
-                std::io::Error::other(format!(
-                    "the build's VM ended before its result ({e}): out of memory-mib?"
-                ))
-            })?;
-        let outcome: Outcome = serde_json::from_slice(&outcome)
-            .map_err(|e| std::io::Error::other(format!("the build's result: {e}")))?;
+        let mut kept = kept.map(tokio::fs::File::from_std);
+        let outcome = loop {
+            let said = wire::read_json(stream, wire::MAX_STAGE_RESULT)
+                .await
+                .map_err(|e| {
+                    std::io::Error::other(format!(
+                        "the build's VM ended before its result ({e}): out of memory-mib?"
+                    ))
+                })?;
+            let said: Value = serde_json::from_slice(&said)
+                .map_err(|e| std::io::Error::other(format!("the build's result: {e}")))?;
+            // the cache, asked for once the buildpacks are detected: sent once
+            if said["restore"] != true {
+                break serde_json::from_value::<Outcome>(said)
+                    .map_err(|e| std::io::Error::other(format!("the build's result: {e}")))?;
+            }
+            let Some(kept) = kept.take() else {
+                return Err(std::io::Error::other("the build asked for a cache twice"));
+            };
+            let bytes = kept.metadata().await?.len();
+            build.note(format!("Restoring a cache of {}", sized(bytes)));
+            // used: kept longer
+            let _ = kept.set_modified(std::time::SystemTime::now()).await;
+            stream.write_u64(bytes).await?;
+            tokio::io::copy(&mut kept.take(bytes), stream).await?;
+        };
         if outcome.error.is_some() {
             return Ok((outcome, None));
         }
+        let path = self.images.work.join(format!(".droplet-{id}.partial"));
+        let (sha256, bytes) = self.receive(stream, &path, "a droplet").await?;
+        let droplet = Received::adopt(path, sha256, bytes);
+        if let Some(cache) = cache {
+            let started = Instant::now();
+            let received = self.images.work.join(format!(".cache-{id}.partial"));
+            match self.receive_pieces(stream, &received).await? {
+                Some(0) => {
+                    let _ = std::fs::remove_file(&received);
+                    if std::fs::remove_file(&cache).is_ok() {
+                        build.note("Nothing cached: the last build's cache is forgotten".into());
+                    }
+                }
+                Some(bytes) => {
+                    keep_cache(&received, &cache).map_err(std::io::Error::other)?;
+                    build.note(format!(
+                        "Kept a cache of {} for the next build in {}s",
+                        sized(bytes),
+                        started.elapsed().as_secs()
+                    ));
+                }
+                None => {
+                    let _ = std::fs::remove_file(&received);
+                    build.note("The cache was not packed: the last build's is kept".into());
+                }
+            }
+        }
+        Ok((outcome, Some(droplet)))
+    }
+
+    /// Receives the pieces of `stream` (`[len: u32 BE][bytes]`, then a length of 0, or
+    /// `u32::MAX` for none whole) into the file `path`, [`Images::limit`] bytes at most: their
+    /// size, None for none whole.
+    async fn receive_pieces(
+        &self,
+        stream: &mut UnixStream,
+        path: &Path,
+    ) -> std::io::Result<Option<u64>> {
+        let mut file = tokio::fs::File::create(path).await?;
+        let mut bytes = 0u64;
+        let mut piece = Vec::new();
+        let received = loop {
+            let len = stream.read_u32().await?;
+            match len {
+                0 => break Some(bytes),
+                u32::MAX => break None,
+                len => {
+                    bytes += u64::from(len);
+                    if bytes > self.images.limit {
+                        let _ = std::fs::remove_file(path);
+                        return Err(std::io::Error::other(format!(
+                            "a cache of more than {} MiB",
+                            self.images.limit >> 20
+                        )));
+                    }
+                    piece.resize(len as usize, 0);
+                    stream.read_exact(&mut piece).await?;
+                    file.write_all(&piece).await?;
+                }
+            }
+        };
+        file.flush().await?;
+        Ok(received)
+    }
+
+    /// Receives `[len: u64 BE][bytes]` of `stream` into the file `path`, `what` of
+    /// [`Images::limit`] bytes at most: its sha256 and size. Hidden: an upload once whole.
+    async fn receive(
+        &self,
+        stream: &mut UnixStream,
+        path: &Path,
+        what: &str,
+    ) -> std::io::Result<(String, u64)> {
         let bytes = stream.read_u64().await?;
         let limit = self.images.limit;
         if bytes > limit {
             return Err(std::io::Error::other(format!(
-                "a droplet of {} MiB: {} MiB at most",
+                "{what} of {} MiB: {} MiB at most",
                 bytes >> 20,
                 limit >> 20
             )));
         }
-        // hidden: an upload once whole
-        let path = self.images.work.join(format!(".droplet-{id}.partial"));
         let received = async {
             let mut file = tokio::fs::File::create(&path).await?;
             let mut hasher = Sha256::new();
@@ -784,12 +963,127 @@ impl Builds {
         }
         .await;
         match received {
-            Ok(sha256) => Ok((outcome, Some(Received::adopt(path, sha256, bytes)))),
+            Ok(sha256) => Ok((sha256, bytes)),
             Err(e) => {
-                let _ = std::fs::remove_file(&path);
+                let _ = std::fs::remove_file(path);
                 Err(e)
             }
         }
+    }
+}
+
+/// Keeps the cache received at `received` as `path`, by a rename; the caches not used for a
+/// while removed.
+fn keep_cache(received: &Path, path: &Path) -> Result<(), String> {
+    let dir = path.parent().expect("in the caches' directory");
+    std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    for other in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let stale = other.metadata().is_ok_and(|file| {
+            file.modified()
+                .is_ok_and(|at| at.elapsed().is_ok_and(|age| age > BUILDER_KEPT))
+        });
+        if stale {
+            let _ = std::fs::remove_file(other.path());
+        }
+    }
+    std::fs::rename(received, path).map_err(|e| {
+        let _ = std::fs::remove_file(received);
+        format!("{}: {e}", path.display())
+    })
+}
+
+/// `bytes` in MiB, in KiB below one.
+fn sized(bytes: u64) -> String {
+    match bytes >> 20 {
+        0 => format!("{} KiB", bytes.div_ceil(1024)),
+        mib => format!("{mib} MiB"),
+    }
+}
+
+/// A cache's name: letters, digits, `-`, `_` and `.`, not first.
+fn check_cache_name(name: &str) -> Result<(), String> {
+    let valid = !name.is_empty()
+        && name.len() <= MAX_CACHE_NAME
+        && !name.starts_with('.')
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+    match valid {
+        true => Ok(()),
+        false => Err(format!(
+            "'{name}': {MAX_CACHE_NAME} letters, digits, '-', '_' or '.' at most, not '.' first"
+        )),
+    }
+}
+
+/// `<id>[@<version>]`.
+fn split_buildpack(buildpack: &str) -> (&str, Option<&str>) {
+    match buildpack.split_once('@') {
+        Some((id, version)) => (id, Some(version)),
+        None => (buildpack, None),
+    }
+}
+
+/// The order of the buildpacks `asked` for, as `(id, version)`, of those the builder's
+/// `metadata` lists: a version left out the latest of that id. One it lacks fails it,
+/// naming those of the builder's order (its `order` label).
+fn order(
+    metadata: &Value,
+    order_label: Option<&str>,
+    asked: &[String],
+) -> Result<Vec<(String, String)>, String> {
+    let listed: Vec<(&str, &str)> = metadata["buildpacks"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|buildpack| Some((buildpack["id"].as_str()?, buildpack["version"].as_str()?)))
+        .collect();
+    let mut order = Vec::new();
+    for buildpack in asked {
+        let (id, version) = split_buildpack(buildpack);
+        let versions = listed
+            .iter()
+            .filter(|(listed, _)| *listed == id)
+            .map(|(_, v)| *v);
+        let found = match version {
+            Some(version) => versions.into_iter().find(|listed| *listed == version),
+            None => versions.max_by(|a, b| by_version(a, b)),
+        };
+        let Some(version) = found else {
+            let mut named: Vec<String> = order_label
+                .and_then(|label| serde_json::from_str::<Value>(label).ok())
+                .and_then(|order| order.as_array().cloned())
+                .into_iter()
+                .flatten()
+                .flat_map(|entry| entry["group"].as_array().cloned().unwrap_or_default())
+                .filter_map(|group| Some(group["id"].as_str()?.to_string()))
+                .collect();
+            if named.is_empty() {
+                named = listed.iter().map(|(id, _)| id.to_string()).collect();
+            }
+            named.dedup();
+            return Err(format!(
+                "the builder has no buildpack {buildpack}: its order names {}",
+                named.join(", ")
+            ));
+        };
+        order.push((id.to_string(), version.to_string()));
+    }
+    Ok(order)
+}
+
+/// Versions compared by their numbers, dot by dot; text where one is none.
+fn by_version(a: &str, b: &str) -> std::cmp::Ordering {
+    let numbers = |version: &str| -> Option<Vec<u64>> {
+        version
+            .split(['.', '-', '+'])
+            .take(3)
+            .map(|part| part.parse().ok())
+            .collect()
+    };
+    match (numbers(a), numbers(b)) {
+        (Some(a), Some(b)) => a.cmp(&b),
+        _ => a.cmp(b),
     }
 }
 
@@ -810,6 +1104,8 @@ struct Builder {
     os: String,
     arch: String,
     platform_api: String,
+    /// The buildpacks asked for, `(id, version)`: none, the builder's order.
+    order: Vec<(String, String)>,
 }
 
 /// What `/init` answers a build with (its `stage::Outcome`).
@@ -823,8 +1119,10 @@ struct Outcome {
 
 /// What a droplet runs, as the platform spec has an exporter set an image's config: the
 /// default process's link to the launcher (the buildpacks' default, else `web`, else the only
-/// one), else the launcher itself.
-fn launch(outcome: &Outcome, platform_api: &str) -> Over {
+/// one), else the launcher itself. A `command` is the launcher's to run, in place of any
+/// process: through bash (the run image's), as CF runs a command, the layers' profile
+/// scripts sourced and their env set.
+fn launch(outcome: &Outcome, platform_api: &str, command: Option<&str>) -> Over {
     let process = outcome
         .default
         .as_ref()
@@ -833,11 +1131,13 @@ fn launch(outcome: &Outcome, platform_api: &str) -> Over {
             [only] => Some(only),
             _ => None,
         });
+    let entrypoint = match (command, process) {
+        (Some(command), _) => vec!["/cnb/lifecycle/launcher".into(), command.to_string()],
+        (None, Some(kind)) => vec![format!("/cnb/process/{kind}")],
+        (None, None) => vec!["/cnb/lifecycle/launcher".into()],
+    };
     Over {
-        entrypoint: vec![match process {
-            Some(kind) => format!("/cnb/process/{kind}"),
-            None => "/cnb/lifecycle/launcher".into(),
-        }],
+        entrypoint,
         env: vec![
             format!("CNB_LAYERS_DIR={LAYERS_DIR}"),
             format!("CNB_APP_DIR={APP_DIR}"),
@@ -999,7 +1299,8 @@ mod tests {
 
     /// A build's output is read from any line on, its end told once the lines before it were;
     /// only the last lines are kept. A droplet runs its default process, else `web`, else
-    /// its only one, else the launcher.
+    /// its only one, else the launcher; a command, by the launcher. The buildpacks asked for
+    /// are the builder's, of the version named, else the latest.
     #[test]
     fn a_build_tells_its_lines_then_its_end_and_what_its_droplet_runs() {
         let build = Build {
@@ -1037,9 +1338,43 @@ mod tests {
             (&["worker"], None, "/cnb/process/worker"),
             (&["a", "b"], None, "/cnb/lifecycle/launcher"),
         ] {
-            let launch = launch(&outcome(processes, default), "0.13");
+            let launch = launch(&outcome(processes, default), "0.13", None);
             assert_eq!(launch.entrypoint, [entrypoint]);
             assert!(launch.env.contains(&"CNB_PLATFORM_API=0.13".to_string()));
+        }
+        let command = "java -jar app.jar --port=$PORT";
+        let launch = launch(&outcome(&["web"], None), "0.13", Some(command));
+        assert_eq!(launch.entrypoint, ["/cnb/lifecycle/launcher", command]);
+
+        let metadata = serde_json::json!({"buildpacks": [
+            {"id": "paketo-buildpacks/java", "version": "22.8.0"},
+            {"id": "paketo-buildpacks/maven", "version": "6.9.0"},
+            {"id": "paketo-buildpacks/maven", "version": "6.26.0"},
+        ]});
+        let label = r#"[{"group":[{"id":"paketo-buildpacks/java","version":"22.8.0"}]}]"#;
+        let asked = |asked: &[&str]| {
+            let asked: Vec<String> = asked.iter().map(|asked| asked.to_string()).collect();
+            order(&metadata, Some(label), &asked)
+        };
+        let named = |id: &str, version: &str| (id.to_string(), version.to_string());
+        assert_eq!(
+            asked(&["paketo-buildpacks/maven", "paketo-buildpacks/java@22.8.0"]),
+            Ok(vec![
+                named("paketo-buildpacks/maven", "6.26.0"),
+                named("paketo-buildpacks/java", "22.8.0")
+            ])
+        );
+        for missing in ["paketo-buildpacks/go", "paketo-buildpacks/java@1.0.0"] {
+            assert_eq!(
+                asked(&[missing]),
+                Err(format!(
+                    "the builder has no buildpack {missing}: its order names paketo-buildpacks/java"
+                ))
+            );
+        }
+        assert!(check_cache_name("b5e0f1a2-0c1d-4e5f-8a9b-0c1d2e3f4a5b").is_ok());
+        for name in ["", ".hidden", "../up", "a/b"] {
+            assert!(check_cache_name(name).is_err(), "{name}");
         }
     }
 }

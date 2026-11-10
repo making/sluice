@@ -2219,7 +2219,9 @@ fn the_cf_cli_deploys_to_the_wicket() {
     std::fs::write(site.join("index.html"), "<h1>home, again</h1>").unwrap();
     std::fs::write(site.join("lib.wasm"), "for the browser").unwrap();
     let site_path = site.to_str().unwrap();
-    cf.fails(&[
+    // the staging log's last lines are in cf push's output: the CLI stops following it once
+    // the build failed
+    let refused = cf.fails(&[
         "push",
         "site",
         "-p",
@@ -2227,9 +2229,8 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "-b",
         "staticfile_buildpack",
     ]);
-    let refused = cf.ok(&["logs", "site", "--recent"]);
     assert!(
-        refused.contains("there is no buildpack 'staticfile_buildpack'"),
+        refused.contains("   Staging failed: there is no buildpack 'staticfile_buildpack'"),
         "{refused}"
     );
     assert_eq!(page("/"), (200, "<h1>home</h1>".into()));
@@ -2407,11 +2408,13 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
              (SLUICE_CNB_LIFECYCLE, else ~/.local/cnb/lifecycle)"
         );
     }
-    let mut cnb = Vec::new();
+    let (mut cnb, mut uncredentialed) = (Vec::new(), Vec::new());
     if let Some(builder) = &builder {
-        cnb.extend_from_slice(&["--cnb-builder", builder, "--cnb-builder-username", "robot"]);
-        cnb.extend_from_slice(&["--cnb-builder-password", "p4ss"]);
-        cnb.extend_from_slice(&["--cnb-egress", "localhost:9"]);
+        uncredentialed.extend_from_slice(&["--cnb-builder", builder]);
+        uncredentialed.extend_from_slice(&["--cnb-egress", "localhost:9"]);
+        cnb.extend_from_slice(&uncredentialed);
+        cnb.extend_from_slice(&["--cnb-builder-username", "robot", "--cnb-builder-password"]);
+        cnb.extend_from_slice(&["p4ss", "--cnb-memory-mib", "512"]);
     }
 
     let flume = Process::spawn(
@@ -3321,15 +3324,55 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         for expected in [
             "[STG/0] OUT sample buildpack: building as 1001:1000, STAGED_VAR=from-the-manifest",
             "sample buildpack: a line on stderr",
-            "reaching localhost:9",
+            "sample buildpack: build 1 of the cache, which kept ''",
+            // the app's memory, 1G by default, over --cnb-memory-mib
+            "1024 MiB, 8192 MiB of disk, 2 vCPUs, reaching localhost:9",
             "the buildpack cnb",
         ] {
             assert!(logs.contains(expected), "{expected}: {logs}");
         }
-        let droplet = format!(
-            "/v3/apps/{}/droplets/current",
-            cf.ok(&["app", "src", "--guid"]).trim()
+        // built again by the buildpack named: on the cache of the last build, the wicket's
+        let pushed = cf.ok(&[
+            "push",
+            "-f",
+            manifest,
+            "-p",
+            source,
+            "-b",
+            "sample/buildpack",
+        ]);
+        for expected in [
+            "(its buildpacks sample/buildpack)",
+            "Restoring a cache of ",
+            "Restoring data for \"sample_buildpack:cache\" from cache",
+            "sample buildpack: build 2 of the cache, which kept 'not the droplet's'",
+            "KiB for the next build",
+        ] {
+            assert!(pushed.contains(expected), "{expected}: {pushed}");
+        }
+        let guid = cf.ok(&["app", "src", "--guid"]).trim().to_string();
+        let cache = dir.join(format!("deployed/caches/{guid}.tar"));
+        assert!(cache.is_file());
+        assert_eq!(get(&listen, "src.localhost", "/", None).0, 200);
+        // one the builder lacks fails the build, why in cf push's output
+        let refused = cf.fails(&[
+            "push",
+            "-f",
+            manifest,
+            "-p",
+            source,
+            "-b",
+            "other/buildpack",
+        ]);
+        assert!(
+            refused.contains(
+                "   Staging failed: the builder has no buildpack other/buildpack: its order \
+                 names sample/buildpack"
+            ),
+            "{refused}"
         );
+        cf.ok(&["push", "-f", manifest, "-p", source, "-b", "cnb"]);
+        let droplet = format!("/v3/apps/{guid}/droplets/current");
         let droplet: Value = serde_json::from_str(&cf.ok(&["curl", &droplet])).unwrap();
         assert_eq!(
             (&droplet["buildpacks"][0]["name"], &droplet["stack"]),
@@ -3404,7 +3447,8 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         ],
         &flume_url,
         &dir.join("cf"),
-        &[&["--any-credentials"], &cnb[..]].concat(),
+        // no credentials of the builder's: the run image is pulled with those of the build
+        &[&["--any-credentials"], &uncredentialed[..]].concat(),
     );
     cf.ok(&["scale", "fc", "-i", "2"]);
     let served_as = |console: &str| {
@@ -3454,7 +3498,13 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         // the logs are this cf-api's, started after the build: none since
         assert!(!logs.contains("sample buildpack: building"), "{logs}");
         assert!(registry.pulls() > builds, "the run image, pulled by b");
+        // deleted: the cache of its builds forgotten (the wicket's directory was lost since)
+        let guid = cf.ok(&["app", "src", "--guid"]).trim().to_string();
+        let cache = dir.join(format!("deployed/caches/{guid}.tar"));
+        std::fs::create_dir_all(cache.parent().unwrap()).unwrap();
+        std::fs::write(&cache, b"").unwrap();
         cf.ok(&["delete", "src", "-r", "-f"]);
+        assert!(!cache.exists());
     }
 
     for app in ["fc", "zipped"] {
@@ -3879,6 +3929,7 @@ fn cnb_builder(registry: &Registry, lifecycle: &Path, guest: &Path) -> String {
     let metadata = json!({
         "lifecycle": {"apis": {"platform": {"supported": ["0.13"]}}},
         "images": [{"image": format!("{}/private/run:1", registry.address)}],
+        "buildpacks": [{"id": "sample/buildpack", "version": "0.0.1"}],
     });
     let config = json!({
         "architecture": arch,

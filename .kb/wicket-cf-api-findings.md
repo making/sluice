@@ -127,6 +127,15 @@ What the OSS CLI (8.19.0) does with a stack, seen 2026-11-10 against wickets of 
 - `cf push -s <stack>` with a zip reaches the app's `lifecycle.data.stack`
 - `cf app` shows the stack of the current droplet: empty before staging
 
+## A failed build's last lines
+
+The OSS CLI (8.19.0) follows the staging log through log-cache's `Walk` 2s behind
+(`WithWalkDelay(2*time.Second)`, polled every 250ms when there is nothing new,
+`actor/sharedaction/logging.go`), and stops at the first `GET /v3/builds/<guid>` answering
+`FAILED`: the lines of the build's last 2s, the cf-api's `Staging failed: ...` among them,
+never reach `cf push`'s output (`cf logs --recent` has them). The cf-api records a build
+failed 3s after its last line.
+
 ## The demo's GIF
 
 2.5MB ([demo/README.md](../sluice-wicket-cf-api/demo/README.md)).
