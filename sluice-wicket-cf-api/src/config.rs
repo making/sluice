@@ -38,6 +38,8 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
   --cnb-builder-password <password>
   --cnb-builder-password-file <path>
                               read the password from a file instead
+  --cnb-run-image <image>     the run image a droplet runs on, in place of the builder's: of
+                              the builder's OS, architecture and distribution (Paketo's tiny)
   --cnb-egress <host:port>    a destination a build may connect to, as a route's egress of
                               the wicket; repeatable (or comma-separated). None: a build
                               has no network
@@ -135,6 +137,7 @@ const VALUED: &[&str] = &[
     "cnb-builder-username",
     "cnb-builder-password",
     "cnb-builder-password-file",
+    "cnb-run-image",
     "cnb-egress",
     "cnb-memory-mib",
     "cnb-disk-mib",
@@ -309,13 +312,22 @@ pub fn parse(
         number("cnb-vcpus", u64::from(Cnb::VCPUS), 1..=32)?,
         number("cnb-timeout", Cnb::TIMEOUT.as_secs(), 1..=60 * 60)?,
     ];
+    let run_image = value("cnb-run-image");
     let cnb = match value("cnb-builder") {
         Some(builder) => {
-            sluice_wicket_registry::Reference::parse(&builder)
-                .map_err(|e| format!("--cnb-builder: {e}"))?;
+            for (name, image) in [
+                ("builder", Some(&builder)),
+                ("run-image", run_image.as_ref()),
+            ] {
+                if let Some(image) = image {
+                    sluice_wicket_registry::Reference::parse(image)
+                        .map_err(|e| format!("--cnb-{name}: {e}"))?;
+                }
+            }
             let [memory_mib, disk_mib, vcpus, timeout] = sized;
             Some(Cnb {
                 builder,
+                run_image,
                 credentials: cnb_credentials,
                 egress: cnb_egress,
                 memory_mib: memory_mib.unwrap_or(Cnb::MEMORY_MIB),
@@ -325,11 +337,13 @@ pub fn parse(
             })
         }
         None if cnb_credentials.is_some()
+            || run_image.is_some()
             || !cnb_egress.is_empty()
             || sized.iter().any(Option::is_some) =>
         {
             return Err(
-                "--cnb-builder-username, --cnb-egress and the build's size need --cnb-builder: \
+                "--cnb-builder-username, --cnb-run-image, --cnb-egress and the build's size need \
+                 --cnb-builder: \
                  they are a build's"
                     .into(),
             );
@@ -713,7 +727,8 @@ mod tests {
             args(
                 "--wicket http://w:1 --any-credentials --domain x.io --domain y.io,Z.io. \
                  --wicket-away-grace 0 --cnb-builder r.io/builder:1 --cnb-builder-username u \
-                 --cnb-builder-password p --cnb-egress a.io:443,b.io:443 --cnb-egress c.io:80 \
+                 --cnb-builder-password p --cnb-run-image r.io/run-tiny:1 \
+                 --cnb-egress a.io:443,b.io:443 --cnb-egress c.io:80 \
                  --cnb-memory-mib 4096 --cnb-timeout 1800",
             ),
             |_| None,
@@ -723,6 +738,7 @@ mod tests {
         // the builder of source, its builds' egress; its credentials its registry's alone
         let cnb = config.settings.cnb.unwrap();
         assert_eq!(cnb.builder, "r.io/builder:1");
+        assert_eq!(cnb.run_image.as_deref(), Some("r.io/run-tiny:1"));
         assert_eq!(cnb.egress, ["a.io:443", "b.io:443", "c.io:80"]);
         assert_eq!(cnb.credentials_of("r.io/run:1"), Some(("u", "p")));
         assert_eq!(cnb.credentials_of("other.io/run:1"), None);
@@ -824,6 +840,7 @@ mod tests {
             "--cnb-egress a.io:443",
             "--cnb-builder-username u",
             "--cnb-vcpus 4",
+            "--cnb-run-image r.io/run:1",
         ] {
             let line = format!("--wicket http://w:1 --any-credentials {line}");
             assert!(error(&line).contains("--cnb-builder"), "{line}");

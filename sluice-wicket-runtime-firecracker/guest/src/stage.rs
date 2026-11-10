@@ -77,8 +77,11 @@ struct Request {
     /// The run image, pinned to its digest, and as its builder names it.
     run_image: String,
     run_image_name: String,
+    /// Its target, as the lifecycle's analyzer reads it of the image.
     os: String,
     arch: String,
+    arch_variant: Option<String>,
+    distro: Option<Distro>,
     /// The buildpacks detecting, in one group: none, the builder's order.
     #[serde(default)]
     order: Vec<Buildpack>,
@@ -88,6 +91,13 @@ struct Request {
     /// Whether the wicket has a cache to restore, which it sends when asked.
     #[serde(default)]
     restore: bool,
+}
+
+/// The distribution a run image names.
+#[derive(Deserialize)]
+struct Distro {
+    name: String,
+    version: String,
 }
 
 /// A buildpack of the order asked for.
@@ -671,13 +681,25 @@ fn quoted(text: &str) -> String {
 
 /// What an analyzer would have written of the run image: no previous image, nothing cached.
 fn analyzed(request: &Request) -> String {
-    format!(
+    let mut analyzed = format!(
         "[run-image]\n  reference = {}\n  image = {}\n  [run-image.target]\n    os = {}\n    arch = {}\n",
         quoted(&request.run_image),
         quoted(&request.run_image_name),
         quoted(&request.os),
         quoted(&request.arch),
-    )
+    );
+    if let Some(variant) = &request.arch_variant {
+        analyzed.push_str(&format!("    arch-variant = {}\n", quoted(variant)));
+    }
+    // none: the detector reads the builder's /etc/os-release, as the lifecycle's does
+    if let Some(distro) = &request.distro {
+        analyzed.push_str(&format!(
+            "    [run-image.target.distro]\n      name = {}\n      version = {}\n",
+            quoted(&distro.name),
+            quoted(&distro.version)
+        ));
+    }
+    analyzed
 }
 
 /// Runs the lifecycle's `phase` in the root, as the builder's user, with `env` over the
@@ -894,6 +916,11 @@ mod tests {
             run_image_name: "example.com/\"run\\:latest".into(),
             os: "linux".into(),
             arch: "arm64".into(),
+            arch_variant: Some("v8".into()),
+            distro: Some(Distro {
+                name: "ubuntu".into(),
+                version: "26.04".into(),
+            }),
             order: Vec::new(),
             cache: false,
             restore: false,
@@ -903,6 +930,8 @@ mod tests {
         assert_eq!(run["reference"].as_str(), Some("example.com/run@sha256:ab"));
         assert_eq!(run["image"].as_str(), Some("example.com/\"run\\:latest"));
         assert_eq!(run["target"]["arch"].as_str(), Some("arm64"));
+        assert_eq!(run["target"]["arch-variant"].as_str(), Some("v8"));
+        assert_eq!(run["target"]["distro"]["version"].as_str(), Some("26.04"));
 
         let asked = [Buildpack {
             id: "paketo-buildpacks/java".into(),

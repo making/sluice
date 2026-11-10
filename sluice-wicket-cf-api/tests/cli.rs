@@ -2409,12 +2409,13 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         );
     }
     let (mut cnb, mut uncredentialed) = (Vec::new(), Vec::new());
-    if let Some(builder) = &builder {
+    if let Some((builder, run_image)) = &builder {
         uncredentialed.extend_from_slice(&["--cnb-builder", builder]);
         uncredentialed.extend_from_slice(&["--cnb-egress", "localhost:9"]);
         cnb.extend_from_slice(&uncredentialed);
         cnb.extend_from_slice(&["--cnb-builder-username", "robot", "--cnb-builder-password"]);
         cnb.extend_from_slice(&["p4ss", "--cnb-memory-mib", "512"]);
+        cnb.extend_from_slice(&["--cnb-run-image", run_image]);
     }
 
     let flume = Process::spawn(
@@ -3287,8 +3288,9 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     assert!(pushed.contains(per_connection), "{pushed}");
 
     // source: staged by the builder's buildpacks in a VM of the wicket, with the app's
-    // environment, the build's output the staging log; what it built runs on the builder's
-    // run image, as its user, the launcher starting the process the buildpack named
+    // environment, the build's output the staging log; what it built runs on the run image
+    // named in the builder's (--cnb-run-image), as its user, the launcher starting the process
+    // the buildpack named
     if builder.is_some() {
         use std::os::unix::fs::PermissionsExt as _;
         let source = dir.join("source");
@@ -3304,7 +3306,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         let (status, body) = get(&listen, "src.localhost", "/", None);
         assert_eq!(status, 200, "{body}\n{pushed}");
         for expected in [
-            "uid 2000 gid 2001\n",
+            "uid 3000 gid 3001\n",
             // the launcher's doing (it takes CNB_APP_DIR for itself): the launch layer's bin
             "PATH=/layers/sample_buildpack/runtime/bin",
             "STAGED_VAR=from-the-manifest\n",
@@ -3328,6 +3330,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
             // the app's memory, 1G by default, over --cnb-memory-mib
             "1024 MiB, 8192 MiB of disk, 2 vCPUs, reaching localhost:9",
             "the buildpack cnb",
+            "for the run image ",
         ] {
             assert!(logs.contains(expected), "{expected}: {logs}");
         }
@@ -3873,9 +3876,9 @@ fn cnb_lifecycle() -> Option<PathBuf> {
 }
 
 /// A builder of one buildpack, the guest crate's sample one (beside `guest`), with the
-/// lifecycle of `lifecycle`, and its run image, a base naming a user: the builder's reference
-/// in `registry`.
-fn cnb_builder(registry: &Registry, lifecycle: &Path, guest: &Path) -> String {
+/// lifecycle of `lifecycle`, and its run image, a base naming a user; another run image of its
+/// target, naming another: their references in `registry`, the builder's first.
+fn cnb_builder(registry: &Registry, lifecycle: &Path, guest: &Path) -> (String, String) {
     let arch = if cfg!(target_arch = "x86_64") {
         "amd64"
     } else {
@@ -3928,12 +3931,18 @@ fn cnb_builder(registry: &Registry, lifecycle: &Path, guest: &Path) -> String {
         let serve = read(guest.with_file_name("sample-process"));
         layer_file(tar, &format!("{buildpack}/serve"), 0o755, 0, &serve);
     });
-    let run = layer(|tar| {
-        let users = "root:x:0:0::/root:/bin/sh\nrunner:x:2000:2001::/home/runner:/bin/sh\n";
-        layer_file(tar, "etc/passwd", 0o644, 0, users.as_bytes());
-    });
-    let config = json!({"architecture": arch, "os": "linux", "config": {"User": "runner"}});
-    registry.push_image("private/run", "1", &config, &[run]);
+    for (repository, user) in [
+        ("private/run", "runner:x:2000:2001"),
+        ("private/tiny", "tiny:x:3000:3001"),
+    ] {
+        let run = layer(|tar| {
+            let users = format!("root:x:0:0::/root:/bin/sh\n{user}::/home/runner:/bin/sh\n");
+            layer_file(tar, "etc/passwd", 0o644, 0, users.as_bytes());
+        });
+        let name = &user[..user.find(':').unwrap()];
+        let config = json!({"architecture": arch, "os": "linux", "config": {"User": name}});
+        registry.push_image(repository, "1", &config, &[run]);
+    }
     let metadata = json!({
         "lifecycle": {"apis": {"platform": {"supported": ["0.13"]}}},
         "images": [{"image": format!("{}/private/run:1", registry.address)}],
@@ -3953,7 +3962,11 @@ fn cnb_builder(registry: &Registry, lifecycle: &Path, guest: &Path) -> String {
         },
     });
     registry.push_image("private/builder", "1", &config, &[base, cnb]);
-    format!("{}/private/builder:1", registry.address)
+    let address = &registry.address;
+    (
+        format!("{address}/private/builder:1"),
+        format!("{address}/private/tiny:1"),
+    )
 }
 
 /// The cf-api as an image (no docker here: this binary stripped, what it links, the host's

@@ -323,6 +323,9 @@ pub struct BuildRequest<'a> {
     pub username: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub password: Option<&'a str>,
+    /// The run image in place of the builder's.
+    #[serde(rename = "run-image", skip_serializing_if = "Option::is_none")]
+    pub run_image: Option<&'a str>,
     /// The digest of the source, a layer kept.
     pub source: &'a str,
     /// The app's environment, as the buildpacks see it.

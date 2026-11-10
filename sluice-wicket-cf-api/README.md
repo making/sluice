@@ -1074,6 +1074,7 @@ docker compose up -d --force-recreate --wait wicket-b
 | `--org <name>` / `--space <name>` | the organization and its space the first start makes (default `sluice` / `wicket`) |
 | `--cnb-builder <image>` | the Cloud Native Buildpacks builder staging a zip of source on a Firecracker wicket with `--guest` ([Buildpacks](#buildpacks): `cnb`); none: a zip of source fails staging |
 | `--cnb-builder-username <name>` / `--cnb-builder-password <password>` / `--cnb-builder-password-file <path>` | its registry's credentials, its run image's too where that is of the same registry |
+| `--cnb-run-image <image>` | the run image every droplet runs on, in place of the builder's: of the builder's OS, architecture and distribution, else staging fails ([Buildpacks](#buildpacks): a tiny one) |
 | `--cnb-egress <host:port>` | a destination a build may connect to, as a route's `egress` of the wicket (the registries its buildpacks download from, or a proxy); repeatable (or comma-separated). None: a build has no network |
 | `--cnb-memory-mib <MiB>` / `--cnb-disk-mib <MiB>` | a build VM's memory (default 2048) and scratch disk (default 8192), the app's own where larger, as CF stages |
 | `--cnb-vcpus <n>` / `--cnb-timeout <secs>` | its vCPUs (default 2) and how long a build may take (default 900) |
@@ -1136,7 +1137,7 @@ A zip is staged by the buildpack detecting it, kept on its droplet (`cf app`); a
 | `wasm` | `wasip3` | the file the web process command names (`-c hello.wasm`), else the package's only `.wasm` | that component |
 | `rootfs` | `firecracker` | the `.ext4` the command names, else the package's only `.ext4` | that rootfs |
 | `site` | `wasip3` | no command, no file of the two above, an `index.html` at the root | sluice-wicket-site and the package's files ([Static sites](#static-sites)) |
-| `cnb` | `firecracker` | with `--cnb-builder` alone: no command naming a file of the above, none of them, any file | the rootfs a wicket makes of what the builder's buildpacks built, over the builder's run image |
+| `cnb` | `firecracker` | with `--cnb-builder` alone: no command naming a file of the above, none of them, any file | the rootfs a wicket makes of what the builder's buildpacks built, over the builder's run image (`--cnb-run-image`'s where named) |
 
 [![cf push of a Node.js and a Spring Boot app's source, built by the buildpacks of paketobuildpacks/ubuntu-resolute-builder in a microVM of a Firecracker wicket and served](demo/sluice-cf-cnb-demo.gif)](demo/sluice-cf-cnb-demo.mp4)
 
@@ -1163,6 +1164,12 @@ one (Paketo's `tiny` and `static`) staging fails, the app running the droplet it
 droplet's: a command changed takes a `cf restage`. A tiny builder
 (`paketobuildpacks/builder-noble-java-tiny`) builds and serves an app with no command: Paketo's
 processes run without a shell ([tried](../.kb/cnb-java-on-firecracker.md#a-tiny-builder)).
+`--cnb-run-image` names the run image every droplet runs on in place of the builder's, as `pack
+build --run-image`: `paketobuildpacks/ubuntu-resolute-run-tiny` under `ubuntu-resolute-builder`,
+which names none, serves Go and Java on a rootfs of 89 and 377 MiB against 292 and 580
+([measured](../.kb/cnb-java-on-firecracker.md#a-run-image-of-the-platforms)). One of another OS,
+architecture or distribution than the builder's fails staging before the build. It is the
+cf-api's, not an app's: a stack here is a wickets' runtime (`cf push -s`), not a run image.
 
 A build restores the cache of the app's last build on that wicket (the layers its buildpacks
 cache: Maven's repository, the JDK they built with), and leaves its own: the next build there

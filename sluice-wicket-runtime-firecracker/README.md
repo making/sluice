@@ -677,7 +677,12 @@ build has no registry and no daemon in reach, and the wicket keeps the cache its
 ```
 
 `builder` and `source` are required; `username` and `password` are the builder's registry's
-(the run image is asked with them when it is there too), `env` the app's environment as the
+(the run image is asked with them when it is there too); `run-image` is the run image in place
+of the one the builder's label names (Paketo's tiny, which `ubuntu-resolute-builder` names
+none of), as `pack build --run-image`: of the builder's target, its OS and architecture, and its
+distribution where both name one (`io.buildpacks.base.distro.*`, else
+`io.buildpacks.stack.distro.*`), else the build fails before a VM is; the detector checks the
+buildpacks' targets against it, as an analyzer's. `env` is the app's environment as the
 buildpacks see it (`/platform/env`), `egress` the destinations the build may connect to, as a
 route's (none: no network; a buildpack downloading its runtime needs each host it is
 redirected to), `memory-mib` (2048), `vcpus` (2), `disk-mib` (8192: the build's scratch, which

@@ -108,6 +108,32 @@ The launcher's direct form (`launcher -- <argv>`) is no way to a command there: 
 no `$VAR` expansion, and the variables the layers set (`$JAVA_HOME`) unknown before the
 launcher runs, unlike CF's `-c`.
 
+### A run image of the platform's
+
+Measured 2026-11-10 on the same host, a release build, `--cnb-run-image`:
+`ubuntu-resolute-builder@sha256:b17a8dce...` (whose metadata names `ubuntu-resolute-run`
+alone) on `ubuntu-resolute-run-tiny@sha256:675c19ba...` (no shell), against its own
+`ubuntu-resolute-run@sha256:09a7c9ed...` the same session. The rootfs time includes the run
+image's pull; the builds on `ubuntu-resolute-run` were warm (the cache of the tiny ones).
+
+| app | run image | build | droplet | rootfs | start |
+|---|---|---|---|---|---|
+| Go | tiny | 34s cold | 17 MiB | 3s to make 89 MiB | |
+| Go | resolute-run | 18s warm | 17 MiB | 14s to make 292 MiB | |
+| Java | tiny | 66s cold | 235 MiB | 7s to make 377 MiB | `Started` in 11.7s at 1024 MiB |
+| Java | resolute-run | 27s warm | 235 MiB | 20s to make 580 MiB | in 12.0s |
+
+Both serve with no command: Go's binary and Java's `web` process are direct. `-c` on tiny fails
+staging (`needs`). The run image's stack id (`io.buildpacks.stacks.resolute.tiny`) is not the
+builder's (`io.buildpacks.stacks.resolute`), which nothing checks in a build. The lifecycle checks
+a run image only through the detector (each buildpack's `[[targets]]` against the run image's
+os, arch, variant and distribution, `TargetSatisfiedForBuild`); the stack id only in the
+rebaser. The wicket refuses one of another target than the builder's before the build:
+`ubuntu-noble-run-tiny` (ubuntu 24.04) under the resolute builder (26.04) fails staging at once.
+Paketo's images name their distribution in `io.buildpacks.stack.distro.*`, not the
+`io.buildpacks.base.distro.*` the lifecycle reads; with neither, the detector reads the build
+image's `/etc/os-release`.
+
 ### An egress by proxy
 
 `--cnb-egress` naming a forward proxy alone (a CONNECT proxy on the host), `HTTPS_PROXY` and

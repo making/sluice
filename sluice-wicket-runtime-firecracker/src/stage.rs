@@ -16,8 +16,8 @@
 //! A build names a builder image and a source kept before. The builder's rootfs is made as
 //! an image's (`image`) and kept by its manifest's digest; a VM of it is booted with a
 //! scratch disk, within the VMs' budget as any other, and `/init` there runs the builder's
-//! `detector` and `builder` on the source: no analyzer (the wicket names the run image, pinned
-//! to its digest), no exporter. What comes back is the droplet -- a tar of what goes over the
+//! `detector` and `builder` on the source: no analyzer (the wicket names the run image, the
+//! builder's or one of its target, pinned to its digest), no exporter. What comes back is the droplet -- a tar of what goes over the
 //! run image's root file system: the launch layers, the app, the launcher -- kept as a layer,
 //! and the `launch` it runs with. `PUT /api/images` of the run image with that layer and
 //! launch makes the rootfs, on this wicket or any other: a droplet is built once.
@@ -152,6 +152,9 @@ struct Request {
     builder: String,
     username: Option<String>,
     password: Option<String>,
+    /// The run image, in place of the one the builder names: of the builder's target.
+    #[serde(rename = "run-image")]
+    run_image: Option<String>,
     /// The digest of the source, a tar kept as a layer.
     source: String,
     /// The app's environment, as the buildpacks see it (`/platform/env`).
@@ -182,6 +185,7 @@ struct Request {
 struct Asked {
     builder: String,
     credentials: Option<(String, String)>,
+    run_image: Option<String>,
     source: std::fs::File,
     env: Env,
     egress: Vec<Rule>,
@@ -502,6 +506,10 @@ impl Builds {
             (None, None) => None,
             _ => return Err(invalid("username and password go together".into())),
         };
+        if let Some(run_image) = &request.run_image {
+            sluice_wicket_registry::Reference::parse(run_image)
+                .map_err(|e| invalid(format!("run-image: {e}")))?;
+        }
         let source = check_digest(&request.source).map_err(|e| invalid(format!("source: {e}")))?;
         // held open: the build has it however long the builder takes to make
         let source = std::fs::File::open(self.layer(&source)).map_err(|_| {
@@ -565,6 +573,7 @@ impl Builds {
         Ok(Asked {
             builder: request.builder,
             credentials,
+            run_image: request.run_image,
             source,
             env,
             egress,
@@ -755,11 +764,14 @@ impl Builds {
             inspected.config["config"]["Labels"]["io.buildpacks.buildpack.order"].as_str(),
             &asked.buildpacks,
         )?;
-        let run_image_name = metadata["images"][0]["image"]
-            .as_str()
-            .or(metadata["stack"]["runImage"]["image"].as_str())
-            .ok_or("the builder names no run image")?
-            .to_string();
+        let run_image_name = match &asked.run_image {
+            Some(named) => named.clone(),
+            None => metadata["images"][0]["image"]
+                .as_str()
+                .or(metadata["stack"]["runImage"]["image"].as_str())
+                .ok_or("the builder names no run image")?
+                .to_string(),
+        };
         // the builder's credentials go to its own registry alone
         let registry = |image: &str| {
             sluice_wicket_registry::Reference::parse(image).map(|reference| reference.registry)
@@ -770,8 +782,13 @@ impl Builds {
             .inspect(&run_image_name, credentials.filter(|_| same))
             .await
             .map_err(|e| format!("the run image {run_image_name}: {e}"))?;
-        let text =
-            |key: &str, default: &str| run.config[key].as_str().unwrap_or(default).to_string();
+        let target = Target::of(&run.config);
+        // the builder's own is its author's to match; one named in its place, the platform's
+        if asked.run_image.is_some() {
+            target
+                .fits(&Target::of(&inspected.config))
+                .map_err(|e| format!("the run image {run_image_name} {e}"))?;
+        }
         let rootfs = self
             .images
             .builder(&asked.builder, &inspected.digest, credentials, |line| {
@@ -786,8 +803,7 @@ impl Builds {
             rootfs,
             run_image: run.image,
             run_image_name,
-            os: text("os", "linux"),
-            arch: text("architecture", image::ARCHITECTURE),
+            target,
             platform_api: platform_api.to_string(),
             order,
         })
@@ -814,8 +830,10 @@ impl Builds {
             "platform_api": builder.platform_api,
             "run_image": builder.run_image,
             "run_image_name": builder.run_image_name,
-            "os": builder.os,
-            "arch": builder.arch,
+            "os": builder.target.os,
+            "arch": builder.target.arch,
+            "arch_variant": builder.target.variant,
+            "distro": builder.target.distro,
             "order": order,
             "cache": cache.is_some(),
             "restore": kept.is_some(),
@@ -1098,14 +1116,91 @@ impl Build {
 /// A builder, ready for a build.
 struct Builder {
     rootfs: PathBuf,
-    /// The run image pinned to its digest, as named by the builder, and its platform.
+    /// The run image pinned to its digest, as named (by the builder, else the build), and
+    /// its target.
     run_image: String,
     run_image_name: String,
-    os: String,
-    arch: String,
+    target: Target,
     platform_api: String,
     /// The buildpacks asked for, `(id, version)`: none, the builder's order.
     order: Vec<(String, String)>,
+}
+
+/// An image's target, as the lifecycle reads a run image's: its config's platform, the
+/// distribution its labels name (`io.buildpacks.base.distro.*`, else the older
+/// `io.buildpacks.stack.distro.*` Paketo's images have).
+#[derive(Debug, PartialEq)]
+struct Target {
+    os: String,
+    arch: String,
+    variant: Option<String>,
+    distro: Option<Distro>,
+}
+
+#[derive(Debug, PartialEq, Serialize)]
+struct Distro {
+    name: String,
+    version: String,
+}
+
+impl Target {
+    /// The target of the image whose config is `config`.
+    fn of(config: &Value) -> Target {
+        let text = |value: &Value| {
+            value
+                .as_str()
+                .filter(|text| !text.is_empty())
+                .map(String::from)
+        };
+        let labels = &config["config"]["Labels"];
+        let label = |key: &str| {
+            text(&labels[format!("io.buildpacks.base.{key}")])
+                .or_else(|| text(&labels[format!("io.buildpacks.stack.{key}")]))
+        };
+        let (name, version) = (label("distro.name"), label("distro.version"));
+        Target {
+            os: text(&config["os"]).unwrap_or_else(|| "linux".into()),
+            arch: text(&config["architecture"]).unwrap_or_else(|| image::ARCHITECTURE.into()),
+            variant: text(&config["variant"]),
+            distro: (name.is_some() || version.is_some()).then(|| Distro {
+                name: name.unwrap_or_default(),
+                version: version.unwrap_or_default(),
+            }),
+        }
+    }
+
+    /// Whether what is built on `builder` runs on this one: the same OS and architecture, and
+    /// the same variant and distribution where both name one (the buildpacks install what was
+    /// built for the builder's).
+    fn fits(&self, builder: &Target) -> Result<(), String> {
+        let differ = |a: &str, b: &str| !a.is_empty() && !b.is_empty() && a != b;
+        let variants = (self.variant.as_deref(), builder.variant.as_deref());
+        let distros = (self.distro.as_ref(), builder.distro.as_ref());
+        let fits = self.os == builder.os
+            && self.arch == builder.arch
+            && !matches!(variants, (Some(a), Some(b)) if a != b)
+            && !matches!(distros, (Some(a), Some(b))
+                if differ(&a.name, &b.name) || differ(&a.version, &b.version));
+        match fits {
+            true => Ok(()),
+            false => Err(format!(
+                "is {self}, the builder {builder}: not of its target"
+            )),
+        }
+    }
+}
+
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}/{}", self.os, self.arch)?;
+        if let Some(variant) = &self.variant {
+            write!(f, "/{variant}")?;
+        }
+        if let Some(distro) = &self.distro {
+            write!(f, " ({} {})", distro.name, distro.version)?;
+        }
+        Ok(())
+    }
 }
 
 /// What `/init` answers a build with (its `stage::Outcome`).
@@ -1310,7 +1405,8 @@ mod tests {
     /// A build's output is read from any line on, its end told once the lines before it were;
     /// only the last lines are kept. A droplet runs its default process, else `web`, else
     /// its only one, else the launcher; a command, by the launcher. The buildpacks asked for
-    /// are the builder's, of the version named, else the latest.
+    /// are the builder's, of the version named, else the latest. A run image named is of the
+    /// builder's target.
     #[test]
     fn a_build_tells_its_lines_then_its_end_and_what_its_droplet_runs() {
         let build = Build {
@@ -1384,6 +1480,34 @@ mod tests {
                 ))
             );
         }
+        // a run image named in the builder's place: of its OS, architecture and distribution
+        let config = |arch: &str, labels: Value| serde_json::json!({"os": "linux", "architecture": arch, "config": {"Labels": labels}});
+        let stack = |version: &str| {
+            serde_json::json!({"io.buildpacks.stack.distro.name": "ubuntu",
+                "io.buildpacks.stack.distro.version": version})
+        };
+        let builder = Target::of(&config("amd64", stack("26.04")));
+        assert_eq!(builder.to_string(), "linux/amd64 (ubuntu 26.04)");
+        let base = serde_json::json!({"io.buildpacks.base.distro.name": "ubuntu",
+            "io.buildpacks.base.distro.version": "26.04",
+            "io.buildpacks.stack.distro.version": "24.04"});
+        for (run, fits) in [
+            (config("amd64", base), true),
+            (config("amd64", Value::Null), true),
+            (config("amd64", stack("24.04")), false),
+            (config("arm64", stack("26.04")), false),
+        ] {
+            let run = Target::of(&run);
+            assert_eq!(run.fits(&builder).is_ok(), fits, "{run}");
+        }
+        assert_eq!(
+            Target::of(&config("arm64", stack("26.04"))).fits(&builder),
+            Err(
+                "is linux/arm64 (ubuntu 26.04), the builder linux/amd64 (ubuntu 26.04): not of \
+                 its target"
+                    .into()
+            )
+        );
         assert!(check_cache_name("b5e0f1a2-0c1d-4e5f-8a9b-0c1d2e3f4a5b").is_ok());
         for name in ["", ".hidden", "../up", "a/b"] {
             assert!(check_cache_name(name).is_err(), "{name}");

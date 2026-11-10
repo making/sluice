@@ -77,6 +77,8 @@ const READ_OUT: std::time::Duration = std::time::Duration::from_secs(5);
 pub struct Cnb {
     /// The builder image.
     pub builder: String,
+    /// The run image in place of the builder's (`--cnb-run-image`).
+    pub run_image: Option<String>,
     /// Its registry's `(username, password)`.
     pub credentials: Option<(String, String)>,
     /// The destinations a build may connect to (`--cnb-egress`); none: no network.
@@ -706,6 +708,7 @@ async fn build(
         builder: &cnb.builder,
         username: credentials.map(|(username, _)| username),
         password: credentials.map(|(_, password)| password),
+        run_image: cnb.run_image.as_deref(),
         source: &source.sha256,
         env: &env,
         egress: &cnb.egress,
@@ -735,13 +738,17 @@ async fn build(
     drop(source.spool);
     let (wicket, id) = started.map_err(|e| e.to_string())?;
     let line = format!(
-        "Building {} bytes of source (sha256 {}) with {}{} on {}, {} MiB, {} MiB of disk, {} vCPU{}{}",
+        "Building {} bytes of source (sha256 {}) with {}{}{} on {}, {} MiB, {} MiB of disk, {} vCPU{}{}",
         source.bytes,
         &source.sha256[..12],
         cnb.builder,
         match asked.ids.as_slice() {
             [] => String::new(),
             ids => format!(" (its buildpacks {})", ids.join(", ")),
+        },
+        match &cnb.run_image {
+            Some(run_image) => format!(" for the run image {run_image}"),
+            None => String::new(),
         },
         wicket.label,
         request.memory_mib,
