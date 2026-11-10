@@ -78,6 +78,9 @@ pub struct ImageConfig {
     pub env: Vec<String>,
     pub user: String,
     pub workdir: String,
+    /// Files the launch runs, by their absolute paths, each with what runs it: an image
+    /// without one is refused, as its process would fail at its start.
+    pub needs: BTreeMap<String, String>,
 }
 
 impl Tree {
@@ -231,6 +234,30 @@ impl Tree {
     /// The directory of the tree `path` names, through its links as they resolve below the
     /// root, made where missing (root's, 0755, as a runtime makes one).
     fn resolve(&mut self, path: &str) -> Result<PathBuf, String> {
+        Ok(self.walk(path, true)?.expect("made where missing"))
+    }
+
+    /// Whether `path` names a file of the tree the user `uid` (of the group `gid`) may
+    /// execute, through its links as they resolve below the root: nothing made.
+    fn runs(&mut self, path: &str, uid: u32, gid: u32) -> bool {
+        let Ok(Some(found)) = self.walk(path, false) else {
+            return false;
+        };
+        let named = self.relative_name(&found);
+        self.files.get(&named).is_some_and(|meta| {
+            let bit = match () {
+                () if uid == 0 => 0o111,
+                () if meta.uid == uid => 0o100,
+                () if meta.gid == gid => 0o010,
+                () => 0o001,
+            };
+            meta.kind == Kind::File && meta.mode & bit != 0
+        })
+    }
+
+    /// Where `path` leads in the tree, through its links as they resolve below the root: with
+    /// `make` a directory, made where missing; else what is there, None where nothing is.
+    fn walk(&mut self, path: &str, make: bool) -> Result<Option<PathBuf>, String> {
         let mut at = self.root.clone();
         let mut pending: Vec<String> = path
             .split('/')
@@ -271,7 +298,9 @@ impl Tree {
                     pending.extend(parts.into_iter().rev());
                 }
                 Ok(known) if known.is_dir() => at = next,
+                Ok(_) if !make && pending.is_empty() => at = next,
                 Ok(_) => return Err(format!("{path}: {part} is no directory")),
+                Err(_) if !make => return Ok(None),
                 Err(_) => {
                     std::fs::create_dir(&next).map_err(|e| format!("{path}: {e}"))?;
                     set_mode(&next, 0o700).map_err(|e| format!("{path}: {e}"))?;
@@ -281,7 +310,7 @@ impl Tree {
                 }
             }
         }
-        Ok(at)
+        Ok(Some(at))
     }
 
     /// `path`, below the root, as the notes name it.
@@ -376,6 +405,11 @@ impl Tree {
                 .and_then(|fields| fields.get(3)?.parse().ok())
                 .unwrap_or(0),
         };
+        for (path, why) in &config.needs {
+            if !self.runs(path, uid, gid) {
+                return Err(format!("the image has no {path} its user may run: {why}"));
+            }
+        }
         let mut env = config.env;
         if !env.iter().any(|pair| pair.starts_with("HOME=")) {
             let home = of_uid.as_ref().and_then(|fields| fields.get(5).copied());
@@ -762,7 +796,8 @@ mod tests {
 
     /// The layers unpack as a runtime would have them, without root and whatever a file's
     /// mode; the image holds each file's owner, mode and time, passes e2fsck, and comes out
-    /// the same from a build of its own. What a layer may not do is refused.
+    /// the same from a build of its own. What a layer may not do is refused, and a launch
+    /// needing a file its user cannot run.
     #[test]
     fn layers_make_the_image_they_say() {
         let Ok(tools) = Tools::find() else {
@@ -779,6 +814,8 @@ mod tests {
             env: vec!["PATH=/bin".into()],
             user: "app:other".into(),
             workdir: "/app".into(),
+            // through the image's link /bin
+            needs: BTreeMap::from([("/bin/tool".into(), "it serves".into())]),
         };
         let mut digests = Vec::new();
         for n in 0..2 {
@@ -802,6 +839,17 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(1100));
         }
         assert!(digests[0] == digests[1], "another build, other bytes");
+        // a file the launch needs: missing, not one its user may run, no file; none made
+        let mut tree = tree(&work.join("needs"));
+        for missing in ["/bin/bash", "/app/secret", "/app", "/nowhere/bash"] {
+            let mut needing = config();
+            needing.needs = BTreeMap::from([(missing.into(), "a command's shell".into())]);
+            assert_eq!(
+                tree.launch(needing, 8080, Vec::new()).unwrap_err(),
+                format!("the image has no {missing} its user may run: a command's shell")
+            );
+        }
+        assert!(!work.join("needs/nowhere").exists());
         let image = work.join("0.ext4");
         let fsck = Command::new("/usr/sbin/e2fsck")
             .args(["-fn"])

@@ -87,6 +87,27 @@ of a warm Java build of 67s):
 The cache restored in 2.5s (566 MiB), kept in 1-14s after the droplet. A build in jail mode
 restores and keeps it the same (Node, 15s).
 
+### A tiny builder
+
+Measured 2026-11-10 on the same host, a release build:
+`paketobuildpacks/builder-noble-java-tiny@sha256:8da97829...` (lifecycle 0.21.28) on
+`ubuntu-noble-run-tiny:0.0.157@sha256:7af66d69...` (no shell), the Java app, the same egress.
+
+| what | time, size |
+|---|---|
+| the builder's rootfs | 57s, 1189 MiB |
+| build, droplet | 65s cold, 28s warm (566 MiB cached), 235 MiB |
+| rootfs | 7s to make 386 MiB |
+| start at 1024 MiB | `Started` after 5.8s (`-Xmx415922K`) |
+
+With no command it serves: the `web` process is direct, the exec.d helpers (the memory
+calculator, the CA certificates) are binaries. `cf push -c` builds, then the rootfs is refused:
+the launcher runs a command with `/bin/bash` (`launch/bash.go`), which the run image lacks, so the
+build's `launch` names it in `needs` and the wicket checks it (the app keeps its droplet).
+The launcher's direct form (`launcher -- <argv>`) is no way to a command there: no shell syntax,
+no `$VAR` expansion, and the variables the layers set (`$JAVA_HOME`) unknown before the
+launcher runs, unlike CF's `-c`.
+
 ### An egress by proxy
 
 `--cnb-egress` naming a forward proxy alone (a CONNECT proxy on the host), `HTTPS_PROXY` and

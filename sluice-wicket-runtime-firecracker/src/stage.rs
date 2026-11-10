@@ -1120,8 +1120,8 @@ struct Outcome {
 /// What a droplet runs, as the platform spec has an exporter set an image's config: the
 /// default process's link to the launcher (the buildpacks' default, else `web`, else the only
 /// one), else the launcher itself. A `command` is the launcher's to run, in place of any
-/// process: through bash (the run image's), as CF runs a command, the layers' profile
-/// scripts sourced and their env set.
+/// process: through bash (the run image's, which the image made must hold), as CF runs a
+/// command, the layers' profile scripts sourced and their env set.
 fn launch(outcome: &Outcome, platform_api: &str, command: Option<&str>) -> Over {
     let process = outcome
         .default
@@ -1146,6 +1146,16 @@ fn launch(outcome: &Outcome, platform_api: &str, command: Option<&str>) -> Over 
         ],
         path: vec!["/cnb/process".into(), "/cnb/lifecycle".into()],
         workdir: APP_DIR.into(),
+        // the lifecycle's launcher execs it by this path (`launch/bash.go`)
+        needs: match command {
+            Some(_) => BTreeMap::from([(
+                "/bin/bash".into(),
+                "the launcher runs the command with it: a run image without a shell (Paketo's \
+                 tiny) runs a buildpack's process alone, no command"
+                    .into(),
+            )]),
+            None => BTreeMap::new(),
+        },
     }
 }
 
@@ -1340,11 +1350,13 @@ mod tests {
         ] {
             let launch = launch(&outcome(processes, default), "0.13", None);
             assert_eq!(launch.entrypoint, [entrypoint]);
+            assert!(launch.needs.is_empty());
             assert!(launch.env.contains(&"CNB_PLATFORM_API=0.13".to_string()));
         }
         let command = "java -jar app.jar --port=$PORT";
         let launch = launch(&outcome(&["web"], None), "0.13", Some(command));
         assert_eq!(launch.entrypoint, ["/cnb/lifecycle/launcher", command]);
+        assert_eq!(launch.needs.keys().collect::<Vec<_>>(), ["/bin/bash"]);
 
         let metadata = serde_json::json!({"buildpacks": [
             {"id": "paketo-buildpacks/java", "version": "22.8.0"},

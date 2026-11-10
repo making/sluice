@@ -8,6 +8,7 @@
 //! A droplet (`stage`) is served so too: its tar laid over the layers of its run image
 //! (`layers`), what it runs over the image's config (`launch`).
 
+use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -91,6 +92,10 @@ pub struct Over {
     /// Empty: the image's.
     #[serde(default)]
     pub workdir: String,
+    /// Files of the image the launch runs, by their absolute paths, each with what runs it:
+    /// an image without one is refused (a command's shell, say).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub needs: BTreeMap<String, String>,
 }
 
 impl Over {
@@ -115,6 +120,7 @@ impl Over {
         if !self.workdir.is_empty() {
             config.workdir = self.workdir.clone();
         }
+        config.needs = self.needs.clone();
         config
     }
 }
@@ -358,6 +364,7 @@ fn image_config(config: &Value) -> ImageConfig {
         env: strings("Env"),
         user: text("User"),
         workdir: text("WorkingDir"),
+        needs: Default::default(),
     }
 }
 
@@ -537,8 +544,10 @@ mod tests {
             env: vec!["CNB_APP_DIR=/app".into(), "CNB_LAYERS_DIR=/layers".into()],
             path: vec!["/cnb/process".into(), "/cnb/lifecycle".into()],
             workdir: String::new(),
+            needs: BTreeMap::from([("/bin/bash".into(), "a command's shell".into())]),
         };
         let over = over.over(image);
+        assert_eq!(over.needs.keys().collect::<Vec<_>>(), ["/bin/bash"]);
         assert_eq!(
             (&over.entrypoint[..], over.cmd.len()),
             (&["/cnb/process/web".to_string()][..], 0)

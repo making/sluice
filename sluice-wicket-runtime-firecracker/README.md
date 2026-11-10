@@ -686,7 +686,8 @@ most) the build VM's. The VM counts in the budget as any other; a build finding 
 30s fails. `buildpacks` (`<id>[@<version>]`, of the builder's: a version left out is the latest
 it has) are the only ones detecting, in one group, the order the detector is given; none, the
 builder's order. `command` is what the droplet runs, a shell's command line: the launcher runs
-it with bash (the run image's, as CF runs a command), in place of the default process.
+it with bash (the run image's, as CF runs a command), in place of the default process. A run
+image without `/bin/bash` (Paketo's tiny) takes none: its rootfs is refused.
 
 `cache` names the cache the build restores and leaves (an app's guid, say): the `cache = true`
 layers of the last build of that name, a tar kept in `caches/` of the console's directory,
@@ -706,9 +707,10 @@ it).
 
 The droplet runs on its run image: `PUT /api/images` with the run image as `image`, the
 droplet's digest in `layers` (kept layers, laid over the image's in order) and the build's
-`launch` (what runs over the image's config: `entrypoint`, `env`, `path`, `workdir`) makes
-the rootfs, here or on any other wicket that was given the layer. 409 with `"missing"` names a
-layer not kept.
+`launch` (what runs over the image's config: `entrypoint`, `env`, `path`, `workdir`, and
+`needs`: the files it runs, each with why, which the image must hold, its user allowed to run
+them, else 422) makes the rootfs, here or on any other wicket that was given the layer. 409
+with `"missing"` names a layer not kept.
 
 #### Disks
 

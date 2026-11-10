@@ -3380,6 +3380,14 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
             "{droplet}"
         );
         assert!(cf.ok(&["buildpacks"]).contains("cnb"));
+        // a command on a run image without bash, which the launcher runs it with: staging
+        // fails, the app runs the droplet it had
+        let refused = cf.fails(&["push", "-f", manifest, "-p", source, "-c", "serve"]);
+        assert!(
+            refused.contains("the image has no /bin/bash its user may run"),
+            "{refused}"
+        );
+        assert_eq!(get(&listen, "src.localhost", "/", None).0, 200);
     }
 
     // deleted while the wicket is down: removed when it is back

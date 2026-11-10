@@ -1157,8 +1157,11 @@ paketo-buildpacks/java`, `-b paketo-buildpacks/nodejs@10.15.0` (a version left o
 latest the builder has); one it lacks fails staging, naming its order. `-b cnb` is the builder's
 order again. A web process command naming no file of the package (`cf push -c 'java -jar
 app.jar'`, a manifest's `command:`) is what the droplet runs in place of the default process:
-the launcher runs it with bash, the run image's (Paketo's `tiny` and `static` have none), as
-CF runs a command. It is the droplet's: a command changed takes a `cf restage`.
+the launcher runs it with bash, the run image's, as CF runs a command: on a run image without
+one (Paketo's `tiny` and `static`) staging fails, the app running the droplet it had. It is the
+droplet's: a command changed takes a `cf restage`. A tiny builder
+(`paketobuildpacks/builder-noble-java-tiny`) builds and serves an app with no command: Paketo's
+processes run without a shell ([tried](../.kb/cnb-java-on-firecracker.md#a-tiny-builder)).
 
 A build restores the cache of the app's last build on that wicket (the layers its buildpacks
 cache: Maven's repository, the JDK they built with), and leaves its own: the next build there
