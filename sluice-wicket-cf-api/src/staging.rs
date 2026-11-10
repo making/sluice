@@ -68,10 +68,9 @@ const MAX_LINK: u64 = 4096;
 /// How often in a row a wicket may not answer for its build before the build is given up.
 const FOLLOW_TRIES: u32 = 5;
 
-/// How long after its last line a build is recorded failed: the CLI reads the staging log
-/// 2s behind (log-cache's walk delay) and stops at the failure, which would cut the lines
-/// telling why.
-const FAILED_AFTER: std::time::Duration = std::time::Duration::from_secs(3);
+/// How long a staging's end waits for the CLI following its log to print the last lines
+/// ([`Logs::read_out`]): it reads 2s behind (log-cache's walk delay), every 250ms.
+const READ_OUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// The builder staging source (`--cnb-builder`), and what its builds get.
 #[derive(Clone, Debug)]
@@ -523,6 +522,7 @@ pub async fn run(
                 created_at: at.clone(),
                 updated_at: at.clone(),
             };
+            logs.read_out(app, READ_OUT).await;
             store.update(|state| {
                 if let Some(staging) = state.builds.iter_mut().find(|kept| kept.guid == build) {
                     staging.state = "STAGED".into();
@@ -534,7 +534,7 @@ pub async fn run(
         }
         Err(e) => {
             logs.add(app, "STG", format!("Staging failed: {e}"));
-            tokio::time::sleep(FAILED_AFTER).await;
+            logs.read_out(app, READ_OUT).await;
             store.update(|state| {
                 if let Some(staging) = state.builds.iter_mut().find(|kept| kept.guid == build) {
                     staging.state = "FAILED".into();

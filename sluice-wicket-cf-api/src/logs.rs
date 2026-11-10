@@ -6,6 +6,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use base64::Engine as _;
 use serde_json::{Value, json};
@@ -14,6 +15,13 @@ use crate::store::epoch_nanos;
 
 /// Lines kept per app.
 const RING: usize = 1000;
+
+/// How long since its last read a reader walking an app's lines is taken as following them:
+/// the CLI reads every 250ms while nothing is new (`cliRetryBackoff`, v8.19.0).
+const FOLLOWING: Duration = Duration::from_secs(1);
+
+/// How often [`Logs::read_out`] looks again.
+const LOOK: Duration = Duration::from_millis(50);
 
 /// The stream a line is of, as `cf logs` tells them apart.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -36,8 +44,16 @@ pub struct Line {
 }
 
 #[derive(Default)]
+struct Ring {
+    lines: VecDeque<Line>,
+    /// The `start_time` of the last read walking the lines, and when it came: the CLI walks
+    /// from the line after the last it printed.
+    walked: Option<(u128, tokio::time::Instant)>,
+}
+
+#[derive(Default)]
 pub struct Logs {
-    rings: Mutex<HashMap<String, VecDeque<Line>>>,
+    rings: Mutex<HashMap<String, Ring>>,
 }
 
 impl Logs {
@@ -63,7 +79,7 @@ impl Logs {
         text: String,
     ) {
         let mut rings = self.rings.lock().expect("no panic under the lock");
-        let ring = rings.entry(app.to_string()).or_default();
+        let ring = &mut rings.entry(app.to_string()).or_default().lines;
         let timestamp = ring
             .back()
             .map_or(0, |last| last.timestamp + 1)
@@ -82,7 +98,7 @@ impl Logs {
 
     /// The lines of `app` from `start` (inclusive) to `end` (exclusive), at
     /// most `limit`; the newest first with `descending`, and then the newest
-    /// `limit` of them.
+    /// `limit` of them. A read in order walks them: its reader is past what is before `start`.
     pub fn read(
         &self,
         app: &str,
@@ -91,16 +107,47 @@ impl Logs {
         limit: usize,
         descending: bool,
     ) -> Vec<Line> {
-        let rings = self.rings.lock().expect("no panic under the lock");
-        let lines =
-            rings.get(app).into_iter().flatten().filter(|line| {
-                line.timestamp >= start && end.is_none_or(|end| line.timestamp < end)
-            });
+        let mut rings = self.rings.lock().expect("no panic under the lock");
+        if !descending && let Some(ring) = rings.get_mut(app) {
+            ring.walked = Some((start, tokio::time::Instant::now()));
+        }
+        let lines = rings
+            .get(app)
+            .into_iter()
+            .flat_map(|ring| &ring.lines)
+            .filter(|line| line.timestamp >= start && end.is_none_or(|end| line.timestamp < end));
         if descending {
             lines.rev().take(limit).cloned().collect()
         } else {
             lines.take(limit).cloned().collect()
         }
+    }
+
+    /// Waits, `within` at most, for a reader following `app`'s lines to walk past the last of
+    /// them, and a look more for it to print them: the CLI walks the staging log 2s behind and
+    /// stops at the staging's end, which would cut its last lines. No reader following
+    /// ([`FOLLOWING`] for one to start: the CLI starts as the staging does): no wait more.
+    pub async fn read_out(&self, app: &str, within: Duration) {
+        let started = tokio::time::Instant::now();
+        let deadline = started + within;
+        loop {
+            // whether a reader follows, and whether it is past the last line
+            let following = {
+                let rings = self.rings.lock().expect("no panic under the lock");
+                rings.get(app).and_then(|ring| {
+                    let last = ring.lines.back().map_or(0, |line| line.timestamp);
+                    let (start, at) = ring.walked?;
+                    (at.elapsed() < FOLLOWING).then_some(start > last)
+                })
+            };
+            match following {
+                None if started.elapsed() >= FOLLOWING => return,
+                Some(true) => break,
+                Some(false) if tokio::time::Instant::now() >= deadline => return,
+                None | Some(false) => tokio::time::sleep(LOOK).await,
+            }
+        }
+        tokio::time::sleep(LOOK).await;
     }
 
     pub fn forget(&self, app: &str) {
@@ -177,5 +224,41 @@ mod tests {
         let view = envelopes("c", &logs.read("c", 0, None, 10, false));
         assert_eq!(view["envelopes"]["batch"][0]["instance_id"], "2");
         assert_eq!(view["envelopes"]["batch"][0]["log"]["type"], "ERR");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_staging_ends_once_the_reader_following_it_is_past_its_last_line() {
+        use tokio::time::Instant;
+        let within = Duration::from_secs(5);
+        let logs = std::sync::Arc::new(Logs::default());
+        logs.add("a", "STG", "Staged");
+        // no reader: a wait for one to start, no more
+        let start = Instant::now();
+        logs.read_out("a", within).await;
+        assert_eq!(start.elapsed(), FOLLOWING);
+        // the CLI's walk: from the start until the line is 2s old, then past it
+        let last = logs.read("a", 0, None, 100, false)[0].timestamp;
+        let reader = {
+            let logs = logs.clone();
+            tokio::spawn(async move {
+                for _ in 0..8 {
+                    logs.read("a", 0, None, 100, false);
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                logs.read("a", last + 1, None, 100, false);
+            })
+        };
+        let start = Instant::now();
+        logs.read_out("a", within).await;
+        // at its next look, and a look more
+        let waited = start.elapsed();
+        assert!(waited > Duration::from_secs(2) && waited <= Duration::from_secs(2) + LOOK * 2);
+        reader.await.unwrap();
+        // a reader gone: no reader
+        logs.add("a", "STG", "again");
+        tokio::time::sleep(FOLLOWING).await;
+        let start = Instant::now();
+        logs.read_out("a", within).await;
+        assert_eq!(start.elapsed(), FOLLOWING);
     }
 }

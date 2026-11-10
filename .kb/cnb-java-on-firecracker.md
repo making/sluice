@@ -57,7 +57,12 @@ the release wicket, lifecycle 0.21.28 linux.arm64), the same apps with `ubuntu-r
 arm64 image, the same egress: the builder's rootfs made in 186s (3465 MiB); built in 11s (Node,
 270 MiB), 13s (Go, 16 MiB, serving `linux/arm64`), 26s (Java, 230 MiB), each served. The Java
 app took 164s to start in its template (`Started HelloApplication in 148.481 seconds`): the
-JVM's start on a Mac, not the build's.
+JVM's start on a Mac, not the build's. With the cache (the same day, `35560cf3`): Node 13s cold,
+11s warm (201 MiB restored, the engine reused), Java 157s cold and 51s warm on a loaded Mac
+(554 MiB restored, the JDK, Maven and the app reused), 30s cold again on a quiet one (Maven's
+7.9s, 50s before), Go 36s cold; `-b
+paketo-buildpacks/nodejs` built, an id the builder lacks failed naming its order, `-c 'node
+custom.js'` served.
 
 The hosts a build connected to (each on 443, the same with both builders), what `egress` has
 to name:

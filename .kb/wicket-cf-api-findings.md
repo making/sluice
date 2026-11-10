@@ -127,14 +127,18 @@ What the OSS CLI (8.19.0) does with a stack, seen 2026-11-10 against wickets of 
 - `cf push -s <stack>` with a zip reaches the app's `lifecycle.data.stack`
 - `cf app` shows the stack of the current droplet: empty before staging
 
-## A failed build's last lines
+## A build's last lines
 
 The OSS CLI (8.19.0) follows the staging log through log-cache's `Walk` 2s behind
 (`WithWalkDelay(2*time.Second)`, polled every 250ms when there is nothing new,
 `actor/sharedaction/logging.go`), and stops at the first `GET /v3/builds/<guid>` answering
-`FAILED`: the lines of the build's last 2s, the cf-api's `Staging failed: ...` among them,
-never reach `cf push`'s output (`cf logs --recent` has them). The cf-api records a build
-failed 3s after its last line.
+`STAGED` or `FAILED`: the lines of the build's last 2s, the cf-api's `Staged ...` or `Staging
+failed: ...` among them, never reach `cf push`'s output (`cf logs --recent` has them). The
+pruning is the client's: no read carries an `end_time`, each starts after the last line printed
+(`start_time`, go-log-cache v2.0.7 `walk.go`). So the cf-api records a build's end once the
+reader walking its log reads from past its last line (5s at most), 1s for one to start, no
+wait without one. Seen on an arm64 Lima VM before the success waited too: a cached build of the
+test's sample buildpack ended within 2s of its first lines, and `cf push` showed none of them.
 
 ## The demo's GIF
 
