@@ -149,14 +149,35 @@ pub struct TlsSettings {
     pub key_pem: Vec<u8>,
 }
 
-/// Whether the data directory can be written, made if missing: before the listener binds, which
-/// a VM's `/init` takes for ready.
-pub fn check_data_dir(dir: &std::path::Path) -> Result<(), String> {
+/// Takes the data directory, made if missing, for this process: an exclusive `flock` of its
+/// `.lock`, held while the file returned is open (the kernel lets it go at the process's end, a
+/// kill included), refused while another process holds it, before anything there is removed or
+/// written; then whether it can be written. Before the listener binds, which a VM's `/init`
+/// takes for ready.
+pub fn check_data_dir(dir: &std::path::Path) -> Result<std::fs::File, String> {
+    let failed = |e: std::io::Error| format!("--data-dir {}: {e}", dir.display());
+    std::fs::create_dir_all(dir).map_err(failed)?;
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(".lock"))
+        .map_err(failed)?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            return Err(format!(
+                "--data-dir {}: in use by another sluice-wicket-cf-api",
+                dir.display()
+            ));
+        }
+        Err(std::fs::TryLockError::Error(e)) => return Err(failed(e)),
+    }
     let probe = dir.join(format!("{}.tmp", store::guid()));
-    std::fs::create_dir_all(dir)
-        .and_then(|()| std::fs::write(&probe, b""))
+    std::fs::write(&probe, b"")
         .and_then(|()| std::fs::remove_file(&probe))
-        .map_err(|e| format!("--data-dir {}: {e}", dir.display()))
+        .map_err(failed)?;
+    Ok(lock)
 }
 
 /// The wickets `settings` name.
@@ -317,6 +338,24 @@ mod tests {
     use tokio::time::Instant;
 
     use super::*;
+
+    /// The data directory is one process's: a second take is refused while the first is held,
+    /// taken once it is let go.
+    #[test]
+    fn a_data_directory_is_taken_by_one() {
+        let dir = std::env::temp_dir().join(format!("cf-api-lock-{}", store::guid()));
+        let held = check_data_dir(&dir).unwrap();
+        assert_eq!(
+            check_data_dir(&dir).unwrap_err(),
+            format!(
+                "--data-dir {}: in use by another sluice-wicket-cf-api",
+                dir.display()
+            )
+        );
+        drop(held);
+        drop(check_data_dir(&dir).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn settings(data_dir: PathBuf, tls: Option<TlsSettings>) -> Settings {
         Settings {

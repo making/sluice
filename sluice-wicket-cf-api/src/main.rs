@@ -24,10 +24,14 @@ async fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if let Err(e) = sluice_wicket_cf_api::check_data_dir(&config.settings.data_dir) {
-        eprintln!("{e}");
-        return ExitCode::FAILURE;
-    }
+    // held to the end: a second process on the directory is refused
+    let _data_dir = match sluice_wicket_cf_api::check_data_dir(&config.settings.data_dir) {
+        Ok(lock) => lock,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
     if let Err(e) = sluice_wicket_cf_api::check_wickets(&config.settings).await {
         eprintln!("{e}");
         return ExitCode::FAILURE;
