@@ -318,8 +318,9 @@ pub async fn serve(
         registry: registry::Registry::new()?,
         build: describe_build(),
     });
-    // the deployments a stop left under way
+    // the deployments, the stagings and the apps' deletes a stop left under way
     controller.resume();
+    api.take_up();
     let stop = controller.stop.clone();
     let watch = tokio::spawn(controller.watch());
     tokio::select! {

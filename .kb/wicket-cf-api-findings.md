@@ -21,6 +21,13 @@ package upload under way (12 MB at 4 MB/s, SIGTERM 1s in): answered 200 at 3.0s,
 request(s) and 0 put(s) cut`). So an upgrade's gap is the 0.7-0.8s boot above plus what the
 requests under way take, `--stop-grace` (8s) at most; not measured again in a VM.
 
+What the CLI (8.19.0) does in that gap: a request refused (`connect: connection refused`) is sent
+3 times in 35ms in all, then `FAILED` (`CF_TRACE=true cf curl /v3/apps` against a closed port). So
+a `cf push` across a restart of the cf-api gets through only when none of its requests falls in
+the gap: the staging the cf-api takes up ends `STAGED` either way, and a CLI test of a push across
+a restart would pass by its timing alone, which is why none is written; the unit tests cut a
+staging at each step instead (`staging::tests::a_staging_cut_short_is_taken_up`).
+
 ## A start that never listens
 
 An app's process living and not listening takes its start `boot-ms` (the health check's timeout, 60s

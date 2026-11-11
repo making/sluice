@@ -41,6 +41,9 @@ pub const USES_ANNOTATION: &str = "wicket.sluice.ik.am/uses";
 /// The annotation of an app setting how long a VM serves: its routes' `lifetime-ms`.
 pub const LIFETIME_ANNOTATION: &str = "wicket.sluice.ik.am/lifetime-ms";
 
+/// The operation of the job of an app's delete waiting for its unbinds.
+pub const APP_DELETE: &str = "app.delete";
+
 /// The stack of a wasm wicket's apps.
 pub const STACK: &str = "wasip3";
 /// The stack of a Firecracker wicket's apps.
@@ -862,8 +865,37 @@ pub struct Build {
     pub lifecycle: Lifecycle,
     pub error: Option<String>,
     pub droplet: Option<String>,
+    /// What its staging needs to go on at the next start, a stop of the cf-api cutting it short
+    /// (`crate::staging::run`): none once it ended, and in a build staged before it was kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staging: Option<Staging>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+/// What a staging under way is asked for, and how far its build of source is.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Staging {
+    /// The API's URL, which a build of source is told (`VCAP_APPLICATION`).
+    pub base: String,
+    /// The web process command it stages for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Its build of source on a wicket, once started.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub building: Option<Building>,
+}
+
+/// A build of source a wicket runs: followed from the line `after` on.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Building {
+    /// The wicket's name.
+    pub wicket: String,
+    /// The build's id there.
+    pub id: String,
+    /// The lines of its output taken: kept as they are taken, written with the next change
+    /// (the stop's last at least).
+    pub after: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -1383,6 +1415,12 @@ impl State {
         self.builds.iter().find(|build| build.guid == guid)
     }
 
+    /// What the staging of the build `guid` under way keeps.
+    pub fn staging_mut(&mut self, guid: &str) -> Option<&mut Staging> {
+        let build = self.builds.iter_mut().find(|build| build.guid == guid)?;
+        build.staging.as_mut()
+    }
+
     pub fn droplet(&self, guid: &str) -> Option<&Droplet> {
         self.droplets.iter().find(|droplet| droplet.guid == guid)
     }
@@ -1729,13 +1767,11 @@ impl State {
         blobs
     }
 
-    /// Fails the builds a stop of the cf-api cut short: no staging outlives
-    /// it.
+    /// Fails the builds a stop of the cf-api cut short that keep nothing to go on from: those
+    /// of a state written before they kept it. The others are taken up (`crate::staging::run`).
     pub fn fail_unfinished_builds(&mut self) {
-        for build in self
-            .builds
-            .iter_mut()
-            .filter(|build| build.state == "STAGING")
+        for build in (self.builds.iter_mut())
+            .filter(|build| build.state == "STAGING" && build.staging.is_none())
         {
             build.state = "FAILED".into();
             build.error =
@@ -1744,8 +1780,10 @@ impl State {
         }
     }
 
-    /// Settles what the jobs wait for that no operation under way will: an app's delete
-    /// after its unbinds, which a stop of the cf-api cut short, fails.
+    /// Settles what the jobs wait for that no operation under way will, failing the job: a
+    /// binding's operation a stop of the cf-api cut short before it was kept. An app's delete
+    /// after its unbinds is taken up (`crate::api::Api::take_up`): an app deleted already is
+    /// waited for no more.
     pub fn settle_unfinished_waits(&mut self) {
         let under_way: Vec<String> = self
             .instances
@@ -1759,10 +1797,20 @@ impl State {
                     .map(|binding| binding.guid.clone()),
             )
             .collect();
+        let apps: Vec<&str> = self.apps.iter().map(|app| app.guid.as_str()).collect();
+        let bindings: Vec<&str> = (self.bindings.iter()).map(|b| b.guid.as_str()).collect();
         for job in &mut self.jobs {
-            let before = job.waits.len();
-            job.waits.retain(|wait| under_way.contains(wait));
-            if job.waits.len() < before && job.errors.is_empty() {
+            let deleting = job.operation == APP_DELETE;
+            let mut cut = false;
+            job.waits.retain(|wait| {
+                if under_way.contains(wait) || deleting && apps.contains(&wait.as_str()) {
+                    return true;
+                }
+                // of an app's delete, neither an app nor a binding: the app, deleted
+                cut |= !deleting || bindings.contains(&wait.as_str());
+                false
+            });
+            if cut && job.errors.is_empty() {
                 job.errors.push(JobError {
                     code: 10001,
                     title: "UnknownError".into(),
@@ -1919,7 +1967,8 @@ impl Store {
         self.changes.notified().await;
     }
 
-    /// Changes what is not kept (the wickets' outcomes, their budgets).
+    /// Changes what is not kept (the wickets' outcomes, their budgets), or what is kept with the
+    /// next change written (how far a build of source was followed).
     pub fn note<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         f(&mut self.state.lock().expect("no panic under the lock"))
     }
@@ -2137,7 +2186,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_current_droplet_keeps_the_previous_the_packages_the_newest_and_no_build_outlives_a_restart()
+    fn the_current_droplet_keeps_the_previous_the_packages_the_newest_and_a_restart_what_it_takes_up()
      {
         let mut state = State::new("o", "s", &["localhost".into()]);
         let space = state.spaces[0].guid.clone();
@@ -2228,8 +2277,14 @@ mod tests {
             shown.contains("\"***\"") && !shown.contains("p4ss"),
             "{shown}"
         );
-        // a staging cut short fails, a staged build stays
-        for (guid, staged) in [("b1", "STAGING"), ("b2", "STAGED")] {
+        // a staging cut short keeping nothing to go on from fails, one keeping it is taken up,
+        // a staged build stays
+        let kept = Some(Staging::default());
+        for (guid, staged, staging) in [
+            ("b1", "STAGING", None),
+            ("b2", "STAGED", None),
+            ("b3", "STAGING", kept),
+        ] {
             state.builds.push(Build {
                 guid: guid.into(),
                 app: app.clone(),
@@ -2238,13 +2293,14 @@ mod tests {
                 lifecycle: Lifecycle::Docker,
                 error: None,
                 droplet: None,
+                staging,
                 created_at: now(),
                 updated_at: now(),
             });
         }
         state.fail_unfinished_builds();
         let states: Vec<&str> = state.builds.iter().map(|b| b.state.as_str()).collect();
-        assert_eq!(states, ["FAILED", "STAGED"]);
+        assert_eq!(states, ["FAILED", "STAGED", "STAGING"]);
         // its bindings go with it, another app's stay
         for (guid, bound) in [("b1", app.as_str()), ("b2", "other")] {
             state.bindings.push(Binding {
@@ -2259,6 +2315,36 @@ mod tests {
                 updated_at: now(),
             });
         }
+        // what jobs wait for at a start: an unbind under way and an app's delete after it
+        // stay, an app deleted already is done, an operation no longer under way is cut
+        let unbinding = Operation::new(OperationKind::Delete, None, None);
+        state.bindings[0].operation = Some(unbinding);
+        let waits = [
+            (APP_DELETE, vec!["b1", app.as_str()]),
+            (APP_DELETE, vec!["deleted"]),
+            (APP_DELETE, vec!["b2", app.as_str()]),
+            ("service_bindings.delete", vec!["b2"]),
+        ];
+        for (operation, waits) in waits {
+            let waits = waits.into_iter().map(String::from).collect();
+            state.add_waiting_job(operation, waits, None);
+        }
+        state.settle_unfinished_waits();
+        let settled: Vec<(&str, Vec<&str>, usize)> = (state.jobs.iter())
+            .map(|job| {
+                let waits = job.waits.iter().map(String::as_str).collect();
+                (job.state(), waits, job.errors.len())
+            })
+            .collect();
+        assert_eq!(
+            settled,
+            [
+                ("PROCESSING", vec!["b1", app.as_str()], 0),
+                ("COMPLETE", vec![], 0),
+                ("PROCESSING", vec![app.as_str()], 1),
+                ("FAILED", vec![], 1),
+            ]
+        );
         assert_eq!(
             state.remove_app(&app),
             vec![

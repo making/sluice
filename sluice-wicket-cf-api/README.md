@@ -391,7 +391,7 @@ cf restart hello                          # VCAP_SERVICES holds the broker's cre
 - **Bindings.** The credentials (an async one's fetched once it succeeds) are in `VCAP_SERVICES`
   under the offering's name, with the plan's and the offering's tags, from the app's next start,
   as any binding. A manifest's `services:` waits for its bindings, `cf delete` of an app for its
-  unbinds. `cf service --params` and the binding's parameters are the broker's, when its offering
+  unbinds, across a restart of the cf-api. `cf service --params` and the binding's parameters are the broker's, when its offering
   says they are retrievable
 - `cf delete-service` is refused while the instance is bound, `cf delete-service-broker` while
   the broker has instances; `cf purge-service-instance` drops an instance and its bindings
@@ -533,7 +533,11 @@ curl http://web.localhost:8080/
   env): the old VM stops (SIGTERM: the requests under way answered within `--stop-grace`, all
   written out), the new one boots on the disk: a boot long of no API
   ([measured](../.kb/wicket-cf-api-findings.md)), the CLI's login still good, the wicket's apps
-  served all along. A new image that does not start is refused (422), the old VM started again
+  served all along. A staging under way goes on (a build of source followed on, built again where
+  its wicket restarted too), as does an app's delete waiting for its unbinds; a CLI request in the
+  gap fails (the CLI tries again at once only), so a `cf push` gets through only when none of
+  its requests falls in it. A new image that does not start is refused (422), the old VM started
+  again
 - **the wicket's own upgrade**: `docker pull` its image, `docker stop wicket` (SIGTERM: it drains,
   then stops the VMs, the cf-api's all written out to its disk, within `--stop-timeout`: 40, above
   the drain's 20s and a disk's 20s), `docker rm wicket` and the same `docker run`: the apps and the

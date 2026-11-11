@@ -30,6 +30,12 @@
 //! build) and a tar of the zip's files, the wicket's read-only at `/` for it ([`pack_site`]):
 //! dot files (but `.well-known/`) and the manifest are left out, so a `.git`, a `.env` or the
 //! env of a `manifest.yml` never reaches the wicket.
+//!
+//! A build keeps what its staging is asked for, and the build of source its wicket runs, with
+//! how far its output was taken (`crate::store::Staging`): a stop of the cf-api cutting it
+//! short, the next start takes it up ([`run`]), staging again from the package (an image's
+//! manifest read again, its rootfs asked of the wicket, which keeps it by its digest) but a
+//! build of source, followed on, built again where its wicket knows it no more.
 
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
@@ -40,7 +46,9 @@ use sha2::{Digest, Sha256};
 use crate::controller::{Controller, no_maker};
 use crate::logs::{Logs, Stream};
 use crate::registry::Registry;
-use crate::store::{Blob, Built, DockerImage, Droplet, Files, Package, Spool, Store, guid, now};
+use crate::store::{
+    Blob, Building, Built, DockerImage, Droplet, Files, Package, Spool, Staging, Store, guid, now,
+};
 use crate::wicket::{BuildRequest, BuildView, Failure, LayerRef, Runtime, Wicket, stacks_named};
 
 /// A rootfs's file name ends so; a droplet's kind is its file's.
@@ -420,65 +428,35 @@ impl Takes {
     }
 }
 
-/// Stages the build `build` of `package` and records how it went: STAGED
-/// with its droplet, or FAILED naming why. A zip is staged by the buildpack detecting it, of
-/// those its app names ([`detect`], for the web process `command`); an image's component is pulled
-/// from its registry with the package's credentials, if any, or its rootfs made by a wicket.
-/// `base` is the API's URL, which a build of source is told (`VCAP_APPLICATION`).
-#[allow(clippy::too_many_arguments)]
+/// Stages the build `build` and records how it went: STAGED with its droplet, or FAILED naming
+/// why. What it stages is as the build keeps it ([`Staging`]): its package, the web process
+/// `command`, the API's URL `base`, which a build of source is told (`VCAP_APPLICATION`). A
+/// zip is staged by the buildpack detecting it, of those its app names ([`detect`]); an image's
+/// component is pulled from its registry with the package's credentials, if any, or its rootfs
+/// made by a wicket. Taken up after a restart of the cf-api, it stages again but a build of
+/// source a wicket runs, followed on from the line it got to, built again where that wicket
+/// knows it no more.
 pub async fn run(
     store: &Arc<Store>,
     logs: &Logs,
     registry: &Registry,
     controller: &Controller,
-    base: &str,
     build: &str,
-    package: &Package,
-    command: Option<&str>,
 ) {
-    let app = package.app.as_str();
-    let (pin, named) = store.read(|state| {
-        let app = state.app(app);
-        let named = app.map(|app| app.buildpacks.clone());
-        (app.and_then(|app| app.pin), named.unwrap_or_default())
-    });
-    let takes = Takes {
-        pin,
-        stacks: controller.stacks().await,
+    let Some((app, package, staging)) = store.read(|state| {
+        let kept = state.build(build)?;
+        let package = state
+            .package(&kept.package)
+            .cloned()
+            .ok_or(kept.package.clone());
+        Some((kept.app.clone(), package, kept.staging.clone()?))
+    }) else {
+        return;
     };
-    let (wasm, rootfs) = (takes.may(Runtime::Wasm), takes.may(Runtime::Firecracker));
-    let staged = match &package.docker {
-        _ if !wasm && !rootfs => Err(takes.nothing()),
-        None => match Buildpack::named(&named, controller.cnb.is_some()) {
-            Ok((detecting, ids)) => {
-                // told of those whose stack a wicket runs: one of another is refused, detected
-                let told: Vec<Buildpack> = detecting
-                    .iter()
-                    .copied()
-                    .filter(|buildpack| takes.may(buildpack.stack()))
-                    .collect();
-                if !told.is_empty() {
-                    let detects: Vec<_> = told.iter().map(|kept| kept.detects()).collect();
-                    let line = format!(
-                        "Staging with the buildpack{} {}: the web process command names the file, else {}",
-                        if told.len() == 1 { "" } else { "s" },
-                        names(&told),
-                        detects.join(", else ")
-                    );
-                    logs.add(app, "STG", line);
-                }
-                match unpack(store.clone(), &package.guid, command, detecting, takes).await {
-                    Ok(Unpacked::Staged(staged)) => Ok(*staged),
-                    Ok(Unpacked::Source(source)) => {
-                        let asked = Asked { ids, command };
-                        self::build(store, logs, controller, base, app, source, asked).await
-                    }
-                    Err(e) => Err(e),
-                }
-            }
-            Err(e) => Err(e),
-        },
-        Some(docker) => image(logs, registry, controller, app, docker, (wasm, rootfs)).await,
+    let app = app.as_str();
+    let staged = match &package {
+        Ok(package) => staged(store, logs, registry, controller, build, package, staging).await,
+        Err(_) => Err("the package is gone".into()),
     };
     let staged = staged.and_then(|staged| {
         if staged.bytes.is_empty() {
@@ -524,7 +502,7 @@ pub async fn run(
             let droplet = Droplet {
                 guid: guid(),
                 app: app.to_string(),
-                package: package.guid.clone(),
+                package: package.map_or_else(|guid| guid, |package| package.guid),
                 sha256: staged.sha256,
                 file: staged.entry,
                 staged_as: Some(staged.stack),
@@ -542,6 +520,7 @@ pub async fn run(
                 if let Some(staging) = state.builds.iter_mut().find(|kept| kept.guid == build) {
                     staging.state = "STAGED".into();
                     staging.droplet = Some(droplet.guid.clone());
+                    staging.staging = None;
                     staging.updated_at = at;
                 }
                 state.droplets.push(droplet);
@@ -554,11 +533,113 @@ pub async fn run(
                 if let Some(staging) = state.builds.iter_mut().find(|kept| kept.guid == build) {
                     staging.state = "FAILED".into();
                     staging.error = Some(format!("StagingError - {e}"));
+                    staging.staging = None;
                     staging.updated_at = at;
                 }
             });
         }
     }
+}
+
+/// What the build `build` of `package`, asked for as `staging` has it, staged: see [`run`].
+async fn staged(
+    store: &Arc<Store>,
+    logs: &Logs,
+    registry: &Registry,
+    controller: &Controller,
+    build: &str,
+    package: &Package,
+    staging: Staging,
+) -> Result<Staged, String> {
+    let app = package.app.as_str();
+    if let Some(building) = &staging.building {
+        if let Some(staged) = follow_on(store, logs, controller, build, app, building).await {
+            return staged;
+        }
+        store.update(|state| {
+            if let Some(staging) = state.staging_mut(build) {
+                staging.building = None;
+            }
+        });
+    }
+    let command = staging.command.as_deref();
+    let (pin, named) = store.read(|state| {
+        let app = state.app(app);
+        let named = app.map(|app| app.buildpacks.clone());
+        (app.and_then(|app| app.pin), named.unwrap_or_default())
+    });
+    let takes = Takes {
+        pin,
+        stacks: controller.stacks().await,
+    };
+    let (wasm, rootfs) = (takes.may(Runtime::Wasm), takes.may(Runtime::Firecracker));
+    match &package.docker {
+        _ if !wasm && !rootfs => Err(takes.nothing()),
+        None => {
+            let (detecting, ids) = Buildpack::named(&named, controller.cnb.is_some())?;
+            // told of those whose stack a wicket runs: one of another is refused, detected
+            let told: Vec<Buildpack> = detecting
+                .iter()
+                .copied()
+                .filter(|buildpack| takes.may(buildpack.stack()))
+                .collect();
+            if !told.is_empty() {
+                let detects: Vec<_> = told.iter().map(|kept| kept.detects()).collect();
+                let line = format!(
+                    "Staging with the buildpack{} {}: the web process command names the file, else {}",
+                    if told.len() == 1 { "" } else { "s" },
+                    names(&told),
+                    detects.join(", else ")
+                );
+                logs.add(app, "STG", line);
+            }
+            match unpack(store.clone(), &package.guid, command, detecting, takes).await? {
+                Unpacked::Staged(staged) => Ok(*staged),
+                Unpacked::Source(source) => {
+                    let asked = Asked { ids, command };
+                    let base = staging.base.as_str();
+                    self::build(store, logs, controller, base, (build, app), source, asked).await
+                }
+            }
+        }
+        Some(docker) => image(logs, registry, controller, app, docker, (wasm, rootfs)).await,
+    }
+}
+
+/// Follows on the build of source `building` of the build `build`, the app `app`'s, which a
+/// stop of the cf-api cut short: what it staged; None where it is to be built again (its wicket
+/// knows it no more, or is configured no more).
+async fn follow_on(
+    store: &Arc<Store>,
+    logs: &Logs,
+    controller: &Controller,
+    build: &str,
+    app: &str,
+    building: &Building,
+) -> Option<Result<Staged, String>> {
+    let Some(cnb) = &controller.cnb else {
+        return Some(Err("no builder is configured (--cnb-builder)".into()));
+    };
+    let named = |wicket: &&Arc<Wicket>| wicket.name == building.wicket;
+    let Some(wicket) = controller.wickets.iter().find(named) else {
+        let line = format!(
+            "The wicket {} building it is configured no more: built again",
+            building.wicket
+        );
+        logs.add(app, "STG", line);
+        return None;
+    };
+    let line = format!(
+        "Following the build on {} from the line {} of its output on",
+        wicket.label, building.after
+    );
+    logs.add(app, "STG", line);
+    let staged = built(store, logs, controller, cnb, (build, app), wicket, building).await;
+    if staged.is_none() {
+        let line = format!("{} knows the build no more: built again", wicket.sentence());
+        logs.add(app, "STG", line);
+    }
+    staged
 }
 
 /// Stages the zip of the package `guid`, its droplet made, on a blocking thread: a VM of one
@@ -701,7 +782,7 @@ async fn build(
     logs: &Logs,
     controller: &Controller,
     base: &str,
-    app: &str,
+    (build, app): (&str, &str),
     source: Source,
     asked: Asked<'_>,
 ) -> Result<Staged, String> {
@@ -774,22 +855,69 @@ async fn build(
         }
     );
     logs.add(app, "STG", line);
-    let built = follow(logs, wicket, app, &id).await;
-    let staged = match built {
-        Ok(built) => place(store, logs, controller, wicket, app, built, cnb).await,
-        Err(e) => Err(e),
+    let building = Building {
+        wicket: wicket.name.clone(),
+        id,
+        after: 0,
     };
-    // ended already: forgotten, its droplet the wicket's to keep as any upload
-    let _ = wicket.forget_build(&id).await;
-    staged
+    store.update(|state| {
+        if let Some(staging) = state.staging_mut(build) {
+            staging.building = Some(building.clone());
+        }
+    });
+    built(
+        store,
+        logs,
+        controller,
+        cnb,
+        (build, app),
+        wicket,
+        &building,
+    )
+    .await
+    .unwrap_or_else(|| {
+        Err(format!(
+            "the build is lost: {} knows it no more",
+            wicket.label
+        ))
+    })
 }
 
-/// Follows the build `id` on `wicket` to its end, its output the app `app`'s staging log:
-/// what it built, else its error.
-async fn follow(logs: &Logs, wicket: &Wicket, app: &str, id: &str) -> Result<BuildView, String> {
-    let (mut after, mut failed) = (0, 0);
+/// Follows the build of source `building` of the build `build`, the app `app`'s, on `wicket`
+/// to its end and stages what it built ([`place`]), the build forgotten then: None where the
+/// wicket knows it no more.
+async fn built(
+    store: &Arc<Store>,
+    logs: &Logs,
+    controller: &Controller,
+    cnb: &Cnb,
+    (build, app): (&str, &str),
+    wicket: &Wicket,
+    building: &Building,
+) -> Option<Result<Staged, String>> {
+    let staged = match follow(store, logs, wicket, (build, app), building).await {
+        Ok(view) => place(store, logs, controller, wicket, app, view, cnb).await,
+        Err(Some(e)) => Err(e),
+        Err(None) => return None,
+    };
+    // ended already: forgotten, its droplet the wicket's to keep as any upload
+    let _ = wicket.forget_build(&building.id).await;
+    Some(staged)
+}
+
+/// Follows the build of source `building` on `wicket` from its line `after` on to its end,
+/// its output the app `app`'s staging log, how far it got kept with the build `build`: what it
+/// built, else its error; `Err(None)` where the wicket knows it no more.
+async fn follow(
+    store: &Store,
+    logs: &Logs,
+    wicket: &Wicket,
+    (build, app): (&str, &str),
+    building: &Building,
+) -> Result<BuildView, Option<String>> {
+    let (mut after, mut failed) = (building.after, 0);
     loop {
-        let view = match wicket.follow_build(id, after).await {
+        let view = match wicket.follow_build(&building.id, after).await {
             Ok(view) => view,
             Err(Failure::Unreachable(e)) if failed < FOLLOW_TRIES => {
                 failed += 1;
@@ -800,10 +928,10 @@ async fn follow(logs: &Logs, wicket: &Wicket, app: &str, id: &str) -> Result<Bui
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                 continue;
             }
-            Err(e) => return Err(format!("the build is lost: {e}")),
+            Err(Failure::Refused { status: 404, .. }) => return Err(None),
+            Err(e) => return Err(Some(format!("the build is lost: {e}"))),
         };
         failed = 0;
-        after = view.next;
         for line in &view.lines {
             let stream = match line.stream.as_str() {
                 "stderr" => Stream::Err,
@@ -811,10 +939,24 @@ async fn follow(logs: &Logs, wicket: &Wicket, app: &str, id: &str) -> Result<Bui
             };
             logs.add_as(app, "STG", stream, line.line.as_str());
         }
+        if view.next != after {
+            after = view.next;
+            // written with the next change: lines taken twice at most after a crash
+            store.note(|state| {
+                let staging = state.staging_mut(build);
+                if let Some(building) = staging.and_then(|staging| staging.building.as_mut()) {
+                    building.after = after;
+                }
+            });
+        }
         match view.state.as_str() {
             "building" => {}
             "built" => return Ok(view),
-            _ => return Err(view.error.unwrap_or_else(|| "the build failed".into())),
+            _ => {
+                return Err(Some(
+                    view.error.unwrap_or_else(|| "the build failed".into()),
+                ));
+            }
         }
     }
 }
@@ -1685,5 +1827,254 @@ mod tests {
         let linked = linked.finish().unwrap().into_inner();
         let refused = pack_site(&mut archive(linked), &mut Vec::new(), 1 << 20).unwrap_err();
         assert!(refused.contains("'passwd' is a symbolic link"), "{refused}");
+    }
+
+    /// A Firecracker wicket's builds as staging uses them: any build but `lost` (one before a
+    /// restart of it) ended, with the lines `one` and `two` and the droplet [`LAYER`], whose
+    /// rootfs it makes ([`rootfs_sha`]); one it starts is `new`. What it was asked, counted.
+    #[derive(Default)]
+    struct Builder {
+        started: std::sync::atomic::AtomicUsize,
+        uploaded: std::sync::atomic::AtomicUsize,
+        forgotten: std::sync::Mutex<Vec<String>>,
+    }
+
+    const LAYER: &[u8] = b"what buildpacks built";
+
+    /// The digest of the rootfs the builder makes.
+    fn rootfs_sha() -> String {
+        "cd".repeat(32)
+    }
+
+    impl Builder {
+        /// Serves it on a port of its own: its URL.
+        async fn start() -> (Arc<Builder>, String) {
+            let builder = Arc::new(Builder::default());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let serving = builder.clone();
+            tokio::spawn(sluice_wicket_server::accept::run(
+                listener,
+                16,
+                "builder",
+                move |stream, _, slot| {
+                    let builder = serving.clone();
+                    tokio::spawn(sluice_wicket_server::http::serve(stream, slot, move |r| {
+                        builder.clone().answer(r)
+                    }));
+                },
+            ));
+            (builder, url)
+        }
+
+        async fn answer(
+            self: Arc<Self>,
+            request: hyper::Request<sluice_wicket_server::http::Body>,
+        ) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
+            use http_body_util::BodyExt as _;
+            use serde_json::json;
+            use std::sync::atomic::Ordering;
+            let (head, body) = request.into_parts();
+            body.collect().await.unwrap();
+            let path = head.uri.path().to_string();
+            let at = |key: &str| {
+                let query = head.uri.query().unwrap_or_default();
+                let value = query.strip_prefix(key).and_then(|at| at.strip_prefix('='));
+                value.map_or(0, |at| at.parse::<usize>().unwrap())
+            };
+            let run_image = format!("registry.test/run@sha256:{}", "ab".repeat(32));
+            let mut answer = hyper::Response::new(http_body_util::Full::default());
+            let segments: Vec<&str> = path.split('/').collect();
+            let answered = match (&head.method, &segments[..]) {
+                (&http::Method::PUT, ["", "api", "layers", _]) => {
+                    self.uploaded.fetch_add(1, Ordering::Relaxed);
+                    json!({})
+                }
+                (&http::Method::GET, ["", "api", "layers", _]) => {
+                    let bytes = LAYER.len().to_string();
+                    let headers = answer.headers_mut();
+                    headers.insert("sluice-layer-bytes", bytes.parse().unwrap());
+                    *answer.body_mut() = bytes::Bytes::from_static(&LAYER[at("at")..]).into();
+                    return answer;
+                }
+                (&http::Method::POST, ["", "api", "builds"]) => {
+                    self.started.fetch_add(1, Ordering::Relaxed);
+                    json!({"id": "new"})
+                }
+                (&http::Method::GET, ["", "api", "builds", "lost"]) => {
+                    *answer.status_mut() = http::StatusCode::NOT_FOUND;
+                    json!({"error": "no build lost"})
+                }
+                (&http::Method::GET, ["", "api", "builds", _]) => {
+                    let lines =
+                        ["one", "two"].map(|line| json!({"stream": "stdout", "line": line}));
+                    json!({
+                        "state": "built",
+                        "next": lines.len(),
+                        "lines": lines[at("after")..],
+                        "droplet": {"sha256": sha256(LAYER), "bytes": LAYER.len()},
+                        "run-image": run_image,
+                        "launch": {"processes": []},
+                    })
+                }
+                (&http::Method::DELETE, ["", "api", "builds", id]) => {
+                    self.forgotten.lock().unwrap().push(id.to_string());
+                    json!({})
+                }
+                (&http::Method::PUT, ["", "api", "images"]) => json!({
+                    "image": run_image,
+                    "name": "rootfs.ext4",
+                    "sha256": rootfs_sha(),
+                    "bytes": 4096,
+                }),
+                (method, path) => panic!("{method} {path:?}"),
+            };
+            *answer.body_mut() = answered.to_string().into();
+            answer
+        }
+    }
+
+    /// Builds a stop of the cf-api cut short, the state opened again, each end STAGED with the
+    /// droplet it would have staged: a zip staged again, a build of source a wicket runs followed
+    /// on from the line it got to, one the wicket knows no more built again.
+    #[tokio::test]
+    async fn a_staging_cut_short_is_taken_up() {
+        use std::sync::atomic::Ordering;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let dir = std::env::temp_dir().join(format!("cf-api-take-up-{}", guid()));
+        let (builder, url) = Builder::start().await;
+        let names = ["w".to_string(), "v".to_string()];
+        let runs = [
+            ("w".to_string(), Runtime::Firecracker),
+            ("v".to_string(), Runtime::Wasm),
+        ];
+        let open = || {
+            let localhost = ["localhost".to_string()];
+            Store::open(&dir, "o", "s", &localhost, &names, &runs.clone().into()).unwrap()
+        };
+        let building = |id: &str, after| crate::store::Building {
+            wicket: "w".into(),
+            id: id.into(),
+            after,
+        };
+        let source = zipped(&[("sample.app", b"an app")]);
+        let cut = [
+            ("zip", zipped(&[("hello.wasm", COMPONENT)]), None),
+            ("on", source.clone(), Some(building("known", 1))),
+            ("lost", source, Some(building("lost", 2))),
+        ];
+        let store = open();
+        let mut builds = Vec::new();
+        for (name, zip, building) in cut {
+            let package = guid();
+            let write = |file: &mut std::fs::File| file.write_all(&zip).map_err(|e| e.to_string());
+            store.make_package(&package, write).unwrap();
+            builds.push(store.update(|state| {
+                let space = state.spaces[0].guid.clone();
+                let app = state.create_app(name, &space).guid.clone();
+                state.packages.push(Package {
+                    guid: package.clone(),
+                    app: app.clone(),
+                    state: "READY".into(),
+                    sha256: None,
+                    docker: None,
+                    created_at: now(),
+                    updated_at: now(),
+                });
+                let build = crate::store::Build {
+                    guid: guid(),
+                    app: app.clone(),
+                    package,
+                    state: "STAGING".into(),
+                    lifecycle: Default::default(),
+                    error: None,
+                    droplet: None,
+                    staging: Some(Staging {
+                        base: "http://api.test".into(),
+                        command: None,
+                        building,
+                    }),
+                    created_at: now(),
+                    updated_at: now(),
+                };
+                state.builds.push(build.clone());
+                (build.guid, app)
+            }));
+        }
+        drop(store);
+
+        let store = Arc::new(open());
+        let logs = Logs::default();
+        let cnb = Cnb {
+            builder: "registry.test/builder:1".into(),
+            run_image: None,
+            credentials: None,
+            egress: Vec::new(),
+            memory_mib: Cnb::MEMORY_MIB,
+            disk_mib: Cnb::DISK_MIB,
+            vcpus: Cnb::VCPUS,
+            timeout: Cnb::TIMEOUT,
+        };
+        let controller = Controller::new(
+            store.clone(),
+            vec![
+                Arc::new(Wicket::new("w", 2, &url, None, crate::OWNER)),
+                Arc::new(Wicket::new(
+                    "v",
+                    2,
+                    "http://127.0.0.1:1",
+                    None,
+                    crate::OWNER,
+                )),
+            ],
+            Arc::new(Logs::default()),
+            std::time::Duration::ZERO,
+            Some(cnb),
+        );
+        let registry = Registry::new().unwrap();
+        let runs =
+            (builds.iter()).map(|(build, _)| run(&store, &logs, &registry, &controller, build));
+        futures_util::future::join_all(runs).await;
+
+        let staged: Vec<(String, String)> = store.read(|state| {
+            let staged = builds.iter().map(|(build, _)| {
+                let build = state.build(build).unwrap();
+                assert!(build.staging.is_none(), "{build:?}");
+                let droplet = build
+                    .droplet
+                    .as_ref()
+                    .and_then(|droplet| state.droplet(droplet));
+                let sha256 = droplet.map(|droplet| droplet.sha256.clone());
+                (build.state.clone(), sha256.unwrap_or_default())
+            });
+            staged.collect()
+        });
+        let built = ("STAGED".to_string(), rootfs_sha());
+        assert_eq!(
+            staged,
+            [("STAGED".into(), sha256(COMPONENT)), built.clone(), built]
+        );
+        assert_eq!(builder.started.load(Ordering::Relaxed), 1, "lost alone");
+        assert_eq!(builder.uploaded.load(Ordering::Relaxed), 1, "its source");
+        assert_eq!(*builder.forgotten.lock().unwrap(), ["known", "new"]);
+        let lines = |at: usize| {
+            let lines = logs.read(&builds[at].1, 0, None, 100, false);
+            lines.into_iter().map(|line| line.text).collect::<Vec<_>>()
+        };
+        let on = lines(1);
+        let following = "Following the build on the wicket w from the line 1 of its output on";
+        assert!(
+            on.iter().any(|line| line == following)
+                && on.iter().any(|line| line == "two")
+                && !on.iter().any(|line| line == "one"),
+            "{on:?}"
+        );
+        let lost = lines(2);
+        let again = "The wicket w knows the build no more: built again";
+        assert!(
+            lost.iter().any(|line| line == again) && lost.iter().any(|line| line == "one"),
+            "{lost:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

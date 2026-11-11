@@ -1805,7 +1805,7 @@ impl Api {
             }
             let mut waits = brokered.clone();
             waits.push(guid.to_string());
-            let job = state.add_waiting_job("app.delete", waits, None);
+            let job = state.add_waiting_job(crate::store::APP_DELETE, waits, None);
             for binding in &brokered {
                 let binding = state.binding_mut(binding).expect("listed above");
                 binding.operation = Some(crate::store::Operation::new(
@@ -1818,15 +1818,22 @@ impl Api {
         })?;
         let Some((job, unbound)) = job else {
             self.controller.remove(guid, &app.name).await;
-            return self.job(req, "app.delete", Vec::new(), None);
+            return self.job(req, crate::store::APP_DELETE, Vec::new(), None);
         };
         self.operations.kick();
+        self.delete_once_unbound(&job, guid, &app.name, unbound);
+        Ok(self.located(req, &job))
+    }
+
+    /// Deletes the app `guid` named `name` once the bindings `unbound` its delete's job `job`
+    /// waits for are unbound, settling the job; the app left if one is not.
+    fn delete_once_unbound(&self, job: &str, guid: &str, name: &str, unbound: Vec<String>) {
         let (operations, controller, store) = (
             self.operations.clone(),
             self.controller.clone(),
             self.store.clone(),
         );
-        let (guid, located) = (guid.to_string(), job.clone());
+        let (job, guid, name) = (job.to_string(), guid.to_string(), name.to_string());
         tokio::spawn(async move {
             operations
                 .until(|state| {
@@ -1838,11 +1845,52 @@ impl Api {
             let unbound =
                 store.read(|state| state.job(&job).is_some_and(|job| job.errors.is_empty()));
             if unbound {
-                controller.remove(&guid, &app.name).await;
+                controller.remove(&guid, &name).await;
             }
             store.update(|state| state.settle(&job, &guid, None));
         });
-        Ok(self.located(req, &located))
+    }
+
+    /// Takes up what a stop of the cf-api cut short (kept as `Store::open` left it): the
+    /// stagings under way, and each app's delete once its bindings are unbound.
+    pub fn take_up(&self) {
+        let (builds, deletes) = self.store.read(|state| {
+            let builds: Vec<(String, String)> = (state.builds.iter())
+                .filter(|build| build.state == "STAGING" && build.staging.is_some())
+                .map(|build| (build.guid.clone(), build.app.clone()))
+                .collect();
+            let deletes: Vec<(String, String, String, Vec<String>)> = (state.jobs.iter())
+                .filter(|job| job.operation == crate::store::APP_DELETE)
+                .filter_map(|job| {
+                    let app = job.waits.iter().find_map(|wait| state.app(wait))?;
+                    let unbound = job.waits.iter().filter(|wait| **wait != app.guid);
+                    let unbound = unbound.cloned().collect();
+                    Some((
+                        job.guid.clone(),
+                        app.guid.clone(),
+                        app.name.clone(),
+                        unbound,
+                    ))
+                })
+                .collect();
+            (builds, deletes)
+        });
+        for (build, app) in builds {
+            let line = "Staging taken up after a restart of the cf-api: its lines before are gone";
+            self.logs.add(&app, "STG", line);
+            let (store, logs, registry, controller) = (
+                self.store.clone(),
+                self.logs.clone(),
+                self.registry.clone(),
+                self.controller.clone(),
+            );
+            tokio::spawn(async move {
+                staging::run(&store, &logs, &registry, &controller, &build).await;
+            });
+        }
+        for (job, guid, name, unbound) in deletes {
+            self.delete_once_unbound(&job, &guid, &name, unbound);
+        }
     }
 
     /// The command and the health checks, a check refused when the app as annotated would not take
@@ -2211,6 +2259,11 @@ impl Api {
             lifecycle,
             error: None,
             droplet: None,
+            staging: Some(crate::store::Staging {
+                base: req.base.clone(),
+                command: app.process.command.clone(),
+                building: None,
+            }),
             created_at: at.clone(),
             updated_at: at,
         };
@@ -2232,21 +2285,8 @@ impl Api {
                 self.registry.clone(),
                 self.controller.clone(),
             );
-            let (guid, command) = (guid.clone(), app.process.command.clone());
-            let base = req.base.clone();
-            async move {
-                staging::run(
-                    &store,
-                    &logs,
-                    &registry,
-                    &controller,
-                    &base,
-                    &guid,
-                    &package,
-                    command.as_deref(),
-                )
-                .await;
-            }
+            let guid = guid.clone();
+            async move { staging::run(&store, &logs, &registry, &controller, &guid).await }
         });
         // past the wait, or at a stop, the staging goes on: the CLI polls the build
         tokio::select! {

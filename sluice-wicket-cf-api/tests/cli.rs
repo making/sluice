@@ -20,7 +20,7 @@
 //! both --, a service broker
 //! (a stub) -- who registers it, who sees its plans, its operations at once and polled
 //! across a restart of the cf-api, failed, its bindings' credentials, a manifest's and an
-//! app's delete waiting for it, its catalog fetched again --,
+//! app's delete waiting for it, across a restart of the cf-api too, its catalog fetched again --,
 //! delete. And against a Firecracker wicket, where `/dev/kvm` is usable: a
 //! private image made into a rootfs by the wicket, its process's user, files and
 //! environment seen from the VM, its connections through the security groups, a scale keeping
@@ -2243,8 +2243,20 @@ fn the_cf_cli_deploys_to_the_wicket() {
         "{shown}"
     );
 
+    // relay's delete waits for its unbind, which the broker has polled: a restart of the cf-api
+    // meanwhile takes it up
+    let relay = cf.ok(&["app", "relay", "--guid"]).trim().to_string();
+    broker.hold(true);
+    cf.ok(&["curl", "-X", "DELETE", &format!("/v3/apps/{relay}")]);
+    drop(api);
+    let (api, _) = with_rules(&two_wickets, &["email=*@example.com", "groups=devs"]);
+    broker.hold(false);
+    eventually("relay deleted after the restart", || {
+        !cf.ok(&["apps"]).contains("relay")
+    });
+
     // gone from the wickets; their instances stay, unbound
-    for app in ["hello", "counter", "relay", "img", "site"] {
+    for app in ["hello", "counter", "img", "site"] {
         cf.ok(&["delete", app, "-r", "-f"]);
     }
     for (console, listen) in [(&console, &listen), (&console_b, &listen_b)] {
