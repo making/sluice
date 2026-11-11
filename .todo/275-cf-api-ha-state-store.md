@@ -3,6 +3,7 @@ Difficulty: High
 # sluice-wicket-cf-api: the state in a store several instances share
 
 First of 275-284 (several cf-api instances, updated one at a time). The others need this one.
+285-287 are what one instance gains without it, done first.
 
 ## What holds it to one instance
 
@@ -55,8 +56,7 @@ with no new flag, dependency or service (no PostgreSQL, bucket or flume), and re
 gate of each item; what an item adds for several instances is tested beside it, not in its
 place.
 
-Here: the file backend stays one process, and says so: a `flock` on the directory refuses a
-second one (nothing does today). Whether it keeps `state.json` as one document or takes the
+Here: the file backend stays one process, refusing a second (287). Whether it keeps `state.json` as one document or takes the
 records' layout, a state of today is read.
 
 ## Tests

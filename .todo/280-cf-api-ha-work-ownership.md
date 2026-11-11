@@ -2,7 +2,9 @@ Difficulty: High
 
 # sluice-wicket-cf-api: builds, broker operations and jobs outliving their instance
 
-Needs 275, 276, 278. Part of 275-284.
+Needs 275, 276, 278, 286. Part of 275-284. 286 makes a build and a job go on from what the
+state keeps, at a start of one instance; this gives that to another instance while the first
+is gone.
 
 ## What holds it to one instance
 

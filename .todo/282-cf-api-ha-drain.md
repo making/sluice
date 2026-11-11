@@ -2,7 +2,9 @@ Difficulty: Medium
 
 # sluice-wicket-cf-api: an instance stops without a request lost, and says when it is ready
 
-Needs 278, 280. Part of 275-284.
+Needs 278, 280, 285. Part of 275-284. 285 is the stop of one instance (the requests under way
+finished, `/healthz`); this is what several add: steps 2 and 4 below, and who takes an
+instance out of the routing.
 
 ## What holds it to one instance
 
