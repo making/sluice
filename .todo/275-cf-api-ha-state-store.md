@@ -47,6 +47,18 @@ caller, the ones that return `Vec<Blob>` to delete or spawn inside included).
   the fails move to 276 and 280, `follow_wickets` / `follow_domains` to 283
 - a `state.json` is imported once (`--state` given, the store empty, the file there)
 
+## One instance stays as it is
+
+The rule of every item of 275-284: at its end, one instance on the file backend works as today
+with no new flag, dependency or service (no PostgreSQL, bucket or flume), and reads the
+`--data-dir` the release before wrote. `tests/cli.rs` as it is, on the file backend, is the
+gate of each item; what an item adds for several instances is tested beside it, not in its
+place.
+
+Here: the file backend stays one process, and says so: a `flock` on the directory refuses a
+second one (nothing does today). Whether it keeps `state.json` as one document or takes the
+records' layout, a state of today is read.
+
 ## Tests
 
 The store's own tests run against both backends (PostgreSQL as a child process or a container,

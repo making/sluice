@@ -43,6 +43,12 @@ Needs 275. Part of 275-284; 279, 280, 281 and 282 build on its lease.
 - a takeover is a start to the wickets: `held-ms` and `MAX_PAUSE` hold only if the lease's
   expiry plus a listing stays below `HELD` (15s). Bound the lease by it
 
+## One instance (275's rule)
+
+On the file backend the lease is the directory's `flock`: this process leads from its start,
+with no wait for an expiry. It sends no epoch, or one a wicket predating the fencing ignores:
+a new cf-api on an old wicket and an old one on a new wicket both work.
+
 ## Tests
 
 `controller::tests` with two controllers on one store and the mock wicket: one leads, the other

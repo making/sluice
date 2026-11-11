@@ -42,6 +42,11 @@ own flags:
 - `GET /v3/info` names the instance's build (it does); the instances table is what an operator
   reads for the update's progress
 
+## One instance (275's rule)
+
+On the file backend the flags are the topology, as today: a restart with other `--wicket`s or
+`--domain`s follows them at once, with no admin call.
+
 ## Tests
 
 Store tests: a row written by a "newer" shape survives an update by an older one; a start on a

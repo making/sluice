@@ -39,6 +39,11 @@ Recommended: 1, as it keeps what the CLI shows; 2 only for what already applies 
 - a request an instance cannot forward (no leader within a bound) is answered 503 with
   `Retry-After`; the CLI retries a 503? Check v8.19.0, else hold the request for a takeover
 
+## One instance (275's rule)
+
+The leader is the instance itself: an edit is tried and committed in the process as today, no
+hop, no address of its own to configure.
+
 ## Tests
 
 The API tests with two `Api`s on one store: an edit through the follower refused by the mock

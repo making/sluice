@@ -41,6 +41,12 @@ Simpler alternative to weigh: all of it on the leader (one lease, 278), the hand
 writing the row. A build then runs away from the instance holding the upload, which 276 allows;
 a takeover is the leader's. Fewer leases, but a leader's stop interrupts every build at once.
 
+## One instance (275's rule)
+
+On the file backend a start still means all work of the run before is ownerless (the `flock`
+says so): it is taken up or failed at once, with no wait for a lease to expire. A build that
+cannot go on fails with today's message.
+
 ## Tests
 
 `staging` / `operations` tests with two instances on one store and the mock wicket / broker
