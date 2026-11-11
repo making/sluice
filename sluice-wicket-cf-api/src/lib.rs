@@ -40,6 +40,7 @@ pub mod roles;
 pub mod security_groups;
 pub mod services;
 pub mod staging;
+pub mod stop;
 pub mod store;
 mod tls;
 pub mod uaa;
@@ -131,6 +132,8 @@ pub struct Settings {
     pub service_broker_editors: security_groups::Editors,
     /// The listener's own TLS; None: plain HTTP.
     pub tls: Option<TlsSettings>,
+    /// How long a stop waits for the requests and the puts under way.
+    pub stop_grace: std::time::Duration,
 }
 
 /// A wicket the apps are placed on.
@@ -242,7 +245,8 @@ fn tls_acceptor(tls: &TlsSettings) -> Result<tokio_rustls::TlsAcceptor, String> 
 }
 
 /// Serves the API on `listener` until `shutdown` completes, the wickets
-/// reconciled all along.
+/// reconciled all along; then stops ([`stop`]): the listener closed, the requests and the puts
+/// under way finished within `--stop-grace`, the state written.
 pub async fn serve(
     listener: TcpListener,
     settings: Settings,
@@ -316,17 +320,36 @@ pub async fn serve(
     });
     // the deployments a stop left under way
     controller.resume();
+    let stop = controller.stop.clone();
     let watch = tokio::spawn(controller.watch());
     tokio::select! {
         () = api::run(listener, acceptor, api) => {}
         () = shutdown => {}
     }
+    // the listener closed
+    stop.begin();
+    let (connections, requests, puts) = stop.under_way();
+    println!(
+        "API: stopping: no new connection; {connections} connection(s), {requests} request(s) \
+         and {puts} put(s) under way, given {}s",
+        settings.stop_grace.as_secs_f32()
+    );
+    if tokio::time::timeout(settings.stop_grace, stop.drained())
+        .await
+        .is_err()
+    {
+        let (connections, requests, puts) = stop.under_way();
+        println!(
+            "API: stopped past --stop-grace: {connections} connection(s), {requests} request(s) \
+             and {puts} put(s) cut"
+        );
+    }
     watch.abort();
     if let Some(flume) = flume {
         flume.abort();
-        // the watch's cursor as it got
-        store.update(|_| ());
     }
+    // what was noted, the flume watch's cursor as it got
+    store.update(|_| ());
     Ok(())
 }
 
@@ -377,6 +400,7 @@ mod tests {
             security_group_editors: security_groups::Editors::default(),
             service_broker_editors: security_groups::Editors::default(),
             tls,
+            stop_grace: std::time::Duration::from_secs(8),
         }
     }
 
@@ -489,6 +513,128 @@ mod tests {
         let mut status = [0; 8];
         admitted.read_exact(&mut status).await.unwrap();
         assert_eq!(&status, b"HTTP/1.1");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A wicket answering its first listing (the start's) at once, the next once `opened` is
+    /// true, and one after a revision never: its URL.
+    async fn held_wicket(opened: tokio::sync::watch::Receiver<bool>) -> String {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let listed = Arc::new(AtomicUsize::new(0));
+        let serving = move |stream, _, slot| {
+            let (opened, listed) = (opened.clone(), listed.clone());
+            tokio::spawn(sluice_wicket_server::http::serve(stream, slot, move |r| {
+                let (mut opened, listed) = (opened.clone(), listed.clone());
+                async move {
+                    if hyper::Request::uri(&r).query().is_some() {
+                        std::future::pending::<()>().await;
+                    }
+                    if listed.fetch_add(1, Ordering::Relaxed) > 0 {
+                        opened.wait_for(|opened| *opened).await.unwrap();
+                    }
+                    let listing = br#"{"revision": 0, "generation": 0, "apps": []}"#;
+                    hyper::Response::new(http_body_util::Full::new(bytes::Bytes::from_static(
+                        listing,
+                    )))
+                }
+            }));
+        };
+        tokio::spawn(sluice_wicket_server::accept::run(
+            listener, 16, "wicket", serving,
+        ));
+        url
+    }
+
+    /// The answer next on `client`, its head and body.
+    async fn answer(client: &mut TcpStream) -> String {
+        let mut read = Vec::new();
+        let end = loop {
+            if let Some(at) = read.windows(4).position(|window| window == b"\r\n\r\n") {
+                break at + 4;
+            }
+            assert_ne!(client.read_buf(&mut read).await.unwrap(), 0, "cut short");
+        };
+        let head = String::from_utf8_lossy(&read[..end]).to_lowercase();
+        let length: usize = (head.lines())
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .map_or(0, |length| length.parse().unwrap());
+        while read.len() < end + length {
+            assert_ne!(client.read_buf(&mut read).await.unwrap(), 0, "cut short");
+        }
+        String::from_utf8_lossy(&read).into_owned()
+    }
+
+    /// `/healthz` says ready once the wickets were listed. A stop closes the listener and an
+    /// idle connection at once, answers a request under way whole, closing its connection, and
+    /// ends once past `--stop-grace` with one still under way.
+    #[tokio::test]
+    async fn a_stop_answers_the_requests_under_way() {
+        let dir = std::env::temp_dir().join(format!("cf-api-stop-{}", store::guid()));
+        let (open, opened) = tokio::sync::watch::channel(false);
+        let mut settings = settings(dir.clone(), None);
+        settings.wickets[0].url = held_wicket(opened).await;
+        settings.stop_grace = std::time::Duration::from_secs(1);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(serve(listener, settings, async {
+            let _ = stopped.await;
+        }));
+
+        let mut idle = TcpStream::connect(address).await.unwrap();
+        let mut healthz = async || {
+            let probe = "GET /healthz HTTP/1.1\r\nhost: t\r\n\r\n";
+            idle.write_all(probe.as_bytes()).await.unwrap();
+            answer(&mut idle).await
+        };
+        let answered = healthz().await;
+        assert!(answered.starts_with("HTTP/1.1 503 "), "{answered}");
+        assert!(
+            answered.ends_with("\r\n\r\nnot ready: not listed yet: the wicket\n"),
+            "{answered}"
+        );
+        open.send_replace(true);
+        let started = Instant::now();
+        while !healthz().await.ends_with("\r\n\r\nready\n") {
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+
+        // each in its handler, reading its body
+        let sending = async || {
+            let mut client = TcpStream::connect(address).await.unwrap();
+            let head = "POST /v3/x HTTP/1.1\r\nhost: t\r\nexpect: 100-continue\r\n\
+                        content-length: 5\r\n\r\n";
+            client.write_all(head.as_bytes()).await.unwrap();
+            let mut continued = [0; 25];
+            client.read_exact(&mut continued).await.unwrap();
+            client.write_all(b"ab").await.unwrap();
+            client
+        };
+        let mut under_way = sending().await;
+        let _cut = sending().await;
+        let started = Instant::now();
+        stop.send(()).unwrap();
+
+        assert_eq!(idle.read(&mut [0; 1]).await.unwrap(), 0);
+        while TcpStream::connect(address).await.is_ok() {
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+            tokio::task::yield_now().await;
+        }
+        under_way.write_all(b"cde").await.unwrap();
+        let mut answered = String::new();
+        under_way.read_to_string(&mut answered).await.unwrap();
+        assert!(answered.starts_with("HTTP/1.1 401 "), "{answered}");
+        assert!(answered.contains("\r\nconnection: close\r\n"), "{answered}");
+
+        served.await.unwrap().unwrap();
+        let stopped = started.elapsed();
+        assert!(
+            (1000..2000).contains(&stopped.as_millis()),
+            "stopped after {stopped:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

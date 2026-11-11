@@ -6,11 +6,14 @@
 //! All the listener's slots taken, a connection gives way ([`Slot::asked`])
 //! unless its request was admitted ([`Body::admit`]): a request of no one known
 //! holds nothing against someone else's, however it keeps moving.
+//!
+//! A listener stopping ([`serve_until`]) has each connection answer the request
+//! under way and close behind it, an idle one at once.
 
 use std::convert::Infallible;
 use std::future::Future;
 use std::io;
-use std::pin::Pin;
+use std::pin::{Pin, pin};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll, ready};
@@ -106,6 +109,8 @@ impl hyper::body::Body for Body {
 pub struct Writing {
     claim: Claim,
     body_ended: AtomicBool,
+    /// A request was handed to the handler, its answer not all written yet.
+    answering: AtomicBool,
 }
 
 impl Writing {
@@ -113,6 +118,7 @@ impl Writing {
         Arc::new(Writing {
             claim,
             body_ended: AtomicBool::new(false),
+            answering: AtomicBool::new(false),
         })
     }
 
@@ -127,6 +133,7 @@ impl Writing {
     /// The stream took all it was given: an ended answer's connection yields.
     fn flushed(&self) {
         if self.body_ended.swap(false, Ordering::Relaxed) {
+            self.answering.store(false, Ordering::Relaxed);
             self.claim.yields();
         }
     }
@@ -266,6 +273,21 @@ where
     B: hyper::body::Body + 'static,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
+    serve_until(io, slot, handler, std::future::pending()).await
+}
+
+/// As [`serve`], and once `stop` is ready, a listener's stop: a connection with no request
+/// handed to `handler` closes at once, one with a request goes on until its answer is written,
+/// saying `connection: close`, and then closes; no next request is read.
+pub async fn serve_until<I, H, F, B, S>(io: I, slot: Slot, handler: H, stop: S)
+where
+    I: AsyncRead + AsyncWrite + Unpin,
+    H: Fn(hyper::Request<Body>) -> F,
+    F: Future<Output = hyper::Response<B>>,
+    B: hyper::body::Body + 'static,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+    S: Future<Output = ()>,
+{
     let claim = slot.claim();
     claim.yields();
     let writing = Writing::new(claim.clone());
@@ -273,6 +295,7 @@ where
     let service = hyper::service::service_fn(|request: hyper::Request<Incoming>| {
         // no longer the one that waited longest
         claim.yields();
+        writing.answering.store(true, Ordering::Relaxed);
         let answer = handler(request.map(|incoming| Body {
             incoming,
             wait: Wait::default(),
@@ -281,14 +304,27 @@ where
         let writing = writing.clone();
         async move { Ok::<_, Infallible>(answer.await.map(|body| writing.answer(body))) }
     });
-    let connection = hyper::server::conn::http1::Builder::new()
-        .timer(TokioTimer::new())
-        .header_read_timeout(QUIET)
-        .serve_connection(TokioIo::new(io), service);
-    tokio::select! {
-        // a client leaving, or left behind, is no news
-        _ = connection => {}
-        () = slot.asked() => {}
+    let mut connection = pin!(
+        hyper::server::conn::http1::Builder::new()
+            .timer(TokioTimer::new())
+            .header_read_timeout(QUIET)
+            .serve_connection(TokioIo::new(io), service)
+    );
+    let mut stop = pin!(stop);
+    let mut stopping = false;
+    loop {
+        tokio::select! {
+            // a client leaving, or left behind, is no news
+            _ = connection.as_mut() => return,
+            () = slot.asked() => return,
+            () = stop.as_mut(), if !stopping => {
+                if !writing.answering.load(Ordering::Relaxed) {
+                    return;
+                }
+                stopping = true;
+                connection.as_mut().graceful_shutdown();
+            }
+        }
     }
 }
 

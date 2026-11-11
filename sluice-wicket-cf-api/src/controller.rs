@@ -80,6 +80,7 @@ use crate::logs::Logs;
 use crate::placement::{Budget, Evacuated, Move};
 use crate::services::Offer;
 use crate::staging::Cnb;
+use crate::stop::Stop;
 use crate::store::{
     App, Built, HealthCheck, Lifetime, Outcome, Purge, ReadinessCheck, Removal, State, Store,
 };
@@ -191,6 +192,10 @@ pub struct Controller {
     pub cnb: Option<Cnb>,
     /// The wickets whose last listing failed, by name.
     down: Mutex<BTreeSet<String>>,
+    /// The wickets whose watch's first listing came back, answered or not, by name.
+    listed_once: Mutex<BTreeSet<String>>,
+    /// The cf-api's stop: what it waits for of the puts, and whether one may begin.
+    pub stop: Stop,
     /// The apps whose indices a wicket's stack, newly listed, placed again: their shares are
     /// to apply ([`Controller::apply_placed`]).
     placed_again: Mutex<BTreeSet<String>>,
@@ -213,6 +218,8 @@ impl Controller {
             away_grace,
             cnb,
             down: Mutex::default(),
+            listed_once: Mutex::default(),
+            stop: Stop::default(),
             held: Mutex::default(),
             shares: Mutex::default(),
             did_not_start: Mutex::default(),
@@ -717,6 +724,7 @@ impl Controller {
                 "the data of service instance {} on {} ({}/{})",
                 purge.instance, wicket.label, purge.store, purge.namespace
             );
+            let _put = self.stop.put().await;
             let deleted = match wicket.purge(&purge.store, &purge.namespace).await {
                 Ok(keys) => {
                     println!("SERVICES: deleted {named}: {keys} key(s)");
@@ -763,6 +771,7 @@ impl Controller {
         });
         for guid in pending {
             let label = &wicket.label;
+            let _put = self.stop.put().await;
             match wicket.delete(&guid).await {
                 Ok(_) => println!("[{guid}] CELL: removed from {label}: the app was deleted"),
                 Err(e) if e.retried() => {
@@ -780,13 +789,14 @@ impl Controller {
 
     /// Puts the app `guid`'s share `desired` on `wicket` (or removes the app from it) and records
     /// the outcome: what the process stats and the log show. The share is the caller's to hold
-    /// ([`Controller::hold_share`]).
+    /// ([`Controller::hold_share`]). During a stop, only a request's begins ([`Stop::put`]).
     pub async fn apply(
         &self,
         wicket: &Wicket,
         guid: &str,
         desired: Option<&AppBody>,
     ) -> Result<(), Failure> {
+        let _put = self.stop.put().await;
         let share = (wicket.name.clone(), guid.to_string());
         let Some(app) = desired else {
             (self.did_not_start.lock().expect("no panic under the lock")).remove(&share);
@@ -1294,6 +1304,7 @@ impl Controller {
                 Ok(listing) => listing,
                 Err(e) => {
                     self.unreachable(&wicket, &e);
+                    self.came_back(&wicket);
                     away = true;
                     steady = None;
                     let since = *unanswered.get_or_insert_with(Instant::now);
@@ -1322,6 +1333,7 @@ impl Controller {
                 );
             }
             let another = self.note(&wicket, &listing);
+            self.came_back(&wicket);
             self.apply_placed();
             let moved = another || after != Some(listing.revision);
             after = Some(listing.revision);
@@ -1765,6 +1777,31 @@ impl Controller {
         );
         for guid in guids {
             self.record(wicket, &guid, Outcome::Unreachable, &line);
+        }
+    }
+
+    /// A listing of `wicket` came back, answered (and noted) or not.
+    fn came_back(&self, wicket: &Wicket) {
+        let mut listed = self.listed_once.lock().expect("no panic under the lock");
+        if !listed.contains(&wicket.name) {
+            listed.insert(wicket.name.clone());
+        }
+    }
+
+    /// Whether the API is ready: every wicket listed once (or found not answering), the state
+    /// read before; not from the stop on. Err with why not.
+    pub fn ready(&self) -> Result<(), String> {
+        if self.stop.stopping() {
+            return Err("the cf-api stops".into());
+        }
+        let listed = self.listed_once.lock().expect("no panic under the lock");
+        let unlisted: Vec<&str> = (self.wickets.iter())
+            .filter(|wicket| !listed.contains(&wicket.name))
+            .map(|wicket| wicket.label.as_str())
+            .collect();
+        match unlisted.is_empty() {
+            true => Ok(()),
+            false => Err(format!("not listed yet: {}", unlisted.join(", "))),
         }
     }
 

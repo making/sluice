@@ -12,6 +12,15 @@ The cf-api in a VM of the wicket, on its disk (its README,
 - its VM killed: the API back in 782ms, an app answering throughout (16 of 16 requests), its state
   there
 
+## A stop
+
+The release binary on the host (`--wicket` unreachable), SIGTERM to its exit: idle, 11-13ms. A
+package upload under way (12 MB at 4 MB/s, SIGTERM 1s in): answered 200 at 3.0s, the process gone
+2.05s after the signal; a new connection refused meanwhile. With `--stop-grace 1` and the upload at
+1 MB/s: gone after 1.02s, the upload cut (`stopped past --stop-grace: 1 connection(s), 1
+request(s) and 0 put(s) cut`). So an upgrade's gap is the 0.7-0.8s boot above plus what the
+requests under way take, `--stop-grace` (8s) at most; not measured again in a VM.
+
 ## A start that never listens
 
 An app's process living and not listening takes its start `boot-ms` (the health check's timeout, 60s

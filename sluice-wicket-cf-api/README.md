@@ -530,9 +530,10 @@ curl http://web.localhost:8080/
   size takes its push. **`disk-mib`**: an image's droplet is a reference, a zip's is kept as a file
   for each app (that one, the one before, and its package, with the upload while it comes)
 - **an upgrade**: `PUT /api/images` of the new image, then this app with its `sha256` (or another
-  env): the old VM stops (SIGTERM, all written out), the new one boots on the disk: a boot long of
-  no API ([measured](../.kb/wicket-cf-api-findings.md)), the CLI's login still good, the wicket's
-  apps served all along. A new image that does not start is refused (422), the old VM started again
+  env): the old VM stops (SIGTERM: the requests under way answered within `--stop-grace`, all
+  written out), the new one boots on the disk: a boot long of no API
+  ([measured](../.kb/wicket-cf-api-findings.md)), the CLI's login still good, the wicket's apps
+  served all along. A new image that does not start is refused (422), the old VM started again
 - **the wicket's own upgrade**: `docker pull` its image, `docker stop wicket` (SIGTERM: it drains,
   then stops the VMs, the cf-api's all written out to its disk, within `--stop-timeout`: 40, above
   the drain's 20s and a disk's 20s), `docker rm wicket` and the same `docker run`: the apps and the
@@ -1098,6 +1099,7 @@ docker compose up -d --force-recreate --wait wicket-b
 | `--service-broker-editor <claim>=<pattern>` | who may register, update and delete the [service brokers](#service-brokers) and set who sees their plans, nobody without it: as `--security-group-editor` |
 | `--service-broker-editor-client <id>` | a client of `--client-credentials` who may too; repeatable |
 | `--tls-cert <path>` / `--tls-key <path>` | serve TLS: the certificate chain and its private key, PEM. Without them, behind a TLS proxy, `X-Forwarded-Proto: https` makes the links `https` |
+| `--stop-grace <secs>` | how long a stop (SIGTERM, SIGINT, stdin's end) waits for the requests and the wickets' puts under way, the listener closed ([Behavior](#behavior); default 8: within the 10s a Firecracker wicket gives a VM's process) |
 | `--exit-on-stdin-close` | exit when stdin reaches its end (a parent's child process) |
 
 Each option also reads `SLUICE_WICKET_CF_API_<NAME>` from the environment; another variable of that
@@ -1390,8 +1392,15 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
   log names the flume on start (`flume none` without one), and the hosts each watch opened for
   (`cf logs: watching the flume <url> for <hosts>`): a request whose `Host` is none of them is in
   no app's log. See [Live access log](../.kb/live-access-log.md#wickets-and-the-cf-api)
-- auth: see [Login](#login). Every request but the root document, `/v3`, `/v3/info` and the
-  UAA endpoints needs a valid token (log-cache's included), and its holder may what its
+- a stop (SIGTERM, SIGINT, stdin's end with `--exit-on-stdin-close`): the listener closes, an idle
+  connection too; a request under way is answered, saying `connection: close`, a build's waiting
+  for its staging at once (`STAGING`, the CLI polling it); the puts to the wickets under way
+  finish, and no other begins (what it was for is taken up at the next start); then the state is
+  written. Past `--stop-grace` (8s) what is left is cut, as by a kill
+- `GET /healthz`, no token: 200 once every wicket was listed (or found not answering) since the
+  start, 503 saying why not before, and from a stop on: a probe's, logged by no line
+- auth: see [Login](#login). Every request but the root document, `/v3`, `/v3/info`, `/healthz`
+  and the UAA endpoints needs a valid token (log-cache's included), and its holder may what its
   [roles](#organizations-spaces-and-roles) say
 - errors are in CC's shape (`{"errors": [{"code", "title", "detail"}]}`); `/v3/info` names
   this API

@@ -102,6 +102,10 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
                               a client of --client-credentials who may too; repeatable
   --tls-cert <path>           serve TLS: the certificate chain, PEM
   --tls-key <path>            and its private key, PEM
+  --stop-grace <secs>         how long a stop (SIGTERM, SIGINT, stdin's end) waits for the
+                              requests and the wickets' puts under way, the listener closed
+                              (default 8: within a Firecracker wicket's 10s to a VM's
+                              process)
   --exit-on-stdin-close       exit when stdin reaches its end (a parent's child process)
   --version                   print the build (version, commit, build time) and exit
 
@@ -166,6 +170,7 @@ const VALUED: &[&str] = &[
     "service-broker-editor-client",
     "tls-cert",
     "tls-key",
+    "stop-grace",
 ];
 
 /// The switches read from the environment too.
@@ -273,6 +278,13 @@ pub fn parse(
             format!("--wicket-away-grace: a number of seconds (0 = never), not '{seconds}'")
         })?,
         None => DEFAULT_WICKET_AWAY_GRACE,
+    };
+    let stop_grace = match value("stop-grace") {
+        Some(seconds) => seconds
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| format!("--stop-grace: a number of seconds, not '{seconds}'"))?,
+        None => DEFAULT_STOP_GRACE,
     };
     let cnb_egress: Vec<String> = values("cnb-egress")
         .iter()
@@ -535,6 +547,7 @@ pub fn parse(
             security_group_editors,
             service_broker_editors,
             tls,
+            stop_grace: std::time::Duration::from_secs(stop_grace),
         },
     })))
 }
@@ -545,6 +558,10 @@ pub const ONE_WICKET: &str = "wicket";
 /// Default of `--wicket-away-grace`, in seconds: a wicket restarting, its apps' VMs booting,
 /// is back well within it.
 const DEFAULT_WICKET_AWAY_GRACE: u64 = 30;
+
+/// Default of `--stop-grace`, in seconds: below the 10s a Firecracker wicket gives a VM's
+/// process after SIGTERM, the state written in what is left.
+const DEFAULT_STOP_GRACE: u64 = 8;
 
 /// The wickets `--wicket` names, each `<name>=<url>` (or comma-separated), or one `<url>`, named
 /// [`ONE_WICKET`]: distinct names of distinct consoles.
@@ -657,6 +674,7 @@ mod tests {
             config.settings.wicket_away_grace,
             std::time::Duration::from_secs(30)
         );
+        assert_eq!(config.settings.stop_grace.as_secs(), 8);
         assert_eq!(config.settings.domains, ["c.example"]);
         assert_eq!(config.settings.data_dir, PathBuf::from("cf-api"));
         assert_eq!(config.settings.org, "sluice");
@@ -726,7 +744,7 @@ mod tests {
         let config = serve(parse(
             args(
                 "--wicket http://w:1 --any-credentials --domain x.io --domain y.io,Z.io. \
-                 --wicket-away-grace 0 --cnb-builder r.io/builder:1 --cnb-builder-username u \
+                 --wicket-away-grace 0 --stop-grace 30 --cnb-builder r.io/builder:1 --cnb-builder-username u \
                  --cnb-builder-password p --cnb-run-image r.io/run-tiny:1 \
                  --cnb-egress a.io:443,b.io:443 --cnb-egress c.io:80 \
                  --cnb-memory-mib 4096 --cnb-timeout 1800",
@@ -735,6 +753,7 @@ mod tests {
         ));
         assert_eq!(config.settings.domains, ["x.io", "y.io", "z.io"]);
         assert!(config.settings.wicket_away_grace.is_zero());
+        assert_eq!(config.settings.stop_grace.as_secs(), 30);
         // the builder of source, its builds' egress; its credentials its registry's alone
         let cnb = config.settings.cnb.unwrap();
         assert_eq!(cnb.builder, "r.io/builder:1");
@@ -848,6 +867,10 @@ mod tests {
         assert!(
             error("--wicket http://w:1 --wicket-away-grace 30s")
                 .contains("--wicket-away-grace: a number of seconds")
+        );
+        assert!(
+            error("--wicket http://w:1 --stop-grace 8s")
+                .contains("--stop-grace: a number of seconds, not '8s'")
         );
         assert!(error("--wicket http://w:1 --colour").contains("--colour"));
         assert!(error("--wicket").contains("needs a value"));

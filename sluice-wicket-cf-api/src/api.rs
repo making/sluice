@@ -1,8 +1,8 @@
 //! The HTTP server: the subset of the Cloud Controller v3 API the cf CLI
 //! uses, the UAA endpoints (`/uaa`) and log-cache's read API (`/api/v1`) on
 //! one origin, in CC's shapes (an error is `{"errors": [{"code", "title",
-//! "detail"}]}`). Every request but the root document, `/v3/info` and the
-//! UAA endpoints needs a token of [`Uaa`]; with a [`Provider`], the browser
+//! "detail"}]}`). Every request but the root document, `/v3/info`, `/healthz` and
+//! the UAA endpoints needs a token of [`Uaa`]; with a [`Provider`], the browser
 //! pages `/uaa/passcode` and `/uaa/callback` of `cf login --sso`.
 //!
 //! Routes and `instances` apply at once: an edit a wicket refuses is
@@ -254,12 +254,14 @@ impl Req {
 }
 
 /// Serves the API on `listener` for good, [`MAX_CONNECTIONS`] at once; with
-/// `tls`, each connection's handshake first.
+/// `tls`, each connection's handshake first. Each connection, and each request's handler, is
+/// one a stop waits for ([`crate::stop::Stop`]); dropped, the listener closes.
 pub async fn run(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, api: Arc<Api>) {
     accept::run(listener, MAX_CONNECTIONS, "--listen", |stream, _, slot| {
         let api = api.clone();
         let tls = tls.clone();
-        tokio::spawn(async move {
+        let stop = api.controller.stop.clone();
+        tokio::spawn(stop.connection(async move {
             let Some(acceptor) = tls else {
                 return serve_connection(stream, slot, api).await;
             };
@@ -269,13 +271,14 @@ pub async fn run(listener: TcpListener, tls: Option<tokio_rustls::TlsAcceptor>, 
             let handshake = tokio::select! {
                 handshake = handshake => handshake,
                 () = slot.asked() => return,
+                () = api.controller.stop.stopped() => return,
             };
             match handshake {
                 Ok(Ok(stream)) => serve_connection(stream, slot, api).await,
                 Ok(Err(e)) => eprintln!("tls handshake failed: {e}"),
                 Err(e) => eprintln!("tls handshake failed: {e}"),
             }
-        });
+        }));
     })
     .await
 }
@@ -284,16 +287,18 @@ async fn serve_connection<S>(stream: S, slot: Slot, api: Arc<Api>)
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
-    connection::serve(stream, slot, |request| {
+    let stopped = api.controller.stop.stopped();
+    let handler = |request| {
         let api = api.clone();
         async move {
             // in a task of its own: an edit goes on when its client gives up (a start may take
             // the health check's whole timeout), the state and the wicket's answer kept
-            let handled = tokio::spawn(async move { api.handle(request).await }).await;
-            handled.unwrap_or_else(|e| ApiError::internal(&e).into())
+            let stop = api.controller.stop.clone();
+            let handled = tokio::spawn(stop.request(async move { api.handle(request).await }));
+            (handled.await).unwrap_or_else(|e| ApiError::internal(&e).into())
         }
-    })
-    .await
+    };
+    connection::serve_until(stream, slot, handler, stopped).await
 }
 
 impl Api {
@@ -365,6 +370,10 @@ impl Api {
             Ok(response) => response,
             Err(error) => error.into(),
         };
+        // a probe's, every few seconds
+        if req.path == "/healthz" {
+            return response;
+        }
         println!(
             "{} {} {}{}",
             response.status().as_u16(),
@@ -383,6 +392,7 @@ impl Api {
         match (&req.method, segments.as_slice()) {
             (&Method::GET, []) => Ok(json(StatusCode::OK, &views::root(base))),
             (&Method::GET, ["v3"]) => Ok(json(StatusCode::OK, &views::v3(base))),
+            (&Method::GET, ["healthz"]) => Ok(self.health()),
             (&Method::GET, ["v3", "info"]) => {
                 let stacks = self.controller.stacks().await;
                 Ok(json(
@@ -539,6 +549,24 @@ impl Api {
                 }
             }
         }
+    }
+
+    /// `GET /healthz`: 200 once the controller is ready ([`Controller::ready`]), 503 saying why
+    /// not before, and from the stop on.
+    fn health(&self) -> Response {
+        let (status, body) = match self.controller.ready() {
+            Ok(()) => (StatusCode::OK, "ready\n".to_string()),
+            Err(why) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("not ready: {why}\n"),
+            ),
+        };
+        hyper::Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(Full::new(Bytes::from(body)))
+            .expect("a valid answer")
     }
 
     fn authenticate(&self, req: &Req) -> Result<(), ApiError> {
@@ -2220,8 +2248,11 @@ impl Api {
                 .await;
             }
         });
-        // past the wait, the staging goes on: the CLI polls the build
-        let _ = tokio::time::timeout(STAGING_WAIT, staging).await;
+        // past the wait, or at a stop, the staging goes on: the CLI polls the build
+        tokio::select! {
+            _ = tokio::time::timeout(STAGING_WAIT, staging) => {}
+            () = self.controller.stop.stopped() => {}
+        }
         self.store
             .read(|state| {
                 state

@@ -11,6 +11,8 @@ publish = false
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "sync", "io-std", "io-util", "signal", "fs"] }
 hyper = { version = "1", features = ["server", "http1"] }
+# a stop's wait for the connections, the requests and the puts under way
+tokio-util = { version = "0.7", features = ["rt"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"

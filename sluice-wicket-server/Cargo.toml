@@ -9,7 +9,7 @@ publish = false
 [workspace]
 
 [dependencies]
-tokio = { version = "1", features = ["rt", "net", "sync", "time", "io-util"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "sync", "time", "io-util"] }
 hyper = { version = "1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 # TCP keepalive on a connection whose peer may vanish; all: the probes' interval and count
