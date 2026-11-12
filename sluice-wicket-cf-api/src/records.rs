@@ -1,5 +1,5 @@
 //! The state as records: a row per organization, space, app, route, package, build, ... and one
-//! per thing kept whole (the removals, the purges, the flume's cursor, the wickets' ids, the
+//! per thing kept whole (the removals, the purges, the wickets' ids, the
 //! keyvalue homes, the wickets' stacks, the blobs' sweeps), so a change writes what it changed and another process
 //! takes what changed (`crate::postgres`).
 //!
@@ -191,7 +191,6 @@ macro_rules! singles {
 singles!(
     "removals": removals,
     "purges": purges,
-    "flume": flume,
     "wicket_ids": wicket_ids,
     "homes": homes,
     "wicket_stacks": wickets.runtimes,
@@ -359,7 +358,7 @@ impl Diff<'_> {
     }
 
     /// What is kept whole is small: told from what was written by its body, so a change aside
-    /// from a transaction (`Store::note`: the flume's cursor, what a wicket listed it runs) is
+    /// from a transaction (`Store::note`: what a wicket listed it runs) is
     /// written with the next.
     fn single<T: Serialize>(&mut self, id: &'static str, value: &T) {
         let body = serde_json::to_string(value).expect("a state's value is JSON");

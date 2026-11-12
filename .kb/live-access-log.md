@@ -73,6 +73,12 @@ counter); a view shows them in that order, which is per node the node's order, a
 nodes the order they reached the flume. The time column is the node's clock, shown with its date in the browser's time zone (the
 zone on hover).
 
+Each line also carries the time the flume took it (`WatchRecord.time_unix_nanos`): unique and
+ascending with the sequence, the same for every watcher, so watchers keeping the lines (the
+cf-api's instances) hold them at one timestamp. A watch that resumes after no line begins with
+the newest lines (`--backfill`), or with `WatchRequest.oldest` with every line of the ring: what
+the others watching hold.
+
 The SSE event id is the flume's position (`<epoch>-<seq>`). A browser reconnecting sends
 it as `Last-Event-ID` and resumes right after it from the flume's ring -- on any node, as
 the position is the flume's -- without repeating a line. Pause closes the stream and resume
@@ -83,6 +89,8 @@ view over with the note that the flume restarted.
 
 ```
 wicket ──Feed (as a node)──> sluice-flume <──Watch── sluice-wicket-cf-api <──log-cache read── cf logs
+                                  ^                        |
+                                  +──Feed (its own lines)──+
 ```
 
 A wicket (`sluice-wicket-runtime-wasi --flume URL --flume-token TOKEN`) feeds as a node does -- the
@@ -157,21 +165,37 @@ the log of the app holding its host, which `cf logs` shows as Cloud Foundry does
   maps it: the share's `k`th instance its `k`th index, those past it the remainder's. A node no
   wicket listed (one predating it, or not listed yet) is taken as the one wicket holding the
   app's indices, else as one wicket's.
-- The watch resumes past its cursor (kept in `state.json`) when the hosts change or the
-  stream drops. Without a host it holds no watch: an empty filter passes every line.
+- The cf-api's own lines (`STG`, `API`, `CELL`) go round the flume too: each instance feeds as
+  the node `cf-api:<id>` (the id made in its `--data-dir`, `flume-node`) the kind `cf-log` with
+  the route key `cf-api:logs` (fields `app`, `source`, `stream`, `line`, and `run` / `n`, which
+  tell an instance its own line came round), and watches that route key with its apps' hosts.
+  Every instance holds every instance's lines, at the flume's time, in the flume's order: a
+  reader walks on from one instance to another by `start_time`. A reader walking a staging's
+  log on an instance not reconciling the wickets is fed too (`cf-walk`: `app`, `start`), for the
+  one staging to wait for it ([A build's last lines](wicket-cf-api-findings.md#a-builds-last-lines)).
+  With a flume away the cf-api's own lines reach no log until it is back (the tap's ring of 512,
+  then gaps); they are on its stdout. Any other watcher sees these lines as a node's: the
+  flume's export sends them on unless `--otlp-kinds` leaves `cf-log` and `cf-walk` out.
+- The watch begins with the oldest lines the flume has at hand (`oldest`), so an instance
+  starting holds what the others do, within the flume's ring (`--ring-size`), and resumes past
+  the last line it took, kept in memory, when the hosts change or the stream drops.
 - Its startup line names the flume (`flume none` without `--flume`); a watch opened for
   other hosts than the last one said, or after a failure was reported (`cf logs: the watch
   of the flume ... ended`), logs `cf logs: watching the flume <url> for <hosts>`. The hosts
   are matched exactly: a line whose route key is none of them reaches no app.
-- Lines lost become an `LGR` ERR line in the log of every app watched, as they may be any
-  app's: `Up to N lines missed` when the watch fell behind, a flume restart. A wicket's drops
-  go to the apps it holds indices of (`the wicket b's queue to the flume was full`), every
-  app's of a node no wicket listed. A node's drops are never an app's lines and are left out.
-- The lines are kept in memory, 1000 per app, stamped when they reach the cf-api: the
-  order `cf logs` streams them in. While the cf-api watches, the nodes and the wicket keep
-  feeding, and `cf logs --recent` shows what arrived since.
-- After a flume restart the wicket sends again the lines of its ring the new flume lacks,
-  so an app's log may repeat some.
+- Lines lost become an `LGR` ERR line in the log of every app, as they may be any
+  app's: `Up to N lines missed` when the watch fell behind or an instance's queue was full, a
+  flume restart. A wicket's drops go to the apps it holds indices of (`the wicket b's queue to
+  the flume was full`), every app's of a node no wicket listed. A node's drops are never an
+  app's lines and are left out. An `LGR` line is of the watch that lost them, placed right after
+  the last line it took: the instances may differ in them.
+- The lines are kept in memory, 1000 per app, stamped with the flume's time (the cf-api's own
+  clock for a flume predating it): the order `cf logs` streams them in. While the cf-api
+  watches, the nodes and the wicket keep feeding, and `cf logs --recent` shows what arrived
+  since. The lines of an app the state has no more go a minute after the last.
+- After a flume restart a node sends again the lines of its ring the new flume lacks: the
+  cf-api takes none it took of the run before (a node's line not past the last taken of it, by
+  `node_seq` and time).
 
 ## OTLP export
 

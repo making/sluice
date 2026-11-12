@@ -3725,7 +3725,7 @@ pub(crate) mod tests {
             let followed = lines(&other);
             let following = "Following the build on the wicket a from the line 1 of its output on";
             let taken = "Staging taken up where a restart of the cf-api, or the instance staging \
-                         it, left it: its lines before are gone";
+                         it, left it";
             assert!(
                 [taken, following, "two"]
                     .map(String::from)

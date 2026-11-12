@@ -63,3 +63,11 @@ a broker's operation and an app's delete in the next leader's turn, against the 
 broker, the first killed or paused. The CLI test's kill during a CNB build is the same takeover
 with the real wicket; what the unit test cannot show is `cf push` reading the staging log across
 it (281).
+
+## From 281
+
+- `flume::tests::the_instances_on_a_flume_hold_one_log` runs two instances' logs on one flume in
+  process; what is left for the CLI test: `cf push` reading the staging log through the instance
+  that did not stage, and across a takeover (the lines before it are in the next leader's log)
+- each instance needs a `--data-dir` of its own for its flume node id (`flume-node`): an
+  `emptyDir` makes a new node per pod, which the flume lists as disconnected until its restart

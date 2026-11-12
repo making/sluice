@@ -229,8 +229,32 @@ Decided against the alternatives:
 - an app's delete is due once none of its job's waits is an operation under way, not when "each
   binding it listed was unbound": a binding gone another way (its instance purged) no longer
   leaves the job waiting until a restart
-- no line of a staging is carried over: the log of the instance that staged it first holds them
-  (281)
+- no line of a staging is carried over by the store: with a flume every instance holds them
+  ([The logs of several instances](#the-logs-of-several-instances))
+
+## The logs of several instances
+
+The flume is the bus of the cf-api's own lines too
+([Live access log](live-access-log.md#wickets-and-the-cf-api)). Decided against the alternatives:
+
+- the own lines as rows of the store: a table growing by every staging line, a second source to
+  merge with the flume's in one order. The flume already orders the apps' lines for every watcher
+- the flume's time as a line's timestamp, not each instance's clock or counter: the CLI walks by
+  `start_time`, so two instances must name a line by one number. An `LGR` line is the watch's
+  own, placed one nanosecond after the last line taken: a flume line can only collide with it by
+  being taken within that nanosecond
+- no cursor in the store: an instance starting watches from the oldest line at hand
+  (`WatchRequest.oldest`), and holds what the others do within the flume's ring (10000 lines,
+  64 MiB by default; 1000 per app kept)
+- with `--flume` one instance's own lines go round the flume as several instances' do: one path.
+  The cost is a flume away: the own lines wait in the tap (512) where before they were in the
+  ring at once
+- a staging's end waits for its own last line to come round (`run`, `n`) before it looks at the
+  readers, 5s at most as before
+- the reader of a staging's log is told through the flume too (`cf-walk`), by an instance not
+  reconciling the wickets while the app has a build `STAGING`: 4 lines a second per `cf push`
+  for the time of the staging, none otherwise. Against a call to the leader's `--instance-url`:
+  nothing is told between instances but through the store and the flume
 
 ## A stop
 
@@ -373,7 +397,8 @@ failed: ...` among them, never reach `cf push`'s output (`cf logs --recent` has 
 pruning is the client's: no read carries an `end_time`, each starts after the last line printed
 (`start_time`, go-log-cache v2.0.7 `walk.go`). So the cf-api records a build's end once the
 reader walking its log reads from past its last line (5s at most), 1s for one to start, no
-wait without one. Seen on an arm64 Lima VM before the success waited too: a cached build of the
+wait without one. The reader may read from another instance: that one feeds the read to the
+flume ([The logs of several instances](#the-logs-of-several-instances)). Seen on an arm64 Lima VM before the success waited too: a cached build of the
 test's sample buildpack ended within 2s of its first lines, and `cf push` showed none of them.
 
 ## The demo's GIF

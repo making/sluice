@@ -95,6 +95,11 @@ message WatchRequest {
   AccessFilter filter = 1;
   // Resume after this line; absent = begin with the newest lines at hand.
   optional Cursor after = 2;
+  // A watch that resumes after no line (no cursor, or one of another run)
+  // begins with every line at hand passing the filter, oldest first, in place
+  // of the newest: what a watcher keeping the lines needs to hold what the
+  // others watching do.
+  bool oldest = 3;
 }
 
 // A position in the flume's stream of lines; `epoch` names the flume's run.
@@ -125,6 +130,10 @@ message WatchRecord {
   uint64 seq = 1;
   string node_id = 2;
   AccessEvent event = 3;
+  // When the flume took the line, in nanoseconds since the epoch: unique and
+  // ascending with `seq`, the same for every watcher. 0 from a flume
+  // predating it.
+  uint64 time_unix_nanos = 4;
 }
 
 // Lines that did not reach the watcher.

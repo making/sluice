@@ -477,7 +477,7 @@ pub async fn run(
     };
     if taken {
         let line = "Staging taken up where a restart of the cf-api, or the instance staging it, \
-                    left it: its lines before are gone";
+                    left it";
         logs.add(&app, "STG", line);
     }
     while !staged_once(store, logs, registry, controller, build).await {}

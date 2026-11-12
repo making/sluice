@@ -21,6 +21,8 @@ pub const MAX_FILTER_ENTRIES: usize = 1024;
 #[derive(Debug)]
 pub struct Line {
     pub seq: u64,
+    /// When it was taken, in nanoseconds since the epoch: unique and ascending with `seq`.
+    pub time_unix_nanos: u64,
     pub node_id: String,
     pub body: LineBody,
 }
@@ -78,6 +80,8 @@ pub struct Hub {
 #[derive(Default)]
 struct State {
     seq: u64,
+    /// The last line's `time_unix_nanos`.
+    time: u64,
     ring: VecDeque<Arc<Line>>,
     /// The bytes of `ring`'s lines, by [`line_bytes`].
     retained: usize,
@@ -284,8 +288,14 @@ impl Hub {
 
     fn append(&self, state: &mut State, node_id: &str, body: LineBody) {
         state.seq += 1;
+        // a clock standing still or set back: the next nanosecond
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos() as u64);
+        state.time = now.max(state.time + 1);
         let line = Arc::new(Line {
             seq: state.seq,
+            time_unix_nanos: state.time,
             node_id: node_id.to_string(),
             body,
         });
@@ -307,11 +317,14 @@ impl Hub {
 
     /// Opens a watch: the events to send first (hello, node states, backfill),
     /// the live receiver continuing right after them, the sequence the
-    /// snapshot reached, and the guard keeping the watcher registered.
+    /// snapshot reached, and the guard keeping the watcher registered. The
+    /// backfill of a watch resuming after no line of this run: the newest
+    /// lines, or with `oldest` every line of the ring.
     pub fn watch(
         self: &Arc<Self>,
         filter: AccessFilter,
         after: Option<Cursor>,
+        oldest: bool,
     ) -> Result<Watch, String> {
         Self::check(&filter)?;
         let mut state = self.state();
@@ -325,6 +338,11 @@ impl Hub {
         first.extend(Self::node_states(&state));
         match resume {
             Some(cursor) => first.extend(Self::since(&state, &filter, cursor.seq)),
+            None if oldest => first.extend(
+                (state.ring.iter())
+                    .filter(|line| passes(&filter, line))
+                    .map(|line| record(line)),
+            ),
             None => {
                 let mut newest: Vec<WatchEvent> = state
                     .ring
@@ -568,6 +586,7 @@ pub fn record(line: &Line) -> WatchEvent {
             seq: line.seq,
             node_id: line.node_id.clone(),
             event: Some(access.clone()),
+            time_unix_nanos: line.time_unix_nanos,
         })),
         LineBody::Dropped(count) => event(watch_event::Body::Gap(WatchGap {
             seq: line.seq,
@@ -648,8 +667,8 @@ mod tests {
             route_keys: keys(count),
             ..Default::default()
         };
-        assert!(hub.watch(at(MAX_FILTER_ENTRIES), None).is_ok());
-        assert!(hub.watch(at(MAX_FILTER_ENTRIES + 1), None).is_err());
+        assert!(hub.watch(at(MAX_FILTER_ENTRIES), None, false).is_ok());
+        assert!(hub.watch(at(MAX_FILTER_ENTRIES + 1), None, false).is_err());
     }
 
     #[test]
@@ -657,7 +676,7 @@ mod tests {
         let hub = Arc::new(Hub::new(10, 1 << 20, 10));
         let (_node, mut control) = hub.connect("n1", "boot");
         let watch = hub
-            .watch(filter(&["r1"], &[]), None)
+            .watch(filter(&["r1"], &[]), None, false)
             .expect("a small filter is accepted");
         assert_eq!(started(&mut control).route_keys, vec!["r1".to_string()]);
         drop(watch);

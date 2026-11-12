@@ -13,35 +13,50 @@
 //! wicket --Feed--> sluice-flume <--Watch-- cf-api --log-cache read API--> cf logs
 //! ```
 //!
-//! The watch resumes past the last line it took (the cursor, kept with the
-//! state) when the apps' hosts change or the stream drops. The lines lost on
-//! the way -- dropped by the wicket, passed while the watch fell behind, or
-//! gone with a restart of the flume -- become a line saying so (`LGR`) in
-//! every app's log, as they may be any app's; those a wicket dropped, in the
-//! logs of the apps it holds indices of. Without a host there is no
-//! watch: the flume passes every line to an empty filter.
+//! The cf-api's own lines (`crate::logs`) go round the flume too, fed as the
+//! node `cf-api:<id>` (the id made in `--data-dir`, [`NODE_FILE`]): every
+//! instance watching takes every instance's, at the time the flume took them,
+//! so their logs are one.
+//!
+//! A watch begins with the oldest lines the flume has at hand: an instance
+//! starting holds what the others do, within the flume's ring. It resumes
+//! past the last line it took when the apps' hosts change or the stream
+//! drops. The lines lost on the way -- dropped by a wicket or an instance,
+//! passed while the watch fell behind, or gone with a restart of the flume --
+//! become a line saying so (`LGR`) in every app's log, as they may be any
+//! app's; those a wicket dropped, in the logs of the apps it holds indices
+//! of. These are each watch's own: they may differ between instances.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::convert::Infallible;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use sluice_wicket_tunnel::flume::Tap;
 use tonic::transport::Endpoint;
 
-use crate::logs::{Logs, Stream};
+use crate::logs::{FED_LINE, FED_WALK, FEED_ROUTE, Logs, Stream};
 use crate::proto::flume_client::FlumeClient;
 use crate::proto::{AccessEvent, AccessFilter, Cursor, WatchRequest, watch_event, watch_gap};
-use crate::store::{FlumeCursor, State, Store, rfc3339};
+use crate::store::{State, Store, rfc3339};
 use crate::tls;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// The kinds of the wicket's lines the apps' logs show.
-const KINDS: [&str; 3] = ["response", "stderr", "stdout"];
+/// The kinds of the lines the apps' logs show: the wickets', the instances'.
+const KINDS: [&str; 5] = ["response", "stderr", "stdout", FED_LINE, FED_WALK];
 
 /// How the wickets are named among the flume's nodes (`wicket:<client-id>`):
 /// the lines a sluice node drops are never the apps'.
 const WICKET_NODE: &str = "wicket:";
+
+/// How the cf-api's instances are named among them (`cf-api:<id>`).
+const API_NODE: &str = "cf-api:";
+
+/// The file of `--data-dir` holding the instance's id among the flume's nodes, made at its
+/// first start: another directory is another node.
+pub const NODE_FILE: &str = "flume-node";
 
 const MIN_BACKOFF: Duration = Duration::from_secs(1);
 
@@ -52,9 +67,6 @@ const WARN_EVERY: Duration = Duration::from_secs(300);
 
 /// Bound on one connect attempt.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How often a cursor moved is written with the state.
-const KEEP_EVERY: Duration = Duration::from_secs(5);
 
 /// The flume the apps' logs come from (`--flume`).
 #[derive(Clone, Debug)]
@@ -69,16 +81,56 @@ pub struct FlumeSettings {
     pub insecure: bool,
 }
 
-/// Watches the flume for good: one watch at a time while an app has a host,
-/// redialed with a backoff whenever its stream ends.
-pub async fn watch(flume: FlumeSettings, store: Arc<Store>, logs: Arc<Logs>) {
+/// The logs of an instance on the flume, and the tasks keeping them: the feed of its own
+/// lines as the node `cf-api:<id>`, the id that of the data directory `dir`, and the watch.
+pub fn start(
+    flume: FlumeSettings,
+    dir: &Path,
+    store: Arc<Store>,
+) -> Result<(Arc<Logs>, [tokio::task::JoinHandle<()>; 2]), String> {
+    let node = node(dir)?;
+    let tap = Tap::new();
+    let logs = Arc::new(Logs::feeding(tap.clone()));
+    println!("cf logs: feeding the flume {} as {node}", flume.url);
+    let to = sluice_wicket_tunnel::flume::FlumeSettings {
+        url: flume.url.clone(),
+        token: flume.token.clone(),
+        ca_cert: None,
+        insecure: flume.insecure,
+    };
+    let feeding = sluice_wicket_tunnel::flume::feed(to, flume.ca_pem.clone(), tap, node);
+    let watching = watch(flume, store, logs.clone());
+    Ok((logs, [tokio::spawn(feeding), tokio::spawn(watching)]))
+}
+
+/// This instance's node among the flume's: `cf-api:` and the id [`NODE_FILE`] of `dir` holds,
+/// made when it has none.
+fn node(dir: &Path) -> Result<String, String> {
+    let file = dir.join(NODE_FILE);
+    let failed = |e: std::io::Error| format!("{}: {e}", file.display());
+    let id = match std::fs::read_to_string(&file) {
+        Ok(id) if !id.trim().is_empty() => id.trim().to_string(),
+        Ok(_) | Err(_) => {
+            let id = uuid::Uuid::new_v4().simple().to_string();
+            std::fs::create_dir_all(dir).map_err(failed)?;
+            std::fs::write(&file, format!("{id}\n")).map_err(failed)?;
+            id
+        }
+    };
+    Ok(format!("{API_NODE}{id}"))
+}
+
+/// Watches the flume for good: one watch at a time, redialed with a backoff
+/// whenever its stream ends.
+async fn watch(flume: FlumeSettings, store: Arc<Store>, logs: Arc<Logs>) {
     let mut backoff = MIN_BACKOFF;
     let mut warned: Option<Instant> = None;
     let mut suppressed = 0u64;
     let mut announced = None;
+    let mut position = Position::default();
     loop {
         let began = Instant::now();
-        let Err(e) = session(&flume, &store, &logs, &mut announced).await;
+        let Err(e) = session(&flume, &store, &logs, &mut position, &mut announced).await;
         if warned.is_none_or(|at| at.elapsed() >= WARN_EVERY) {
             let more = match suppressed {
                 0 => String::new(),
@@ -104,46 +156,39 @@ pub async fn watch(flume: FlumeSettings, store: Arc<Store>, logs: Arc<Logs>) {
     }
 }
 
-/// Watches until the stream ends: opened once an app has a host, opened
-/// again past the cursor whenever the hosts change. A watch opened for hosts
-/// other than those `announced` last is said, with the hosts: a line of a
-/// host none of them is in no app's log.
+/// Watches until the stream ends: opened again past the last line taken
+/// whenever the apps' hosts change. A watch opened for hosts other than those
+/// `announced` last is said, with the hosts: a line of a host none of them is
+/// in no app's log.
 async fn session(
     flume: &FlumeSettings,
     store: &Store,
     logs: &Logs,
+    position: &mut Position,
     announced: &mut Option<Vec<String>>,
 ) -> Result<Infallible, BoxError> {
-    let mut client = None;
+    let mut client = FlumeClient::new(endpoint(flume)?.connect().await?);
     let mut changes = store.changes();
     loop {
         let hosts = store.read(apps_by_host);
-        if hosts.is_empty() {
-            let _ = changes.changed().await;
-            continue;
-        }
-        let client = match &mut client {
-            Some(client) => client,
-            None => client.insert(FlumeClient::new(endpoint(flume)?.connect().await?)),
-        };
-        let after = store.read(|state| state.flume);
+        let watched: Vec<String> = hosts.keys().cloned().collect();
+        let mut route_keys = watched.clone();
+        route_keys.push(FEED_ROUTE.to_string());
         let mut request = tonic::Request::new(WatchRequest {
             filter: Some(AccessFilter {
-                route_keys: hosts.keys().cloned().collect(),
+                route_keys,
                 kinds: KINDS.iter().map(|kind| kind.to_string()).collect(),
                 node_ids: Vec::new(),
             }),
-            after: after.map(|cursor| Cursor {
-                epoch: cursor.epoch,
-                seq: cursor.seq,
-            }),
+            after: position.cursor,
+            // what the other instances hold
+            oldest: true,
         });
         request
             .metadata_mut()
             .insert("authorization", format!("Bearer {}", flume.token).parse()?);
         let mut events = client.watch(request).await?.into_inner();
-        let watched: Vec<String> = hosts.keys().cloned().collect();
-        if announced.as_ref() != Some(&watched) {
+        if !watched.is_empty() && announced.as_ref() != Some(&watched) {
             println!(
                 "cf logs: watching the flume {} for {}",
                 flume.url,
@@ -155,33 +200,26 @@ async fn session(
             store,
             logs,
             hosts,
-            epoch: after.map_or(0, |cursor| cursor.epoch),
-            moved: false,
+            position: &mut *position,
         };
-        let mut keep = tokio::time::interval(KEEP_EVERY);
-        let ended = loop {
+        loop {
             tokio::select! {
-                event = events.message() => match event {
-                    Ok(Some(event)) => {
+                event = events.message() => match event? {
+                    Some(event) => {
                         if let Some(body) = event.body {
-                            taker.take(body).await;
+                            taker.take(body);
                         }
                     }
-                    Ok(None) => break Some("the flume ended the watch".into()),
-                    Err(e) => break Some(BoxError::from(e)),
+                    None => return Err("the flume ended the watch".into()),
                 },
-                // the apps' hosts changed: watched again past the cursor
+                // the apps' hosts changed: watched again past the last line taken
                 _ = changes.changed() => {
+                    logs.keep(|app| store.read(|state| state.app(app).is_some()));
                     if store.read(apps_by_host) != taker.hosts {
-                        break None;
+                        break;
                     }
                 }
-                _ = keep.tick() => taker.keep().await,
             }
-        };
-        taker.keep().await;
-        if let Some(e) = ended {
-            return Err(e);
         }
     }
 }
@@ -199,37 +237,79 @@ fn apps_by_host(state: &State) -> BTreeMap<String, String> {
         .collect()
 }
 
-/// Takes a watch's lines into the apps' logs, its position into the state.
+/// Where a watch resumes, and what tells a line fed twice.
+#[derive(Default)]
+struct Position {
+    /// The flume's run the watch sees; 0 before one.
+    epoch: u64,
+    /// The last line taken of that run.
+    cursor: Option<Cursor>,
+    /// The last line taken of each node: its `node_seq` and time.
+    last: HashMap<String, (u64, i64)>,
+    /// [`Position::last`] as the flume's run before left it: a node feeds a flume started
+    /// again its recent lines again, until one past these.
+    before: HashMap<String, (u64, i64)>,
+}
+
+impl Position {
+    /// Whether the node fed `event` to the flume's run before already.
+    fn again(&mut self, node: &str, event: &AccessEvent) -> bool {
+        let line = (event.node_seq, event.time_unix_millis);
+        if let Some(&(seq, time)) = self.before.get(node) {
+            if line.0 <= seq && line.1 <= time {
+                return true;
+            }
+            self.before.remove(node);
+        }
+        self.last.insert(node.to_string(), line);
+        false
+    }
+}
+
+/// Takes a watch's lines into the apps' logs.
 struct Taker<'a> {
     store: &'a Store,
     logs: &'a Logs,
     /// The hosts watched, and the app of each.
     hosts: BTreeMap<String, String>,
-    /// The flume's run the watch sees.
-    epoch: u64,
-    /// The cursor moved since it was last written.
-    moved: bool,
+    position: &'a mut Position,
 }
 
 impl Taker<'_> {
-    async fn take(&mut self, event: watch_event::Body) {
+    fn take(&mut self, event: watch_event::Body) {
         match event {
             watch_event::Body::Hello(hello) => {
                 if hello.reset {
                     self.lost("Lines may be missing: the flume restarted".into());
                 }
-                if self.epoch != hello.epoch {
+                if self.position.epoch != hello.epoch {
                     // a position of another run: none until a line of this one
-                    self.store.note(|state| state.flume = None).await;
-                    self.moved = true;
-                    self.epoch = hello.epoch;
+                    self.position.cursor = None;
+                    self.position.before = std::mem::take(&mut self.position.last);
+                    self.position.epoch = hello.epoch;
                 }
             }
             watch_event::Body::Record(record) => {
-                self.advance(record.seq).await;
+                self.advance(record.seq);
                 let Some(event) = record.event else {
                     return;
                 };
+                if self.position.again(&record.node_id, &event) {
+                    return;
+                }
+                // a flume predating the time: this instance's
+                let at = match record.time_unix_nanos {
+                    0 => crate::store::epoch_nanos(),
+                    at => u128::from(at),
+                };
+                if event.route_key == FEED_ROUTE {
+                    let field = |name: &str| {
+                        let found = event.fields.iter().find(|field| field.name == name);
+                        found.map(|field| field.value.as_str())
+                    };
+                    self.logs.fed(&event.kind, field, Some(at));
+                    return;
+                }
                 let Some(app) = self.hosts.get(&event.route_key) else {
                     return;
                 };
@@ -252,16 +332,22 @@ impl Taker<'_> {
                     "response" => ("RTR", router, Stream::Out, router_line(&event, app, served)),
                     _ => return,
                 };
-                self.logs.push(app, source, index, stream, text);
+                self.logs.push(app, source, index, stream, text, Some(at));
             }
             watch_event::Body::Gap(gap) => {
                 if gap.seq > 0 {
-                    self.advance(gap.seq).await;
+                    self.advance(gap.seq);
                 }
                 let dropped = gap.dropped;
                 match gap.cause() {
-                    watch_gap::Cause::NodeDropped if !gap.node_id.starts_with(WICKET_NODE) => {}
-                    watch_gap::Cause::NodeDropped => self.dropped(&gap.node_id, dropped),
+                    watch_gap::Cause::NodeDropped if gap.node_id.starts_with(WICKET_NODE) => {
+                        self.dropped(&gap.node_id, dropped)
+                    }
+                    watch_gap::Cause::NodeDropped if gap.node_id.starts_with(API_NODE) => self
+                        .lost(format!(
+                            "Up to {dropped} lines missed: the cf-api's queue to the flume was full"
+                        )),
+                    watch_gap::Cause::NodeDropped => {}
                     _ => self.lost(format!(
                         "Up to {dropped} lines missed: the cf-api fell behind the flume"
                     )),
@@ -271,28 +357,22 @@ impl Taker<'_> {
         }
     }
 
-    /// Moves the cursor to the line `seq` of the flume.
-    async fn advance(&mut self, seq: u64) {
-        let cursor = FlumeCursor {
-            epoch: self.epoch,
+    /// Moves the position to the line `seq` of the flume.
+    fn advance(&mut self, seq: u64) {
+        self.position.cursor = Some(Cursor {
+            epoch: self.position.epoch,
             seq,
-        };
-        self.store.note(|state| state.flume = Some(cursor)).await;
-        self.moved = true;
+        });
     }
 
-    /// Writes the cursor moved.
-    async fn keep(&mut self) {
-        if std::mem::take(&mut self.moved) {
-            self.store.update(|_| ()).await;
-        }
-    }
-
-    /// Tells every app watched that lines may be lost: which app's they
-    /// were is unknown.
+    /// Tells every app that lines may be lost: which app's they were is unknown.
     fn lost(&self, text: String) {
-        let apps: BTreeSet<&String> = self.hosts.values().collect();
-        self.lost_to(apps, text);
+        let mut apps: BTreeSet<String> = self.hosts.values().cloned().collect();
+        let known = |state: &State| -> Vec<String> {
+            state.apps.iter().map(|app| app.guid.clone()).collect()
+        };
+        apps.extend(self.store.read(known));
+        self.lost_to(&apps, text);
     }
 
     /// Tells the apps watched that the wicket of the flume node `node` holds some of that its
@@ -319,7 +399,8 @@ impl Taker<'_> {
 
     fn lost_to<'a>(&self, apps: impl IntoIterator<Item = &'a String>, text: String) {
         for app in apps {
-            self.logs.push(app, "LGR", 0, Stream::Err, text.clone());
+            self.logs
+                .push(app, "LGR", 0, Stream::Err, text.clone(), None);
         }
     }
 }
@@ -409,6 +490,7 @@ mod tests {
         watch_event::Body::Record(WatchRecord {
             seq,
             node_id: "wicket:a".into(),
+            time_unix_nanos: seq,
             event: Some(AccessEvent {
                 node_seq: 1,
                 // 2026-10-30T01:17:47.500Z
@@ -434,6 +516,16 @@ mod tests {
         line
     }
 
+    /// `line` as its node's line `node_seq`, logged `later` milliseconds on.
+    fn numbered(node_seq: u64, later: i64, mut line: watch_event::Body) -> watch_event::Body {
+        if let watch_event::Body::Record(record) = &mut line {
+            let event = record.event.as_mut().unwrap();
+            event.node_seq = node_seq;
+            event.time_unix_millis += later;
+        }
+        line
+    }
+
     fn gap(node_id: &str, cause: watch_gap::Cause) -> watch_event::Body {
         watch_event::Body::Gap(WatchGap {
             seq: 0,
@@ -451,6 +543,83 @@ mod tests {
             .collect()
     }
 
+    /// Two instances on one flume hold one log: a line either added is in both, at one
+    /// timestamp and in one order, and in one starting after it; a reader walking on one is
+    /// the other's, whose staging's end waits for it. Each feeds as its directory's node.
+    #[tokio::test]
+    async fn the_instances_on_a_flume_hold_one_log() {
+        use crate::controller::tests::until;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("grpc://{}", listener.local_addr().unwrap());
+        let settings = sluice_flume::Settings {
+            token: "f1ume".into(),
+            ring_size: 100,
+            ring_bytes: 1 << 20,
+            backfill: 1,
+            tls: None,
+            otlp: None,
+        };
+        tokio::spawn(sluice_flume::serve(
+            listener,
+            settings,
+            std::future::pending(),
+        ));
+        let instance = async |name: &str| {
+            let dir = format!("sluice-cf-api-flume-{name}-{}", std::process::id());
+            let dir = std::env::temp_dir().join(dir);
+            let _ = std::fs::remove_dir_all(&dir);
+            let (domains, wickets) = (["localhost".to_string()], ["a".to_string()]);
+            let runs = BTreeMap::new();
+            let store = Store::open(&dir, "o", "s", &domains, &wickets, &runs, None, None);
+            let flume = FlumeSettings {
+                url: url.clone(),
+                token: "f1ume".into(),
+                ca_pem: None,
+                insecure: false,
+            };
+            let (logs, _) = start(flume, &dir, Arc::new(store.await.unwrap())).unwrap();
+            (logs, dir)
+        };
+        // newest first: not a reader walking them
+        let all = |logs: &Logs| logs.read("app", 0, None, 100, true);
+        let (first, first_dir) = instance("first").await;
+        first.add("app", "STG", "one");
+        first.add_as("app", "STG", Stream::Err, "two");
+        until("the lines came round", || all(&first).len() == 2).await;
+        let (second, second_dir) = instance("second").await;
+        second.add("app", "API", "three");
+        until("each holds every line", || {
+            all(&first).len() == 3 && all(&second).len() == 3
+        })
+        .await;
+        let held = all(&first);
+        assert_eq!(held, all(&second));
+        let shown: Vec<_> = (held.iter())
+            .map(|line| (line.source, line.stream, line.text.as_str()))
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("API", Stream::Out, "three"),
+                ("STG", Stream::Err, "two"),
+                ("STG", Stream::Out, "one"),
+            ]
+        );
+        let past = held[0].timestamp + 1;
+        second.following("app", past);
+        until("the reader is the first's too", || {
+            first.walked("app") == Some(past)
+        })
+        .await;
+        let began = Instant::now();
+        first.read_out("app", Duration::from_secs(5)).await;
+        assert!(began.elapsed() < Duration::from_secs(1), "a reader past it");
+        assert_ne!(node(&first_dir).unwrap(), node(&second_dir).unwrap());
+        for dir in [first_dir, second_dir] {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
     /// Each line goes to the app holding its host, as cf has it: the output
     /// `APP/PROC/WEB` OUT / ERR of its instance (0 from a wicket naming
     /// none), a response `RTR` in the gorouter's format, naming the instance
@@ -458,7 +627,8 @@ mod tests {
     /// share of the wicket listing the line's node, a response's `RTR` that
     /// wicket's place. The lines lost reach every app watched -- a sluice
     /// node's drops none of them, a wicket's those it holds indices of -- and
-    /// the cursor follows the lines taken, of the flume's run at hand.
+    /// the position follows the lines taken, of the flume's run at hand: the
+    /// lines a node feeds a flume started again once more are taken once.
     #[tokio::test]
     async fn lines_reach_the_app_of_their_host_and_losses_every_app() {
         let dir = std::env::temp_dir().join(format!("sluice-cf-api-flume-{}", std::process::id()));
@@ -468,11 +638,6 @@ mod tests {
         let runs = BTreeMap::new();
         let store = Store::open(&dir, "o", "s", &localhost, &wickets, &runs, None, None);
         let store = store.await.unwrap();
-        store
-            .update(|state| {
-                state.flume = Some(FlumeCursor { epoch: 1, seq: 9 });
-            })
-            .await;
         // its index 0 on a, 1 on b
         let scaled = store
             .update(|state| {
@@ -492,6 +657,11 @@ mod tests {
             })
             .await;
         let logs = Logs::default();
+        let mut position = Position {
+            epoch: 1,
+            cursor: Some(Cursor { epoch: 1, seq: 9 }),
+            ..Default::default()
+        };
         let mut taker = Taker {
             store: &store,
             logs: &logs,
@@ -501,28 +671,24 @@ mod tests {
                 ("hi.localhost".to_string(), "app-a".to_string()),
                 ("scaled.localhost".to_string(), scaled.clone()),
             ]),
-            epoch: 1,
-            moved: false,
+            position: &mut position,
         };
-        taker
-            .take(watch_event::Body::Hello(WatchHello {
-                epoch: 2,
+        let restart = |epoch: u64| {
+            watch_event::Body::Hello(WatchHello {
+                epoch,
                 reset: true,
                 build: None,
-            }))
-            .await;
-        assert_eq!(store.read(|state| state.flume), None, "another run's");
-        taker
-            .take(event(
-                1,
-                "stdout",
-                "a.localhost",
-                &[("instance", "1"), ("line", "out")],
-            ))
-            .await;
-        taker
-            .take(event(2, "stderr", "hi.localhost", &[("line", "err")]))
-            .await;
+            })
+        };
+        taker.take(restart(2));
+        assert_eq!(taker.position.cursor, None, "another run's");
+        taker.take(event(
+            1,
+            "stdout",
+            "a.localhost",
+            &[("instance", "1"), ("line", "out")],
+        ));
+        taker.take(event(2, "stderr", "hi.localhost", &[("line", "err")]));
         let response = |seq: u64, host: &str, status: &str, instance: Option<&str>| {
             let mut fields = vec![
                 ("method", "GET"),
@@ -537,28 +703,18 @@ mod tests {
             fields.extend(instance.map(|instance| ("instance", instance)));
             event(seq, "response", host, &fields)
         };
-        taker
-            .take(response(3, "b.localhost", "200", Some("1")))
-            .await;
-        taker.take(response(4, "b.localhost", "503", None)).await;
-        taker
-            .take(event(
-                5,
-                "stdout",
-                "c.localhost",
-                &[("line", "not watched")],
-            ))
-            .await;
-        taker
-            .take(gap("node-0", watch_gap::Cause::NodeDropped))
-            .await;
-        taker
-            .take(gap("wicket:x", watch_gap::Cause::NodeDropped))
-            .await;
-        taker
-            .take(gap("wicket:b", watch_gap::Cause::NodeDropped))
-            .await;
-        taker.take(gap("", watch_gap::Cause::Behind)).await;
+        taker.take(response(3, "b.localhost", "200", Some("1")));
+        taker.take(response(4, "b.localhost", "503", None));
+        taker.take(event(
+            5,
+            "stdout",
+            "c.localhost",
+            &[("line", "not watched")],
+        ));
+        taker.take(gap("node-0", watch_gap::Cause::NodeDropped));
+        taker.take(gap("wicket:x", watch_gap::Cause::NodeDropped));
+        taker.take(gap("wicket:b", watch_gap::Cause::NodeDropped));
+        taker.take(gap("", watch_gap::Cause::Behind));
 
         let lost = |text: &str| ("LGR", 0, Stream::Err, text.to_string());
         let restarted = lost("Lines may be missing: the flume restarted");
@@ -598,32 +754,26 @@ mod tests {
             ]
         );
         assert_eq!(
-            store.read(|state| state.flume),
-            Some(FlumeCursor { epoch: 2, seq: 5 }),
+            taker.position.cursor,
+            Some(Cursor { epoch: 2, seq: 5 }),
             "the last line taken"
         );
         // b's instance past its share, a's request of one past it, b's request: named as
         // `cf app` lists them, each request by its wicket's router
-        taker
-            .take(of(
-                "wicket:b",
-                event(
-                    6,
-                    "stdout",
-                    "scaled.localhost",
-                    &[("instance", "3"), ("line", "past")],
-                ),
-            ))
-            .await;
-        taker
-            .take(response(7, "scaled.localhost", "200", Some("5")))
-            .await;
-        taker
-            .take(of(
-                "wicket:b",
-                response(8, "scaled.localhost", "200", Some("0")),
-            ))
-            .await;
+        taker.take(of(
+            "wicket:b",
+            event(
+                6,
+                "stdout",
+                "scaled.localhost",
+                &[("instance", "3"), ("line", "past")],
+            ),
+        ));
+        taker.take(response(7, "scaled.localhost", "200", Some("5")));
+        taker.take(of(
+            "wicket:b",
+            response(8, "scaled.localhost", "200", Some("0")),
+        ));
         let of_scaled = lines(&logs, &scaled);
         let shown: Vec<_> = (of_scaled.iter())
             .map(|(source, index, _, text)| (*source, *index, text.rsplit(' ').next().unwrap()))
@@ -644,6 +794,23 @@ mod tests {
             of_scaled[2].3,
             "Up to 3 lines missed: the wicket b's queue to the flume was full"
         );
+        // the flume started again: b feeds its recent lines again, then one more, and a's
+        // next run its first
+        let output = |seq: u64, line: &str| {
+            let fields = [("instance", "3"), ("line", line)];
+            event(seq, "stdout", "scaled.localhost", &fields)
+        };
+        taker.take(restart(3));
+        taker.take(of("wicket:b", output(1, "past")));
+        taker.take(of("wicket:b", numbered(2, 1, output(2, "new"))));
+        taker.take(numbered(1, 1, output(3, "first")));
+        let of_scaled = lines(&logs, &scaled);
+        let texts: Vec<&str> = (of_scaled[7..].iter())
+            .map(|(_, _, _, text)| text.as_str())
+            .collect();
+        let restarted = "Lines may be missing: the flume restarted";
+        assert_eq!(texts, [restarted, "new", "first"]);
+        assert_eq!(position.cursor, Some(Cursor { epoch: 3, seq: 3 }));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

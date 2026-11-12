@@ -101,10 +101,6 @@ pub struct State {
     /// of it, and leaves it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub removals: Vec<Removal>,
-    /// Where the watch of the flume resumes: past the last line it took
-    /// (`flume`); None before one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub flume: Option<FlumeCursor>,
     /// The id each wicket last listed, by name: another behind a name is another wicket
     /// (`crate::controller`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -204,13 +200,6 @@ impl From<RemovalForm> for Removal {
             RemovalForm::Removal { app, wicket } => Removal { app, wicket },
         }
     }
-}
-
-/// A position in the flume's lines: its run (`epoch`) and the line's `seq`.
-#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
-pub struct FlumeCursor {
-    pub epoch: u64,
-    pub seq: u64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
@@ -2264,7 +2253,7 @@ impl Store {
         }
     }
 
-    /// Changes of what is kept whole (`crate::records`: the flume's cursor, the stacks the
+    /// Changes of what is kept whole (`crate::records`: the keyvalue homes, the stacks the
     /// wickets list) what the next change may write, or what is not kept at all. Nothing of
     /// the state's lists, which only a change writes.
     pub async fn note<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
@@ -2857,7 +2846,7 @@ pub(crate) mod tests {
             let followed = |staging: &mut Staging| staging.command = Some("followed".into());
             store.note_staging(&build, followed).await;
             store
-                .note(|state| state.flume = Some(FlumeCursor { epoch: 1, seq: 7 }))
+                .note(|state| state.homes = [("kv".to_string(), "a".to_string())].into())
                 .await;
             let moved = store.update(|state| state.app_mut(&second).unwrap().started = true);
             moved.await;
@@ -2873,7 +2862,7 @@ pub(crate) mod tests {
             is["domains"] = was["domains"].clone();
             assert_eq!(is, was);
             assert_eq!(names(&store), ["first", "second"]);
-            assert_eq!(is["flume"]["seq"], 7);
+            assert_eq!(is["homes"]["kv"], "a");
             assert_eq!(is["builds"][0]["staging"]["command"], "followed");
             drop(store);
             let store = open(&dir, url, &["apps.example.com", "localhost"]).await;

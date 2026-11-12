@@ -140,6 +140,7 @@ async fn watch(
         .watch(WatchRequest {
             filter: Some(filter),
             after,
+            oldest: false,
         })
         .await
         .unwrap()
@@ -264,7 +265,9 @@ async fn watchers_steer_the_feeds_and_get_the_lines_passing_their_filter() {
 
 /// A watch with a cursor resumes right after it, past a gap for the lines the
 /// ring lost meanwhile; one without, or with a cursor of another run, begins
-/// with the newest lines. Its hello names the flume's build.
+/// with the newest lines, or with every line of the ring when it asks for the
+/// oldest: each with the time the flume took it, ascending and the same for
+/// every watcher. Its hello names the flume's build.
 #[tokio::test]
 async fn a_watch_resumes_after_its_cursor() {
     let url = flume(4, 2).await;
@@ -317,6 +320,26 @@ async fn a_watch_resumes_after_its_cursor() {
             "6 node-1 request a.local #6"
         ]
     );
+    let mut times = Vec::new();
+    for after in [None, cursor(epoch + 1, 5)] {
+        let request = WatchRequest {
+            filter: Some(AccessFilter::default()),
+            after,
+            oldest: true,
+        };
+        let mut all = client.watch(request).await.unwrap().into_inner();
+        let (mut seqs, mut taken) = (Vec::new(), Vec::new());
+        while seqs.len() < 4 {
+            if let watch_event::Body::Record(record) = next(&mut all).await {
+                seqs.push(record.seq);
+                taken.push(record.time_unix_nanos);
+            }
+        }
+        assert_eq!(seqs, [3, 4, 5, 6], "the ring whole");
+        assert!(taken[0] > 0 && taken.windows(2).all(|pair| pair[0] < pair[1]));
+        times.push(taken);
+    }
+    assert_eq!(times[0], times[1]);
 }
 
 /// A watcher reading slower than the lines come catches up from the ring, and

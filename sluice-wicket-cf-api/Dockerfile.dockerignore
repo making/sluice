@@ -12,6 +12,11 @@
 !sluice-wicket-console/src
 !sluice-wicket-registry/Cargo.toml
 !sluice-wicket-registry/src
+!sluice-wicket-tunnel/Cargo.toml
+!sluice-wicket-tunnel/build.rs
+!sluice-wicket-tunnel/src
+!sluice-flume/Cargo.toml
+!sluice-flume/src
 !sluice-wicket-cf-api/Cargo.toml
 !sluice-wicket-cf-api/Cargo.lock
 !sluice-wicket-cf-api/build.rs

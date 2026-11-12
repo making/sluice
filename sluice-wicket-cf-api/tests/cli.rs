@@ -3538,6 +3538,10 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     // made of it and the run image, no build
     if builder.is_some() {
         let builds = registry.pulls();
+        // this cf-api started after the builds: their lines are the flume's
+        let built = |logs: String| logs.matches("sample buildpack: building").count();
+        let builds_logged = built(cf.ok(&["logs", "src", "--recent"]));
+        assert!(builds_logged > 0);
         cf.ok(&["scale", "src", "-i", "2"]);
         let made = api.line("made the rootfs of the droplet");
         assert!(made.contains("The wicket b made the rootfs of"), "{made}");
@@ -3546,8 +3550,8 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         });
         assert_eq!(get(&listen, "src.localhost", "/", None).0, 200);
         let logs = cf.ok(&["logs", "src", "--recent"]);
-        // the logs are this cf-api's, started after the build: none since
-        assert!(!logs.contains("sample buildpack: building"), "{logs}");
+        // no build since
+        assert_eq!(built(logs.clone()), builds_logged, "{logs}");
         assert!(registry.pulls() > builds, "the run image, pulled by b");
         // deleted: the cache of its builds forgotten (the wicket's directory was lost since)
         let guid = cf.ok(&["app", "src", "--guid"]).trim().to_string();

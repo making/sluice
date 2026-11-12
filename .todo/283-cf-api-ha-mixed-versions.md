@@ -88,3 +88,15 @@ topology record changes. A previous release's binary beside the current one in t
   on a store (two would drive one). The schema version of this item is where to refuse it
 - `Operation::undo` and `Staging::taken` are fields an older build drops when it writes the row
   again: an undo owed is then never sent
+
+## From 281
+
+- the logs are one through the flume: `--flume` must name one flume on every instance, and
+  several instances without it each hold a log of their own (refuse at a start, as planned)
+- a flume predating `WatchRequest.oldest` and `WatchRecord.time_unix_nanos` (additive fields)
+  begins a watch with its newest lines and stamps none: each instance then stamps a line with its
+  own clock, and the instances' timestamps differ. Update the flume before the cf-api
+- a build that does not know `cf-log` / `cf-walk` (one before 281) neither feeds nor takes them:
+  its log lacks the others' lines and the others lack its own
+- the `single` row `flume` (the cursor of builds before 281) is read by no build now and left in
+  the store: drop it with the schema's next migration

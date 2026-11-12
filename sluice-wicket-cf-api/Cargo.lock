@@ -1974,6 +1974,24 @@ name = "sluice-build-info"
 version = "0.0.1-SNAPSHOT"
 
 [[package]]
+name = "sluice-flume"
+version = "0.0.1-SNAPSHOT"
+dependencies = [
+ "flate2",
+ "prost",
+ "reqwest",
+ "rustls",
+ "sluice-build-info",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-health",
+ "tonic-prost",
+ "tonic-prost-build",
+ "webpki-roots",
+]
+
+[[package]]
 name = "sluice-wicket-cf-api"
 version = "0.0.1-SNAPSHOT"
 dependencies = [
@@ -1995,10 +2013,12 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "sluice-build-info",
+ "sluice-flume",
  "sluice-wicket-console",
  "sluice-wicket-oidc",
  "sluice-wicket-registry",
  "sluice-wicket-server",
+ "sluice-wicket-tunnel",
  "tar",
  "tokio",
  "tokio-postgres",
@@ -2067,6 +2087,21 @@ dependencies = [
  "hyper-util",
  "socket2",
  "tokio",
+]
+
+[[package]]
+name = "sluice-wicket-tunnel"
+version = "0.0.1-SNAPSHOT"
+dependencies = [
+ "futures-util",
+ "prost",
+ "rustls",
+ "tokio",
+ "tokio-util",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
+ "uuid",
 ]
 
 [[package]]
@@ -2367,6 +2402,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
@@ -2426,6 +2462,19 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "tonic-health"
+version = "0.14.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "78ca1afa8326cc0dc9999e4f2861ff8532c6edacdb6cf775ab3984dcb3299529"
+dependencies = [
+ "prost",
+ "tokio",
+ "tokio-stream",
+ "tonic",
+ "tonic-prost",
 ]
 
 [[package]]

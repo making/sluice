@@ -365,7 +365,7 @@ async fn run(
     stop: watch::Receiver<bool>,
 ) -> Result<(), String> {
     eprintln!("otlp: exporting to {}", settings.url);
-    let watch = hub.watch(settings.filter.clone(), None)?;
+    let watch = hub.watch(settings.filter.clone(), None, false)?;
     let seen = watch.seq;
     let (sender, mut receiver) = mpsc::channel(WATCH_BUFFER);
     // dropped when the exporter stops: the nodes nobody else watches stop feeding
@@ -1094,6 +1094,7 @@ mod tests {
                 seq: 1,
                 node_id: "node-1".to_string(),
                 event: Some(access),
+                time_unix_nanos: 0,
             })),
         }
     }

@@ -46,6 +46,8 @@ form_urlencoded = "1"
 base64 = "0.22"
 # the key the tokens are signed with
 getrandom = "0.4"
+# its own lines' feed to the sluice-flume, as a wicket's
+sluice-wicket-tunnel = { path = "../sluice-wicket-tunnel" }
 # the live access log the apps' logs come from: a watch of the sluice-flume
 tonic = { version = "0.14", features = ["tls-ring", "tls-webpki-roots"] }
 tonic-prost = "0.14"
@@ -66,6 +68,8 @@ webpki-roots = "1"
 rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["blocking", "cookies"] }
 sluice-wicket-oidc = { path = "../sluice-wicket-oidc", features = ["mock"] }
+# the flume two instances' logs go round
+sluice-flume = { path = "../sluice-flume" }
 # paused time for the bound on a quiet connection
 tokio = { version = "1", features = ["test-util"] }
 # the layers of the image the test pushes for a Firecracker wicket

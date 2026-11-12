@@ -1087,7 +1087,7 @@ going on with them.
 | `--wicket-token <token>` / `--wicket-token-file <path>` | their `--console-token`, one for all |
 | `--wicket-away-grace <secs>` | of several wickets, one not answering that long is gone: placed on no more, the indices on it started on the others, until it has answered as long again ([Several wickets](#several-wickets); default 30, 0 = never) |
 | `--domain <name>` | a shared domain; repeatable (or comma-separated): the first takes the default and random routes (default `localhost`). Through a sluice server, a suffix whose wildcard DNS reaches it |
-| `--data-dir <path>` | the state and the blobs (default `cf-api`), one process's (an exclusive `flock` of its `.lock`: a second start on it fails): `state.json` (written by a rename on every change; not with `--state`), `jwt.key` and `sessions.json` (the logins; not with `--state`), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app), `droplets/<sha256>.tar` (a static site's files, a droplet buildpacks built); with `--blobs` of these the uploads and the blobs being made only |
+| `--data-dir <path>` | the state and the blobs (default `cf-api`), one process's (an exclusive `flock` of its `.lock`: a second start on it fails): `state.json` (written by a rename on every change; not with `--state`), `jwt.key` and `sessions.json` (the logins; not with `--state`), `flume-node` (its node id among the flume's, with `--flume`), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app), `droplets/<sha256>.tar` (a static site's files, a droplet buildpacks built); with `--blobs` of these the uploads and the blobs being made only |
 | `--blobs <url>` | the packages and the droplets in an S3 bucket in place of `--data-dir`'s ([The blobs in a bucket](ha.md#the-blobs-in-a-bucket)): `s3://bucket` or `s3://bucket/prefix` |
 | `--blobs-endpoint <url>` / `--blobs-region <name>` | the bucket's S3 endpoint, `http(s)://host[:port]`, addressed by path (default AWS), and its region (default `us-east-1`) |
 | `--blobs-access-key-id <id>` / `--blobs-secret-access-key <key>` / `--blobs-secret-access-key-file <path>` | its credentials (required with `--blobs`) |
@@ -1412,10 +1412,13 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
   With `--flume`, the app's own too, from the live access log the wicket feeds: its output
   (`APP/PROC/WEB` OUT / ERR), on a wasi wicket its requests (`RTR`, in the gorouter's access log
   format), each naming its instance, and the lines lost on the way (`LGR`). The cf-api
-  watches its apps' hosts and resumes past the last line it took (kept in `state.json`); its
+  watches its apps' hosts, from the oldest line the flume has at hand; its
   log names the flume on start (`flume none` without one), and the hosts each watch opened for
   (`cf logs: watching the flume <url> for <hosts>`): a request whose `Host` is none of them is in
-  no app's log. See [Live access log](../.kb/live-access-log.md#wickets-and-the-cf-api)
+  no app's log. Its own lines go through the flume too (fed as the node `cf-api:<id>`), stamped
+  by it: [several instances](ha.md#the-logs) hold one log, and while the flume is away the
+  cf-api's own lines are on its stdout only. See
+  [Live access log](../.kb/live-access-log.md#wickets-and-the-cf-api)
 - a stop (SIGTERM, SIGINT, stdin's end with `--exit-on-stdin-close`): the listener closes, an idle
   connection too; a request under way is answered, saying `connection: close`, a build's waiting
   for its staging at once (`STAGING`, the CLI polling it); the puts to the wickets under way

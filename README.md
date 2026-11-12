@@ -783,7 +783,7 @@ holding a request back; the page shows the lines missed and the nodes disconnect
 browser reconnecting, to any node, resumes after the last line it showed. The server starts
 and serves with the flume down. A wicket feeds the flume too (`--flume`): the requests it
 answered (`response`) and its guests' output (`stdout`, `stderr`), each naming its
-instance, which the cf-api turns into the apps' `cf logs` by the wicket that fed each; a Firecracker wicket its VMs'
+instance, which the cf-api turns into the apps' `cf logs` by the wicket that fed each (its own lines go round the flume too, so its instances hold one log); a Firecracker wicket its VMs'
 output, each line naming its VM. Topology, drops, ordering, wickets, OTLP export
 (`--otlp-endpoint`: every line to a collector as OTLP/HTTP logs) and proxy settings:
 [.kb/live-access-log.md](.kb/live-access-log.md).

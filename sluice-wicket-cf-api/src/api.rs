@@ -906,15 +906,25 @@ impl Api {
                     return Ok(json(StatusCode::OK, &logs::envelopes(app, &[])));
                 }
                 let number = |key: &str| req.q(key).and_then(|value| value.parse::<u128>().ok());
+                let start = number("start_time").unwrap_or(0);
+                let descending = req.q("descending") == Some("true");
                 let lines = self.logs.read(
                     app,
-                    number("start_time").unwrap_or(0),
+                    start,
                     number("end_time"),
                     req.q("limit")
                         .and_then(|limit| limit.parse().ok())
                         .unwrap_or(100),
-                    req.q("descending") == Some("true"),
+                    descending,
                 );
+                // a staging's end waits for the reader of its log, on the instance staging
+                let staging = |state: &State| {
+                    let mut builds = state.builds.iter();
+                    builds.any(|build| build.app == *app && build.state == "STAGING")
+                };
+                if !descending && !self.store.leads() && self.store.read(staging) {
+                    self.logs.following(app, start);
+                }
                 Ok(json(StatusCode::OK, &logs::envelopes(app, &lines)))
             }
             _ => Err(ApiError::unknown(&req.method, &req.path)),

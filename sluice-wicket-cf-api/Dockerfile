@@ -1,7 +1,8 @@
 # sluice-wicket-cf-api as a static musl binary on distroless static. The flume proto lives
 # in sluice-proto, the build script dependency in sluice-build-info, the OpenID Provider
 # client in sluice-wicket-oidc, the connections in sluice-wicket-server, the pages' style in
-# sluice-wicket-console, the image pulls in sluice-wicket-registry and the component a static
+# sluice-wicket-console, the image pulls in sluice-wicket-registry, the feed of its own lines
+# to the flume in sluice-wicket-tunnel and the component a static
 # site is staged with in sluice-wicket-site (on the WIT of sluice-wicket-runtime-wasi), so the
 # build context is the repository root:
 #   docker build -f sluice-wicket-cf-api/Dockerfile --build-arg GIT_COMMIT=$(git rev-parse HEAD) .
@@ -30,6 +31,11 @@ COPY sluice-wicket-console/Cargo.toml sluice-wicket-console/
 COPY sluice-wicket-console/src sluice-wicket-console/src
 COPY sluice-wicket-registry/Cargo.toml sluice-wicket-registry/
 COPY sluice-wicket-registry/src sluice-wicket-registry/src
+COPY sluice-wicket-tunnel/Cargo.toml sluice-wicket-tunnel/build.rs sluice-wicket-tunnel/
+COPY sluice-wicket-tunnel/src sluice-wicket-tunnel/src
+# of its tests only: the manifest is read for the lock
+COPY sluice-flume/Cargo.toml sluice-flume/
+COPY sluice-flume/src sluice-flume/src
 COPY sluice-wicket-cf-api/Cargo.toml sluice-wicket-cf-api/Cargo.lock sluice-wicket-cf-api/build.rs sluice-wicket-cf-api/
 COPY sluice-wicket-cf-api/src sluice-wicket-cf-api/src
 COPY --from=site /src/sluice-wicket-site/target/wasm32-wasip3/release/sluice_wicket_site.wasm /site.wasm

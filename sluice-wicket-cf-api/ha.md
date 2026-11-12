@@ -6,7 +6,8 @@ the droplets in an S3 bucket (`--blobs`); and who reconciles the wickets, one in
 ([The reconciling of the wickets](#the-reconciling-of-the-wickets)), which makes the edits the
 wickets take at once for every instance ([An edit on any instance](#an-edit-on-any-instance)) and
 does the work that outlives a request
-([The work outliving a request](#the-work-outliving-a-request)).
+([The work outliving a request](#the-work-outliving-a-request)); and the apps' logs, one on every
+instance through the flume ([The logs](#the-logs)).
 The options are in the README's [Options](README.md#options).
 
 ## The state in PostgreSQL
@@ -169,9 +170,29 @@ what the store keeps of it. There is no lease per build or operation: the one of
 - a provision or a bind whose outcome is unknown is undone at the broker (orphan mitigation) only
   once the store keeps that it failed and is to be undone: an instance whose turn ended sends no
   undo. A turn ending before the broker answered the undo, the next sends it again
-- the staging log's lines are in the instance that staged: one taking a build up says so (`Staging
-  taken up ...: its lines before are gone`) and logs from there
+- one taking a build up says so in the staging log (`Staging taken up ...`) and logs on; the
+  lines before are in every instance's log ([The logs](#the-logs))
 - `cf push` waits 15s for a build on the instance it reached, then polls it, on any
 
 What was decided is in
 [.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#the-work-outliving-a-request).
+
+## The logs
+
+With `--flume` on every instance (one flume), an app's log is the same on each: `cf logs` and the
+staging log of `cf push` read from any, and go on from another.
+
+- an instance feeds its own lines (`STG`, `API`, `CELL`) to the flume, as the node `cf-api:<id>`
+  (the id made in its `--data-dir`, `flume-node`: a directory per instance), and takes every
+  instance's from its watch, with the apps' own. A line's timestamp is the flume's, the order the
+  flume's
+- an instance starting takes the lines the flume has at hand (`--ring-size`, 10000 by default),
+  the newest 1000 of each app: what the others hold, but what the flume let go of
+- the lines lost (`LGR`) are each instance's watch's own: they may differ between instances
+- while the flume is away the instances' own lines reach no log (they are on each one's stdout);
+  the newest 512 of each instance come once it is back, the rest are told as lost
+- a staging's end waits for the reader of its log on whichever instance it reads
+- without `--flume` a log is the instance's alone: for one instance
+
+What was decided is in
+[.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#the-logs-of-several-instances).

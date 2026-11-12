@@ -9,7 +9,8 @@
 //! in a zip or from an OCI registry (`registry`), a rootfs in a zip or made by
 //! a wicket of an OCI image, and what every wicket offers of its keyvalue stores
 //! and capabilities are its services. With a flume, the apps' output and requests
-//! reach their logs from the live access log the wickets feed (`flume`). Several
+//! reach their logs from the live access log the wickets feed (`flume`), and its
+//! own lines go round it, so every instance on it holds one log (`logs`). Several
 //! wickets are reached through a sluice server, each advertising the hosts of the
 //! apps it runs. Of several instances on one store, one at a time reconciles the
 //! wickets, the holder of a lease (`lease`).
@@ -18,6 +19,7 @@
 //! cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> wickets
 //!                                                  ^                            |
 //!                                                  +--Watch-- sluice-flume <--Feed+
+//!                                                  +--Feed------^
 //! ```
 
 pub mod api;
@@ -307,7 +309,14 @@ pub async fn serve(
         Some(tls) => Some(tls_acceptor(tls)?),
         None => None,
     };
-    let logs = Arc::new(logs::Logs::default());
+    // on a flume, the logs of every instance on it
+    let (logs, flume) = match settings.flume.clone() {
+        Some(flume) => {
+            let (logs, tasks) = flume::start(flume, &settings.data_dir, store.clone())?;
+            (logs, Some(tasks))
+        }
+        None => (Arc::new(logs::Logs::default()), None),
+    };
     let osb = osb::Client::new()?;
     let controller = Arc::new(controller::Controller::new(
         store.clone(),
@@ -318,10 +327,6 @@ pub async fn serve(
         osb.clone(),
         registry::Registry::new()?,
     ));
-    let flume = settings
-        .flume
-        .clone()
-        .map(|flume| tokio::spawn(flume::watch(flume, store.clone(), logs.clone())));
     let peers = tls::client_config(settings.instance_ca.as_deref(), "--instance-ca-cert")?;
     let peers = reqwest::Client::builder()
         .connect_timeout(PEER_CONNECT_TIMEOUT)
@@ -375,10 +380,10 @@ pub async fn serve(
     }
     keeping.abort();
     sweep.abort();
-    if let Some(flume) = flume {
-        flume.abort();
+    for task in flume.iter().flatten() {
+        task.abort();
     }
-    // what was noted, the flume watch's cursor as it got, what was seen of the wickets
+    // what was noted, what was seen of the wickets
     store.update(|_| ()).await;
     // the next instance's turn at once
     lease.release().await;
