@@ -1,9 +1,9 @@
 //! An S3 bucket for the tests of the blobs: one a test binary shares, each test with a prefix
 //! of its own. `SLUICE_CF_API_TEST_S3` names one there (`https://id:key@host:port/bucket`, with
 //! `SLUICE_CF_API_TEST_S3_CA` the file of the PEM CA verifying it, if not the webPKI roots);
-//! else a container of `versity/versitygw` over a directory (Docker on the PATH; CI's runner
-//! has it), taking TLS with a certificate made here, which ends with the test process: its
-//! stdin's end stops the gateway.
+//! else a container of `rustfs/rustfs` (Docker on the PATH; CI's runner has it), taking TLS
+//! with a certificate made here, its bucket made at the first use, which ends with the test
+//! process: its stdin's end stops the server.
 
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use crate::blobs::BlobSettings;
 
-const IMAGE: &str = "versity/versitygw:v1.10.0";
+const IMAGE: &str = "rustfs/rustfs:1.0.5";
 
 /// Hang guard of a start, the image pulled.
 const START: Duration = Duration::from_secs(120);
@@ -47,20 +47,20 @@ fn container() -> BlobSettings {
     let name = format!("sluice-cf-api-test-s3-{}", std::process::id());
     let tls = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
     let (cert, key) = (tls.cert.pem(), tls.signing_key.serialize_pem());
-    // a bucket of the gateway is a directory of its root
-    let run = "printf %s \"$TLS_CERT\" >/tls.crt; printf %s \"$TLS_KEY\" >/tls.key; \
-               mkdir -p /data/blobs; \
-               versitygw --cert /tls.crt --key /tls.key posix /data & \
+    // the certificate and its key by the names the server looks for
+    let run = "mkdir /tmp/tls; printf %s \"$TLS_CERT\" >/tmp/tls/rustfs_cert.pem; \
+               printf %s \"$TLS_KEY\" >/tmp/tls/rustfs_key.pem; \
+               /usr/bin/rustfs --tls-path /tmp/tls /data & \
                cat >/dev/null; kill $!; wait";
     let child = Command::new("docker")
         .args(["run", "--rm", "-i", "--name", &name, "--entrypoint", "sh"])
         .args([
             "-e",
-            "ROOT_ACCESS_KEY=test",
+            "RUSTFS_ACCESS_KEY=test",
             "-e",
-            "ROOT_SECRET_KEY=test-secret",
+            "RUSTFS_SECRET_KEY=test-secret",
         ])
-        .args(["-p", "127.0.0.1::7070"])
+        .args(["-p", "127.0.0.1::9000"])
         .args(["-e", &format!("TLS_CERT={cert}"), "-e"])
         .arg(format!("TLS_KEY={key}"))
         .args([IMAGE, "-c", run])
@@ -75,7 +75,7 @@ fn container() -> BlobSettings {
     loop {
         assert!(began.elapsed() < START, "{IMAGE} did not start");
         let port = Command::new("docker")
-            .args(["port", &name, "7070"])
+            .args(["port", &name, "9000"])
             .output();
         let port = String::from_utf8(port.expect("docker on the PATH").stdout).unwrap();
         let at = port.lines().next().and_then(|at| at.rsplit_once(':'));
@@ -104,7 +104,7 @@ pub async fn bucket() -> BlobSettings {
     };
     let s3 = crate::s3::S3::new(&bucket).expect("the bucket's settings");
     let began = Instant::now();
-    while let Err(e) = s3.list().await {
+    while let Err(e) = s3.make_bucket().await {
         assert!(began.elapsed() < START, "{e}");
         tokio::time::sleep(Duration::from_millis(100)).await;
     }

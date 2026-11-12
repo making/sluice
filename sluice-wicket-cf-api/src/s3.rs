@@ -151,6 +151,19 @@ impl S3 {
         }
     }
 
+    /// Makes the bucket, unless it is there: a test server's.
+    #[cfg(test)]
+    pub async fn make_bucket(&self) -> Result<(), String> {
+        let uri = match self.bucket.as_str() {
+            "" => "/",
+            bucket => bucket,
+        };
+        match self.call("PUT", uri, "", CALL_TIMEOUT).await {
+            Err(e) if !e.starts_with("409") => Err(format!("s3: make the bucket: {e}")),
+            _ => Ok(()),
+        }
+    }
+
     fn uri(&self, key: &str) -> String {
         format!("{}/{}{key}", self.bucket, self.prefix)
     }

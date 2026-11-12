@@ -73,10 +73,16 @@ needed.
 - the sweep takes the state for all that names a blob: two states on one bucket and prefix
   delete each other's
 
-Measured on one host (release build, two instances on one PostgreSQL 18 and one Versity S3
-Gateway 1.10.0 over a directory, both in containers; a wasi wicket): a `cf push` of a 140 MiB zip
-(a component and random bytes) through one instance, 10.3s; the peak resident memory of the two
-19 and 21 MiB. An app pushed through one instance without a start and started through the
+Measured on one host (release build, two instances on one PostgreSQL 18 and one bucket, both in
+containers; a wasi wicket): a `cf push` of a 140 MiB zip (a component and random bytes) through
+one instance, the peak resident memory of the two:
+
+| the bucket | the push | peak resident memory |
+|---|---|---|
+| Versity S3 Gateway 1.10.0 over a directory | 10.3s | 19 and 21 MiB |
+| RustFS 1.0.5 | 11.2s | 19 and 21 MiB |
+
+On both: an app pushed through one instance without a start and started through the
 other is staged from the bucket's package and its droplet put to the wicket from the bucket.
 
 ## A stop

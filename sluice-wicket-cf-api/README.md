@@ -1113,7 +1113,8 @@ Run against PostgreSQL 18; what it costs is in
   theirs does not name
 - as an app of a Firecracker wicket, its `egress` names the endpoint
 
-Run against Versity S3 Gateway 1.10.0 (`versity/versitygw`, its POSIX backend); what was decided
+Run against RustFS 1.0.5 (`rustfs/rustfs`) and Versity S3 Gateway 1.10.0 (`versity/versitygw`,
+its POSIX backend); what was decided
 and measured is in [.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#the-blobs-bucket).
 
 ## Options
@@ -1572,7 +1573,7 @@ of the cf-api's own, and the images against a registry in the test (`tests/regis
 store's tests (`store::tests`) run a PostgreSQL in a container (`postgres:18-alpine`, Docker on
 the PATH) over TLS and without, or the one `SLUICE_CF_API_TEST_POSTGRES` names (over TLS with
 `SLUICE_CF_API_TEST_POSTGRES_CA` the file of its CA), and an S3 bucket in one
-(`versity/versitygw:v1.10.0`, over TLS), or the one `SLUICE_CF_API_TEST_S3` names
+(`rustfs/rustfs:1.0.5`, over TLS), or the one `SLUICE_CF_API_TEST_S3` names
 (`https://id:key@host:port/bucket`, `SLUICE_CF_API_TEST_S3_CA` the file of its CA). Where
 `/dev/kvm` is usable, with Firecracker and a guest kernel (as the wicket's VM test finds them), a
 second test runs against `../sluice-wicket-runtime-firecracker` (`sg kvm -c 'cargo test'` until
