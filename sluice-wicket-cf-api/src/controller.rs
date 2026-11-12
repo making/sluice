@@ -76,13 +76,14 @@ use std::time::Duration;
 use futures_util::future::join_all;
 use tokio::time::Instant;
 
+use crate::blobs::Reading;
 use crate::logs::Logs;
 use crate::placement::{Budget, Evacuated, Move};
 use crate::services::Offer;
 use crate::staging::Cnb;
 use crate::stop::Stop;
 use crate::store::{
-    App, Built, HealthCheck, Lifetime, Outcome, Purge, ReadinessCheck, Removal, State, Store,
+    App, Blob, Built, HealthCheck, Lifetime, Outcome, Purge, ReadinessCheck, Removal, State, Store,
 };
 use crate::wicket::{
     AppBody, ComponentRef, Failure, FilesRef, ListedApp, Listing, MadeImage, Runtime, Sandbox,
@@ -307,7 +308,7 @@ impl Controller {
                 state.remove_app(guid)
             })
             .await;
-        self.store.delete(&blobs);
+        self.store.delete(&blobs).await;
         self.logs.forget(guid);
         self.forget(guid);
         println!("[{guid}] API: deleted app {name}");
@@ -944,19 +945,13 @@ impl Controller {
             .as_ref()
             .is_some_and(|files| files.sha256 == sha256)
         {
-            let path = self.store.files_path(sha256);
-            return match tokio::fs::File::open(&path).await {
-                Ok(files) => wicket.upload_files(sha256, files).await,
-                Err(e) => Err(gone(sha256, &path, e)),
+            return match self.reading(&Blob::Files(sha256.to_string())).await? {
+                Some(files) => wicket.upload_files(sha256, files).await,
+                None => Err(gone(sha256)),
             };
         }
-        let path = self.store.droplet_path(sha256);
-        match tokio::fs::File::open(&path).await {
-            Ok(component) => return wicket.upload(sha256, component).await,
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
-                return Err(gone(sha256, &path, e));
-            }
-            Err(_) => {}
+        if let Some(component) = self.reading(&Blob::Droplet(sha256.to_string())).await? {
+            return wicket.upload(sha256, component).await;
         }
         let droplet = self.store.read(|state| {
             // the newest of that digest: an older one's package, and its credentials, may
@@ -982,10 +977,7 @@ impl Controller {
             Some(Made::Image(image, credentials))
         });
         let (made, of) = match droplet {
-            None => {
-                let e = std::io::Error::from(std::io::ErrorKind::NotFound);
-                return Err(gone(sha256, &path, e));
-            }
+            None => return Err(gone(sha256)),
             Some(Made::Image(image, credentials)) => {
                 let credentials = credentials
                     .as_ref()
@@ -1072,15 +1064,20 @@ impl Controller {
             || wicket.make_image(&built.run_image, credentials, Some((layer, &built.launch)));
         match make().await {
             Err(Failure::Refused { missing, .. }) if !missing.is_empty() => {
-                let path = self.store.files_path(layer);
-                match tokio::fs::File::open(&path).await {
-                    Ok(tar) => wicket.upload_layer(layer, tar).await?,
-                    Err(e) => return Err(gone(layer, &path, e)),
+                match self.reading(&Blob::Files(layer.to_string())).await? {
+                    Some(tar) => wicket.upload_layer(layer, tar).await?,
+                    None => return Err(gone(layer)),
                 }
                 make().await
             }
             made => made,
         }
+    }
+
+    /// The blob as it is read; None: it is not kept. Blobs that do not answer are a wicket
+    /// that does not: tried again.
+    async fn reading(&self, blob: &Blob) -> Result<Option<Reading>, Failure> {
+        (self.store.reading(blob).await).map_err(Failure::Unreachable)
     }
 
     /// Records the outcome of `wicket`'s share, logging it when it changed.
@@ -2047,12 +2044,9 @@ fn vm_sandbox(
     }
 }
 
-/// The droplet `sha256` is neither where it was kept nor to be made again.
-fn gone(sha256: &str, path: &std::path::Path, e: std::io::Error) -> Failure {
-    Failure::refused(
-        409,
-        format!("the droplet {sha256} is gone from {}: {e}", path.display()),
-    )
+/// The droplet `sha256` is neither kept nor to be made again.
+fn gone(sha256: &str) -> Failure {
+    Failure::refused(409, format!("the droplet {sha256} is gone"))
 }
 
 /// Whether the wicket serves `desired` as listed: the capabilities and the egress in any order;
@@ -2791,7 +2785,7 @@ mod tests {
         let runs = wickets.iter().cloned().map(|name| (name, Runtime::Wasm));
         let localhost = ["localhost".into()];
         let runs = runs.collect();
-        let store = Store::open(&dir, "o", "s", &localhost, &wickets, &runs, None);
+        let store = Store::open(&dir, "o", "s", &localhost, &wickets, &runs, None, None);
         let store = store.await.unwrap();
         let guid = store
             .update(|state| {

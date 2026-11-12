@@ -168,27 +168,7 @@ impl Postgres {
             config.connect_timeout(CONNECT_TIMEOUT);
         }
         config.keepalives_idle(Duration::from_secs(10));
-        let mut roots = rustls::RootCertStore::empty();
-        match &settings.ca_pem {
-            Some(pem) => {
-                use rustls::pki_types::pem::PemObject as _;
-                for cert in rustls::pki_types::CertificateDer::pem_slice_iter(pem) {
-                    let cert = cert.map_err(|e| format!("--state-ca-cert: {e}"))?;
-                    (roots.add(cert)).map_err(|e| format!("--state-ca-cert: {e}"))?;
-                }
-                if roots.is_empty() {
-                    return Err("--state-ca-cert: no certificate in it".into());
-                }
-            }
-            None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
-        }
-        let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
-            rustls::crypto::ring::default_provider(),
-        ))
-        .with_safe_default_protocol_versions()
-        .map_err(|e| format!("--state: tls: {e}"))?
-        .with_root_certificates(roots)
-        .with_no_client_auth();
+        let tls = crate::tls::client_config(settings.ca_pem.as_deref(), "--state-ca-cert")?;
         Ok(Postgres {
             config,
             tls: MakeRustlsConnect::new(tls),

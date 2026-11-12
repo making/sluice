@@ -1039,7 +1039,9 @@ impl Api {
                 if !found {
                     return Err(ApiError::not_found("Package"));
                 }
-                store.delete(&[crate::store::Blob::Package(guid.to_string())]);
+                store
+                    .delete(&[crate::store::Blob::Package(guid.to_string())])
+                    .await;
                 self.job(req, "package.delete", Vec::new(), None).await
             }
             (&Method::POST, ["resource_matches"]) => {
@@ -2101,7 +2103,7 @@ impl Api {
             }
             Ok(state.set_current_droplet(guid, &droplet))
         }).await?;
-        self.store.delete(&blobs);
+        self.store.delete(&blobs).await;
         self.logs
             .add(guid, "API", format!("Set the current droplet to {droplet}"));
         Ok(json(
@@ -2206,7 +2208,7 @@ impl Api {
                 (view, blobs)
             })
             .await;
-        self.store.delete(&blobs);
+        self.store.delete(&blobs).await;
         if let Some(image) = image {
             self.logs
                 .add(app, "API", format!("Created a docker package of {image}"));
@@ -2239,21 +2241,19 @@ impl Api {
             .ok_or_else(|| ApiError::bad_request("no body"))?;
         let body = std::fs::File::open(spool.path())
             .map_err(|e| ApiError::from(format!("{}: {e}", spool.path().display())))?;
-        let copied = {
-            let (store, guid) = (self.store.clone(), guid.to_string());
-            tokio::task::spawn_blocking(move || {
-                store.make_package(&guid, |file| {
-                    let mut hashed = Hashed::new(file);
-                    let bytes =
-                        crate::multipart::copy_part(&content_type, body, "bits", &mut hashed)?
-                            .ok_or("the upload has no 'bits' part")?;
-                    Ok((bytes, hashed.finish()))
-                })
-            })
-            .await
-            .map_err(|e| ApiError::from(format!("the upload: {e}")))?
-        };
+        // the zip of the upload's body, on this instance's disk until it is kept
+        let (bits, mut file) = self.store.spool()?;
+        let copied = tokio::task::spawn_blocking(move || {
+            let mut hashed = Hashed::new(&mut file);
+            let bytes = crate::multipart::copy_part(&content_type, body, "bits", &mut hashed)?
+                .ok_or("the upload has no 'bits' part")?;
+            Ok::<_, String>((bytes, hashed.finish()))
+        })
+        .await
+        .map_err(|e| ApiError::from(format!("the upload: {e}")))?;
         let (bytes, sha256) = copied.map_err(ApiError::bad_request)?;
+        let blob = Blob::Package(guid.to_string());
+        self.store.keep(&blob, bits, &sha256).await?;
         let updated = self
             .store
             .update(|state| {
@@ -2272,10 +2272,10 @@ impl Api {
             })
             .await;
         let Some((view, blobs)) = updated else {
-            self.store.delete(&[Blob::Package(guid.to_string())]);
+            self.store.delete(&[Blob::Package(guid.to_string())]).await;
             return Err(replaced());
         };
-        self.store.delete(&blobs);
+        self.store.delete(&blobs).await;
         self.logs.add(
             &package.app,
             "API",
@@ -2587,7 +2587,7 @@ impl Api {
                 Ok::<_, ApiError>((deployment, superseded, blobs, before))
             })
             .await?;
-        self.store.delete(&blobs);
+        self.store.delete(&blobs).await;
         if let Some(line) = superseded {
             self.logs.add(&app, "API", line);
         }

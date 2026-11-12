@@ -47,6 +47,38 @@ a copy, compared with the one before for the rows to write); the file's is the w
 written and synced. Both grow with the state, not with the change; no cache of the reads is
 needed.
 
+## The blobs' bucket
+
+`--blobs` (an S3 bucket) beside the directory's files. Decided:
+
+- one put per object, no multipart upload: an upload is 160 MiB at most and a droplet bounded,
+  both far below a put's 5 GiB, so nothing unfinished is ever in the bucket to sweep. The
+  payload's digest is signed (the bucket checks what it got): a droplet's is its name, a
+  package's is taken as it is copied out of the upload
+- the six calls (put, get, head, delete, list, each signed) on `reqwest`, not an SDK
+- deletion by a sweep, not by the handler that dropped the blob: another instance may be reading
+  it (a put to a wicket, 11 minutes at most), so it goes once a sweeper saw it unnamed for 30
+  minutes, by its own clock, not the bucket's `LastModified`. Listing the bucket against the
+  state also finds what was made and never named
+- a digest made again while its blob is swept: age alone cannot tell (listed unnamed, put again,
+  named, then deleted). A sweep deletes between two changes of the state, its begin (counted,
+  `sweep.rounds`) and its end, one instance at a time; a droplet is named in a change that
+  checks no sweep began since its blobs were seen kept, with none under way then, else they are
+  looked for again and what is gone staged again. A sweep sends its last delete 60s after its
+  begin, each given 30s; one begun 10 minutes ago is taken for cut short and another instance
+  sweeps. An instance paused between that check and its delete for 10 minutes would still delete:
+  the bucket takes no fencing
+- the directory deletes what a change dropped at once, by the same begin and end: its reader
+  holds the file
+- the sweep takes the state for all that names a blob: two states on one bucket and prefix
+  delete each other's
+
+Measured on one host (release build, two instances on one PostgreSQL 18 and one Versity S3
+Gateway 1.10.0 over a directory, both in containers; a wasi wicket): a `cf push` of a 140 MiB zip
+(a component and random bytes) through one instance, 10.3s; the peak resident memory of the two
+19 and 21 MiB. An app pushed through one instance without a start and started through the
+other is staged from the bucket's package and its droplet put to the wicket from the bucket.
+
 ## A stop
 
 The release binary on the host (`--wicket` unreachable), SIGTERM to its exit: idle, 11-13ms. A

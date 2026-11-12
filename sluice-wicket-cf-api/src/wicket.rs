@@ -33,6 +33,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+use crate::blobs::Reading;
+
 /// A PUT may compile the component: generous.
 const EDIT_TIMEOUT: Duration = Duration::from_secs(240);
 /// A rootfs made of an image, or uploaded (4 GiB at most): minutes, the wicket's own bound of
@@ -694,39 +696,34 @@ impl Wicket {
         serde_json::from_slice(&body).map_err(|e| Failure::Unreachable(format!("the answer: {e}")))
     }
 
-    /// Uploads the component in `file` as it is read: it may be larger than this process's
+    /// Uploads the component `blob` as it is read: it may be larger than this process's
     /// memory.
-    pub async fn upload(&self, sha256: &str, file: tokio::fs::File) -> Result<(), Failure> {
-        self.upload_as("components", "application/wasm", sha256, file)
+    pub async fn upload(&self, sha256: &str, blob: Reading) -> Result<(), Failure> {
+        self.upload_as("components", "application/wasm", sha256, blob)
             .await
     }
 
-    /// Uploads a static site's files, the tar in `file`, as [`Wicket::upload`] a component.
-    pub async fn upload_files(&self, sha256: &str, file: tokio::fs::File) -> Result<(), Failure> {
-        self.upload_as("files", "application/x-tar", sha256, file)
+    /// Uploads a static site's files, the tar `blob`, as [`Wicket::upload`] a component.
+    pub async fn upload_files(&self, sha256: &str, blob: Reading) -> Result<(), Failure> {
+        self.upload_as("files", "application/x-tar", sha256, blob)
             .await
     }
 
-    /// PUTs `file`, of `content_type`, to `/api/<kind>/<sha256>`.
+    /// PUTs `blob`, of `content_type`, to `/api/<kind>/<sha256>`.
     async fn upload_as(
         &self,
         kind: &str,
         content_type: &str,
         sha256: &str,
-        file: tokio::fs::File,
+        blob: Reading,
     ) -> Result<(), Failure> {
-        let bytes = file
-            .metadata()
-            .await
-            .map_err(|e| Failure::Unreachable(format!("the upload of {kind}: {e}")))?
-            .len();
         let request = self
             .client
             .put(format!("{}/api/{kind}/{sha256}", self.base))
             .timeout(IMAGE_TIMEOUT)
             .header("content-type", content_type)
-            .header("content-length", bytes)
-            .body(file);
+            .header("content-length", blob.bytes)
+            .body(blob.body);
         let (status, body) = self.send(request).await?;
         if !status.is_success() {
             return Err(refused(status, &body));
@@ -734,10 +731,10 @@ impl Wicket {
         Ok(())
     }
 
-    /// Uploads a layer, the tar in `file`, as [`Wicket::upload`] a component: a build's source,
+    /// Uploads a layer, the tar `blob`, as [`Wicket::upload`] a component: a build's source,
     /// a droplet built on another wicket. Kept as long as an upload no app names.
-    pub async fn upload_layer(&self, sha256: &str, file: tokio::fs::File) -> Result<(), Failure> {
-        self.upload_as("layers", "application/x-tar", sha256, file)
+    pub async fn upload_layer(&self, sha256: &str, blob: Reading) -> Result<(), Failure> {
+        self.upload_as("layers", "application/x-tar", sha256, blob)
             .await
     }
 

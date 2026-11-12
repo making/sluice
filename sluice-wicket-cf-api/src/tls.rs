@@ -1,4 +1,5 @@
-//! TLS for the flume connection (`grpcs://`), as the wicket's: verification
+//! The roots the store's and the bucket's TLS is verified against ([`client_config`]), and TLS
+//! for the flume connection (`grpcs://`), as the wicket's: verification
 //! against a pinned CA (`--flume-ca-cert`), against the webPKI roots
 //! (default), or no verification at all (`--flume-insecure`, for self-signed
 //! setups).
@@ -9,6 +10,33 @@ use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, Server
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
+
+/// A client's TLS verified against the PEM CA `ca_pem` (the option `flag`'s), else against the
+/// webPKI roots.
+pub fn client_config(ca_pem: Option<&[u8]>, flag: &str) -> Result<rustls::ClientConfig, String> {
+    let mut roots = rustls::RootCertStore::empty();
+    match ca_pem {
+        Some(pem) => {
+            use rustls::pki_types::pem::PemObject as _;
+            for cert in CertificateDer::pem_slice_iter(pem) {
+                let cert = cert.map_err(|e| format!("{flag}: {e}"))?;
+                (roots.add(cert)).map_err(|e| format!("{flag}: {e}"))?;
+            }
+            if roots.is_empty() {
+                return Err(format!("{flag}: no certificate in it"));
+            }
+        }
+        None => roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned()),
+    }
+    let tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .map_err(|e| format!("{flag}: tls: {e}"))?
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    Ok(tls)
+}
 
 /// Wraps `endpoint` in the TLS mode implied by `--flume-insecure` /
 /// `--flume-ca-cert`.

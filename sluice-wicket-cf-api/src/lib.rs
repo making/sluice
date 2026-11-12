@@ -20,6 +20,7 @@
 //! ```
 
 pub mod api;
+pub mod blobs;
 pub mod brokers;
 pub mod config;
 pub mod controller;
@@ -39,6 +40,7 @@ pub mod postgres;
 mod records;
 pub mod registry;
 pub mod roles;
+mod s3;
 pub mod security_groups;
 pub mod services;
 pub mod staging;
@@ -118,6 +120,9 @@ pub struct Settings {
     /// The store of the state in place of the directory's (`crate::postgres`): several
     /// instances'.
     pub state: Option<postgres::PostgresSettings>,
+    /// The bucket of the packages and the droplets in place of the directory (`crate::blobs`):
+    /// several instances'.
+    pub blobs: Option<blobs::BlobSettings>,
     pub org: String,
     pub space: String,
     /// The builder staging source (`crate::staging`); None: no source is staged.
@@ -273,6 +278,7 @@ pub async fn serve(
             &names,
             &runs,
             settings.state.as_ref(),
+            settings.blobs.as_ref(),
         )
         .await?,
     );
@@ -332,6 +338,7 @@ pub async fn serve(
     api.take_up();
     let stop = controller.stop.clone();
     let watch = tokio::spawn(controller.watch());
+    let sweep = tokio::spawn(store.clone().keep_swept());
     tokio::select! {
         () = api::run(listener, acceptor, api) => {}
         () = shutdown => {}
@@ -355,6 +362,7 @@ pub async fn serve(
         );
     }
     watch.abort();
+    sweep.abort();
     if let Some(flume) = flume {
         flume.abort();
     }
@@ -401,6 +409,7 @@ mod tests {
             domains: vec!["apps.test".into()],
             data_dir,
             state: None,
+            blobs: None,
             org: "org".into(),
             space: "space".into(),
             cnb: None,

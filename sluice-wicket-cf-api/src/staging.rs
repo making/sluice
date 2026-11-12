@@ -39,15 +39,18 @@
 
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::blobs::Reading;
 use crate::controller::{Controller, no_maker};
 use crate::logs::{Logs, Stream};
 use crate::registry::Registry;
 use crate::store::{
-    Blob, Building, Built, DockerImage, Droplet, Files, Package, Spool, Staging, Store, guid, now,
+    Blob, Building, Built, DockerImage, Droplet, Files, Package, Spool, Staging, State, Store,
+    guid, now,
 };
 use crate::wicket::{BuildRequest, BuildView, Failure, LayerRef, Runtime, Wicket, stacks_named};
 
@@ -381,6 +384,18 @@ pub struct Staged {
     pub buildpack: Option<Buildpack>,
 }
 
+impl Staged {
+    /// The blobs its droplet names: its component or rootfs, unless a wicket made and keeps
+    /// it (of an image, of what buildpacks built), and its tar.
+    fn blobs(&self) -> Vec<Blob> {
+        let made = self.built.is_some() || self.image.is_some() && self.stack != Runtime::Wasm;
+        let component = (!made).then(|| Blob::Droplet(self.sha256.clone()));
+        let files = (self.files.as_ref()).or(self.built.as_ref().map(|built| &built.layer));
+        let files = files.map(|files| Blob::Files(files.sha256.clone()));
+        component.into_iter().chain(files).collect()
+    }
+}
+
 /// The stacks a package may be staged as: those the wickets run, the app's pin alone of them.
 #[derive(Clone, Debug)]
 pub struct Takes {
@@ -435,7 +450,8 @@ impl Takes {
 /// component is pulled from its registry with the package's credentials, if any, or its rootfs
 /// made by a wicket. Taken up after a restart of the cf-api, it stages again but a build of
 /// source a wicket runs, followed on from the line it got to, built again where that wicket
-/// knows it no more.
+/// knows it no more. Staged again where a sweep deleted a blob of its droplet before the
+/// state named it ([`Store::unswept`]): one of a digest dropped a while ago.
 pub async fn run(
     store: &Arc<Store>,
     logs: &Logs,
@@ -443,6 +459,17 @@ pub async fn run(
     controller: &Controller,
     build: &str,
 ) {
+    while !staged_once(store, logs, registry, controller, build).await {}
+}
+
+/// [`run`], once; false: to stage again.
+async fn staged_once(
+    store: &Arc<Store>,
+    logs: &Logs,
+    registry: &Registry,
+    controller: &Controller,
+    build: &str,
+) -> bool {
     let Some((app, package, staging)) = store.read(|state| {
         let kept = state.build(build)?;
         let package = state
@@ -451,21 +478,17 @@ pub async fn run(
             .ok_or(kept.package.clone());
         Some((kept.app.clone(), package, kept.staging.clone()?))
     }) else {
-        return;
+        return true;
     };
     let app = app.as_str();
     let staged = match &package {
         Ok(package) => staged(store, logs, registry, controller, build, package, staging).await,
         Err(_) => Err("the package is gone".into()),
     };
-    let staged = staged.and_then(|staged| {
-        if staged.bytes.is_empty() {
-            return Ok(staged);
-        }
-        store
-            .write_droplet(&staged.sha256, &staged.bytes)
-            .map(|()| staged)
-    });
+    let staged = match staged {
+        Ok(staged) if !staged.bytes.is_empty() => keep_pulled(store, staged).await,
+        staged => staged,
+    };
     let at = now();
     match staged {
         Ok(staged) => {
@@ -499,6 +522,7 @@ pub async fn run(
                     ))
                 ),
             );
+            let blobs = staged.blobs();
             let droplet = Droplet {
                 guid: guid(),
                 app: app.to_string(),
@@ -516,8 +540,26 @@ pub async fn run(
                 updated_at: at.clone(),
             };
             logs.read_out(app, READ_OUT).await;
-            store
-                .update(|state| {
+            loop {
+                let rounds = store.unswept().await;
+                match kept(store, &blobs).await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        let line =
+                            "A blob of the droplet was swept as it was staged: staging again";
+                        logs.add(app, "STG", line);
+                        return false;
+                    }
+                    Err(e) => {
+                        eprintln!("BLOBS: a droplet waits for its blobs: {e}");
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                }
+                let named = |state: &mut State| {
+                    if state.sweep.rounds != rounds {
+                        return false;
+                    }
                     if let Some(staging) = state.builds.iter_mut().find(|kept| kept.guid == build) {
                         staging.state = "STAGED".into();
                         staging.droplet = Some(droplet.guid.clone());
@@ -525,8 +567,12 @@ pub async fn run(
                         staging.updated_at = at.clone();
                     }
                     state.droplets.push(droplet.clone());
-                })
-                .await;
+                    true
+                };
+                if store.update(named).await {
+                    break;
+                }
+            }
         }
         Err(e) => {
             logs.add(app, "STG", format!("Staging failed: {e}"));
@@ -543,6 +589,28 @@ pub async fn run(
                 .await;
         }
     }
+    true
+}
+
+/// Keeps the component pulled of `staged`.
+async fn keep_pulled(store: &Store, staged: Staged) -> Result<Staged, String> {
+    let (spool, mut file) = store.spool()?;
+    file.write_all(&staged.bytes)
+        .map_err(|e| format!("{}: {e}", spool.path().display()))?;
+    drop(file);
+    let blob = Blob::Droplet(staged.sha256.clone());
+    store.keep(&blob, spool, &staged.sha256).await?;
+    Ok(staged)
+}
+
+/// Whether the `blobs` are all kept.
+async fn kept(store: &Store, blobs: &[Blob]) -> Result<bool, String> {
+    for blob in blobs {
+        if !store.has(blob).await? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 /// What the build `build` of `package`, asked for as `staging` has it, staged: see [`run`].
@@ -651,7 +719,8 @@ async fn follow_on(
 /// Stages the zip of the package `guid`, its droplet made, on a blocking thread: a VM of one
 /// vCPU has one worker, which the API and the watch run on. The buildpack is the one of
 /// `detecting` detecting it ([`detect`]); what `takes` does not is refused before it is unpacked.
-/// Source is packed for its build, not staged yet.
+/// Source is packed for its build, not staged yet. The zip is read from this instance's disk
+/// (a copy of the bucket's), what is made of it kept from there.
 async fn unpack(
     store: Arc<Store>,
     guid: &str,
@@ -659,34 +728,49 @@ async fn unpack(
     detecting: Vec<Buildpack>,
     takes: Takes,
 ) -> Result<Unpacked, String> {
-    let (guid, command) = (guid.to_string(), command.map(str::to_string));
-    tokio::task::spawn_blocking(move || {
-        let zip = std::fs::File::open(store.package_path(&guid))
-            .map_err(|e| format!("the package is gone: {e}"))?;
+    let package = (store.local(&Blob::Package(guid.to_string())).await)
+        .map_err(|e| format!("the package: {e}"))?
+        .ok_or("the package is gone")?;
+    let (scratch, command) = (store.clone(), command.map(str::to_string));
+    let unpacked = tokio::task::spawn_blocking(move || {
+        let store = scratch;
+        let zip =
+            std::fs::File::open(package.path()).map_err(|e| format!("the package is gone: {e}"))?;
         let mut archive = zip::ZipArchive::new(zip).map_err(|e| format!("not a zip: {e}"))?;
         let (buildpack, entry) = detect(&files(&archive), command.as_deref(), &detecting)?;
         takes.accept(buildpack.stack(), buildpack.what())?;
-        let staged = match entry {
+        let (spool, mut file) = store.spool()?;
+        match entry {
             None if buildpack == Buildpack::Cnb => {
-                let (spool, mut tar) = store.spool()?;
-                let (sha256, bytes) = pack_source(&mut archive, &mut tar, MAX_SOURCE_BYTES)?;
-                return Ok(Unpacked::Source(Source {
-                    spool,
-                    sha256,
-                    bytes,
-                }));
+                let (sha256, bytes) = pack_source(&mut archive, &mut file, MAX_SOURCE_BYTES)?;
+                Ok((
+                    Unpacked::Source(Source {
+                        spool,
+                        sha256,
+                        bytes,
+                    }),
+                    None,
+                ))
             }
-            None => stage_site(&store, &mut archive),
-            Some(entry) => store.make_droplet(|droplet| {
-                let staged = stage(&mut archive, buildpack, entry, droplet, MAX_DROPLET_BYTES)?;
-                let sha256 = staged.sha256.clone();
-                Ok((staged, sha256))
-            }),
-        };
-        staged.map(|staged| Unpacked::Staged(Box::new(staged)))
-    })
-    .await
-    .map_err(|e| format!("staging: {e}"))?
+            None => {
+                let (staged, files) = stage_site(&mut archive, &mut file)?;
+                Ok((Unpacked::Staged(Box::new(staged)), Some((files, spool))))
+            }
+            Some(entry) => {
+                let staged = stage(&mut archive, buildpack, entry, &mut file, MAX_DROPLET_BYTES)?;
+                let droplet = Blob::Droplet(staged.sha256.clone());
+                Ok((Unpacked::Staged(Box::new(staged)), Some((droplet, spool))))
+            }
+        }
+    });
+    let (unpacked, made) = unpacked
+        .await
+        .map_err(|e| format!("staging: {e}"))
+        .flatten()?;
+    if let Some((blob, spool)) = made {
+        store.keep(&blob, spool, blob.name()).await?;
+    }
+    Ok(unpacked)
 }
 
 /// A zip as [`unpack`] leaves it: staged, or source to build.
@@ -822,9 +906,8 @@ async fn build(
     };
     let mut started = Err(no_maker());
     for wicket in controller.makers() {
-        let tar = tokio::fs::File::open(source.spool.path())
-            .await
-            .map_err(|e| format!("the source: {e}"))?;
+        let tar = async { Reading::of(tokio::fs::File::open(source.spool.path()).await?).await };
+        let tar = tar.await.map_err(|e| format!("the source: {e}"))?;
         let uploaded = wicket.upload_layer(&source.sha256, tar).await;
         started = match uploaded {
             Ok(()) => wicket.start_build(&request).await,
@@ -1023,7 +1106,7 @@ async fn place(
                 (kept.built.as_ref()).is_some_and(|kept| kept.layer.sha256 == *layer)
             };
             if !store.read(|state| state.droplets.iter().any(named)) {
-                store.delete(&[Blob::Files(layer.clone())]);
+                store.delete(&[Blob::Files(layer.clone())]).await;
             }
             Err(format!("{}: {e}", built.run_image))
         }
@@ -1068,7 +1151,8 @@ async fn fetch(store: &Store, wicket: &Wicket, layer: &LayerRef) -> Result<(), S
     if hex(&hasher.finalize()) != layer.sha256 {
         return Err("the droplet is not of the digest the build answered".into());
     }
-    store.keep_files(&layer.sha256, spool.path())
+    let blob = Blob::Files(layer.sha256.clone());
+    store.keep(&blob, spool, &layer.sha256).await
 }
 
 /// The files of `archive`, by name.
@@ -1080,17 +1164,15 @@ fn files<R: Read + Seek>(archive: &zip::ZipArchive<R>) -> Vec<String> {
         .collect()
 }
 
-/// Stages the static site `archive`: its files packed, sluice-wicket-site its component.
+/// Stages the static site `archive`: its files packed to `tar`, the blob to keep them as,
+/// sluice-wicket-site its component.
 fn stage_site<R: Read + Seek>(
-    store: &Store,
     archive: &mut zip::ZipArchive<R>,
-) -> Result<Staged, String> {
-    let packed = store.make_files(|tar| {
-        let packed = pack_site(archive, tar, MAX_SITE_BYTES)?;
-        let sha256 = packed.sha256.clone();
-        Ok((packed, sha256))
-    })?;
-    Ok(Staged {
+    tar: &mut impl Write,
+) -> Result<(Staged, Blob), String> {
+    let packed = pack_site(archive, tar, MAX_SITE_BYTES)?;
+    let files = Blob::Files(packed.sha256.clone());
+    let staged = Staged {
         entry: SITE_FILE.into(),
         bytes: SITE.to_vec(),
         size: SITE.len() as u64,
@@ -1103,7 +1185,8 @@ fn stage_site<R: Read + Seek>(
         built: None,
         stack: Runtime::Wasm,
         buildpack: Some(Buildpack::Site),
-    })
+    };
+    Ok((staged, files))
 }
 
 /// A static site's files as [`pack_site`] packed them.
@@ -1944,7 +2027,8 @@ mod tests {
 
     /// Builds a stop of the cf-api cut short, the state opened again, each end STAGED with the
     /// droplet it would have staged: a zip staged again, a build of source a wicket runs followed
-    /// on from the line it got to, one the wicket knows no more built again.
+    /// on from the line it got to, one the wicket knows no more built again. And a droplet
+    /// whose blob a sweep deletes as it is staged is staged again.
     #[tokio::test]
     async fn a_staging_cut_short_is_taken_up() {
         use std::sync::atomic::Ordering;
@@ -1959,7 +2043,7 @@ mod tests {
         let open = async || {
             let localhost = ["localhost".to_string()];
             let runs = runs.clone().into();
-            let store = Store::open(&dir, "o", "s", &localhost, &names, &runs, None);
+            let store = Store::open(&dir, "o", "s", &localhost, &names, &runs, None, None);
             store.await.unwrap()
         };
         let building = |id: &str, after| crate::store::Building {
@@ -1977,8 +2061,10 @@ mod tests {
         let mut builds = Vec::new();
         for (name, zip, building) in cut {
             let package = guid();
-            let write = |file: &mut std::fs::File| file.write_all(&zip).map_err(|e| e.to_string());
-            store.make_package(&package, write).unwrap();
+            let (spool, mut file) = store.spool().unwrap();
+            file.write_all(&zip).unwrap();
+            let blob = Blob::Package(package.clone());
+            store.keep(&blob, spool, &sha256(&zip)).await.unwrap();
             builds.push(
                 store
                     .update(|state| {
@@ -2089,6 +2175,48 @@ mod tests {
             lost.iter().any(|line| line == again) && lost.iter().any(|line| line == "one"),
             "{lost:?}"
         );
+
+        // staged once more while another instance's sweep is under way, which deletes the
+        // droplet's blob, named no more, after it was made again: staged again at its end
+        let (build, app) = &builds[0];
+        let droplet = Blob::Droplet(sha256(COMPONENT));
+        let file = dir.join(droplet.key());
+        let sweeping = |by: Option<&str>| {
+            let by = by.map(|instance| crate::store::Sweeping {
+                instance: instance.into(),
+                since: crate::store::epoch_secs(),
+            });
+            store.update(move |state| state.sweep.by = by.clone())
+        };
+        sweeping(Some("another")).await;
+        let again = |state: &mut State| {
+            state.droplets.clear();
+            let build = state.builds.iter_mut().find(|kept| kept.guid == *build);
+            let build = build.unwrap();
+            build.state = "STAGING".into();
+            build.droplet = None;
+            build.staging = Some(Staging {
+                base: "http://api.test".into(),
+                command: None,
+                building: None,
+            });
+        };
+        store.update(again).await;
+        std::fs::remove_file(&file).unwrap();
+        let swept = async {
+            while !file.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            std::fs::remove_file(&file).unwrap();
+            sweeping(None).await;
+        };
+        tokio::join!(run(&store, &logs, &registry, &controller, build), swept);
+        let state = store.read(|state| state.build(build).unwrap().state.clone());
+        assert_eq!(state, "STAGED");
+        assert!(store.read(|state| state.names(&droplet)) && file.exists());
+        let again = "A blob of the droplet was swept as it was staged: staging again";
+        let lines = logs.read(app, 0, None, 100, false);
+        assert_eq!(lines.iter().filter(|line| line.text == again).count(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

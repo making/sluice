@@ -56,6 +56,13 @@ puts nothing; the leader stopped (and one only paused past its lease), the other
 deployment and a move under way to their end; a put with an old epoch refused by the wicket
 (the wickets' own tests, both runtimes).
 
+## From 276
+
+Every instance sweeps the blobs (`Store::keep_swept`), one at a time deleting: `State::sweep`'s
+`by` is a lease of its own (an instance and the seconds since the epoch of its clock, stale after
+`SWEEP_STALE`). The leader alone is to sweep, under the lease here (the store's clock); what a
+droplet's naming checks (`sweep.rounds`, `Store::unswept`) stays.
+
 ## From 275
 
 - `Store::update` is one transaction after another over every instance (the lock of

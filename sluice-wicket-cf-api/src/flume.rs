@@ -465,7 +465,7 @@ mod tests {
         let localhost = ["localhost".to_string()];
         let wickets = ["a".to_string(), "b".to_string()];
         let runs = BTreeMap::new();
-        let store = Store::open(&dir, "o", "s", &localhost, &wickets, &runs, None);
+        let store = Store::open(&dir, "o", "s", &localhost, &wickets, &runs, None, None);
         let store = store.await.unwrap();
         store
             .update(|state| {

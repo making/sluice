@@ -12,14 +12,16 @@
 //! credentials of their images. A write is durable when it returns, for a kill of a
 //! VM holding the directory on its disk.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+pub use crate::blobs::{Blob, Spool};
+use crate::blobs::{BlobSettings, Blobs, Local, Reading};
 use crate::postgres::{Postgres, PostgresSettings, Shared, Writer};
 use crate::staging::Buildpack;
 use crate::wicket::Runtime;
@@ -110,6 +112,9 @@ pub struct State {
     /// by `store/namespace`: where the apps mapping it run (`crate::placement`).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub homes: BTreeMap<String, String>,
+    /// The sweeps of the blobs ([`Store::sweep`]).
+    #[serde(default, skip_serializing_if = "Sweep::is_none")]
+    pub sweep: Sweep,
     /// What each wicket answered of each app, by guid, then by wicket; not kept: a start
     /// lists the wickets.
     #[serde(skip)]
@@ -125,6 +130,37 @@ pub struct State {
         deserialize_with = "crate::placement::Wickets::read_runtimes"
     )]
     pub wickets: crate::placement::Wickets,
+}
+
+/// What the sweeps of the blobs keep: a blob is deleted between a sweep's begin and its end
+/// only, so who names a blob can tell that it was not deleted since it saw it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Sweep {
+    /// The sweeps begun.
+    #[serde(default)]
+    pub rounds: u64,
+    /// The one under way.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<Sweeping>,
+}
+
+/// A sweep under way: the instance deleting, and since when (seconds since the epoch).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Sweeping {
+    pub instance: String,
+    pub since: u64,
+}
+
+impl Sweep {
+    fn is_none(&self) -> bool {
+        *self == Sweep::default()
+    }
+
+    /// Whether a sweep may be deleting at `now`: one begun longer ago than [`SWEEP_STALE`]
+    /// was cut short.
+    fn under_way(&self, now: u64) -> bool {
+        (self.by.as_ref()).is_some_and(|by| by.since + SWEEP_STALE.as_secs() > now)
+    }
 }
 
 /// An app to remove from a wicket that did not take its removal.
@@ -979,6 +1015,12 @@ impl std::fmt::Debug for Built {
 }
 
 impl Droplet {
+    /// The digest of its tar: a site's files, what buildpacks built; one of them at most.
+    fn tar(&self) -> Option<&str> {
+        let built = self.built.as_ref().map(|built| &built.layer);
+        (self.files.as_ref().or(built)).map(|files| files.sha256.as_str())
+    }
+
     /// Its stack: where it runs. Of one staged before it was kept, what its file's name tells.
     pub fn stack(&self) -> Runtime {
         (self.staged_as).unwrap_or_else(|| Runtime::of_file(&self.file))
@@ -1743,27 +1785,29 @@ impl State {
         self.unnamed(gone)
     }
 
+    /// Whether a package or a droplet kept names the blob: one not named is swept.
+    pub fn names(&self, blob: &Blob) -> bool {
+        match blob {
+            Blob::Package(guid) => self.package(guid).is_some(),
+            Blob::Droplet(sha256) => self.droplets.iter().any(|kept| kept.sha256 == *sha256),
+            Blob::Files(sha256) => (self.droplets.iter()).any(|kept| kept.tar() == Some(sha256)),
+        }
+    }
+
     /// The blobs of the droplets `gone` no droplet kept names: their components, their
     /// files.
     fn unnamed(&self, gone: Vec<Droplet>) -> Vec<Blob> {
         let mut blobs = Vec::new();
         for droplet in gone {
-            let named = |kept: &Droplet| kept.sha256 == droplet.sha256;
             let component = Blob::Droplet(droplet.sha256.clone());
-            if !self.droplets.iter().any(named) && !blobs.contains(&component) {
+            if !self.names(&component) && !blobs.contains(&component) {
                 blobs.push(component);
             }
-            // a site's files, the tar buildpacks built: one of them at most
-            let tar = |droplet: &Droplet| {
-                let built = droplet.built.as_ref().map(|built| &built.layer);
-                (droplet.files.as_ref().or(built)).map(|files| files.sha256.clone())
-            };
-            let Some(files) = tar(&droplet) else {
+            let Some(files) = droplet.tar() else {
                 continue;
             };
-            let named = (self.droplets.iter()).any(|kept| tar(kept).as_ref() == Some(&files));
-            let files = Blob::Files(files);
-            if !named && !blobs.contains(&files) {
+            let files = Blob::Files(files.to_string());
+            if !self.names(&files) && !blobs.contains(&files) {
                 blobs.push(files);
             }
         }
@@ -1859,28 +1903,25 @@ impl State {
 /// start.
 const SPOOLED: &str = ".upload";
 
-/// An upload received to a file, removed with this.
-pub struct Spool(PathBuf);
+/// How long a blob no package nor droplet names is kept in a bucket: longer than a read of it
+/// begun while it was named takes (a put to a wicket, a package unpacked), on another instance
+/// as it may be. The directory's reader holds its file, deleted or not.
+pub const SWEEP_GRACE: Duration = Duration::from_secs(30 * 60);
 
-impl Spool {
-    pub fn path(&self) -> &Path {
-        &self.0
-    }
-}
+/// How often the blobs are swept.
+const SWEEP_EVERY: Duration = Duration::from_secs(5 * 60);
 
-impl Drop for Spool {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
+/// How long after its begin a sweep sends its last delete, and what a delete is given.
+const SWEEP_WINDOW: Duration = Duration::from_secs(60);
+const SWEEP_CALL: Duration = Duration::from_secs(30);
 
-/// A blob to delete from the data directory.
-#[derive(Debug, PartialEq)]
-pub enum Blob {
-    Package(String),
-    Droplet(String),
-    Files(String),
-}
+/// A sweep begun that long ago deletes no more ([`SWEEP_WINDOW`], [`SWEEP_CALL`], and the
+/// instances' clocks apart): its instance was cut short, another takes its place.
+const SWEEP_STALE: Duration = Duration::from_secs(10 * 60);
+
+/// The blobs a sweeper saw unnamed, and since when.
+#[derive(Default)]
+pub struct Unnamed(HashMap<Blob, Instant>);
 
 /// How long a request waits for the store's revision (`Store::sync`).
 const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -1889,8 +1930,19 @@ const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// before it is seen. Kept in `state.json` of the data directory, written whole on every
 /// change: one process's (`crate::check_data_dir`); or, with `--state`, in PostgreSQL
 /// (`crate::postgres`): the store of several, the copy following what the others commit.
+///
+/// And the blobs the state names (`crate::blobs`), in the directory or, with `--blobs`, in a
+/// bucket. One the state names no more is swept: deleted between a sweep's begin and its end,
+/// both changes of the state ([`Sweep`]), by one instance at a time. A droplet is named in
+/// the state only where no sweep began since its blobs were seen ([`Store::unswept`]): a
+/// digest made again while its blob is swept is made once more.
 pub struct Store {
     dir: PathBuf,
+    blobs: Blobs,
+    /// This process, to the sweeps.
+    instance: String,
+    /// Held by the sweep of this process under way.
+    sweeping: tokio::sync::Mutex<()>,
     shared: Arc<Shared>,
     /// Held by the one changing the copy.
     writer: Arc<tokio::sync::Mutex<Writer>>,
@@ -1929,7 +1981,8 @@ impl Store {
     /// `postgres` the store's (an empty store takes the directory's `state.json`, once); else
     /// a new one. Its apps are placed on the `wickets` configured (`State::follow_wickets`,
     /// logged), of which those answering now run `runs`, by name: an index is placed on a
-    /// wicket of its app's stack.
+    /// wicket of its app's stack. The blobs are the directory's, or with `bucket` that one's.
+    #[allow(clippy::too_many_arguments)]
     pub async fn open(
         dir: &Path,
         org: &str,
@@ -1938,6 +1991,7 @@ impl Store {
         wickets: &[String],
         runs: &BTreeMap<String, Runtime>,
         postgres: Option<&PostgresSettings>,
+        bucket: Option<&BlobSettings>,
     ) -> Result<Store, String> {
         for sub in ["packages", "droplets"] {
             std::fs::create_dir_all(dir.join(sub))
@@ -1960,6 +2014,12 @@ impl Store {
         let file = dir.join("state.json");
         let mut store = Store {
             dir: dir.to_path_buf(),
+            blobs: match bucket {
+                Some(bucket) => Blobs::S3(crate::s3::S3::new(bucket)?),
+                None => Blobs::Dir(dir.to_path_buf()),
+            },
+            instance: guid(),
+            sweeping: tokio::sync::Mutex::default(),
             shared: Arc::default(),
             writer: Arc::default(),
             postgres: None,
@@ -1978,6 +2038,8 @@ impl Store {
             for line in follow(&mut state) {
                 println!("{line}");
             }
+            // the one process's, cut short
+            state.sweep.by = None;
             store.save(&state)?;
             *store.shared.state.write().expect("no panic under the lock") = state;
             return Ok(store);
@@ -2098,92 +2160,8 @@ impl Store {
         write_by_rename(&file, &json)
     }
 
-    pub fn package_path(&self, guid: &str) -> PathBuf {
-        self.dir.join("packages").join(format!("{guid}.zip"))
-    }
-
-    pub fn droplet_path(&self, sha256: &str) -> PathBuf {
-        self.dir.join("droplets").join(format!("{sha256}.wasm"))
-    }
-
-    /// A static site's files, a tar.
-    pub fn files_path(&self, sha256: &str) -> PathBuf {
-        self.dir.join("droplets").join(format!("{sha256}.tar"))
-    }
-
-    /// Makes the package `guid` of what `write` writes, by a rename.
-    pub fn make_package<T>(
-        &self,
-        guid: &str,
-        write: impl FnOnce(&mut std::fs::File) -> Result<T, String>,
-    ) -> Result<T, String> {
-        make_by_rename(&self.package_path(guid), write)
-    }
-
-    pub fn write_droplet(&self, sha256: &str, bytes: &[u8]) -> Result<(), String> {
-        let path = self.droplet_path(sha256);
-        if path.exists() {
-            return Ok(());
-        }
-        write_by_rename(&path, bytes)
-    }
-
-    /// Makes the droplet of what `write` writes, named by the digest it answers with what
-    /// it made of it (a droplet of that digest kept stays as it is).
-    pub fn make_droplet<T>(
-        &self,
-        write: impl FnOnce(&mut std::fs::File) -> Result<(T, String), String>,
-    ) -> Result<T, String> {
-        self.make_digested(|sha256| self.droplet_path(sha256), write)
-    }
-
-    /// Makes a static site's files of what `write` writes, as [`Store::make_droplet`] a
-    /// droplet.
-    pub fn make_files<T>(
-        &self,
-        write: impl FnOnce(&mut std::fs::File) -> Result<(T, String), String>,
-    ) -> Result<T, String> {
-        self.make_digested(|sha256| self.files_path(sha256), write)
-    }
-
-    /// Makes the blob at `path_of` the digest `write` answers with of what it wrote.
-    fn make_digested<T>(
-        &self,
-        path_of: impl Fn(&str) -> PathBuf,
-        write: impl FnOnce(&mut std::fs::File) -> Result<(T, String), String>,
-    ) -> Result<T, String> {
-        let partial = self
-            .dir
-            .join("droplets")
-            .join(format!("{}.droplet", guid()));
-        let (made, sha256) = make_by_rename(&partial, write)?;
-        let path = path_of(&sha256);
-        let failed = |e: std::io::Error| format!("{}: {e}", path.display());
-        if path.exists() {
-            std::fs::remove_file(&partial).map_err(failed)?;
-        } else {
-            std::fs::rename(&partial, &path)
-                .and_then(|()| std::fs::File::open(self.dir.join("droplets"))?.sync_all())
-                .map_err(failed)?;
-        }
-        Ok(made)
-    }
-
-    /// Keeps the tar spooled at `from` ([`Store::spool`]), of the digest `sha256`, as a
-    /// static site's files are: one of that digest kept stays as it is.
-    pub fn keep_files(&self, sha256: &str, from: &Path) -> Result<(), String> {
-        let path = self.files_path(sha256);
-        if path.exists() {
-            return Ok(());
-        }
-        std::fs::File::open(from)
-            .and_then(|file| file.sync_all())
-            .and_then(|()| std::fs::rename(from, &path))
-            .and_then(|()| std::fs::File::open(self.dir.join("droplets"))?.sync_all())
-            .map_err(|e| format!("{}: {e}", path.display()))
-    }
-
-    /// Where an upload is received, for its owner only, gone with what is returned.
+    /// A file of this instance's disk, for its owner only, gone with what is returned: an
+    /// upload received, a blob made before it is kept ([`Store::keep`]).
     pub fn spool(&self) -> Result<(Spool, std::fs::File), String> {
         let path = self
             .dir
@@ -2199,19 +2177,146 @@ impl Store {
         Ok((Spool(path), file))
     }
 
-    pub fn delete(&self, blobs: &[Blob]) {
-        for blob in blobs {
-            let path = match blob {
-                Blob::Package(guid) => self.package_path(guid),
-                Blob::Droplet(sha256) => self.droplet_path(sha256),
-                Blob::Files(sha256) => self.files_path(sha256),
-            };
-            if let Err(e) = std::fs::remove_file(&path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                eprintln!("cannot delete {}: {e}", path.display());
+    /// Keeps the file spooled, of the digest `sha256`, as `blob`: whole, or not at all.
+    pub async fn keep(&self, blob: &Blob, spool: Spool, sha256: &str) -> Result<(), String> {
+        self.blobs.put(blob, spool, sha256).await
+    }
+
+    /// Whether `blob` is kept.
+    pub async fn has(&self, blob: &Blob) -> Result<bool, String> {
+        self.blobs.has(blob).await
+    }
+
+    /// `blob` as a stream; None: it is not kept.
+    pub async fn reading(&self, blob: &Blob) -> Result<Option<Reading>, String> {
+        self.blobs.read(blob).await
+    }
+
+    /// `blob` in a file of this instance's disk; None: it is not kept.
+    pub async fn local(&self, blob: &Blob) -> Result<Option<Local>, String> {
+        self.blobs.local(blob, || self.spool()).await
+    }
+
+    /// The sweeps begun, once none is under way: the blobs seen kept after this are kept
+    /// while the state says as many ([`Sweep::rounds`]), which a change naming them checks.
+    pub async fn unswept(&self) -> u64 {
+        loop {
+            if let Err(e) = self.sync().await {
+                eprintln!("BLOBS: a droplet waits for the store: {e}");
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                continue;
+            }
+            let now = epoch_secs();
+            let sweep = self.read(|state| state.sweep.clone());
+            if !sweep.under_way(now) {
+                return sweep.rounds;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Deletes the blobs the state names no more, as a change of it listed them: at once in
+    /// the directory, whose readers hold their files; a bucket's are left to the sweep
+    /// ([`Store::sweep`]), another instance reading them as it may be.
+    pub async fn delete(&self, blobs: &[Blob]) {
+        if !self.blobs.shared() {
+            self.sweep_of(blobs.to_vec()).await;
+        }
+    }
+
+    /// Sweeps the blobs for good: [`SWEEP_GRACE`] after a blob was first seen named by
+    /// nothing, it is deleted. Every instance does; one at a time deletes.
+    pub async fn keep_swept(self: Arc<Self>) {
+        let mut unnamed = Unnamed::default();
+        loop {
+            tokio::time::sleep(SWEEP_EVERY).await;
+            if let Err(e) = self.sweep(&mut unnamed, SWEEP_GRACE).await {
+                eprintln!("BLOBS: not swept: {e}");
             }
         }
+    }
+
+    /// One sweep: of the blobs kept, those the state does not name are `unnamed` from now on,
+    /// and deleted once they were for `grace`: what a change dropped, what was made and never
+    /// named (a staging cut short).
+    pub async fn sweep(&self, unnamed: &mut Unnamed, grace: Duration) -> Result<(), String> {
+        let listed: HashSet<Blob> = self.blobs.list().await?.into_iter().collect();
+        self.sync().await?;
+        let now = Instant::now();
+        self.read(|state| {
+            (unnamed.0).retain(|blob, _| listed.contains(blob) && !state.names(blob));
+            for blob in listed.into_iter().filter(|blob| !state.names(blob)) {
+                unnamed.0.entry(blob).or_insert(now);
+            }
+        });
+        let due =
+            |(blob, since): (&Blob, &Instant)| (since.elapsed() >= grace).then(|| blob.clone());
+        let due: Vec<Blob> = unnamed.0.iter().filter_map(due).collect();
+        for blob in self.sweep_of(due).await {
+            unnamed.0.remove(&blob);
+        }
+        Ok(())
+    }
+
+    /// Deletes those of `blobs` the state does not name, between a sweep's begin and its
+    /// end; none while another instance's sweep is under way. Those deleted.
+    async fn sweep_of(&self, blobs: Vec<Blob>) -> Vec<Blob> {
+        // nothing to delete, no sweep cut short to end: no change of the state
+        let cut_short = |sweep: &Sweep| sweep.by.is_some() && !sweep.under_way(epoch_secs());
+        let idle =
+            |state: &State| blobs.iter().all(|blob| state.names(blob)) && !cut_short(&state.sweep);
+        if self.read(idle) {
+            return Vec::new();
+        }
+        let _one = self.sweeping.lock().await;
+        let began = Instant::now();
+        let unnamed = self
+            .update(|state| {
+                let now = epoch_secs();
+                let ours = |by: &Sweeping| by.instance == self.instance;
+                if state.sweep.under_way(now) && !state.sweep.by.as_ref().is_some_and(ours) {
+                    return Vec::new();
+                }
+                let unnamed: Vec<Blob> = (blobs.iter())
+                    .filter(|blob| !state.names(blob))
+                    .cloned()
+                    .collect();
+                state.sweep.by = None;
+                if !unnamed.is_empty() {
+                    state.sweep.rounds += 1;
+                    state.sweep.by = Some(Sweeping {
+                        instance: self.instance.clone(),
+                        since: now,
+                    });
+                }
+                unnamed
+            })
+            .await;
+        if unnamed.is_empty() {
+            return unnamed;
+        }
+        let mut deleted = Vec::new();
+        for blob in unnamed {
+            if began.elapsed() >= SWEEP_WINDOW {
+                break;
+            }
+            let failed = match tokio::time::timeout(SWEEP_CALL, self.blobs.delete(&blob)).await {
+                Ok(Ok(())) => {
+                    deleted.push(blob);
+                    continue;
+                }
+                Ok(Err(e)) => e,
+                Err(_) => "no answer".to_string(),
+            };
+            eprintln!("BLOBS: cannot delete {}: {failed}", blob.key());
+        }
+        self.update(|state| {
+            if (state.sweep.by.as_ref()).is_some_and(|by| by.instance == self.instance) {
+                state.sweep.by = None;
+            }
+        })
+        .await;
+        deleted
     }
 }
 
@@ -2305,6 +2410,10 @@ pub fn rfc3339(secs: u64) -> String {
 mod postgres_server;
 
 #[cfg(test)]
+#[path = "../tests/support/s3_server.rs"]
+mod s3_server;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2317,6 +2426,17 @@ mod tests {
         ca: Option<Vec<u8>>,
         domains: &[&str],
     ) -> Result<Store, String> {
+        try_open_on(dir, url, ca, domains, None).await
+    }
+
+    /// As `try_open`, the blobs in `bucket`.
+    async fn try_open_on(
+        dir: &Path,
+        url: Option<&str>,
+        ca: Option<Vec<u8>>,
+        domains: &[&str],
+        bucket: Option<&BlobSettings>,
+    ) -> Result<Store, String> {
         let domains: Vec<String> = domains.iter().map(|name| name.to_string()).collect();
         let wickets = ["a".to_string(), "b".to_string()];
         let settings = url.map(|url| PostgresSettings {
@@ -2324,7 +2444,17 @@ mod tests {
             ca_pem: ca,
         });
         let runs = BTreeMap::new();
-        Store::open(dir, "o", "s", &domains, &wickets, &runs, settings.as_ref()).await
+        Store::open(
+            dir,
+            "o",
+            "s",
+            &domains,
+            &wickets,
+            &runs,
+            settings.as_ref(),
+            bucket,
+        )
+        .await
     }
 
     /// As `try_open`, verified against the test server's CA.
@@ -2340,6 +2470,140 @@ mod tests {
 
     fn names(store: &Store) -> Vec<String> {
         store.read(|state| state.apps.iter().map(|app| app.name.clone()).collect())
+    }
+
+    /// A blob is kept whole and read, as a stream and from a file, by any instance; swept
+    /// once the state names it no more: in the directory at once, in a bucket (its TLS
+    /// verified against a CA given, the keys under a prefix) after the grace, a read under
+    /// way getting it all either way; what was never named after the grace in both. A sweep
+    /// is seen by who is to name a blob, and waits for another instance's under way until
+    /// that is stale.
+    #[tokio::test]
+    async fn a_blob_is_kept_for_every_instance_and_swept_once_unnamed() {
+        use http_body_util::BodyExt as _;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for shared in [false, true] {
+            let dir = std::env::temp_dir().join(format!("cf-api-blobs-{}", guid()));
+            // the directory's one instance; the bucket's two, on one state
+            let (first, second) = if shared {
+                let (url, _) = postgres_server::database().await;
+                let url = format!("{url}?sslmode=disable");
+                let bucket = s3_server::bucket().await;
+                let open = async |dir: PathBuf| {
+                    let opened = try_open_on(&dir, Some(&url), None, &["localhost"], Some(&bucket));
+                    Arc::new(opened.await.unwrap())
+                };
+                (open(dir.join("a")).await, open(dir.join("b")).await)
+            } else {
+                let store = Arc::new(open(&dir, None, &["localhost"]).await);
+                (store.clone(), store)
+            };
+            let keep = async |blob: &Blob, bytes: &[u8]| {
+                use std::io::Write as _;
+                let (spool, mut file) = first.spool().unwrap();
+                file.write_all(bytes).unwrap();
+                drop(file);
+                let sha256 = crate::staging::sha256(bytes);
+                first.keep(blob, spool, &sha256).await.unwrap();
+            };
+            let zip = b"a zip".to_vec();
+            let component: Vec<u8> = (0..300_000u32).map(|at| (at % 251) as u8).collect();
+            let package = Blob::Package(guid());
+            let droplet = Blob::Droplet(crate::staging::sha256(&component));
+            let orphan = Blob::Files(crate::staging::sha256(b"never named"));
+            keep(&package, &zip).await;
+            keep(&droplet, &component).await;
+            keep(&orphan, b"never named").await;
+            let named = |state: &mut State| {
+                state.packages.push(Package {
+                    guid: package.name().to_string(),
+                    app: "a".into(),
+                    state: "READY".into(),
+                    sha256: None,
+                    docker: None,
+                    created_at: now(),
+                    updated_at: now(),
+                });
+                state.droplets.push(Droplet {
+                    guid: "d".into(),
+                    app: "a".into(),
+                    package: package.name().to_string(),
+                    sha256: droplet.name().to_string(),
+                    file: "hello.wasm".into(),
+                    staged_as: None,
+                    staged_by: None,
+                    bytes: 1,
+                    image: None,
+                    made: BTreeMap::new(),
+                    files: None,
+                    built: None,
+                    created_at: now(),
+                    updated_at: now(),
+                });
+            };
+            first.update(named).await;
+            second.sync().await.unwrap();
+
+            // uploaded through one instance, unpacked through another
+            let local = second.local(&package).await.unwrap().expect("the package");
+            assert_eq!(std::fs::read(local.path()).unwrap(), zip, "shared {shared}");
+            let gone = Blob::Package(guid());
+            assert!(second.local(&gone).await.unwrap().is_none());
+            assert!(second.reading(&gone).await.unwrap().is_none());
+
+            // dropped while it is read
+            let rounds = second.unswept().await;
+            let reading = second
+                .reading(&droplet)
+                .await
+                .unwrap()
+                .expect("the droplet");
+            assert_eq!(reading.bytes, component.len() as u64);
+            first.update(|state| state.droplets.clear()).await;
+            first.delete(std::slice::from_ref(&droplet)).await;
+            let mut unnamed = Unnamed::default();
+            second.sweep(&mut unnamed, SWEEP_GRACE).await.unwrap();
+            let read = reading.body.collect().await.unwrap().to_bytes();
+            assert_eq!(read, component, "shared {shared}");
+            // the directory's is gone at once, the bucket's and what was never named stay
+            // for the grace
+            assert_eq!(second.has(&droplet).await.unwrap(), shared);
+            assert!(second.has(&orphan).await.unwrap());
+            second.sweep(&mut unnamed, Duration::ZERO).await.unwrap();
+            for (blob, kept) in [(&package, true), (&droplet, false), (&orphan, false)] {
+                assert_eq!(
+                    second.has(blob).await.unwrap(),
+                    kept,
+                    "{blob:?}, shared {shared}"
+                );
+            }
+            assert!(first.unswept().await > rounds, "a sweep is seen");
+            assert!(unnamed.0.is_empty());
+
+            // another instance's sweep under way: nothing deleted, nothing named
+            let swept_by = async |since: u64| {
+                let by = Some(Sweeping {
+                    instance: "another".into(),
+                    since,
+                });
+                first.update(|state| state.sweep.by = by.clone()).await;
+                second.sync().await.unwrap();
+            };
+            swept_by(epoch_secs()).await;
+            keep(&orphan, b"never named").await;
+            second.sweep(&mut unnamed, Duration::ZERO).await.unwrap();
+            assert!(second.has(&orphan).await.unwrap());
+            let waited = tokio::time::timeout(Duration::from_millis(300), second.unswept());
+            assert!(waited.await.is_err(), "a sweep under way is waited for");
+            // cut short: taken over
+            swept_by(epoch_secs() - SWEEP_STALE.as_secs()).await;
+            second.unswept().await;
+            second.sweep(&mut unnamed, Duration::ZERO).await.unwrap();
+            assert!(!second.has(&orphan).await.unwrap());
+            first.sync().await.unwrap();
+            assert_eq!(first.read(|state| state.sweep.by.clone()), None);
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// What a change wrote is read at the next start, the lists in their order, with what was

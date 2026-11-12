@@ -4,6 +4,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use crate::blobs::BlobSettings;
 use crate::flume::FlumeSettings;
 use crate::oidc::{OidcSettings, parse_rules};
 use crate::postgres::PostgresSettings;
@@ -27,7 +28,8 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
                               has answered as long again (default 30, 0 = never)
   --domain <name>             a shared domain; repeatable (or comma-separated): the first
                               takes the default and random routes (default localhost)
-  --data-dir <path>           the state, the packages and the droplets (default cf-api)
+  --data-dir <path>           the state, the packages and the droplets, and the uploads as
+                              they come (default cf-api)
   --state <url>               the state in PostgreSQL in place of the directory's: the store of
                               several instances; postgres://user:password@host:port/database
                               ?sslmode=require (libpq's parameters; TLS, which a URL
@@ -35,6 +37,17 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
                               takes the directory's state
   --state-file <path>         read the URL from a file instead
   --state-ca-cert <path>      PEM CA verifying it (default the webPKI roots)
+  --blobs <url>               the packages and the droplets in an S3 bucket in place of the
+                              directory's: the blobs of several instances; s3://bucket or
+                              s3://bucket/prefix
+  --blobs-endpoint <url>      the bucket's S3 endpoint, http(s)://host[:port], addressed by
+                              path (default AWS, by the region)
+  --blobs-region <name>       its region (default us-east-1)
+  --blobs-access-key-id <id>  its credentials
+  --blobs-secret-access-key <key>
+  --blobs-secret-access-key-file <path>
+                              read the key from a file instead
+  --blobs-ca-cert <path>      PEM CA verifying the endpoint (default the webPKI roots)
   --org <name>                the organization made at the first start (default sluice)
   --space <name>              and its space (default wicket)
   --cnb-builder <image>       the Cloud Native Buildpacks builder staging a zip of source on a
@@ -146,6 +159,13 @@ const VALUED: &[&str] = &[
     "state",
     "state-file",
     "state-ca-cert",
+    "blobs",
+    "blobs-endpoint",
+    "blobs-region",
+    "blobs-access-key-id",
+    "blobs-secret-access-key",
+    "blobs-secret-access-key-file",
+    "blobs-ca-cert",
     "org",
     "space",
     "cnb-builder",
@@ -386,6 +406,60 @@ pub fn parse(
         }
         None => None,
     };
+    let named = |name: &str| !name.is_empty() && !name.contains(|c: char| c.is_whitespace());
+    let blobs = match value("blobs") {
+        Some(url) => {
+            let (bucket, prefix) = url
+                .strip_prefix("s3://")
+                .map(|bucket| bucket.split_once('/').unwrap_or((bucket, "")))
+                .filter(|(bucket, _)| named(bucket))
+                .ok_or_else(|| format!("--blobs: expected s3://bucket[/prefix], not '{url}'"))?;
+            // as a key is signed: nothing to escape
+            let plain = |c: char| c.is_ascii_alphanumeric() || "-_./".contains(c);
+            if !prefix.chars().all(plain) {
+                return Err(format!(
+                    "--blobs: a prefix of letters, digits, '-', '_', '.' and '/', not '{prefix}'"
+                ));
+            }
+            let keys = (
+                value("blobs-access-key-id"),
+                secret("blobs-secret-access-key")?,
+            );
+            let (Some(access_key_id), Some(secret_access_key)) = keys else {
+                return Err(
+                    "--blobs needs --blobs-access-key-id and --blobs-secret-access-key \
+                            (or --blobs-secret-access-key-file)"
+                        .into(),
+                );
+            };
+            Some(BlobSettings {
+                bucket: bucket.to_string(),
+                prefix: match prefix.trim_matches('/') {
+                    "" => String::new(),
+                    prefix => format!("{prefix}/"),
+                },
+                endpoint: value("blobs-endpoint"),
+                region: value("blobs-region").unwrap_or_else(|| "us-east-1".to_string()),
+                access_key_id,
+                secret_access_key,
+                ca_pem: pem("blobs-ca-cert")?,
+            })
+        }
+        None => {
+            let alone = [
+                "blobs-endpoint",
+                "blobs-region",
+                "blobs-access-key-id",
+                "blobs-secret-access-key",
+                "blobs-secret-access-key-file",
+                "blobs-ca-cert",
+            ];
+            if let Some(name) = alone.iter().find(|name| value(name).is_some()) {
+                return Err(format!("--{name} needs --blobs: it is the bucket's"));
+            }
+            None
+        }
+    };
     let flume = match value("flume") {
         Some(url) => {
             if !url.starts_with("grpc://") && !url.starts_with("grpcs://") {
@@ -562,6 +636,7 @@ pub fn parse(
             domains,
             data_dir: PathBuf::from(value("data-dir").unwrap_or_else(|| "cf-api".to_string())),
             state,
+            blobs,
             org: value("org").unwrap_or_else(|| "sluice".to_string()),
             space: value("space").unwrap_or_else(|| "wicket".to_string()),
             cnb,
@@ -675,6 +750,9 @@ mod tests {
             "SLUICE_WICKET_CF_API_GROUP_ROLE" => Some("ops=admin".to_string()),
             "SLUICE_WICKET_CF_API_ADMIN_CLIENT" => Some("robot".to_string()),
             "SLUICE_WICKET_CF_API_STATE" => Some("postgres://cf:secret@db/cf".to_string()),
+            "SLUICE_WICKET_CF_API_BLOBS" => Some("s3://cf/blobs/".to_string()),
+            "SLUICE_WICKET_CF_API_BLOBS_ACCESS_KEY_ID" => Some("id".to_string()),
+            "SLUICE_WICKET_CF_API_BLOBS_SECRET_ACCESS_KEY" => Some("hush".to_string()),
             _ => None,
         };
         let config = serve(parse(
@@ -706,6 +784,16 @@ mod tests {
         let state = config.settings.state.expect("a store");
         assert_eq!(state.url, "postgres://cf:secret@db/cf");
         assert!(!format!("{state:?}").contains("secret"));
+        let blobs = config.settings.blobs.expect("a bucket");
+        assert_eq!(
+            (blobs.bucket.as_str(), blobs.prefix.as_str()),
+            ("cf", "blobs/")
+        );
+        assert_eq!(
+            (blobs.endpoint.as_deref(), blobs.region.as_str()),
+            (None, "us-east-1")
+        );
+        assert!(!format!("{blobs:?}").contains("hush"));
         assert_eq!(config.settings.org, "sluice");
         assert!(!config.exit_on_stdin_close);
         let flume = config.settings.flume.expect("a flume");
@@ -906,6 +994,15 @@ mod tests {
         assert_eq!(
             error("--wicket http://w:1 --state mysql://u:secret@db/cf"),
             "--state: expected postgres://user:password@host:port/database"
+        );
+        assert_eq!(
+            error("--wicket http://w:1 --blobs s3://cf --blobs-access-key-id id"),
+            "--blobs needs --blobs-access-key-id and --blobs-secret-access-key (or \
+             --blobs-secret-access-key-file)"
+        );
+        assert_eq!(
+            error("--wicket http://w:1 --blobs-region eu-west-1"),
+            "--blobs-region needs --blobs: it is the bucket's"
         );
         assert!(
             error("--wicket http://w:1 --flume grpc://f:1")

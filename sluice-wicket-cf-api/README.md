@@ -1069,8 +1069,9 @@ docker compose up -d --force-recreate --wait wicket-b
 ## The state in PostgreSQL
 
 `--state postgres://user:password@host:5432/database?sslmode=require` keeps the state in PostgreSQL in place of
-`state.json`: the store several instances are to share. The packages, the droplets, the logins
-and the reconciling of the wickets are one process's still: run one instance on it.
+`state.json`: the store several instances are to share. The logins and the reconciling of the
+wickets are one process's still: run one instance on it. So are the packages and the droplets,
+unless in a bucket ([The blobs in a bucket](#the-blobs-in-a-bucket)).
 
 - its tables (`sluice_cf_records`: a row per organization, app, route, package, ..., its JSON as
   `state.json` has it; `sluice_cf_meta`: the revision; `sluice_cf_commits`: who committed each)
@@ -1090,6 +1091,31 @@ and the reconciling of the wickets are one process's still: run one instance on 
 Run against PostgreSQL 18; what it costs is in
 [.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#the-states-store).
 
+## The blobs in a bucket
+
+`--blobs s3://bucket/prefix` keeps the packages and the droplets in an S3 bucket in place of
+`--data-dir`'s files, under the same keys (`packages/<guid>.zip`, `droplets/<sha256>.wasm`,
+`droplets/<sha256>.tar`): the blobs several instances are to share, with `--state`.
+
+- the bucket is of any S3 at `--blobs-endpoint`, addressed by path (`<endpoint>/<bucket>/<key>`),
+  or without it of AWS in `--blobs-region`. The requests are signed (Signature Version 4) with
+  `--blobs-access-key-id` and `--blobs-secret-access-key`: static keys that may get, put, delete
+  and list below the prefix. An `https://` endpoint is verified against `--blobs-ca-cert`, else
+  the webPKI roots
+- an upload, and a droplet as it is staged, are files of `--data-dir` first (the instance's own),
+  then put in one request: an object is there whole or not at all. A package is unpacked from a
+  copy in `--data-dir`, a droplet goes to a wicket as a stream: neither is held in memory
+- a blob the state names no more (an older package, a droplet neither current nor the one
+  before) is deleted 30 to 35 minutes later, another instance reading it as it may be; one never
+  named (a staging cut short) likewise. In the directory the first goes at once
+- the bucket holds what `disk-mib` is sized for in the directory, and what was dropped in the
+  last 35 minutes. A bucket and prefix are one state's: instances on another state delete what
+  theirs does not name
+- as an app of a Firecracker wicket, its `egress` names the endpoint
+
+Run against Versity S3 Gateway 1.10.0 (`versity/versitygw`, its POSIX backend); what was decided
+and measured is in [.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#the-blobs-bucket).
+
 ## Options
 
 | option | |
@@ -1099,7 +1125,11 @@ Run against PostgreSQL 18; what it costs is in
 | `--wicket-token <token>` / `--wicket-token-file <path>` | their `--console-token`, one for all |
 | `--wicket-away-grace <secs>` | of several wickets, one not answering that long is gone: placed on no more, the indices on it started on the others, until it has answered as long again ([Several wickets](#several-wickets); default 30, 0 = never) |
 | `--domain <name>` | a shared domain; repeatable (or comma-separated): the first takes the default and random routes (default `localhost`). Through a sluice server, a suffix whose wildcard DNS reaches it |
-| `--data-dir <path>` | the state and the blobs (default `cf-api`), one process's (an exclusive `flock` of its `.lock`: a second start on it fails): `state.json` (written by a rename on every change; not with `--state`), `jwt.key` and `sessions.json` (the logins), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app), `droplets/<sha256>.tar` (a static site's files, a droplet buildpacks built) |
+| `--data-dir <path>` | the state and the blobs (default `cf-api`), one process's (an exclusive `flock` of its `.lock`: a second start on it fails): `state.json` (written by a rename on every change; not with `--state`), `jwt.key` and `sessions.json` (the logins), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app), `droplets/<sha256>.tar` (a static site's files, a droplet buildpacks built); with `--blobs` of these the uploads and the blobs being made only |
+| `--blobs <url>` | the packages and the droplets in an S3 bucket in place of `--data-dir`'s ([The blobs in a bucket](#the-blobs-in-a-bucket)): `s3://bucket` or `s3://bucket/prefix` |
+| `--blobs-endpoint <url>` / `--blobs-region <name>` | the bucket's S3 endpoint, `http(s)://host[:port]`, addressed by path (default AWS), and its region (default `us-east-1`) |
+| `--blobs-access-key-id <id>` / `--blobs-secret-access-key <key>` / `--blobs-secret-access-key-file <path>` | its credentials (required with `--blobs`) |
+| `--blobs-ca-cert <path>` | PEM CA verifying the endpoint (default the webPKI roots) |
 | `--state <url>` / `--state-file <path>` | the state in PostgreSQL in place of `--data-dir`'s `state.json` ([The state in PostgreSQL](#the-state-in-postgresql)): `postgres://user:password@host:port/database`, with libpq's parameters (`?sslmode=require`: TLS, which a URL without takes only where the server has it) |
 | `--state-ca-cert <path>` | PEM CA verifying it (default the webPKI roots) |
 | `--org <name>` / `--space <name>` | the organization and its space the first start makes (default `sluice` / `wicket`) |
@@ -1541,7 +1571,9 @@ flume from `../sluice-flume` (or taking `SLUICE_WICKET_RUNTIME_WASI`, `SLUICE_WI
 of the cf-api's own, and the images against a registry in the test (`tests/registry`). The
 store's tests (`store::tests`) run a PostgreSQL in a container (`postgres:18-alpine`, Docker on
 the PATH) over TLS and without, or the one `SLUICE_CF_API_TEST_POSTGRES` names (over TLS with
-`SLUICE_CF_API_TEST_POSTGRES_CA` the file of its CA). Where
+`SLUICE_CF_API_TEST_POSTGRES_CA` the file of its CA), and an S3 bucket in one
+(`versity/versitygw:v1.10.0`, over TLS), or the one `SLUICE_CF_API_TEST_S3` names
+(`https://id:key@host:port/bucket`, `SLUICE_CF_API_TEST_S3_CA` the file of its CA). Where
 `/dev/kvm` is usable, with Firecracker and a guest kernel (as the wicket's VM test finds them), a
 second test runs against `../sluice-wicket-runtime-firecracker` (`sg kvm -c 'cargo test'` until
 the `kvm` group is in the login), source staged by a sample buildpack where the lifecycle and

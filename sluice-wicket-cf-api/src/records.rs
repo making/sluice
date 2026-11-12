@@ -1,6 +1,6 @@
 //! The state as records: a row per organization, space, app, route, package, build, ... and one
 //! per thing kept whole (the removals, the purges, the flume's cursor, the wickets' ids, the
-//! keyvalue homes, the wickets' stacks), so a change writes what it changed and another process
+//! keyvalue homes, the wickets' stacks, the blobs' sweeps), so a change writes what it changed and another process
 //! takes what changed (`crate::postgres`).
 //!
 //! A row is its kind, its id (an entity's guid), its body (the entity's JSON, as `state.json`
@@ -176,6 +176,7 @@ singles!(
     "wicket_ids": wicket_ids,
     "homes": homes,
     "wicket_stacks": wickets.runtimes,
+    "sweep": sweep,
 );
 
 /// The rows a change writes, as they are found.

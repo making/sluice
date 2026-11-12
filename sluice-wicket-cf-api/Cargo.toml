@@ -16,8 +16,9 @@ tokio-util = { version = "0.7", features = ["rt"] }
 http = "1"
 http-body-util = "0.1"
 bytes = "1"
-# the wickets' app API (plain HTTP: the cf-api sits next to its wickets); a droplet as a stream
-reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
+# the wickets' app API (plain HTTP: the cf-api sits next to its wickets); a droplet as a stream;
+# the blobs' bucket (--blobs), its TLS on the provider installed (ring)
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls-no-provider"] }
 # a start's puts to the wickets, and their watches, at once
 futures-util = "0.3"
 # the OpenID Provider behind cf login --sso
@@ -53,8 +54,8 @@ prost = "0.14"
 # matches tonic's tls-ring
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
-# the state in PostgreSQL (--state): its TLS verified against the webPKI roots unless a CA is
-# given
+# the state in PostgreSQL (--state): its TLS, as the bucket's, verified against the webPKI roots
+# unless a CA is given
 tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
 tokio-postgres-rustls = "0.14"
 webpki-roots = "1"
