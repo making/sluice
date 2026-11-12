@@ -1068,7 +1068,7 @@ docker compose up -d --force-recreate --wait wicket-b
 
 ## The state in PostgreSQL
 
-`--state postgres://user:password@host:5432/database` keeps the state in PostgreSQL in place of
+`--state postgres://user:password@host:5432/database?sslmode=require` keeps the state in PostgreSQL in place of
 `state.json`: the store several instances are to share. The packages, the droplets, the logins
 and the reconciling of the wickets are one process's still: run one instance on it.
 
@@ -1082,8 +1082,10 @@ and the reconciling of the wickets are one process's still: run one instance on 
   not answer a change waits for it, and a new request is answered 503 (`/healthz` too)
 - the reads are answered from a copy in memory, brought to the store's revision at each
   request's start (one query) and as the others commit (`LISTEN`)
-- TLS as the URL says (`sslmode=require`; libpq's default `prefer` goes on without where the
-  server has none), the server verified against `--state-ca-cert`, else the webPKI roots
+- give the URL `?sslmode=require`: the state holds the apps' credentials. The server is then
+  verified, its certificate and its host name, against `--state-ca-cert`, else the webPKI roots.
+  Without it (libpq's default `prefer`) a server with TLS is verified the same, and one without
+  is gone on with, the start saying so (`STATE: the connection to the store is not over TLS`)
 
 Run against PostgreSQL 18; what it costs is in
 [.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#the-states-store).
@@ -1098,7 +1100,7 @@ Run against PostgreSQL 18; what it costs is in
 | `--wicket-away-grace <secs>` | of several wickets, one not answering that long is gone: placed on no more, the indices on it started on the others, until it has answered as long again ([Several wickets](#several-wickets); default 30, 0 = never) |
 | `--domain <name>` | a shared domain; repeatable (or comma-separated): the first takes the default and random routes (default `localhost`). Through a sluice server, a suffix whose wildcard DNS reaches it |
 | `--data-dir <path>` | the state and the blobs (default `cf-api`), one process's (an exclusive `flock` of its `.lock`: a second start on it fails): `state.json` (written by a rename on every change; not with `--state`), `jwt.key` and `sessions.json` (the logins), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app), `droplets/<sha256>.tar` (a static site's files, a droplet buildpacks built) |
-| `--state <url>` / `--state-file <path>` | the state in PostgreSQL in place of `--data-dir`'s `state.json` ([The state in PostgreSQL](#the-state-in-postgresql)): `postgres://user:password@host:port/database`, with libpq's parameters |
+| `--state <url>` / `--state-file <path>` | the state in PostgreSQL in place of `--data-dir`'s `state.json` ([The state in PostgreSQL](#the-state-in-postgresql)): `postgres://user:password@host:port/database`, with libpq's parameters (`?sslmode=require`: TLS, which a URL without takes only where the server has it) |
 | `--state-ca-cert <path>` | PEM CA verifying it (default the webPKI roots) |
 | `--org <name>` / `--space <name>` | the organization and its space the first start makes (default `sluice` / `wicket`) |
 | `--cnb-builder <image>` | the Cloud Native Buildpacks builder staging a zip of source on a Firecracker wicket with `--guest` ([Buildpacks](#buildpacks): `cnb`); none: a zip of source fails staging |
@@ -1538,7 +1540,8 @@ flume from `../sluice-flume` (or taking `SLUICE_WICKET_RUNTIME_WASI`, `SLUICE_WI
 `SLUICE_FLUME`); the login through a provider runs against a mock of one in the test, with TLS
 of the cf-api's own, and the images against a registry in the test (`tests/registry`). The
 store's tests (`store::tests`) run a PostgreSQL in a container (`postgres:18-alpine`, Docker on
-the PATH), or the one `SLUICE_CF_API_TEST_POSTGRES` names. Where
+the PATH) over TLS and without, or the one `SLUICE_CF_API_TEST_POSTGRES` names (over TLS with
+`SLUICE_CF_API_TEST_POSTGRES_CA` the file of its CA). Where
 `/dev/kvm` is usable, with Firecracker and a guest kernel (as the wicket's VM test finds them), a
 second test runs against `../sluice-wicket-runtime-firecracker` (`sg kvm -c 'cargo test'` until
 the `kvm` group is in the login), source staged by a sample buildpack where the lifecycle and

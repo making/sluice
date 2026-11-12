@@ -2309,17 +2309,28 @@ mod tests {
     use super::*;
 
     /// A data directory of its own, and the store opened on it: the state in the directory,
-    /// or in the database `url`; the first `domains` flag takes the default routes.
-    async fn open(dir: &Path, url: Option<&str>, domains: &[&str]) -> Store {
+    /// or in the database `url`, its TLS verified against `ca`; the first `domains` flag takes
+    /// the default routes.
+    async fn try_open(
+        dir: &Path,
+        url: Option<&str>,
+        ca: Option<Vec<u8>>,
+        domains: &[&str],
+    ) -> Result<Store, String> {
         let domains: Vec<String> = domains.iter().map(|name| name.to_string()).collect();
         let wickets = ["a".to_string(), "b".to_string()];
         let settings = url.map(|url| PostgresSettings {
             url: url.to_string(),
-            ca_pem: None,
+            ca_pem: ca,
         });
         let runs = BTreeMap::new();
-        let store = Store::open(dir, "o", "s", &domains, &wickets, &runs, settings.as_ref());
-        store.await.unwrap()
+        Store::open(dir, "o", "s", &domains, &wickets, &runs, settings.as_ref()).await
+    }
+
+    /// As `try_open`, verified against the test server's CA.
+    async fn open(dir: &Path, url: Option<&str>, domains: &[&str]) -> Store {
+        let opened = try_open(dir, url, postgres_server::ca(), domains).await;
+        opened.unwrap()
     }
 
     /// What a store keeps, as `state.json` has it.
@@ -2333,10 +2344,11 @@ mod tests {
 
     /// What a change wrote is read at the next start, the lists in their order, with what was
     /// noted aside from a change before it: in the directory, and in PostgreSQL, whose empty
-    /// store takes the directory's state, once.
+    /// store takes the directory's state, once; over a connection without TLS.
     #[tokio::test]
     async fn a_change_is_kept_for_the_next_start() {
         let (url, _) = postgres_server::database().await;
+        let url = format!("{url}?sslmode=disable");
         for url in [None, Some(url.as_str())] {
             let dir = std::env::temp_dir().join(format!("cf-api-store-{}", guid()));
             // as the release before left it: the directory's state
@@ -2399,11 +2411,27 @@ mod tests {
 
     /// Two instances on one PostgreSQL: a change of one is seen by the other (told of it, and
     /// at a request's start at the latest), the changes of both are one after another, none
-    /// lost, and a connection lost is opened again.
+    /// lost, and a connection lost is opened again; over TLS, the server verified, where the
+    /// test server takes it.
     #[tokio::test(flavor = "multi_thread")]
     async fn two_instances_change_one_state() {
-        let (url, behind) = postgres_server::database().await;
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (plain, behind) = postgres_server::database().await;
         let dir = |of: &str| std::env::temp_dir().join(format!("cf-api-store-{of}-{}", guid()));
+        let tls = postgres_server::ca().is_some();
+        let url = match tls {
+            true => format!("{plain}?sslmode=require"),
+            false => plain.clone(),
+        };
+        if tls {
+            // a server the CA does not verify is refused, and not gone on to without TLS
+            // (`prefer`, a URL's default)
+            for url in [&url, &plain] {
+                let refused = try_open(&dir("refused"), Some(url), None, &["localhost"]).await;
+                let error = refused.err().expect("refused");
+                assert!(error.contains("certificate"), "{error}");
+            }
+        }
         let a = open(&dir("a"), Some(&url), &["localhost"]).await;
         let b = open(&dir("b"), Some(&url), &["localhost"]).await;
         assert_eq!(kept(&a), kept(&b));
@@ -2432,6 +2460,12 @@ mod tests {
             }
         };
         tokio::join!(scale(&a, &x, "A"), scale(&b, &y, "B"));
+        // every connection of both, the changing and the listening, is over TLS
+        let over = "SELECT ssl FROM pg_stat_ssl JOIN pg_stat_activity USING (pid) \
+                    WHERE datname = current_database() AND pid <> pg_backend_pid()";
+        let over = behind.query(over, &[]).await.unwrap();
+        let over: Vec<bool> = over.iter().map(|row| row.get(0)).collect();
+        assert_eq!(over, [tls; 4]);
         a.sync().await.unwrap();
         b.sync().await.unwrap();
         assert_eq!(kept(&a), kept(&b));

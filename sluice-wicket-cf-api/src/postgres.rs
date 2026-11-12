@@ -143,7 +143,16 @@ pub struct Postgres {
 fn failed(e: tokio_postgres::Error) -> String {
     match e.as_db_error() {
         Some(db) => format!("--state: {}", db.message()),
-        None => format!("--state: {e}"),
+        None => {
+            // its cause is not in what it says (a TLS handshake's: the certificate refused)
+            let mut said = format!("--state: {e}");
+            let mut cause = std::error::Error::source(&e);
+            while let Some(e) = cause {
+                said += &format!(": {e}");
+                cause = e.source();
+            }
+            said
+        }
     }
 }
 
@@ -317,6 +326,14 @@ impl Postgres {
         first: impl FnOnce() -> Result<State, String>,
     ) -> Result<bool, String> {
         let session = self.open(true).await?;
+        // `prefer`, a URL's default, goes on without TLS where the server has none: said, as
+        // the state holds the apps' credentials. A server not telling is left unsaid
+        let over = "SELECT ssl FROM pg_stat_ssl WHERE pid = pg_backend_pid()";
+        if let Ok(Some(row)) = session.client.query_opt(over, &[]).await
+            && !row.get::<_, bool>(0)
+        {
+            eprintln!("STATE: the connection to the store is not over TLS (sslmode=require)");
+        }
         Postgres::execute(&session, "BEGIN").await?;
         let head = Postgres::head(&session, true).await?;
         let empty = head.0 == 0;

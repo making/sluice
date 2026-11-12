@@ -30,8 +30,9 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
   --data-dir <path>           the state, the packages and the droplets (default cf-api)
   --state <url>               the state in PostgreSQL in place of the directory's: the store of
                               several instances; postgres://user:password@host:port/database
-                              (libpq's parameters, as sslmode=require). An empty one takes
-                              the directory's state
+                              ?sslmode=require (libpq's parameters; TLS, which a URL
+                              without takes only where the server has it). An empty one
+                              takes the directory's state
   --state-file <path>         read the URL from a file instead
   --state-ca-cert <path>      PEM CA verifying it (default the webPKI roots)
   --org <name>                the organization made at the first start (default sluice)
