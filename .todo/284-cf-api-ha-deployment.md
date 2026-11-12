@@ -29,7 +29,8 @@ Needs 275-283: the last of them.
   2. plain processes / containers behind any load balancer, `SIGTERM` and `/healthz`
 - no session affinity needed (277, 279, 281); say what an operator sees when the store is away
   (reads? none: 503), and when no leader is (reads served, edits 503 until one)
-- the README: "Several instances" beside "Several wickets", the update's steps, the sizing
+- `sluice-wicket-cf-api/ha.md` (what several instances share, apart from the README, which
+  points to it from "Several instances"): the deployment, the update's steps, the sizing
   (instances' memory, the store's and the bucket's), a backup (the store's and the bucket's, no
   longer the disk's); `.kb/wicket-cf-api-findings.md`: measured: a leader's takeover, an
   instance's update with `cf push` under way, requests answered throughout
