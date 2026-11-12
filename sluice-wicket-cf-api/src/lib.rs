@@ -45,7 +45,7 @@ pub mod postgres;
 mod records;
 pub mod registry;
 pub mod roles;
-mod s3;
+pub mod s3;
 pub mod security_groups;
 pub mod services;
 pub mod staging;

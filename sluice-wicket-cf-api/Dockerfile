@@ -48,6 +48,7 @@ RUN SLUICE_GIT_COMMIT=${GIT_COMMIT} SLUICE_WICKET_SITE_WASM=/site.wasm \
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=build /src/sluice-wicket-cf-api/target/release/sluice-wicket-cf-api /usr/local/bin/sluice-wicket-cf-api
 # the working directory, where the data directory (cf-api) is made: writable, a volume to keep it
+# (of several instances, ha.md, each one's scratch)
 COPY --from=build --chown=65532:65532 /data /data
 WORKDIR /data
 EXPOSE 9091

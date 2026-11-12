@@ -76,6 +76,10 @@ const SEND_AGAIN: std::time::Duration = std::time::Duration::from_millis(200);
 /// Says a request was sent by another instance: one not reconciling the wickets answers it
 /// [`NOT_MADE`], sending it no further.
 const SENT_ON: &str = "sluice-sent-on";
+/// The host the client of a request sent on asked: the links of its answer are of that one,
+/// while the request's own host is the `--instance-url`'s, which whatever routes to the
+/// instances routes by.
+const SENT_FOR: &str = "sluice-sent-for";
 /// Says of a 503 that nothing was changed: its instance does not reconcile the wickets.
 const NOT_MADE: &str = "sluice-not-made";
 /// What neither a request sent on nor its answer keeps: a connection's own, the body's length
@@ -454,10 +458,10 @@ impl Api {
                 Err(e) => return ApiError::bad_request(format!("the body: {e}")).into(),
             }
         };
-        let host = parts
-            .headers
-            .get(header::HOST)
-            .and_then(|host| host.to_str().ok())
+        let named = |name: &str| parts.headers.get(name).and_then(|host| host.to_str().ok());
+        let sent_for = named(SENT_FOR).filter(|_| parts.headers.contains_key(SENT_ON));
+        let host = sent_for
+            .or(named(header::HOST.as_str()))
             .unwrap_or("127.0.0.1")
             .to_string();
         let forwarded_https = parts
@@ -487,6 +491,11 @@ impl Api {
             Ok(response) => response,
             Err(error) => error.into(),
         };
+        // what it saw of the wickets is every instance's before its answer: the client's next
+        // request, to another instance, reads no less
+        if req.method != Method::GET {
+            self.store.observed().await;
+        }
         // a probe's, every few seconds
         if req.path == "/healthz" {
             return response;
@@ -769,7 +778,7 @@ impl Api {
         }
     }
 
-    /// Sends the request as it came to `leader`, the instance of the turn `turn`, for the
+    /// Sends the request as it came to `leader`, the instance of the turn `turn`, saying the
     /// host and the scheme its client asked: its links are this API's as the client reaches it.
     /// Its answer is waited for while that turn lasts.
     async fn send_on(&self, req: &Req, leader: &str, turn: Option<u64>) -> Sent {
@@ -790,7 +799,7 @@ impl Api {
             HeaderValue::from_str(scheme).expect("http or https"),
         );
         if let Ok(host) = HeaderValue::from_str(host) {
-            headers.insert(header::HOST, host);
+            headers.insert(SENT_FOR, host);
         }
         let request = (self.peers.request(req.method.clone(), url))
             .headers(headers)

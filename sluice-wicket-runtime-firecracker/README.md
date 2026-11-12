@@ -303,11 +303,13 @@ removed ...; restarted ...; adjusted ...`):
 - a target unchanged keeps its VMs, and so does one [adjusted](#how-many-vms-and-how-long): only
   its numbers changed
 - a target restarted serves its next connection from the new VMs; a connection open stays
-  on the VMs it got, which end with the last of them. Replace a rootfs by a rename: a VM has
-  its file open
+  on the VM it got. A booted or pooled VM's process is told to stop then (SIGTERM, 10s to end
+  its connections and itself, as [a stop](#disks) on a disk), the VM gone with it; a clone of a
+  connection's own ends with its last connection. Replace a rootfs by a rename: a VM has its
+  file open
 - a host added or removed is advertised on every node stream; a removed target is served
   until every stream acknowledged its removal (the server may have routed a connection to it
-  before)
+  before), its VMs stopped so then
 - an app's VM on a [disk](#disks) is stopped before its next one starts, last of all
 
 The VMs start beside the rest (`routes reload (file change): its VMs starting`): no edit waits for

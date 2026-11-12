@@ -2,7 +2,7 @@
 //! one static program told apart by the name it is run as, in a builder that has no shell.
 //!
 //! It detects an app holding `sample.app`. Its build says what it sees (the app's
-//! `STAGED_VAR`, as `/platform/env` gave it; its user), puts the buildpack's `serve` -- the
+//! `STAGED_VAR`, as `/platform/env` gave it; its user), waits the app's `SAMPLE_BUILD_MS`, puts the buildpack's `serve` -- the
 //! sample process -- in a launch layer and names it the `web` process, and keeps a cache
 //! layer no droplet holds, counting the builds it was restored to.
 
@@ -48,6 +48,13 @@ fn build() -> std::io::Result<()> {
         std::env::var("STAGED_VAR").unwrap_or_default()
     );
     eprintln!("sample buildpack: a line on stderr");
+    // a build that takes its time, for a test of what happens meanwhile
+    if let Some(millis) = std::env::var("SAMPLE_BUILD_MS")
+        .ok()
+        .and_then(|millis| millis.parse().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(millis));
+    }
     // where a buildpack's tools write: the builder's root is the build's to write
     std::fs::write(dir("HOME")?.join(".sample-build"), b"built")?;
     let bin = layers.join("runtime/bin");

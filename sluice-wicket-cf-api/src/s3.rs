@@ -151,8 +151,7 @@ impl S3 {
         }
     }
 
-    /// Makes the bucket, unless it is there: a test server's.
-    #[cfg(test)]
+    /// Makes the bucket, unless it is there: a test server's, the integration test's too.
     pub async fn make_bucket(&self) -> Result<(), String> {
         let uri = match self.bucket.as_str() {
             "" => "/",

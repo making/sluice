@@ -288,6 +288,60 @@ Two builds and two sets of flags on one store
 - a start refused is tried for the lease's time first: a supervisor starting an instance again
   after a kill finds its row still there
 
+## The deployment of several instances
+
+Two ways to run them, an update one at a time, and the test of both
+([ha.md](../sluice-wicket-cf-api/ha.md#the-deployment)). Decided against the alternatives:
+
+- an instance in a VM has no `disk`: a disk has one writer, so its VM is stopped before the next
+  boots, a boot long of no instance. Its scratch is `/tmp` then, memory
+- a Firecracker wicket tells the process of a VM it replaced or removed to stop (SIGTERM, 10s),
+  for every route, where it killed the VM once its last connection ended. Without it an
+  instance replaced while reconciling the wickets held the lease for as long as a client kept a
+  connection to it, the new VM at the same `--instance-url` answering the edits sent there
+  `not made`; and no app was told of its end. A connection open on the old VM has the 10s, not
+  for as long as it likes: what CF gives an instance
+- an edit sent on has the `Host` of the `--instance-url`, the client's in `sluice-sent-for`,
+  where it had the client's: whatever routes by host (a wicket's `--listen`, a sluice server)
+  sends it to that instance, not to any advertising the API's host
+- a request that is no `GET` is answered once what it saw of the wickets is written
+  (`Store::observed`), not 100ms later: the CLI's next request reaches another instance sooner
+  than that, and `cf push` showed an instance `starting` that the instance before said
+  `crashed`
+- the test's flows run against two instances, not one and then two: every assertion of one
+  holds through a relay sending each request to the next. What only one instance has (the
+  files of its `--data-dir`, a state lost, the VM on a disk) runs on one. The relay sends a
+  refused connection, and a `GET` cut before its answer, to the other instance, as a balancer
+  does; any other request under way on an instance killed is lost, so the test kills between
+  them (`POST /v3/builds` waits 15s for its build: a kill in it fails the push)
+- what the leader found of an app at a takeover is not logged again (`Found in ... as
+  wanted`): the outcome is the store's, and a line is of its change
+
+Measured on one host (the images built from the tree; two instances):
+
+| | behind HAProxy 3.4 (containers) | VMs of two Firecracker wickets, through a sluice server |
+|---|---|---|
+| an instance replaced | 0.87-0.90s (`up --force-recreate`) | 2.4-2.5s (the app's `PUT`, the new VM booted) |
+| its `/healthz` 200 after that | 0.16s | 0.55s |
+| `cf push --strategy rolling`, both replaced in turn meanwhile | 1 of 1 | 2 of 2 |
+| `GET /v3/apps` every 0.2s meanwhile | 23 of 23 | 58 of 58 |
+| an app's requests meanwhile | 856 of 856 | 1113 of 1113 |
+
+- behind HAProxy, the instance reconciling the wickets killed (`docker kill`): `cf apps`
+  answered 4.1s later, `cf scale -i` made 9.5s later (the lease's lapse). A killed container's
+  address refuses nothing, so a request sent there waits for `timeout connect` (2s; with 5s and
+  a redispatch on the last retry only, `cf apps` took 10.1s)
+- the store stopped: `/healthz` 503 on both, the balancer answering 503 with no server left,
+  the app 200; `cf apps` answered 1.7s after PostgreSQL's start
+- a wicket restarted (`docker restart`): its instance ready 1.7s later, `GET /v3/apps` 15 of 15
+  through the other
+- memory: 5.2-5.8 MiB each idle (containers). In a VM without a disk, `memory-mib` 512: a
+  `cf push` of a 135 MiB zip refused at the upload (`No space left on device`: `/tmp` is half
+  the memory, the upload there twice while it comes); 1024: pushed in 15s
+- the store: 9 connections of two instances idle; a database of 8 MB with one app
+- the test's run, both flows side by side: 384s on one instance each before, 511s on two (the
+  wasi flow alone 310s, the Firecracker one 496s)
+
 ## A stop
 
 The release binary on the host (`--wicket` unreachable), SIGTERM to its exit: idle, 11-13ms. A
@@ -318,10 +372,13 @@ answered.
 
 What the CLI (8.19.0) does in that gap: a request refused (`connect: connection refused`) is sent
 3 times in 35ms in all, then `FAILED` (`CF_TRACE=true cf curl /v3/apps` against a closed port). So
-a `cf push` across a restart of the cf-api gets through only when none of its requests falls in
+a `cf push` across a restart of the one cf-api gets through only when none of its requests falls in
 the gap: the staging the cf-api takes up ends `STAGED` either way, and a CLI test of a push across
-a restart would pass by its timing alone, which is why none is written; the unit tests cut a
-staging at each step instead (`staging::tests::a_staging_cut_short_is_taken_up`).
+a restart of one instance would pass by its timing alone, which is why none is written; the unit
+tests cut a staging at each step instead (`staging::tests::a_staging_cut_short_is_taken_up`). Of
+two instances behind what sends a refused connection to the other there is no gap: the CLI test
+stops and starts each in turn during `cf push`
+([the deployment](#the-deployment-of-several-instances)).
 
 ## A start that never listens
 

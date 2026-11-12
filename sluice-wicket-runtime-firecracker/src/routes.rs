@@ -9,10 +9,11 @@
 //! booted, a cloned route's template booted and snapshotted again --
 //! before it changes anything: one failure keeps the current table. A target
 //! kept as it was keeps its VMs. A changed target serves its next connection
-//! from the new VMs; a connection open stays on the VMs it got, which end
-//! with the last of them. A removed target is served until every node stream
-//! acknowledged its removal: the server may have routed a connection to it
-//! before. A target kept serves under the hosts of the reload: its VMs' output
+//! from the new VMs; a connection open stays on the VM it got, a booted one's
+//! process told to stop then ([`Route::stopping`]: SIGTERM, the VM ended once it
+//! exits, `disk::STOP_GRACE` at most), a clone ending with its last connection.
+//! A removed target is served until every node stream acknowledged its removal
+//! (the server may have routed a connection to it before), and stopped so then. A target kept serves under the hosts of the reload: its VMs' output
 //! is named after them.
 //!
 //! How many VMs and how long (`route::Bounds`) is no change of them: the route running takes it
@@ -1341,6 +1342,8 @@ impl Reloader {
         let mut change = Change::default();
         let mut new = HashMap::new();
         let mut kept = Vec::new();
+        // the routes whose target goes on with new VMs
+        let mut replaced = Vec::new();
         for (target, spec, hosts) in targets(specs) {
             let Some(mut started) = ready.remove(&target) else {
                 let of = moved.get(&target).unwrap_or(&target);
@@ -1352,8 +1355,9 @@ impl Reloader {
                 kept.push((target, spec, hosts));
                 continue;
             };
-            if self.started.contains_key(&target) {
+            if let Some(old) = self.started.get(&target) {
                 change.restarted.extend(hosts.iter().cloned());
+                replaced.push(old.route.clone());
             }
             started.route.rename(&hosts);
             // they may have changed as it started
@@ -1442,6 +1446,10 @@ impl Reloader {
             console: current.console,
             held: self.held.clone(),
         });
+        // served by the new VMs from here on: the old ones' processes are told to stop
+        for route in replaced {
+            self.stops.spawn(async move { route.stop().await });
+        }
         self.status.send_modify(|status| status.revision += 1);
         change
     }
@@ -1489,8 +1497,9 @@ impl Reloader {
         }
     }
 
-    /// Drops the removed targets every stream acknowledged by `generation`, the VM of one with
-    /// a disk stopped: no connection of its is to outlive it, what it wrote on the disk.
+    /// Drops the removed targets every stream acknowledged by `generation`, their VMs stopped
+    /// ([`Route::stopping`]): no connection comes to one any more, its process is told to end,
+    /// and no connection of a VM on a disk is to outlive it, what it wrote on the disk.
     fn expire(&mut self, generation: u64) {
         let expired: Vec<String> = self
             .lingering
@@ -1503,8 +1512,15 @@ impl Reloader {
         }
         let current = self.routes.current();
         for target in &expired {
+            // (one going on under another target, its numbers' new one, is no removed one)
+            let serving = |route: &Arc<Route>| {
+                let started = self.started.values();
+                started
+                    .into_iter()
+                    .any(|started| Arc::ptr_eq(&started.route, route))
+            };
             if let Some(route) = current.routes.get(target).cloned()
-                && route.disk().is_some()
+                && !serving(&route)
             {
                 self.stops.spawn(async move { route.stop().await });
             }

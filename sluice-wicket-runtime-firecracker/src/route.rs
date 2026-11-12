@@ -2989,8 +2989,9 @@ impl Route {
     }
 
     /// Takes its pool's VMs out now, its connections failing from then on, no other started in
-    /// their place, and what stops them: what the process wrote is all on the disk, as far as it
-    /// ended within [`disk::STOP_GRACE`], and its open connections end. A VM gives its disk up as
+    /// their place, and what stops them: the process is told to end (SIGTERM), what it wrote is
+    /// all on the disk, as far as it ended within [`disk::STOP_GRACE`], and its open connections
+    /// end. A VM gives its disk up as
     /// it is gone (the lock tells, [`Disk::ready`]); one under way goes as it is dropped ([`Vm`]).
     /// A cloned route's VMs end with their last connection.
     pub fn stopping(&self) -> impl Future<Output = ()> + Send + 'static {
@@ -3007,6 +3008,10 @@ impl Route {
             for member in members {
                 if let Err(e) = member.instance.vm.stop(disk::STOP_GRACE).await {
                     eprintln!("route {label}: its VM's stop: {e}; killed");
+                }
+                // what its process said as it ended, before the VM goes
+                if let Ok(instance) = Arc::try_unwrap(member.instance) {
+                    instance.end().await;
                 }
             }
             drop(stops);

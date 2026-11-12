@@ -550,6 +550,8 @@ curl http://web.localhost:8080/
 - **a backup**: [the disk's](../sluice-wicket-runtime-firecracker/README.md#disks), whose file is
   `deployed/disks/ops/cf-api.ext4` in the volume. Lost, the apps serve on, a new cf-api leaves
   them (see Behavior)
+- **several instances**, a VM each of two wickets with no disk, for an API that stays up
+  through an upgrade and a wicket's: [ha.md](ha.md#as-apps-of-firecracker-wickets)
 - **a crash of the cf-api** (not a stop): the wicket stops its VM and starts another one on the
   disk, [waiting between starts](../sluice-wicket-runtime-firecracker/README.md#a-vm-going-down)
   if it keeps crashing: a boot long of no API. The apps serve on meanwhile
@@ -776,6 +778,10 @@ applications:
   log saying so, and `cf scale -i` must hold both as the app runs and as annotated, refused
   naming which: `cf restart` undoes a difference. A manifest's `instances` the running app
   cannot take (`cf push` restarts it right after) waits for the next start, the log saying so
+- a VM a restart, a push or a stop replaces or removes has its process told to stop: SIGTERM, 10s
+  for it to end its connections and itself, then killed
+  ([Reloading routes](../sluice-wicket-runtime-firecracker/README.md#reloading-routes)); a VM
+  of a connection's own (`per-connection`, `reuse`) ends with its connection
 - `cf app` lists [the VMs alive](#instances), one coming with its restore and going as these say,
   a VM the wicket keeps and has not up yet `STARTING` (`1/2` just after `cf scale -i 2`),
   `0/0` with none, `CRASHED` with why if a request's restore failed, until a restore succeeds: the
@@ -1080,6 +1086,10 @@ broker's operation and an app's delete waiting for its unbinds are that one's wo
 going on with them. Updated one at a time, the oldest build reconciles the wickets until the last
 of it stopped, and `--wicket` / `--domain` are the store's until every instance has the new ones
 ([an update](ha.md#an-update)).
+They hold nothing: plain processes or containers behind a load balancer, or a VM each of two
+Firecracker wickets with no disk ([the deployment](ha.md#the-deployment)), updated one at a time
+with no request lost ([updating them](ha.md#updating-them)); what they take and a backup, the
+store's and the bucket's, in [sizing and backup](ha.md#sizing-and-backup).
 
 ## Options
 
@@ -1097,7 +1107,7 @@ of it stopped, and `--wicket` / `--domain` are the store's until every instance 
 | `--blobs-ca-cert <path>` | PEM CA verifying the endpoint (default the webPKI roots) |
 | `--state <url>` / `--state-file <path>` | the state in PostgreSQL in place of `--data-dir`'s `state.json` ([The state in PostgreSQL](ha.md#the-state-in-postgresql)), and the logins in place of its `jwt.key` and `sessions.json` ([The logins in the store](ha.md#the-logins-in-the-store)): `postgres://user:password@host:port/database`, with libpq's parameters (`?sslmode=require`: TLS, which a URL without takes only where the server has it) |
 | `--state-ca-cert <path>` | PEM CA verifying it (default the webPKI roots) |
-| `--instance-url <url>` | with `--state`, where the other instances reach this one, `http(s)://host:port`: where they send the edits the wickets take at once while it reconciles them ([An edit on any instance](ha.md#an-edit-on-any-instance)). Without it the others are not ready meanwhile |
+| `--instance-url <url>` | with `--state`, where the other instances reach this one and no other, `http(s)://host:port`: where they send the edits the wickets take at once while it reconciles them, under that host ([An edit on any instance](ha.md#an-edit-on-any-instance)). Without it the others are not ready meanwhile |
 | `--instance-ca-cert <path>` | PEM CA verifying the other instances' `https://` URLs (default the webPKI roots) |
 | `--org <name>` / `--space <name>` | the organization and its space the first start makes (default `sluice` / `wicket`) |
 | `--cnb-builder <image>` | the Cloud Native Buildpacks builder staging a zip of source on a Firecracker wicket with `--guest` ([Buildpacks](#buildpacks): `cnb`); none: a zip of source fails staging |
@@ -1539,12 +1549,19 @@ session holds belongs in a service.
 ## Tests
 
 The integration test (`tests/cli.rs`) runs the OSS CLI -- `SLUICE_CF_CLI`, else `cf8` on the
-PATH, never a `cf` that may be the Tanzu one -- against the cf-api and a wicket in local mode
-on a flume, then two, building the wicket and its example guests from `../sluice-wicket-runtime-wasi` and the
+PATH, never a `cf` that may be the Tanzu one -- against two instances of the cf-api on one
+PostgreSQL and one bucket ([ha.md](ha.md)), each of its requests sent to the next by a relay of
+the test (`tests/relay`: a refused connection, and a `GET` cut before its answer, to the other),
+and a wicket in local mode on a flume, then two, building the wicket and its example guests from
+`../sluice-wicket-runtime-wasi` and the
 flume from `../sluice-flume` (or taking `SLUICE_WICKET_RUNTIME_WASI`, `SLUICE_WICKET_GUESTS` and
 `SLUICE_FLUME`); the login through a provider runs against a mock of one in the test, with TLS
-of the cf-api's own, and the images against a registry in the test (`tests/registry`). The
-store's tests (`store::tests`) run a PostgreSQL in a container (`postgres:18-alpine`, Docker on
+of the cf-api's own, and the images against a registry in the test (`tests/registry`). Along it
+the instance reconciling the wickets is killed during a deployment and a build, each instance
+stopped and started in turn during `cf push`, and a wicket named by an update one instance at a
+time; one instance on a `--data-dir` runs for what only it has. The
+integration test and the store's tests (`store::tests`) run a PostgreSQL in a container
+(`postgres:18-alpine`, Docker on
 the PATH) over TLS and without, or the one `SLUICE_CF_API_TEST_POSTGRES` names (over TLS with
 `SLUICE_CF_API_TEST_POSTGRES_CA` the file of its CA), and an S3 bucket in one
 (`rustfs/rustfs:1.0.5`, over TLS), or the one `SLUICE_CF_API_TEST_S3` names
@@ -1556,7 +1573,8 @@ launcher binaries of [buildpacks/lifecycle](https://github.com/buildpacks/lifecy
 (`SLUICE_CNB_LIFECYCLE`, else `~/.local/cnb/lifecycle`), with a wasi wicket beside it for the apps of both stacks,
 then runs the cf-api itself on it, in a VM with a disk, the flume
 and a provider through its egress, across a restart, a wicket killed right after a push and an
-upgrade:
+upgrade, and last two instances of it, a VM each of two wickets with no disk, the store and the
+bucket through their egress, updated one wicket at a time while the CLI pushes:
 
 ```text
 gh release download v8.19.0 -R cloudfoundry/cli -p 'cf8-cli_8.19.0_macosarm.tgz'

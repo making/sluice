@@ -6,6 +6,7 @@
 //! as a process does, half-closes and answers with what came, `/exit` answers and exits,
 //! `/ready?after=N` answers 503 to the first N of them, as a readiness check sees a process
 //! starting, 200 after, counting none served.
+//! Told to stop (SIGTERM, a stop notice's) it says so on its stdout and ends.
 //! `SAMPLE_WAIT_MS` delays its listening, `SAMPLE_EXIT` has it exit instead, as a process failing
 //! to start does; `SAMPLE_SPEAK_FIRST` has it send that line as each connection opens, as a
 //! protocol whose server speaks first does.
@@ -21,7 +22,24 @@ static SERVED: AtomicU64 = AtomicU64::new(0);
 /// The `/ready` requests it answered.
 static READIES: AtomicU64 = AtomicU64::new(0);
 
+/// SIGTERM, a stop notice's: it says so and ends.
+extern "C" fn told_to_stop(_: libc::c_int) {
+    const SAID: &[u8] = b"sample process: told to stop\n";
+    // SAFETY: write and _exit are async-signal-safe, the line a constant
+    unsafe {
+        libc::write(1, SAID.as_ptr().cast(), SAID.len());
+        libc::_exit(0);
+    }
+}
+
 fn main() {
+    // SAFETY: the handler calls what a signal handler may
+    unsafe {
+        libc::signal(
+            libc::SIGTERM,
+            told_to_stop as *const () as libc::sighandler_t,
+        );
+    }
     if std::env::var_os("SAMPLE_EXIT").is_some() {
         eprintln!("sample process: exiting as told");
         std::process::exit(82);

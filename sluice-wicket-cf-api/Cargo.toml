@@ -70,6 +70,9 @@ reqwest = { version = "0.13", default-features = false, features = ["blocking", 
 sluice-wicket-oidc = { path = "../sluice-wicket-oidc", features = ["mock"] }
 # the flume two instances' logs go round
 sluice-flume = { path = "../sluice-flume" }
+# the integration test's relay in front of two instances: a request each to the next
+hyper = { version = "1", features = ["client"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
 # paused time for the bound on a quiet connection
 tokio = { version = "1", features = ["test-util"] }
 # the layers of the image the test pushes for a Firecracker wicket

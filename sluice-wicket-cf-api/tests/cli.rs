@@ -1,6 +1,13 @@
 //! The OSS cf CLI (`SLUICE_CF_CLI`, else `cf8` on the PATH; the Tanzu
 //! distribution refuses any other platform) against the cf-api and a wicket
-//! in local mode, both on a flume: login, push, the app's logs, map-route,
+//! in local mode, both on a flume. The cf-api is two instances on one PostgreSQL and one
+//! bucket (containers, as the store's tests'), each of the CLI's requests sent to the next by
+//! a relay (`relay`): what one instance answers, any does. Along the way the one reconciling
+//! the wickets is killed during a deployment, a build and an app's delete, stopped during a
+//! broker's operation, each is stopped and started in turn while the CLI pushes, and their
+//! options change one instance at a time (a wicket named, the rules of who logs in); one
+//! instance on the files of a `--data-dir` runs for what only it has (a state lost, the VM on
+//! a disk). The flow: login, push, the app's logs, map-route,
 //! scale keeping the warm instance, a rolling push with requests all along,
 //! stop and start, a scale to 0, the limit of a scale and of its `concurrency`, an
 //! instance of a request's own kept by `keep-ms`, the
@@ -33,12 +40,19 @@
 //! the image's had, a second wicket making its own of both; then the
 //! cf-api itself an app of that wicket, in a VM with a disk, the flume and a provider
 //! through its egress: refused with no word on who logs in, its apps and logins kept
-//! across a restart of the VM, a wicket killed right after a push and an upgrade.
+//! across a restart of the VM, a wicket killed right after a push and an upgrade; and last
+//! two instances of it, a VM each of two wickets with no disk, the store and the bucket
+//! through their egress, updated one wicket at a time while the CLI pushes.
 
 mod broker;
+#[path = "support/postgres_server.rs"]
+mod postgres_server;
 #[path = "../../sluice-wicket-runtime-wasi/tests/support/redis_server.rs"]
 mod redis_server;
 mod registry;
+mod relay;
+#[path = "support/s3_server.rs"]
+mod s3_server;
 
 use std::collections::BTreeSet;
 use std::io::{BufRead, BufReader, Read as _, Write as _};
@@ -51,8 +65,11 @@ use std::time::{Duration, Instant};
 
 use broker::Broker;
 use registry::Registry;
+use relay::Relay;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+// what the bucket's support names by `crate::`
+use sluice_wicket_cf_api::{blobs, s3};
 use sluice_wicket_oidc::mock::MockProvider;
 
 /// Hang guard of every wait; the first covers a cold build of the wicket.
@@ -139,6 +156,12 @@ fn guests() -> PathBuf {
 
 fn cf_cli() -> PathBuf {
     PathBuf::from(std::env::var("SLUICE_CF_CLI").unwrap_or_else(|_| "cf8".into()))
+}
+
+/// When the test process began: what the CLI's commands are told by in its output.
+fn began() -> Instant {
+    static BEGAN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *BEGAN.get_or_init(Instant::now)
 }
 
 /// A child process whose log is read line by line, killed on drop.
@@ -285,7 +308,7 @@ impl Cf {
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
-        println!("$ cf {}\n{text}", args.join(" "));
+        println!("[{:?}] $ cf {}\n{text}", began().elapsed(), args.join(" "));
         (output.status.success(), text)
     }
 
@@ -444,37 +467,341 @@ fn variant(hello: &[u8]) -> Vec<u8> {
     component
 }
 
+/// An address of the loopback nothing listens on now.
+fn free_address() -> String {
+    std::net::TcpListener::bind("127.0.0.1:0")
+        .and_then(|listener| listener.local_addr())
+        .unwrap()
+        .to_string()
+}
+
+/// What two instances of the cf-api share in place of the files of a `--data-dir`: a database
+/// of the test's PostgreSQL, over TLS where it takes it, and a prefix of its bucket.
+struct Shared {
+    /// The options naming them.
+    options: Vec<String>,
+    /// The database, for what the test asks the store itself.
+    database: String,
+    runtime: tokio::runtime::Runtime,
+}
+
+impl Shared {
+    /// A new database and prefix, the CAs verifying them files of `dir`.
+    fn new(dir: &Path) -> Shared {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let (database, _) = runtime.block_on(postgres_server::database());
+        let bucket = runtime.block_on(s3_server::bucket());
+        let mut options = Vec::new();
+        let mut option = |name: &str, value: &str| {
+            options.extend([name.to_string(), value.to_string()]);
+        };
+        match postgres_server::ca() {
+            Some(ca) => {
+                let file = dir.join("state-ca.pem");
+                std::fs::write(&file, ca).unwrap();
+                option("--state", &format!("{database}?sslmode=require"));
+                option("--state-ca-cert", file.to_str().unwrap());
+            }
+            None => option("--state", &database),
+        }
+        let prefix = bucket.prefix.trim_end_matches('/');
+        option("--blobs", &format!("s3://{}/{prefix}", bucket.bucket));
+        option("--blobs-region", &bucket.region);
+        option("--blobs-access-key-id", &bucket.access_key_id);
+        option("--blobs-secret-access-key", &bucket.secret_access_key);
+        if let Some(endpoint) = &bucket.endpoint {
+            option("--blobs-endpoint", endpoint);
+        }
+        if let Some(ca) = &bucket.ca_pem {
+            let file = dir.join("blobs-ca.pem");
+            std::fs::write(&file, ca).unwrap();
+            option("--blobs-ca-cert", file.to_str().unwrap());
+        }
+        Shared {
+            options,
+            database,
+            runtime,
+        }
+    }
+
+    /// The CAs its options name, each as the file of an image an instance in a VM reads it
+    /// from: the path in the image (no leading `/`) and the PEM.
+    fn cas(&self) -> Vec<(String, Vec<u8>)> {
+        let options = self.options.chunks(2);
+        let cas = options.filter(|option| option[0].ends_with("-ca-cert"));
+        cas.map(|ca| {
+            let file = format!("etc/sluice/{}.pem", &ca[0][2..]);
+            (file, std::fs::read(&ca[1]).unwrap())
+        })
+        .collect()
+    }
+
+    /// Its options as an instance in a VM takes them: its environment, the CAs the files of
+    /// its image ([`Shared::cas`]), and the `host:port` its egress is to reach for them.
+    fn in_vm(&self) -> (serde_json::Map<String, Value>, Vec<String>) {
+        let (mut env, mut egress) = (serde_json::Map::new(), Vec::new());
+        for option in self.options.chunks(2) {
+            let (name, value) = (&option[0][2..], &option[1]);
+            let value = match name.ends_with("-ca-cert") {
+                true => format!("/etc/sluice/{name}.pem"),
+                false => value.clone(),
+            };
+            let name = name.to_uppercase().replace('-', "_");
+            env.insert(format!("SLUICE_WICKET_CF_API_{name}"), value.into());
+            // postgres://user:password@host:port/database, https://host:port
+            if let Some((_, rest)) = option[1].split_once("://")
+                && matches!(option[0].as_str(), "--state" | "--blobs-endpoint")
+            {
+                let at = rest.rsplit('@').next().unwrap();
+                egress.push(at.split('/').next().unwrap().to_string());
+            }
+        }
+        (env, egress)
+    }
+
+    /// The `--instance-url` of the instance reconciling the wickets, if one holds the lease.
+    fn leader(&self) -> Option<String> {
+        self.runtime.block_on(async {
+            let (client, connection) =
+                tokio_postgres::connect(&self.database, tokio_postgres::NoTls)
+                    .await
+                    .expect("the store");
+            tokio::spawn(connection);
+            let held = "SELECT address FROM sluice_cf_lease WHERE expires > now()";
+            let held = client.query_opt(held, &[]).await.expect("the lease");
+            held.and_then(|row| row.get::<_, Option<String>>(0))
+        })
+    }
+}
+
+/// The cf-api under test: one process on the files of its `--data-dir`, or two on what they
+/// [`Shared`], each with a `--data-dir` of its own, behind the [`Relay`] the CLI targets.
+struct Api {
+    instances: Vec<Instance>,
+    relay: Option<Relay>,
+}
+
+/// One process of it: where it listens, what started it and starts it again.
+struct Instance {
+    process: Process,
+    url: String,
+    args: Vec<String>,
+}
+
+impl Instance {
+    fn start(args: Vec<String>) -> Instance {
+        let (process, url) = Instance::spawn(&args);
+        Instance { process, url, args }
+    }
+
+    /// The process of `args`, and its URL once it listens.
+    fn spawn(args: &[String]) -> (Process, String) {
+        let args_of: Vec<&str> = args.iter().map(String::as_str).collect();
+        let process = Process::spawn(
+            Path::new(env!("CARGO_BIN_EXE_sluice-wicket-cf-api")),
+            &args_of,
+        );
+        let started = process.line("listening on ");
+        let flume = args.iter().position(|arg| arg == "--flume").unwrap();
+        let flume = format!("flume {})", args[flume + 1]);
+        assert!(started.contains(&flume), "{started}");
+        let (_, rest) = started.split_once("listening on ").unwrap();
+        (process, rest.split(' ').next().unwrap().to_string())
+    }
+
+    /// Waits for it to say it is ready (`/healthz`).
+    fn ready(&self, http: &Http) {
+        let url = format!("{}/healthz", self.url);
+        eventually(&format!("ready: {url}"), || {
+            let answered = http.0.get(&url).send();
+            answered.is_ok_and(|response| response.status() == 200)
+        });
+    }
+}
+
+impl Api {
+    /// The next line of an instance's log holding `marker`.
+    fn line(&self, marker: &str) -> String {
+        let deadline = Instant::now() + HANG;
+        loop {
+            for instance in &self.instances {
+                let lines = instance.process.lines.try_iter();
+                if let Some(line) = lines.into_iter().find(|line| line.contains(marker)) {
+                    return line;
+                }
+            }
+            assert!(Instant::now() < deadline, "never logged '{marker}'");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// The word after `marker` in the next line of an instance's log holding it.
+    fn logged(&self, marker: &str) -> String {
+        let line = self.line(marker);
+        let (_, rest) = line.split_once(marker).expect("holds it");
+        rest.split(' ').next().unwrap().to_string()
+    }
+
+    /// The lines the instances logged since the last asked for.
+    fn lines(&self) -> Vec<String> {
+        let logged = |instance: &Instance| instance.process.lines.try_iter().collect::<Vec<_>>();
+        self.instances.iter().flat_map(logged).collect()
+    }
+
+    /// SIGKILL to every instance, the relay gone with them.
+    fn kill(&mut self) {
+        for instance in &mut self.instances {
+            instance.process.kill();
+        }
+        self.relay = None;
+    }
+
+    /// Waits for every instance to say it is ready.
+    fn ready(&self) {
+        let http = Http::new();
+        for instance in &self.instances {
+            instance.ready(&http);
+        }
+    }
+
+    /// Which instance reconciles the wickets, once the lease names one.
+    fn leader(&self, shared: &Shared) -> usize {
+        let deadline = Instant::now() + HANG;
+        loop {
+            let leader = shared.leader();
+            let leads = |instance: &Instance| Some(&instance.url) == leader.as_ref();
+            if let Some(at) = self.instances.iter().position(leads) {
+                return at;
+            }
+            assert!(Instant::now() < deadline, "no instance leads: {leader:?}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// SIGKILL to the instance `at`.
+    fn kill_one(&mut self, at: usize) {
+        self.instances[at].process.kill();
+    }
+
+    /// SIGTERM to the instance `at`, and its exit.
+    fn stop_one(&mut self, at: usize) {
+        self.instances[at].process.terminate();
+        self.instances[at].process.exited();
+    }
+
+    /// The instance `at`, stopped or killed, started again with its options as `change` leaves
+    /// them, once it is ready.
+    fn start_one(&mut self, at: usize, change: impl FnOnce(&mut Vec<String>)) {
+        let instance = &mut self.instances[at];
+        change(&mut instance.args);
+        (instance.process, instance.url) = Instance::spawn(&instance.args);
+        instance.ready(&Http::new());
+    }
+
+    /// Each instance in turn stopped and started again, its options as `change` leaves them.
+    fn roll(&mut self, change: impl Fn(&mut Vec<String>)) {
+        for at in 0..self.instances.len() {
+            self.stop_one(at);
+            self.start_one(at, &change);
+        }
+    }
+
+    /// SIGKILL to the instance `at` once none of the relay's requests but a `GET` is under way
+    /// on it: those a balancer sends to the other instance, any other would be lost.
+    fn kill_between_changes(&mut self, at: usize) {
+        let relay = self.relay.as_ref().expect("several instances");
+        eventually("no change under way", || !relay.changing(at));
+        self.kill_one(at);
+    }
+
+    /// How many requests each instance took of the relay.
+    fn taken(&self) -> Vec<usize> {
+        self.relay.as_ref().map(Relay::taken).unwrap_or_default()
+    }
+}
+
+/// `args` with each `option` and its value taken out, then given the `values`.
+fn options_set(args: &mut Vec<String>, option: &str, values: &[&str]) {
+    while let Some(at) = args.iter().position(|arg| arg == option) {
+        args.drain(at..at + 2);
+    }
+    for value in values {
+        args.extend([option.to_string(), value.to_string()]);
+    }
+}
+
 /// The cf-api on `listen` of the wickets `wickets` (each `--wicket`'s value), its URL once it
-/// listens.
+/// listens: one process on `data`, or with `shared` two on it behind a relay, once both are
+/// ready.
 fn start_api(
     listen: &str,
     wickets: &[String],
     flume: &str,
     data: &Path,
     more: &[&str],
-) -> (Process, String) {
-    let mut args = vec![
-        "--listen",
-        listen,
-        "--wicket-token",
-        TOKEN,
-        "--data-dir",
-        data.to_str().unwrap(),
-        "--flume",
-        flume,
-        "--flume-token",
-        FLUME_TOKEN,
-    ];
+    shared: Option<&Shared>,
+) -> (Api, String) {
+    let mut args = vec!["--wicket-token", TOKEN, "--flume", flume];
+    args.extend_from_slice(&["--flume-token", FLUME_TOKEN]);
     for wicket in wickets {
         args.extend_from_slice(&["--wicket", wicket]);
     }
     args.extend_from_slice(more);
-    let api = Process::spawn(Path::new(env!("CARGO_BIN_EXE_sluice-wicket-cf-api")), &args);
-    let started = api.line("listening on ");
-    assert!(started.contains(&format!("flume {flume})")), "{started}");
-    let (_, rest) = started.split_once("listening on ").unwrap();
-    let url = rest.split(' ').next().unwrap().to_string();
-    (api, url)
+    let args: Vec<String> = args.into_iter().map(String::from).collect();
+    let on = |listen: &str, data: &Path, more: &[String]| {
+        let mut args = args.clone();
+        args.extend(["--listen".into(), listen.to_string()]);
+        args.extend(["--data-dir".into(), data.to_str().unwrap().to_string()]);
+        args.extend_from_slice(more);
+        Instance::start(args)
+    };
+    let Some(shared) = shared else {
+        let instance = on(listen, data, &[]);
+        let url = instance.url.clone();
+        let api = Api {
+            instances: vec![instance],
+            relay: None,
+        };
+        return (api, url);
+    };
+    // their own TLS: the relay's too, each verifying the other instance by it
+    let file_of = |option: &str| {
+        let at = more.iter().position(|arg| *arg == option);
+        at.map(|at| Path::new(more[at + 1]))
+    };
+    let tls = file_of("--tls-cert").map(|cert| {
+        use rustls::pki_types::pem::PemObject as _;
+        use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+        let key = file_of("--tls-key").expect("with the certificate");
+        (
+            CertificateDer::from_pem_file(cert).unwrap(),
+            PrivateKeyDer::from_pem_file(key).unwrap(),
+        )
+    });
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    let listens = [free_address(), free_address()];
+    let instances: Vec<Instance> = (listens.iter().enumerate())
+        .map(|(n, at)| {
+            let mut more = shared.options.clone();
+            more.extend(["--instance-url".into(), format!("{scheme}://{at}")]);
+            if let Some(cert) = file_of("--tls-cert") {
+                more.extend(["--instance-ca-cert".into(), cert.to_str().unwrap().into()]);
+            }
+            let data = data.with_file_name(format!(
+                "{}-{n}",
+                data.file_name().unwrap().to_str().unwrap()
+            ));
+            on(at, &data, &more)
+        })
+        .collect();
+    let relay = Relay::start(listen, listens.to_vec(), tls);
+    let api = Api {
+        instances,
+        relay: Some(relay),
+    };
+    api.ready();
+    (api, format!("{scheme}://{listen}"))
 }
 
 /// Waits for `done`, polled.
@@ -496,6 +823,12 @@ impl Hammer {
     /// Requests `host` on each of `listens` in turn, counting the answers `hello from wasm` and
     /// the others.
     fn start(listens: &[&str], host: &str) -> Hammer {
+        Hammer::of(listens, host, "/", "hello from wasm")
+    }
+
+    /// Requests `path` of `host` on each of `listens` in turn, counting the answers (200)
+    /// beginning with `answer` and the others.
+    fn of(listens: &[&str], host: &str, path: &'static str, answer: &'static str) -> Hammer {
         let stop = Arc::new(AtomicBool::new(false));
         let listens: Vec<String> = listens.iter().map(|listen| listen.to_string()).collect();
         let (stopped, host) = (stop.clone(), host.to_string());
@@ -505,8 +838,8 @@ impl Hammer {
                 if stopped.load(Ordering::Relaxed) {
                     break;
                 }
-                match std::panic::catch_unwind(|| get(listen, &host, "/", None)) {
-                    Ok((200, body)) if body.starts_with("hello from wasm") => served += 1,
+                match std::panic::catch_unwind(|| get(listen, &host, path, None)) {
+                    Ok((200, body)) if body.starts_with(answer) => served += 1,
                     _ => failed += 1,
                 }
             }
@@ -700,12 +1033,15 @@ fn the_cf_cli_deploys_to_the_wicket() {
     };
     let api_listen = free();
     let one_wicket = [format!("http://{console}")];
+    // two instances on one store and one bucket, each request of the CLI to the next
+    let shared = Shared::new(&dir);
     let (mut api, url) = start_api(
         &api_listen,
         &one_wicket,
         &flume_url,
         &dir.join("cf"),
         &["--any-credentials"],
+        Some(&shared),
     );
     let provider = MockProvider::start("cf-api", "s3");
     let http = Http::new();
@@ -1139,16 +1475,6 @@ fn the_cf_cli_deploys_to_the_wicket() {
         recent.contains("[PRIVATE DATA HIDDEN]") && !recent.contains("s3cr3t"),
         "{recent}"
     );
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let state = std::fs::metadata(dir.join("cf/state.json")).unwrap();
-        assert_eq!(
-            state.permissions().mode() & 0o777,
-            0o600,
-            "it holds the env"
-        );
-    }
     cf.ok(&["unset-env", "hello", "GREETING"]);
     let env = cf.ok(&["env", "hello"]);
     assert!(
@@ -1271,6 +1597,9 @@ fn the_cf_cli_deploys_to_the_wicket() {
     // is no good any more, nor is a password
     let generation = listing(&console)["generation"].as_u64().unwrap();
     let (open_token, _) = cf.tokens();
+    // all of the above through both instances, a request each in turn
+    let taken = api.taken();
+    assert!(taken.iter().all(|taken| *taken > 100), "{taken:?}");
     api.kill();
 
     // a lost state (a new data directory): the wicket's apps of the owner stay, and the
@@ -1281,9 +1610,17 @@ fn the_cf_cli_deploys_to_the_wicket() {
         &flume_url,
         &dir.join("cf-lost"),
         &["--any-credentials"],
+        None,
     );
     let left = lost.line("CELL: left");
     assert!(left.contains("left in the wicket"), "{left}");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let state = std::fs::metadata(dir.join("cf-lost/state.json")).unwrap();
+        let mode = state.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "it holds the apps' env");
+    }
     assert_eq!(listing(&console)["generation"], generation);
     assert_eq!(listing(&console)["apps"].as_array().unwrap().len(), 2);
     assert_eq!(get(&listen, "hello.localhost", "/", None).0, 200);
@@ -1326,11 +1663,20 @@ fn the_cf_cli_deploys_to_the_wicket() {
         for rule in rules {
             args.extend_from_slice(&["--oidc-claim", rule]);
         }
-        start_api(&api_listen, wickets, &flume_url, &dir.join("cf"), &args)
+        let shared = Some(&shared);
+        start_api(
+            &api_listen,
+            wickets,
+            &flume_url,
+            &dir.join("cf"),
+            &args,
+            shared,
+        )
     };
-    let (api, url) = with_rules(&one_wicket, &["email=*@example.com", "groups=devs"]);
+    let (mut api, url) = with_rules(&one_wicket, &["email=*@example.com", "groups=devs"]);
+    // (ready: the one reconciling the wickets listed them, finding the apps as the store has
+    // them seen already, which it says of a change only)
     assert!(url.starts_with("https://"), "{url}");
-    api.logged("Found in the wicket as wanted");
     assert_eq!(listing(&console)["generation"], generation);
     let (status, _, body) = http.get(&format!("{url}/v3/apps"), Some(&open_token));
     assert_eq!(status, 401, "{body}");
@@ -1492,11 +1838,19 @@ fn the_cf_cli_deploys_to_the_wicket() {
         why.contains("--wicket a and --wicket c name one wicket (id "),
         "{why}"
     );
-    drop(api);
-    let (api, _) = with_rules(&two_wickets, &["email=*@example.com", "groups=devs"]);
+    // named by an update one instance at a time: the wickets are the store's, so no index
+    // moves while the instance of the flags before is on it, and the first of the new ones
+    // reconciles the wickets once that one stopped
+    let named: Vec<&str> = two_wickets.iter().map(String::as_str).collect();
+    let leader = api.leader(&shared);
+    api.stop_one(1 - leader);
+    api.start_one(1 - leader, |args| options_set(args, "--wicket", &named));
+    assert!(listing(&console_b)["apps"].as_array().unwrap().is_empty());
+    api.stop_one(leader);
     let guid_of = |app: &str| cf.ok(&["app", app, "--guid"]).trim().to_string();
     let hello = guid_of("hello");
     let placed = api.line(&format!("[{hello}] CELL: index 1 placed on the wicket b"));
+    api.start_one(leader, |args| options_set(args, "--wicket", &named));
     assert!(placed.ends_with(": no --wicket names wicket"), "{placed}");
     // the sandbox of the app of `host` as a wicket lists it, if it has it
     let share = |console: &str, host: &str| {
@@ -1655,9 +2009,16 @@ fn the_cf_cli_deploys_to_the_wicket() {
             "{body}"
         );
     }
-    // the cf-api restarted takes it up where it was
-    drop(api);
-    let (api, _) = with_rules(&two_wickets, &["email=*@example.com", "groups=devs"]);
+    // the instance reconciling the wickets killed: the other takes the deployment up where it
+    // was, the CLI's requests going to it alone meanwhile
+    let killed = api.leader(&shared);
+    api.kill_one(killed);
+    eventually("the other instance reconciling the wickets", || {
+        shared
+            .leader()
+            .is_some_and(|url| url != api.instances[killed].url)
+    });
+    api.start_one(killed, |_| ());
     eventually("the deployment taken up", || hosted() == stopped);
     let shown = cf.ok(&["app", "spread"]);
     assert!(
@@ -1692,6 +2053,34 @@ fn the_cf_cli_deploys_to_the_wicket() {
         (Some(hello_sha.clone()), Some(variant_sha.clone()))
     );
     cf.ok(&["continue-deployment", "spread"]);
+    for console in [&console, &console_b] {
+        assert_eq!(component(console), Some(hello_sha.clone()));
+    }
+
+    // each instance stopped and started in turn (SIGTERM) while the CLI pushes, rolling: none
+    // of its requests fails, one finding a listener closed sent to the other instance, what the
+    // one stopping was doing gone on with by the other; the app answers all along
+    let hammering = Hammer::start(&[&listen, &listen_b], "spread.localhost");
+    let rolling = AtomicBool::new(true);
+    let pushes = std::thread::scope(|scope| {
+        let pushes = scope.spawn(|| {
+            let mut pushes = 0;
+            while rolling.load(Ordering::Relaxed) {
+                let app = dir.join("app");
+                let app = app.to_str().unwrap();
+                cf.ok(&["push", "spread", "-p", app, "--strategy", "rolling"]);
+                pushes += 1;
+            }
+            pushes
+        });
+        // (the first push under way)
+        std::thread::sleep(Duration::from_secs(1));
+        api.roll(|_| ());
+        rolling.store(false, Ordering::Relaxed);
+        pushes.join().unwrap()
+    });
+    assert!(pushes > 0);
+    hammering.stop();
     for console in [&console, &console_b] {
         assert_eq!(component(console), Some(hello_sha.clone()));
     }
@@ -1787,21 +2176,8 @@ fn the_cf_cli_deploys_to_the_wicket() {
         ),
         (Some(json!(1)), None)
     );
-    drop(api);
-    let mut args: Vec<&str> = oidc.to_vec();
-    for rule in ["email=*@example.com", "groups=devs"] {
-        args.extend_from_slice(&["--oidc-claim", rule]);
-    }
-    args.extend_from_slice(&["--wicket-away-grace", "2"]);
-    let (api, _) = start_api(
-        &api_listen,
-        &two_wickets,
-        &flume_url,
-        &dir.join("cf"),
-        &args,
-    );
+    api.roll(|args| options_set(args, "--wicket-away-grace", &["2"]));
     let img = guid_of("img");
-    api.line(&format!("[{img}] CELL: Found in the wicket a as wanted"));
     wicket.kill();
     api.line("CELL: The wicket a has not answered for 2s: placed on no more");
     for step in [
@@ -2063,18 +2439,19 @@ fn the_cf_cli_deploys_to_the_wicket() {
         r#"{"async":true}"#,
     ]);
     assert!(output.contains("Create in progress"), "{output}");
-    let shown = cf.ok(&["service", "db2"]);
-    assert!(
-        shown.contains("create in progress") && shown.contains("working on it"),
-        "{shown}"
-    );
+    // (the broker is polled by the instance reconciling the wickets, whichever took the request)
+    eventually("the broker's word on its operation shown", || {
+        let shown = cf.ok(&["service", "db2"]);
+        shown.contains("create in progress") && shown.contains("working on it")
+    });
     let output = cf.fails(&["bind-service", "hello", "db2"]);
     assert!(
         output.contains("An operation for service instance db2 is in progress"),
         "{output}"
     );
-    drop(api);
-    let (api, _) = with_rules(&two_wickets, &["email=*@example.com", "groups=devs"]);
+    let leader = api.leader(&shared);
+    api.stop_one(leader);
+    api.start_one(leader, |_| ());
     broker.hold(false);
     eventually("the instance made after the restart", || {
         cf.ok(&["service", "db2"]).contains("create succeeded")
@@ -2253,8 +2630,9 @@ fn the_cf_cli_deploys_to_the_wicket() {
     let relay = cf.ok(&["app", "relay", "--guid"]).trim().to_string();
     broker.hold(true);
     cf.ok(&["curl", "-X", "DELETE", &format!("/v3/apps/{relay}")]);
-    drop(api);
-    let (api, _) = with_rules(&two_wickets, &["email=*@example.com", "groups=devs"]);
+    let leader = api.leader(&shared);
+    api.kill_one(leader);
+    api.start_one(leader, |_| ());
     broker.hold(false);
     eventually("relay deleted after the restart", || {
         !cf.ok(&["apps"]).contains("relay")
@@ -2284,8 +2662,7 @@ fn the_cf_cli_deploys_to_the_wicket() {
 
     // alice no longer allowed (the rules changed): her next refresh is
     // refused, and her session with it
-    drop(api);
-    let (api, url) = with_rules(&two_wickets, &["email=*@example.com", "groups=ops"]);
+    api.roll(|args| options_set(args, "--oidc-claim", &["email=*@example.com", "groups=ops"]));
     let (status, refused) = http.token(
         &url,
         &format!("grant_type=refresh_token&refresh_token={alice_refresh}"),
@@ -2490,8 +2867,10 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     };
     let start_wicket = || start_wicket_on(&listen, &console, "deployed", &guest);
     let mut wicket = start_wicket();
+    // two instances on one store and one bucket, each request of the CLI to the next
+    let shared = Shared::new(&dir);
     // an API taking any credentials names who edits the security groups by the name given
-    let (api, url) = start_api(
+    let (mut api, url) = start_api(
         &api_listen,
         &[format!("http://{console}")],
         &flume_url,
@@ -2505,6 +2884,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
             &cnb[..],
         ]
         .concat(),
+        Some(&shared),
     );
     let cf = Cf {
         cli: cf_cli(),
@@ -2633,6 +3013,12 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     cf.ok(&["bind-security-group", "web", "sluice", "--space", "wicket"]);
     assert!(!connects(&by_name), "before a restart");
     cf.ok(&["restart", "fc"]);
+    // the VM it replaced was not killed under its process: told to stop (SIGTERM), as the
+    // sample process says ending
+    eventually("the old VM's process told to stop", || {
+        let logs = cf.ok(&["logs", "fc", "--recent"]);
+        logs.contains("OUT sample process: told to stop")
+    });
     let listed = egress();
     let rule_count = listed.as_array().unwrap().len();
     assert_eq!(rule_count, 54, "{listed}");
@@ -3414,7 +3800,22 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
             ),
             "{refused}"
         );
-        cf.ok(&["push", "-f", manifest, "-p", source, "-b", "cnb"]);
+        // the instance reconciling the wickets killed during a build: the other takes it up
+        // from the wicket building it, and the push, reading the staging log from either,
+        // goes on to its end
+        // (a build outlasting the 15s the request that began it waits for it on its instance)
+        cf.ok(&["set-env", "src", "SAMPLE_BUILD_MS", "20000"]);
+        let pushed = cf.command(&["push", "-f", manifest, "-p", source, "-b", "cnb"]);
+        let mut pushing = Process::start(pushed);
+        pushing.line("sample buildpack: building");
+        let killed = api.leader(&shared);
+        api.kill_between_changes(killed);
+        pushing.line("Staging taken up");
+        pushing.line("sample buildpack: build ");
+        pushing.exited();
+        api.start_one(killed, |_| ());
+        cf.ok(&["unset-env", "src", "SAMPLE_BUILD_MS"]);
+        assert_eq!(get(&listen, "src.localhost", "/", None).0, 200);
         let droplet = format!("/v3/apps/{guid}/droplets/current");
         let droplet: Value = serde_json::from_str(&cf.ok(&["curl", &droplet])).unwrap();
         assert_eq!(
@@ -3500,6 +3901,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         &dir.join("cf"),
         // no credentials of the builder's: the run image is pulled with those of the build
         &[&["--any-credentials"], &uncredentialed[..]].concat(),
+        Some(&shared),
     );
     cf.ok(&["scale", "fc", "-i", "2"]);
     let served_as = |console: &str| {
@@ -3530,7 +3932,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     instances_come_to(&cf, "fc", "2/2");
     std::thread::sleep(Duration::from_secs(3));
     assert_eq!((served_as(&console), served_as(&console_b)), (on_a, on_b));
-    let made: Vec<String> = (api.lines.try_iter())
+    let made: Vec<String> = (api.lines().into_iter())
         .filter(|line| line.contains("made the rootfs of"))
         .collect();
     assert_eq!(made, Vec::<String>::new(), "made again");
@@ -3613,6 +4015,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         &flume_url,
         &dir.join("cf"),
         &["--any-credentials"],
+        Some(&shared),
     );
     eventually("both stacks listed", || {
         let stacks = cf.ok(&["stacks"]);
@@ -3703,9 +4106,9 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     // the cf-api as an app of the wicket, owner ops, a disk of its own at its working
     // directory, reaching the console and the flume through its egress; the host an
     // address, not to depend on *.localhost resolving here
-    let cf_api = cf_api_image(&registry, &dir);
+    let cf_api = cf_api_image(&registry, &dir, &shared.cas());
     let http = Http::new();
-    let console_api = |method: reqwest::Method, path: &str, body: Value| {
+    let on_console = |console: &str, method: reqwest::Method, path: &str, body: Value| {
         let response = http
             .0
             .request(method, format!("http://{console}{path}"))
@@ -3717,12 +4120,15 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         let status = response.status().as_u16();
         (status, response.json::<Value>().unwrap())
     };
-    let made = |image: &str| {
+    let console_api =
+        |method: reqwest::Method, path: &str, body: Value| on_console(&console, method, path, body);
+    let made_on = |console: &str, image: &str| {
         let body = json!({"image": image, "username": "robot", "password": "p4ss"});
-        let (status, made) = console_api(reqwest::Method::PUT, "/api/images", body);
+        let (status, made) = on_console(console, reqwest::Method::PUT, "/api/images", body);
         assert_eq!(status, 200, "{made}");
         made["sha256"].as_str().unwrap().to_string()
     };
+    let made = |image: &str| made_on(&console, image);
     let port_of = |address: &str| address.rsplit(':').next().unwrap().to_string();
     let (console_port, flume_port) = (port_of(&console), port_of(&flume_url));
     let provider = MockProvider::start("cf-api", "s3");
@@ -3861,7 +4267,7 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
         .put(format!("http://{console}/api/components/{upgraded}"))
         .bearer_auth(TOKEN)
         .timeout(Duration::from_secs(300))
-        .body(image)
+        .body(image.clone())
         .send()
         .unwrap();
     assert_eq!(uploaded.status().as_u16(), 200);
@@ -3901,6 +4307,138 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     assert_eq!(status, 200, "{removed}");
     assert!(listing(&console)["apps"].as_array().unwrap().is_empty());
 
+    // two instances of it, a VM each of two wickets, holding nothing: no disk (their scratch
+    // on /tmp), the state in PostgreSQL and the blobs in the bucket through their egress, as
+    // the flume and the other one's listener; the CLI through a relay over the wickets'
+    // listeners, as the sluice server spreads a host's requests over the wickets advertising it
+    let (listen_b, console_b) = (free(), free());
+    let wicket_b = start_wicket_on(&listen_b, &console_b, "deployed-ha", &guest);
+    let shared = Shared::new(&dir);
+    let (shared_env, shared_egress) = shared.in_vm();
+    let ports = [&console, &console_b, &listen, &listen_b].map(|at| port_of(at));
+    let put_instance = |at: usize, sha256: &str| {
+        let [of_a, of_b, serves_a, serves_b] = &ports;
+        let (serves, peer) = [(serves_a, serves_b), (serves_b, serves_a)][at];
+        let wickets = format!("a=http://localhost:{of_a},b=http://localhost:{of_b}");
+        let mut env = json!({
+            "SLUICE_WICKET_CF_API_ANY_CREDENTIALS": "true",
+            "SLUICE_WICKET_CF_API_WICKET": wickets,
+            "SLUICE_WICKET_CF_API_WICKET_TOKEN": TOKEN,
+            "SLUICE_WICKET_CF_API_FLUME": format!("grpc://localhost:{flume_port}"),
+            "SLUICE_WICKET_CF_API_FLUME_TOKEN": FLUME_TOKEN,
+            "SLUICE_WICKET_CF_API_DATA_DIR": "/tmp/cf-api",
+            "SLUICE_WICKET_CF_API_INSTANCE_URL": format!("http://127.0.0.1:{serves}"),
+        });
+        env.as_object_mut().unwrap().extend(shared_env.clone());
+        let mut egress = vec![
+            format!("localhost:{of_a}"),
+            format!("localhost:{of_b}"),
+            format!("localhost:{flume_port}"),
+            format!("127.0.0.1:{peer}"),
+        ];
+        egress.extend(shared_egress.clone());
+        on_console(
+            [&console, &console_b][at],
+            reqwest::Method::PUT,
+            "/api/apps/cf-api",
+            json!({
+                "owner": "ops",
+                "hosts": ["127.0.0.1"],
+                "component": {"sha256": sha256, "name": "cf-api.ext4"},
+                "sandbox": {"memory-mib": 256, "egress": egress, "env": env},
+            }),
+        )
+    };
+    let ready = |listen: &str| {
+        eventually("the instance ready", || {
+            fetch(listen, "127.0.0.1", "/healthz", None).is_some_and(|(status, _)| status == 200)
+        });
+    };
+    for (at, (console, listen)) in [(&console, &listen), (&console_b, &listen_b)]
+        .into_iter()
+        .enumerate()
+    {
+        let (status, put) = put_instance(at, &made_on(console, &cf_api));
+        assert_eq!(status, 200, "{put}");
+        ready(listen);
+    }
+    let relay_listen = free();
+    let relay = Relay::start(&relay_listen, vec![listen.clone(), listen_b.clone()], None);
+    let ha_url = format!("http://{relay_listen}");
+    cf.ok(&["api", &ha_url]);
+    cf.ok(&["login", "-u", "me", "-p", "x"]);
+    let rootfs = dir.join("rootfs");
+    let rootfs = rootfs.to_str().unwrap();
+    cf.ok(&["push", "ha", "-p", rootfs, "-i", "2"]);
+    for listen in [&listen, &listen_b] {
+        assert_eq!(get(listen, "ha.localhost", "/env", None).0, 200);
+    }
+    // an edit, made by the one reconciling the wickets whichever the relay sent it to: its
+    // links are of the host the CLI asked
+    for note in ["one", "two"] {
+        let edited = annotate(&cf, "ha", &json!({"example.com/note": note}));
+        let link = format!("\"self\":{{\"href\":\"{ha_url}/v3/apps/");
+        assert!(edited.contains(&link), "{edited}");
+    }
+
+    // an update, one wicket at a time: the app put again with another image, the wicket
+    // starting the new VM before it tells the old one's process to stop, the next once that
+    // one is ready; the CLI pushes all along, none of its requests failing, the app answering
+    // on both listeners
+    let uploaded = http
+        .0
+        .put(format!("http://{console_b}/api/components/{upgraded}"))
+        .bearer_auth(TOKEN)
+        .timeout(Duration::from_secs(300))
+        .body(image)
+        .send()
+        .unwrap();
+    assert_eq!(uploaded.status().as_u16(), 200);
+    let hammering = Hammer::of(&[&listen, &listen_b], "ha.localhost", "/env", "");
+    let updating = AtomicBool::new(true);
+    let pushes = std::thread::scope(|scope| {
+        let pushes = scope.spawn(|| {
+            let mut pushes = 0;
+            while updating.load(Ordering::Relaxed) {
+                cf.ok(&["push", "ha", "-p", rootfs, "--strategy", "rolling"]);
+                pushes += 1;
+            }
+            pushes
+        });
+        // (the first push under way)
+        std::thread::sleep(Duration::from_secs(1));
+        for (at, listen) in [&listen, &listen_b].into_iter().enumerate() {
+            let began = Instant::now();
+            let (status, put) = put_instance(at, &upgraded);
+            assert_eq!(status, 200, "{put}");
+            assert_eq!(put["message"], "restarted 127.0.0.1");
+            let put = began.elapsed();
+            ready(listen);
+            println!(
+                "instance {at} updated: put in {put:?}, ready {:?} after it",
+                began.elapsed() - put
+            );
+        }
+        updating.store(false, Ordering::Relaxed);
+        pushes.join().unwrap()
+    });
+    assert!(pushes > 0);
+    hammering.stop();
+    let taken = relay.taken();
+    assert!(taken.iter().all(|taken| *taken > 10), "{taken:?}");
+    cf.ok(&["delete", "ha", "-r", "-f"]);
+    for console in [&console, &console_b] {
+        let listed = listing(console);
+        let apps = listed["apps"].as_array().unwrap();
+        assert_eq!(apps.len(), 1, "{listed}");
+        assert_eq!(apps[0]["component"]["sha256"], upgraded.as_str());
+        let path = "/api/apps/cf-api?owner=ops";
+        let (status, removed) = on_console(console, reqwest::Method::DELETE, path, json!({}));
+        assert_eq!(status, 200, "{removed}");
+    }
+
+    drop(relay);
+    drop(wicket_b);
     drop(wicket);
     drop(flume);
     drop(provider);
@@ -4041,7 +4579,7 @@ fn cnb_builder(registry: &Registry, lifecycle: &Path, guest: &Path) -> (String, 
 /// The cf-api as an image (no docker here: this binary stripped, what it links, the host's
 /// CA bundle, the working directory its user's and the port its Dockerfile's, in one layer
 /// of no compression: debug builds read it all, more than once); its reference in `registry`.
-fn cf_api_image(registry: &Registry, dir: &Path) -> String {
+fn cf_api_image(registry: &Registry, dir: &Path, files: &[(String, Vec<u8>)]) -> String {
     let built = env!("CARGO_BIN_EXE_sluice-wicket-cf-api");
     let binary = dir.join("cf-api-stripped");
     let stripped = Command::new("strip")
@@ -4066,6 +4604,9 @@ fn cf_api_image(registry: &Registry, dir: &Path) -> String {
         let bundle = "/etc/ssl/certs/ca-certificates.crt";
         let roots = std::fs::read(bundle).unwrap();
         layer_file(tar, &bundle[1..], 0o644, 0, &roots);
+        for (path, bytes) in files {
+            layer_file(tar, path, 0o644, 0, bytes);
+        }
         let mut data = tar::Header::new_gnu();
         data.set_entry_type(tar::EntryType::Directory);
         data.set_mode(0o755);

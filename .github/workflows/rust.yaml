@@ -460,8 +460,9 @@ jobs:
   # and a wicket in local mode on a flume: the test builds the wicket (debug), its example
   # guests (the nightly toolchain examples/ pins), sluice-wicket-site (the cf-api's build
   # embeds it; the nightly it pins) and the flume with cargo, so their targets are cached too.
-  # Its wickets share a redis-server's keyvalue store; the tests of the state's store run a
-  # PostgreSQL in a container (the runner's Docker).
+  # Its wickets share a redis-server's keyvalue store; its two instances of the cf-api, and
+  # the tests of the state's store, run a PostgreSQL and an S3 bucket in containers (the
+  # runner's Docker).
   sluice-wicket-cf-api:
     needs: changes
     if: needs.changes.outputs.cf-api == 'true'
@@ -589,7 +590,9 @@ jobs:
         cargo test --locked
         (cd guest && cargo test --locked)
     # the OSS cf CLI deploying to the wicket, its image made on the wicket (x86_64 alone: the
-    # aarch64 runner has no /dev/kvm): skipped by the cf-api's job, which has no Firecracker
+    # aarch64 runner has no /dev/kvm): skipped by the cf-api's job, which has no Firecracker.
+    # Its instances of the cf-api share a PostgreSQL and an S3 bucket in containers (the
+    # runner's Docker)
     - name: Test the cf-api on it
       if: matrix.arch == 'x86_64'
       run: |

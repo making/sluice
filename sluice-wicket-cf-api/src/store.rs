@@ -1978,6 +1978,8 @@ pub struct Store {
     listener: Option<tokio::task::JoinHandle<()>>,
     /// Told what was seen of the wickets ([`Store::observe`]).
     noted: Arc<tokio::sync::Notify>,
+    /// Something seen of the wickets may not be written yet.
+    unwritten: std::sync::atomic::AtomicBool,
     /// Writes what was seen of the wickets, as it is seen.
     flusher: Option<tokio::task::JoinHandle<()>>,
     flags: Arc<Flags>,
@@ -2088,6 +2090,7 @@ impl Store {
             postgres: None,
             listener: None,
             noted: Arc::default(),
+            unwritten: Default::default(),
             flusher: None,
             flags: Arc::new(Flags {
                 wickets: wickets.to_vec(),
@@ -2286,9 +2289,27 @@ impl Store {
     pub async fn observe<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         let result = self.note(f).await;
         if self.postgres.is_some() {
+            self.unwritten.store(true, Ordering::Relaxed);
             self.noted.notify_one();
         }
         result
+    }
+
+    /// Writes what was seen of the wickets and is not written yet, now and not a moment later:
+    /// a request is answered after it, so what its answer tells of them (a share a wicket
+    /// refused) every instance reads from then on.
+    pub async fn observed(&self) {
+        let Some(postgres) = &self.postgres else {
+            return;
+        };
+        if self.unwritten.swap(false, Ordering::Relaxed) {
+            let mut writing = self.writer.lock().await;
+            postgres
+                .update(&mut writing, &self.shared, |_| (), false)
+                .await;
+            drop(writing);
+            self.shared.changed();
+        }
     }
 
     /// Forgets what was seen of the wickets and not written: this instance's turn reconciling
