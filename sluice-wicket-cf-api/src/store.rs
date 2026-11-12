@@ -2980,7 +2980,16 @@ pub(crate) mod tests {
             }
         }
         let a = open(&dir("a"), Some(&url), &["localhost"]).await;
-        let b = open(&dir("b"), Some(&url), &["localhost"]).await;
+        // an instance starts beside the transactions of another: it waits for none of the locks
+        // they hold on a store laid out already
+        let held = "BEGIN; SELECT 1 FROM sluice_cf_lease; \
+                    LOCK TABLE sluice_cf_records, sluice_cf_sessions IN ROW EXCLUSIVE MODE";
+        behind.batch_execute(held).await.unwrap();
+        let at = dir("b");
+        let b = open(&at, Some(&url), &["localhost"]);
+        let b = tokio::time::timeout(std::time::Duration::from_secs(10), b).await;
+        let b = b.expect("opened beside a transaction");
+        behind.batch_execute("ROLLBACK").await.unwrap();
         assert_eq!(kept(&a), kept(&b));
         let app = |name: &'static str| {
             a.update(move |state| {

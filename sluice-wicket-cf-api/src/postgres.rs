@@ -80,7 +80,10 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// How often a store not answering is said.
 const WARN_EVERY: Duration = Duration::from_secs(30);
 
-/// The tables, made where there are none: a new store is of this build's layout.
+/// The tables, made where there are none: a new store is of this build's layout. On a store
+/// that has them it takes no lock a running instance's transaction waits for, nor waits for
+/// one of theirs: an index or a column is made only where it is missing (as a no-op each
+/// would lock its table against the writers, or all, and deadlock with them).
 fn tables() -> String {
     TABLES.replace("$SCHEMA", &SCHEMA.to_string())
 }
@@ -102,7 +105,9 @@ CREATE TABLE IF NOT EXISTS sluice_cf_records (
     body text,
     PRIMARY KEY (kind, id)
 );
-CREATE INDEX IF NOT EXISTS sluice_cf_records_rev ON sluice_cf_records (rev);
+DO $$ BEGIN IF to_regclass('sluice_cf_records_rev') IS NULL THEN
+    CREATE INDEX sluice_cf_records_rev ON sluice_cf_records (rev);
+END IF; END $$;
 CREATE TABLE IF NOT EXISTS sluice_cf_commits (
     rev bigint PRIMARY KEY,
     writer text NOT NULL,
@@ -119,7 +124,9 @@ CREATE TABLE IF NOT EXISTS sluice_cf_sessions (
     subject text NOT NULL,
     expires timestamptz NOT NULL
 );
-CREATE INDEX IF NOT EXISTS sluice_cf_sessions_expires ON sluice_cf_sessions (expires, jti);
+DO $$ BEGIN IF to_regclass('sluice_cf_sessions_expires') IS NULL THEN
+    CREATE INDEX sluice_cf_sessions_expires ON sluice_cf_sessions (expires, jti);
+END IF; END $$;
 CREATE TABLE IF NOT EXISTS sluice_cf_passcodes (
     code text PRIMARY KEY,
     identity text NOT NULL,
@@ -133,7 +140,11 @@ CREATE TABLE IF NOT EXISTS sluice_cf_lease (
 );
 INSERT INTO sluice_cf_lease (holder, epoch, expires) VALUES (NULL, 0, '-infinity')
     ON CONFLICT DO NOTHING;
-ALTER TABLE sluice_cf_lease ADD COLUMN IF NOT EXISTS address text;
+DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_attribute
+    WHERE attrelid = to_regclass('sluice_cf_lease') AND attname = 'address' AND NOT attisdropped)
+THEN
+    ALTER TABLE sluice_cf_lease ADD COLUMN address text;
+END IF; END $$;
 CREATE TABLE IF NOT EXISTS sluice_cf_instances (
     id text PRIMARY KEY,
     build text NOT NULL,
