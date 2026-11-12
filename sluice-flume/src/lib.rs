@@ -59,6 +59,11 @@ pub fn describe_build() -> String {
     )
 }
 
+/// How often the nodes long disconnected are looked for: a quarter of the time
+/// they stay listed, within these.
+const FORGET_MIN: Duration = Duration::from_millis(100);
+const FORGET_MAX: Duration = Duration::from_secs(60);
+
 /// What the server needs once its listener is bound.
 #[derive(Clone, Debug)]
 pub struct Settings {
@@ -70,6 +75,8 @@ pub struct Settings {
     pub ring_bytes: usize,
     /// The newest lines a watch without a cursor begins with.
     pub backfill: usize,
+    /// How long a node disconnected stays listed; None: until the flume ends.
+    pub forget_after: Option<Duration>,
     /// The PEM certificate chain and private key, for TLS.
     pub tls: Option<(Vec<u8>, Vec<u8>)>,
     /// Where to export every line it receives, OTLP/HTTP.
@@ -89,6 +96,17 @@ pub async fn serve(
         settings.backfill,
     ));
     let export_hub = hub.clone();
+    // a node that never comes back (an id made at each start) is not kept for good
+    let forgetting = settings.forget_after.map(|after| {
+        let hub = hub.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval((after / 4).clamp(FORGET_MIN, FORGET_MAX));
+            loop {
+                tick.tick().await;
+                hub.forget(after);
+            }
+        })
+    });
     let expected: MetadataValue<_> = format!("Bearer {}", settings.token)
         .parse()
         .expect("the token is a valid header value");
@@ -118,6 +136,9 @@ pub async fn serve(
         served = server.add_service(health).add_service(flume).serve_with_incoming(incoming) => served,
         () = shutdown => Ok(()),
     };
+    if let Some(forgetting) = forgetting {
+        forgetting.abort();
+    }
     // what the exporter still holds goes out before the flume exits
     if let Some(exporter) = exporter {
         exporter.shutdown().await;

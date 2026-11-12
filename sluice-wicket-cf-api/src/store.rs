@@ -21,7 +21,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 pub use crate::blobs::{Blob, Spool};
-use crate::blobs::{BlobSettings, Blobs, Local, Reading};
+use crate::blobs::{BlobSettings, Blobs, Opened, Reading};
 use crate::instances::{Member, Topology};
 use crate::lease::{Lease, Seat, Term, Timing};
 use crate::postgres::{Postgres, PostgresSettings, Shared, Writer};
@@ -2358,7 +2358,7 @@ impl Store {
     }
 
     /// A file of this instance's disk, for its owner only, gone with what is returned: an
-    /// upload received, a blob made before it is kept ([`Store::keep`]).
+    /// upload's zip, a blob made, before it is kept ([`Store::keep`]).
     pub fn spool(&self) -> Result<(Spool, std::fs::File), String> {
         let path = self
             .dir
@@ -2389,9 +2389,9 @@ impl Store {
         self.blobs.read(blob).await
     }
 
-    /// `blob` in a file of this instance's disk; None: it is not kept.
-    pub async fn local(&self, blob: &Blob) -> Result<Option<Local>, String> {
-        self.blobs.local(blob, || self.spool()).await
+    /// `blob` to read here and there, on a blocking thread; None: it is not kept.
+    pub async fn seekable(&self, blob: &Blob) -> Result<Option<Opened>, String> {
+        self.blobs.open(blob).await
     }
 
     /// The sweeps begun, once none is under way: the blobs seen kept after this are kept
@@ -2802,11 +2802,35 @@ pub(crate) mod tests {
             first.update(named).await;
             second.sync().await.unwrap();
 
-            // uploaded through one instance, unpacked through another
-            let local = second.local(&package).await.unwrap().expect("the package");
-            assert_eq!(std::fs::read(local.path()).unwrap(), zip, "shared {shared}");
+            // uploaded through one instance, unpacked through another: read here and there,
+            // the bucket's over several of its pieces
+            let read_at = async |blob: &Blob, at: std::io::SeekFrom, bytes: usize| {
+                use std::io::{Read as _, Seek as _};
+                let mut opened = second.seekable(blob).await.unwrap().expect("the blob");
+                let reading = tokio::task::spawn_blocking(move || {
+                    let mut read = vec![0; bytes];
+                    opened.seek(at).unwrap();
+                    opened.read_exact(&mut read).unwrap();
+                    let ended = opened.seek(std::io::SeekFrom::End(0)).unwrap();
+                    (read, ended)
+                });
+                reading.await.unwrap()
+            };
+            let whole = read_at(&package, std::io::SeekFrom::Start(0), zip.len()).await;
+            assert_eq!(whole, (zip.clone(), zip.len() as u64), "shared {shared}");
+            for (at, bytes) in [(0, 10), (299_990, 10), (100_000, 150_000)] {
+                let from = std::io::SeekFrom::End(at as i64 - component.len() as i64);
+                let (read, ended) = read_at(&droplet, from, bytes).await;
+                assert_eq!(read, component[at..at + bytes], "shared {shared}");
+                assert_eq!(ended, component.len() as u64);
+            }
+            let empty = Blob::Package(guid());
+            keep(&empty, b"").await;
+            let nothing = read_at(&empty, std::io::SeekFrom::Start(0), 0).await;
+            assert_eq!(nothing, (Vec::new(), 0), "shared {shared}");
+            first.delete(std::slice::from_ref(&empty)).await;
             let gone = Blob::Package(guid());
-            assert!(second.local(&gone).await.unwrap().is_none());
+            assert!(second.seekable(&gone).await.unwrap().is_none());
             assert!(second.reading(&gone).await.unwrap().is_none());
 
             // dropped while it is read

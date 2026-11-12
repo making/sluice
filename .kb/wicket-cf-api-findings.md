@@ -339,10 +339,36 @@ Measured on one host (the images built from the tree; two instances):
   through the other
 - memory: 5.2-5.8 MiB each idle (containers). In a VM without a disk, `memory-mib` 512: a
   `cf push` of a 135 MiB zip refused at the upload (`No space left on device`: `/tmp` is half
-  the memory, the upload there twice while it comes); 1024: pushed in 15s
+  the memory, the upload was there twice while it came); 1024: pushed in 15s. Since then the
+  zip is written once as it comes and unpacked from the bucket
+  ([An instance's scratch](#an-instances-scratch)); not pushed in a VM again
 - the store: 9 connections of two instances idle; a database of 8 MB with one app
 - the test's run, both flows side by side: 384s on one instance each before, 511s on two (the
   wasi flow alone 310s, the Firecracker one 496s)
+
+## An instance's scratch
+
+The peak of `--data-dir` (its files' blocks, sampled every 5ms) at a `cf push` of a static
+site of 135 MiB (a zip stored, not deflated: its tar is as large), the release binary on the
+host, a wasi wicket beside it, the bucket a RustFS 1.0.5 container:
+
+| | the upload | the staging |
+|---|---|---|
+| the upload's body in a file, then its `bits` part in another; with `--blobs` the package copied from the bucket to be unpacked | 270 MiB | 270 MiB |
+| the `bits` part written as the body comes; with `--blobs` the package read from the bucket by ranges (8 MiB at a time) | 135 MiB | 135 MiB with `--blobs`, 270 MiB without |
+
+Without `--blobs` the staging's 270 MiB are what the directory keeps (the package and the
+droplet), not scratch. Decided against: the upload put to the bucket as a stream (no file at
+all). A put is one request signed with its body's digest, so an object is there whole or not at
+all; a stream of a length not known before its end is a multipart upload, with parts to sweep
+when it is cut, and staging needs a file of what it makes anyway (a droplet is named by its
+digest).
+
+An instance's id among the flume's nodes stays a file of `--data-dir`, new at each start of a
+VM without a disk, and the flume forgets a node disconnected for long (`--forget-after`).
+Decided against: an id of `--instance-url`. An update starts the new VM before the old one
+stops, and the flume ends the older feed of an id fed twice (its control stream), which a
+feeder redials: the two would take the id from each other until the old one is gone.
 
 ## A stop
 

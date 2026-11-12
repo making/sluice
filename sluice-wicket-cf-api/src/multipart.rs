@@ -83,6 +83,36 @@ pub fn copy_part(
     }
 }
 
+/// A body as its frames come over a channel, read on a blocking thread: its end is the
+/// channel's.
+pub struct Coming {
+    frames: tokio::sync::mpsc::Receiver<bytes::Bytes>,
+    frame: bytes::Bytes,
+}
+
+impl Coming {
+    pub fn new(frames: tokio::sync::mpsc::Receiver<bytes::Bytes>) -> Coming {
+        Coming {
+            frames,
+            frame: bytes::Bytes::new(),
+        }
+    }
+}
+
+impl Read for Coming {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        while self.frame.is_empty() {
+            match self.frames.blocking_recv() {
+                Some(frame) => self.frame = frame,
+                None => return Ok(0),
+            }
+        }
+        let read = buffer.len().min(self.frame.len());
+        buffer[..read].copy_from_slice(&self.frame.split_to(read));
+        Ok(read)
+    }
+}
+
 /// A body, read forward in chunks.
 struct Scan<R> {
     body: R,

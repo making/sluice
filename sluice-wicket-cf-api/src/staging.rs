@@ -762,8 +762,9 @@ async fn follow_on(
 /// Stages the zip of the package `guid`, its droplet made, on a blocking thread: a VM of one
 /// vCPU has one worker, which the API and the watch run on. The buildpack is the one of
 /// `detecting` detecting it ([`detect`]); what `takes` does not is refused before it is unpacked.
-/// Source is packed for its build, not staged yet. The zip is read from this instance's disk
-/// (a copy of the bucket's), what is made of it kept from there.
+/// Source is packed for its build, not staged yet. The zip is read where it is kept (the
+/// bucket's a piece at a time: no copy of it here), what is made of it kept from this
+/// instance's disk.
 async fn unpack(
     store: Arc<Store>,
     guid: &str,
@@ -771,15 +772,13 @@ async fn unpack(
     detecting: Vec<Buildpack>,
     takes: Takes,
 ) -> Result<Unpacked, String> {
-    let package = (store.local(&Blob::Package(guid.to_string())).await)
+    let package = (store.seekable(&Blob::Package(guid.to_string())).await)
         .map_err(|e| format!("the package: {e}"))?
         .ok_or("the package is gone")?;
     let (scratch, command) = (store.clone(), command.map(str::to_string));
     let unpacked = tokio::task::spawn_blocking(move || {
         let store = scratch;
-        let zip =
-            std::fs::File::open(package.path()).map_err(|e| format!("the package is gone: {e}"))?;
-        let mut archive = zip::ZipArchive::new(zip).map_err(|e| format!("not a zip: {e}"))?;
+        let mut archive = zip::ZipArchive::new(package).map_err(|e| format!("not a zip: {e}"))?;
         let (buildpack, entry) = detect(&files(&archive), command.as_deref(), &detecting)?;
         takes.accept(buildpack.stack(), buildpack.what())?;
         let (spool, mut file) = store.spool()?;

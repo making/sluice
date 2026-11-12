@@ -99,7 +99,13 @@ final class LiveLogStream implements ClientResponseObserver<WatchRequest, WatchE
 						? gap.id(LiveLogView.idOf(this.epoch, event.getGap().getSeq())) : gap);
 			}
 			case NODE -> {
-				this.nodes.put(event.getNode().getNodeId(), event.getNode().getConnected());
+				// one the flume forgot is listed no more
+				if (event.getNode().getForgotten()) {
+					this.nodes.remove(event.getNode().getNodeId());
+				}
+				else {
+					this.nodes.put(event.getNode().getNodeId(), event.getNode().getConnected());
+				}
 				yield this.send(SseEmitter.event().name("nodes").data(this.view.nodes(this.nodes)));
 			}
 			case BODY_NOT_SET -> true;

@@ -789,6 +789,7 @@ mod tests {
             ring_size: 100,
             ring_bytes: 1 << 20,
             backfill: 1,
+            forget_after: None,
             tls: None,
             otlp: None,
         };

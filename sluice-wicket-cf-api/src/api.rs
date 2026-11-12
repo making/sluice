@@ -59,6 +59,9 @@ use crate::wicket::{AppBody, Failure, ListedApp, Runtime, Wicket};
 
 /// Largest package upload, and component pulled.
 pub(crate) const MAX_UPLOAD_BYTES: usize = 160 << 20;
+
+/// The frames of an upload's body waiting to be written.
+const UPLOAD_FRAMES: usize = 16;
 /// Largest body of any other request.
 const MAX_BODY_BYTES: usize = 1 << 20;
 /// Connections open at once; one beyond takes the place of one without an
@@ -317,15 +320,22 @@ impl From<String> for ApiError {
     }
 }
 
-/// A request, its body read: an upload's to a file.
+/// The zip of an upload: its `bits` part in a file, as it came.
+struct Uploaded {
+    bits: Spool,
+    bytes: u64,
+    sha256: String,
+}
+
+/// A request, its body read: of an upload's, the zip to a file.
 pub(crate) struct Req {
     pub(crate) method: Method,
     pub(crate) path: String,
     pub(crate) query: Vec<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
-    /// An upload's body, in a file.
-    spool: Option<Spool>,
+    /// An upload's zip, until it is kept; why its body holds none.
+    uploaded: std::sync::Mutex<Option<Result<Uploaded, String>>>,
     /// Where the CLI reaches this API: the links name it.
     pub(crate) base: String,
     /// What the holder of its token may; why not without a valid one.
@@ -434,13 +444,15 @@ impl Api {
         if authenticated {
             body.admit();
         }
-        // a package to a file as it comes: it may be larger than this process's memory; and
-        // only from whoever may leave one, the others refused below, their body unread.
+        // a package's zip to a file as it comes: it may be larger than this process's memory;
+        // and only from whoever may leave one, the others refused below, their body unread.
         // Any other body is small
-        let (body, spool) = if path.ends_with("/upload") {
+        let (body, uploaded) = if path.ends_with("/upload") {
             if authenticated {
-                match self.spooled(body).await {
-                    Ok(spool) => (Bytes::new(), Some(spool)),
+                let content_type = parts.headers.get(header::CONTENT_TYPE);
+                let content_type = content_type.and_then(|kind| kind.to_str().ok());
+                match self.uploaded(body, content_type.unwrap_or_default()).await {
+                    Ok(uploaded) => (Bytes::new(), Some(uploaded)),
                     Err(error) => return error.into(),
                 }
             } else {
@@ -481,7 +493,7 @@ impl Api {
                 .collect(),
             headers: parts.headers,
             body,
-            spool,
+            uploaded: std::sync::Mutex::new(uploaded),
             base: format!("{scheme}://{host}"),
             path,
             access,
@@ -878,24 +890,48 @@ impl Api {
             .map_err(|e| ApiError::invalid_token(&e))
     }
 
-    /// `body` in a file, [`MAX_UPLOAD_BYTES`] at most.
-    async fn spooled(&self, mut body: Body) -> Result<Spool, ApiError> {
-        use std::io::Write as _;
-        let (spool, mut file) = self.store.spool()?;
-        let failed = |e: std::io::Error| ApiError::from(format!("{}: {e}", spool.path().display()));
+    /// The `bits` part of the upload `body` ([`MAX_UPLOAD_BYTES`] at most), which
+    /// `content_type` says the parts of, in a file: written as the body comes, so this
+    /// instance's disk holds the zip once, and on a blocking thread: a VM of one vCPU has one
+    /// worker, which its API and its watch run on. A body that is no such upload is read to its
+    /// end all the same: its answer says why.
+    async fn uploaded(
+        &self,
+        mut body: Body,
+        content_type: &str,
+    ) -> Result<Result<Uploaded, String>, ApiError> {
+        let (bits, mut file) = self.store.spool()?;
+        let (frames, coming) = tokio::sync::mpsc::channel(UPLOAD_FRAMES);
+        let content_type = content_type.to_string();
+        let copying = tokio::task::spawn_blocking(move || {
+            let mut hashed = Hashed::new(&mut file);
+            let body = crate::multipart::Coming::new(coming);
+            let bytes = crate::multipart::copy_part(&content_type, body, "bits", &mut hashed)?
+                .ok_or("the upload has no 'bits' part")?;
+            Ok::<_, String>((bytes, hashed.finish()))
+        });
         let mut bytes = 0;
         while let Some(frame) = body.frame().await {
             let frame = frame.map_err(|e| ApiError::bad_request(format!("the body: {e}")))?;
-            let Some(data) = frame.data_ref() else {
+            let Ok(data) = frame.into_data() else {
                 continue;
             };
             bytes += data.len();
             if bytes > MAX_UPLOAD_BYTES {
                 return Err(ApiError::too_large(MAX_UPLOAD_BYTES));
             }
-            file.write_all(data).map_err(failed)?;
+            // refused already: the rest is read and left
+            let _ = frames.send(data).await;
         }
-        Ok(spool)
+        drop(frames);
+        let copied = copying
+            .await
+            .map_err(|e| ApiError::from(format!("the upload: {e}")))?;
+        Ok(copied.map(|(bytes, sha256)| Uploaded {
+            bits,
+            bytes,
+            sha256,
+        }))
     }
 
     fn log_cache(&self, req: &Req, segments: &[&str]) -> Reply {
@@ -2436,9 +2472,8 @@ impl Api {
         Ok(json(StatusCode::CREATED, &view))
     }
 
-    /// The `bits` part of the upload is the zip, copied on a blocking thread: a VM of one vCPU
-    /// has one worker, which its API and its watch run on. The app's older packages go, and an
-    /// upload to one that went is refused.
+    /// Keeps the zip of the upload ([`Api::uploaded`]) as the package. The app's older packages
+    /// go, and an upload to one that went is refused.
     async fn upload(&self, req: &Req, guid: &str) -> Reply {
         let package = self.package_as(req, guid, Need::Operate)?;
         if package.docker.is_some() {
@@ -2451,27 +2486,14 @@ impl Api {
         if !self.store.read(newest) {
             return Err(replaced());
         }
-        let content_type = req
-            .header(header::CONTENT_TYPE)
-            .unwrap_or_default()
-            .to_string();
-        let spool = req
-            .spool
-            .as_ref()
-            .ok_or_else(|| ApiError::bad_request("no body"))?;
-        let body = std::fs::File::open(spool.path())
-            .map_err(|e| ApiError::from(format!("{}: {e}", spool.path().display())))?;
-        // the zip of the upload's body, on this instance's disk until it is kept
-        let (bits, mut file) = self.store.spool()?;
-        let copied = tokio::task::spawn_blocking(move || {
-            let mut hashed = Hashed::new(&mut file);
-            let bytes = crate::multipart::copy_part(&content_type, body, "bits", &mut hashed)?
-                .ok_or("the upload has no 'bits' part")?;
-            Ok::<_, String>((bytes, hashed.finish()))
-        })
-        .await
-        .map_err(|e| ApiError::from(format!("the upload: {e}")))?;
-        let (bytes, sha256) = copied.map_err(ApiError::bad_request)?;
+        let uploaded = req.uploaded.lock().expect("no panic under the lock").take();
+        let Uploaded {
+            bits,
+            bytes,
+            sha256,
+        } = uploaded
+            .ok_or_else(|| ApiError::bad_request("no body"))?
+            .map_err(ApiError::bad_request)?;
         let blob = Blob::Package(guid.to_string());
         self.store.keep(&blob, bits, &sha256).await?;
         let updated = self

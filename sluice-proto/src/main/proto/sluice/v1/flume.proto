@@ -160,4 +160,7 @@ message NodeState {
   string node_id = 1;
   // Whether the node's feed stream is open.
   bool connected = 2;
+  // The flume forgot the node, disconnected for long (`--forget-after`): it
+  // lists it no more, until it feeds again.
+  bool forgotten = 3;
 }

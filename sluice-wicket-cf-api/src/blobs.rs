@@ -4,12 +4,13 @@
 //! share (`crate::s3`).
 //!
 //! A blob is made on the instance's own disk first (a [`Spool`]) and kept whole or not at
-//! all: a rename in the directory, one put to the bucket. It is read as a stream, or from a
-//! file: the directory's own, a copy of the bucket's.
+//! all: a rename in the directory, one put to the bucket. It is read as a stream, or here and
+//! there ([`Opened`]): the directory's file, the bucket's a piece at a time, with no copy of it.
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 
-use crate::s3::S3;
+use crate::s3::{Ranged, S3};
 
 /// A blob, by what names it: a package's guid, a droplet's or its files' digest.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -78,8 +79,7 @@ impl std::fmt::Debug for BlobSettings {
     }
 }
 
-/// A file of the instance's own disk, removed with this: an upload received, a blob being
-/// made, a copy of one.
+/// A file of the instance's own disk, removed with this: an upload's zip, a blob being made.
 pub struct Spool(pub(crate) PathBuf);
 
 impl Spool {
@@ -110,17 +110,27 @@ impl Reading {
     }
 }
 
-/// A blob in a file: the directory's, or a copy gone with this.
-pub enum Local {
-    Kept(PathBuf),
-    Copy(Spool),
+/// A blob read here and there, as a zip is, on a blocking thread: the directory's file, or
+/// the bucket's object.
+pub enum Opened {
+    Kept(std::fs::File),
+    Ranged(Box<Ranged>),
 }
 
-impl Local {
-    pub fn path(&self) -> &Path {
+impl Read for Opened {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         match self {
-            Local::Kept(path) => path,
-            Local::Copy(spool) => spool.path(),
+            Opened::Kept(file) => file.read(buffer),
+            Opened::Ranged(object) => object.read(buffer),
+        }
+    }
+}
+
+impl Seek for Opened {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        match self {
+            Opened::Kept(file) => file.seek(to),
+            Opened::Ranged(object) => object.seek(to),
         }
     }
 }
@@ -197,41 +207,22 @@ impl Blobs {
         }
     }
 
-    /// The blob in a file, the bucket's copied to what `spool` gives; None: it is not kept.
-    pub async fn local(
-        &self,
-        blob: &Blob,
-        spool: impl FnOnce() -> Result<(Spool, std::fs::File), String>,
-    ) -> Result<Option<Local>, String> {
-        use tokio::io::AsyncWriteExt as _;
-        let s3 = match self {
+    /// The blob to read here and there; None: it is not kept.
+    pub async fn open(&self, blob: &Blob) -> Result<Option<Opened>, String> {
+        match self {
             Blobs::Dir(dir) => {
                 let path = dir.join(blob.key());
-                return match tokio::fs::try_exists(&path).await {
-                    Ok(kept) => Ok(kept.then_some(Local::Kept(path))),
+                match tokio::fs::File::open(&path).await {
+                    Ok(file) => Ok(Some(Opened::Kept(file.into_std().await))),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
                     Err(e) => Err(format!("{}: {e}", path.display())),
-                };
+                }
             }
-            Blobs::S3(s3) => s3,
-        };
-        let key = blob.key();
-        let Some(mut object) = s3.get(&key).await? else {
-            return Ok(None);
-        };
-        let (spool, file) = spool()?;
-        let mut file = tokio::fs::File::from_std(file);
-        let unwritten = |e: std::io::Error| format!("{}: {e}", spool.path().display());
-        let mut bytes = 0;
-        while let Some(chunk) = object.response.chunk().await.transpose() {
-            let chunk = chunk.map_err(|e| format!("s3: get {key}: {}", e.without_url()))?;
-            bytes += chunk.len() as u64;
-            file.write_all(&chunk).await.map_err(unwritten)?;
+            Blobs::S3(s3) => {
+                let object = s3.ranged(&blob.key()).await?;
+                Ok(object.map(|object| Opened::Ranged(Box::new(object))))
+            }
         }
-        file.flush().await.map_err(unwritten)?;
-        if bytes != object.bytes {
-            return Err(format!("s3: get {key}: {bytes} of {} bytes", object.bytes));
-        }
-        Ok(Some(Local::Copy(spool)))
     }
 
     /// The blobs kept.

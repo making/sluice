@@ -4,7 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::{broadcast, watch};
 
@@ -182,6 +182,8 @@ struct Node {
     /// The highest `node_seq` received in the node's run `boot_id`.
     last_node_seq: u64,
     feed: Option<Feed>,
+    /// Since when it has no feed.
+    gone: Option<Instant>,
 }
 
 struct Feed {
@@ -238,16 +240,19 @@ impl Hub {
                 boot_id: boot_id.to_string(),
                 last_node_seq: 0,
                 feed: None,
+                gone: None,
             });
         if node.boot_id != boot_id {
             node.boot_id = boot_id.to_string();
             node.last_node_seq = 0;
         }
         let reconnected = node.feed.replace(Feed { id, control }).is_some();
+        node.gone = None;
         if !reconnected {
             let _ = self.live.send(Item::Node(NodeState {
                 node_id: node_id.to_string(),
                 connected: true,
+                forgotten: false,
             }));
         }
         // a node coming back is told what the watchers already ask of it
@@ -264,11 +269,37 @@ impl Hub {
         };
         if node.feed.as_ref().is_some_and(|feed| feed.id == feed_id) {
             node.feed = None;
+            node.gone = Some(Instant::now());
             let _ = self.live.send(Item::Node(NodeState {
                 node_id: node_id.to_string(),
                 connected: false,
+                forgotten: false,
             }));
         }
+    }
+
+    /// Forgets the nodes disconnected for `after` or longer, as a restart of
+    /// the flume does: listed no more, which the watchers are told, their
+    /// lines of the ring kept. One feeding again is a node as any new one: it
+    /// sends again the recent lines it has at hand. How many it forgot.
+    pub fn forget(&self, after: Duration) -> usize {
+        let mut state = self.state();
+        let long_gone = |node: &Node| node.gone.is_some_and(|since| since.elapsed() >= after);
+        let forgotten: Vec<String> = (state.nodes.iter())
+            .filter(|(_, node)| long_gone(node))
+            .map(|(node_id, _)| node_id.clone())
+            .collect();
+        for node_id in &forgotten {
+            state.nodes.remove(node_id);
+            // made again from the watchers when it feeds again
+            state.steer.remove(node_id);
+            let _ = self.live.send(Item::Node(NodeState {
+                node_id: node_id.clone(),
+                connected: false,
+                forgotten: true,
+            }));
+        }
+        forgotten.len()
     }
 
     /// Appends a line of the node to the ring and hands it to the watchers.
@@ -431,6 +462,7 @@ impl Hub {
                 event(watch_event::Body::Node(NodeState {
                     node_id: node_id.clone(),
                     connected: node.feed.is_some(),
+                    forgotten: false,
                 }))
             })
             .collect()
@@ -672,9 +704,9 @@ mod tests {
     }
 
     #[test]
-    fn watchers_steer_a_node_as_they_come_and_go() {
+    fn watchers_steer_a_node_as_they_come_and_go_and_one_long_gone_is_forgotten() {
         let hub = Arc::new(Hub::new(10, 1 << 20, 10));
-        let (_node, mut control) = hub.connect("n1", "boot");
+        let (feed, mut control) = hub.connect("n1", "boot");
         let watch = hub
             .watch(filter(&["r1"], &[]), None, false)
             .expect("a small filter is accepted");
@@ -688,5 +720,45 @@ mod tests {
             ),
             "a node whose watchers are gone is stopped"
         );
+
+        // feeding, or gone not long: listed; gone for long: forgotten, the
+        // watchers told, and a node as any new one when it feeds again
+        let listed = |hub: &Arc<Hub>| {
+            let watch = hub.watch(filter(&[], &[]), None, false).unwrap();
+            let nodes = watch
+                .first
+                .into_iter()
+                .filter_map(|event| match event.body {
+                    Some(watch_event::Body::Node(node)) => Some((node.node_id, node.connected)),
+                    _ => None,
+                });
+            nodes.collect::<Vec<_>>()
+        };
+        let fifth = AccessEvent {
+            node_seq: 5,
+            ..event("line")
+        };
+        hub.publish("n1", fifth);
+        assert_eq!(hub.forget(Duration::ZERO), 0);
+        hub.disconnect("n1", feed);
+        assert_eq!(hub.forget(Duration::from_secs(3600)), 0);
+        assert_eq!(listed(&hub), [("n1".to_string(), false)]);
+        let mut watch = hub.watch(filter(&[], &[]), None, false).unwrap();
+        assert_eq!(hub.forget(Duration::ZERO), 1);
+        let Ok(Item::Node(told)) = watch.live.try_recv() else {
+            panic!("the watchers are told");
+        };
+        assert!(told.forgotten && !told.connected && told.node_id == "n1");
+        assert!(listed(&hub).is_empty());
+        let (_feed, mut control) = hub.connect("n1", "boot");
+        assert_eq!(listed(&hub), [("n1".to_string(), true)]);
+        let started = control
+            .borrow_and_update()
+            .clone()
+            .and_then(|control| control.body);
+        let Some(feed_control::Body::Start(start)) = started else {
+            panic!("a node watched is started");
+        };
+        assert_eq!(start.after_node_seq, 0);
     }
 }

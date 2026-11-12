@@ -74,9 +74,10 @@ affinity.
   `--blobs-access-key-id` and `--blobs-secret-access-key`: static keys that may get, put, delete
   and list below the prefix. An `https://` endpoint is verified against `--blobs-ca-cert`, else
   the webPKI roots
-- an upload, and a droplet as it is staged, are files of `--data-dir` first (the instance's own),
-  then put in one request: an object is there whole or not at all. A package is unpacked from a
-  copy in `--data-dir`, a droplet goes to a wicket as a stream: neither is held in memory
+- an upload's zip (written as its body comes), and a droplet as it is staged, are files of
+  `--data-dir` first (the instance's own), then put in one request: an object is there whole or
+  not at all. A package is unpacked from the bucket, 8 MiB of it at a time, a droplet goes to a
+  wicket as a stream: neither is held in memory, nor a second time in `--data-dir`
 - a blob the state names no more (an older package, a droplet neither current nor the one
   before) is deleted 30 to 35 minutes later, another instance reading it as it may be; one never
   named (a staging cut short) likewise. In the directory the first goes at once
@@ -284,8 +285,8 @@ the requests over them: no session affinity, any instance takes any request.
 - an instance holds nothing to keep: `--state`, `--blobs` and `--flume` are required beside
   another instance. Its `--data-dir` is scratch (an upload and a droplet while they are made)
   and its id among the flume's nodes (`flume-node`): one that does not outlive the instance
-  makes it a new node at each start, the ones before listed as disconnected until the flume's
-  restart
+  makes it a new node at each start, the ones before listed as disconnected until the flume
+  forgets them (its `--forget-after`, an hour)
 - what routes to them sends a connection refused to another instance (the listener of one
   stopping is closed, [A stop](#a-stop)), and takes out one whose `/healthz` is not 200. A
   request cut with no answer (an instance killed) is safe to send again when it is a `GET`
@@ -483,7 +484,7 @@ curl -H 'Host: wicket-a' http://127.0.0.1:8000/healthz            # one instance
 
 - **no `disk`**: the rootfs is read-only, so `--data-dir` is on `/tmp`, a tmpfs of half the
   VM's memory ([Sizing and backup](#sizing-and-backup)), gone with the VM: each start is a new
-  node of the flume. Without a disk the wicket starts the new VM before it tells the old one
+  node of the flume, the one before forgotten an hour later. Without a disk the wicket starts the new VM before it tells the old one
   to stop ([Updating them](#updating-them))
 - **`--instance-url`** is the wicket's `--listen` (beside `--server`), in the other's
   `egress`, and the wicket's name a host of the app there: an edit sent on says `Host:
@@ -531,9 +532,10 @@ measured of both deployments, an update, a kill and the store away is in
 ## Sizing and backup
 
 - **an instance**: some MiB of memory idle, some 20 pushing a large zip: an upload, a package
-  and a droplet go through files of `--data-dir`. On a tmpfs (a VM without a disk) those are
-  memory, an upload there twice while it comes, and `/tmp` is half the VM's: `memory-mib`
-  1024 pushed a 135 MiB zip, 512 refused its upload (`No space left on device`)
+  and a droplet go through files of `--data-dir`: with `--blobs` the zip while it is
+  uploaded, then what staging makes of it (the component, a site's or the source's files as
+  a tar), one at a time. On a tmpfs (a VM without a disk) those are memory, and `/tmp` is
+  half the VM's: `memory-mib` is above twice the larger of the two
 - **the store**: a row per entity, a few hundred bytes each, an app's 2 kB; 1000 apps with
   their routes, packages, builds and droplets are 5000 rows. An instance holds 4 or 5
   connections

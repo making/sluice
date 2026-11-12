@@ -31,6 +31,7 @@ async fn flume(ring_size: usize, backfill: usize) -> String {
         ring_size,
         ring_bytes: 64 << 20,
         backfill,
+        forget_after: None,
         tls: None,
         otlp: None,
     };
@@ -162,7 +163,9 @@ async fn next(events: &mut Streaming<WatchEvent>) -> watch_event::Body {
 fn shape(body: &watch_event::Body) -> String {
     match body {
         watch_event::Body::Hello(hello) => format!("hello reset={}", hello.reset),
-        watch_event::Body::Node(NodeState { node_id, connected }) => {
+        watch_event::Body::Node(NodeState {
+            node_id, connected, ..
+        }) => {
             format!("node {node_id} {}", if *connected { "up" } else { "down" })
         }
         watch_event::Body::Record(record) => {
@@ -574,6 +577,7 @@ async fn the_exporter_batches_the_lines_and_resends_a_refused_batch() {
         ring_size: 100,
         ring_bytes: 1 << 20,
         backfill: 0,
+        forget_after: None,
         tls: None,
         otlp: Some(
             OtlpSettings::new(RawOtlp {

@@ -779,7 +779,7 @@ java -jar sluice-server/target/sluice-server-0.0.1-SNAPSHOT-exec.jar --sluice.to
 ```
 
 A node queues at most 4096 lines for the flume and drops (and counts) the rest, never
-holding a request back; the page shows the lines missed and the nodes disconnected. A
+holding a request back; the page shows the lines missed and the nodes disconnected (for an hour: the flume's `--forget-after`). A
 browser reconnecting, to any node, resumes after the last line it showed. The server starts
 and serves with the flume down. A wicket feeds the flume too (`--flume`): the requests it
 answered (`response`) and its guests' output (`stdout`, `stderr`), each naming its

@@ -17,6 +17,8 @@ usage: sluice-flume --token <token> [options]
   --ring-size <lines>     newest lines kept for backfill and resume (default 10000)
   --ring-bytes <bytes>    most bytes those lines may hold (default 67108864)
   --backfill <lines>      newest lines a new watch begins with (default 200)
+  --forget-after <secs>   how long a node disconnected stays listed (default
+                          3600, 0 = until the flume ends)
   --otlp-endpoint <url>   export every line here, OTLP/HTTP (opt-in; a path of
                           / or none gets /v1/logs appended)
   --otlp-service-name <name>    service.name of the exported resources (default sluice)
@@ -66,6 +68,7 @@ const VALUED: &[&str] = &[
     "ring-size",
     "ring-bytes",
     "backfill",
+    "forget-after",
     "otlp-endpoint",
     "otlp-service-name",
     "otlp-resource-attributes",
@@ -226,6 +229,9 @@ pub fn parse(
             ring_size: number("ring-size", 10_000)?.max(1),
             ring_bytes: number("ring-bytes", 64 << 20)?.max(1),
             backfill: number("backfill", 200)?,
+            forget_after: Some(number("forget-after", 3600)? as u64)
+                .filter(|secs| *secs > 0)
+                .map(std::time::Duration::from_secs),
             tls,
             otlp,
         },
@@ -268,6 +274,8 @@ mod tests {
         assert_eq!(config.settings.ring_size, 50);
         assert_eq!(config.settings.ring_bytes, 1024);
         assert_eq!(config.settings.backfill, 7);
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(config.settings.forget_after, Some(hour));
         assert!(config.settings.tls.is_none());
         // the flag overrides the endpoint, which added the signal's path; the
         // batch size stays the environment's

@@ -31,6 +31,7 @@ variable of that prefix, a misspelled one, is refused at the start):
 `--host`, `--port` (8002), `--token` / `--token-file` (required), `--tls-cert` /
 `--tls-key` (PEM, serves `grpcs://`), `--ring-size`, `--ring-bytes` (64 MiB: the most those
 lines may hold), `--backfill` (200: the newest lines a new view begins with),
+`--forget-after` (3600 s: how long a node disconnected stays listed, 0 = until the flume ends),
 `--exit-on-stdin-close`. `--version` prints its build (version, git
 commit, build time); the `listening on ...` line it prints once bound starts with the same,
 and every view's `WatchHello` carries it, shown next to the page's state (a flume predating
@@ -260,5 +261,11 @@ with them.
 - An idle stream carries an SSE comment every 15s, below the usual 60s proxy idle
   timeouts. The flume pings idle connections every 30s and drops one silent for 10s more,
   so a node or console gone without a word is marked disconnected.
+- A node disconnected for `--forget-after` is forgotten, as by a restart of the flume: listed
+  no more (`NodeState.forgotten`; a console predating it shows it disconnected until its view
+  is opened again), its lines of the ring kept. One whose id is new at each start (a cf-api
+  instance without a disk) is so not listed for good. Feeding again, it is a node as any new
+  one: it sends again the recent lines it has at hand, which the cf-api takes once, as after a
+  flume restart.
 - With `sluice.live-log.url` unset the page names the setting and the server keeps no
   lines.

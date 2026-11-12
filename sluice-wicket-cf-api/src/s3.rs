@@ -1,5 +1,6 @@
 //! The S3 calls of the blobs' bucket (`crate::blobs`): an object put whole from a file, read
-//! as a stream, asked for, deleted, and the bucket's keys listed; signed with Signature
+//! as a stream or a piece at a time ([`Ranged`]), asked for, deleted, and the bucket's keys
+//! listed; signed with Signature
 //! Version 4 (the payload's digest signed: the bucket checks what it got). An endpoint named is
 //! addressed by path (`<endpoint>/<bucket>/<key>`: MinIO-likes, gateways), AWS by the
 //! bucket's host.
@@ -7,6 +8,7 @@
 //! An object is there whole or not at all: a put is one request, so nothing unfinished is left
 //! in the bucket (5 GiB at most, far above an upload's and a droplet's bounds).
 
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::time::Duration;
 
@@ -26,6 +28,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// How often a call is sent when the bucket did not answer it, or answered 5xx.
 const ATTEMPTS: u32 = 3;
 
+/// What a [`Ranged`] read takes of its object at a time.
+const PIECE: u64 = if cfg!(test) { 64 << 10 } else { 8 << 20 };
+
+#[derive(Clone)]
 pub struct S3 {
     client: reqwest::Client,
     /// `https://host[:port]`.
@@ -45,6 +51,78 @@ pub struct S3 {
 pub struct Object {
     pub bytes: u64,
     pub response: reqwest::Response,
+}
+
+/// An object read here and there, as a zip is, a piece of it in memory at a time and no copy
+/// on a disk: of one object, by its tag. Read on a blocking thread of the runtime it was
+/// opened on.
+pub struct Ranged {
+    s3: S3,
+    key: String,
+    runtime: tokio::runtime::Handle,
+    bytes: u64,
+    tag: Option<String>,
+    /// Where the next read is.
+    at: u64,
+    /// The piece at hand, and where it begins.
+    piece: bytes::Bytes,
+    piece_at: u64,
+}
+
+impl Ranged {
+    /// The object's size.
+    pub fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    /// The piece holding `self.at`: of an object's end, its last one whole (a zip's directory).
+    async fn fetch(&mut self) -> Result<(), String> {
+        let from = match self.bytes - self.at <= PIECE {
+            true => self.bytes.saturating_sub(PIECE),
+            false => self.at,
+        };
+        let to = (from + PIECE).min(self.bytes) - 1;
+        let range = format!("bytes={from}-{to}");
+        let gone = || format!("s3: get {}: gone while it was read", self.key);
+        let sent = self.s3.piece(&self.key, &range, self.tag.as_deref()).await;
+        let (at, bytes, _, piece) = sent?.ok_or_else(gone)?;
+        if at != from || bytes != self.bytes || piece.len() as u64 != to - from + 1 {
+            return Err(format!("s3: get {}: not the {range} asked for", self.key));
+        }
+        (self.piece, self.piece_at) = (piece, from);
+        Ok(())
+    }
+}
+
+impl Read for Ranged {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if self.at >= self.bytes || buffer.is_empty() {
+            return Ok(0);
+        }
+        if self.at < self.piece_at || self.at >= self.piece_at + self.piece.len() as u64 {
+            let runtime = self.runtime.clone();
+            runtime
+                .block_on(self.fetch())
+                .map_err(std::io::Error::other)?;
+        }
+        let held = &self.piece[(self.at - self.piece_at) as usize..];
+        let read = buffer.len().min(held.len());
+        buffer[..read].copy_from_slice(&held[..read]);
+        self.at += read as u64;
+        Ok(read)
+    }
+}
+
+impl Seek for Ranged {
+    fn seek(&mut self, to: SeekFrom) -> std::io::Result<u64> {
+        let at = match to {
+            SeekFrom::Start(at) => Some(at),
+            SeekFrom::End(by) => self.bytes.checked_add_signed(by),
+            SeekFrom::Current(by) => self.at.checked_add_signed(by),
+        };
+        self.at = at.ok_or_else(|| std::io::Error::other("a seek before the object"))?;
+        Ok(self.at)
+    }
 }
 
 impl S3 {
@@ -89,7 +167,8 @@ impl S3 {
     /// Puts the file at `from`, of the digest `sha256`, as the object `key`: whole, or not.
     pub async fn put(&self, key: &str, from: &Path, sha256: &str) -> Result<(), String> {
         let uri = self.uri(key);
-        let sent = (self.send("PUT", &uri, "", sha256, BODY_TIMEOUT, Some(from))).await;
+        let sent = self.send("PUT", &uri, "", BODY_TIMEOUT, Some((from, sha256)), &[]);
+        let sent = sent.await;
         sent.map(|_| ()).map_err(|e| format!("s3: put {key}: {e}"))
     }
 
@@ -104,6 +183,65 @@ impl S3 {
             .content_length()
             .ok_or_else(|| failed("no content-length".into()))?;
         Ok(Some(Object { bytes, response }))
+    }
+
+    /// The object `key` to read here and there, its last piece at hand; None: there is none.
+    pub async fn ranged(&self, key: &str) -> Result<Option<Ranged>, String> {
+        let range = format!("bytes=-{PIECE}");
+        let last = match self.piece(key, &range, None).await {
+            // an object of no byte has no last ones
+            Err(e) if e.contains(": 416") => Some((0, 0, None, bytes::Bytes::new())),
+            last => last?,
+        };
+        let Some((at, bytes, tag, piece)) = last else {
+            return Ok(None);
+        };
+        Ok(Some(Ranged {
+            s3: self.clone(),
+            key: key.to_string(),
+            runtime: tokio::runtime::Handle::current(),
+            bytes,
+            tag,
+            at: 0,
+            piece,
+            piece_at: at,
+        }))
+    }
+
+    /// The bytes `range` names of the object `key`, of the one tagged `tag` only: where they
+    /// begin, the object's size and tag, and the bytes; None: there is none.
+    async fn piece(
+        &self,
+        key: &str,
+        range: &str,
+        tag: Option<&str>,
+    ) -> Result<Option<(u64, u64, Option<String>, bytes::Bytes)>, String> {
+        let failed = |e: String| format!("s3: get {key}: {e}");
+        let mut headers = vec![("range", range.to_string())];
+        headers.extend(tag.map(|tag| ("if-match", tag.to_string())));
+        let uri = self.uri(key);
+        let sent = self.send("GET", &uri, "", BODY_TIMEOUT, None, &headers);
+        let Some(response) = sent.await.map_err(failed)? else {
+            return Ok(None);
+        };
+        let header = |name: &str| {
+            let value = response.headers().get(name)?.to_str().ok()?;
+            Some(value.to_string())
+        };
+        // `bytes 0-9/100`; the whole object from a bucket taking no range
+        let placed = match header("content-range") {
+            Some(range) => (|| {
+                let (piece, bytes) = range.strip_prefix("bytes ")?.split_once('/')?;
+                let (at, _) = piece.split_once('-')?;
+                Some((at.parse().ok()?, bytes.parse().ok()?))
+            })(),
+            None => response.content_length().map(|bytes| (0, bytes)),
+        };
+        let (at, bytes) = placed.ok_or_else(|| failed("no content-range".into()))?;
+        let tag = header("etag");
+        let piece = response.bytes().await;
+        let piece = piece.map_err(|e| failed(e.without_url().to_string()))?;
+        Ok(Some((at, bytes, tag, piece)))
     }
 
     pub async fn has(&self, key: &str) -> Result<bool, String> {
@@ -175,25 +313,26 @@ impl S3 {
         query: &str,
         timeout: Duration,
     ) -> Result<Option<reqwest::Response>, String> {
-        let nothing = hex(&Sha256::digest(b""));
-        self.send(method, uri, query, &nothing, timeout, None).await
+        self.send(method, uri, query, timeout, None, &[]).await
     }
 
-    /// Sends the call, its body (of the digest `payload`) the file `body`, read on each
-    /// attempt; None: answered 404.
+    /// Sends the call, its body the file `body` names with its digest, read on each attempt,
+    /// with the `headers` beside the signed ones; None: answered 404.
     async fn send(
         &self,
         method: &str,
         uri: &str,
         query: &str,
-        payload: &str,
         timeout: Duration,
-        body: Option<&Path>,
+        body: Option<(&Path, &str)>,
+        headers: &[(&'static str, String)],
     ) -> Result<Option<reqwest::Response>, String> {
         let url = match query {
             "" => format!("{}{uri}", self.origin),
             query => format!("{}{uri}?{query}", self.origin),
         };
+        let nothing = hex(&Sha256::digest(b""));
+        let payload = body.map_or(nothing.as_str(), |(_, sha256)| sha256);
         let mut attempt = 1;
         loop {
             let method = reqwest::Method::from_bytes(method.as_bytes()).expect("a method");
@@ -201,7 +340,10 @@ impl S3 {
             for (name, value) in self.signed(method.as_str(), uri, query, payload, epoch_secs()) {
                 request = request.header(name, value);
             }
-            if let Some(body) = body {
+            for (name, value) in headers {
+                request = request.header(*name, value);
+            }
+            if let Some((body, _)) = body {
                 let unread = |e: std::io::Error| format!("{}: {e}", body.display());
                 let file = tokio::fs::File::open(body).await.map_err(unread)?;
                 let bytes = file.metadata().await.map_err(unread)?.len();
