@@ -3,7 +3,8 @@
 //! asynchronous when its parameters say `"async": true` -- a deprovision or an unbind when
 //! what it deletes was made so -- and its last operation is in progress for one poll (as
 //! long as [`Broker::hold`] holds), then succeeded, or failed with the parameters'
-//! `fail_async`; `fail` refuses it at once (400). A binding's credentials name it. Plain HTTP
+//! `fail_async`; `fail` refuses it at once (400), and a provision saying `"unknown": true` is
+//! made and answered 500. A binding's credentials name it. Plain HTTP
 //! on the loopback, one request per connection, on a thread of its own.
 
 use std::collections::HashMap;
@@ -266,6 +267,9 @@ impl Content {
                         pending,
                     },
                 );
+                if body["parameters"]["unknown"] == true {
+                    return refused(500, "InternalError", "made, the answer lost");
+                }
                 match asynchronous {
                     true => (
                         202,

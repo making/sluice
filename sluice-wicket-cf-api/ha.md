@@ -4,7 +4,9 @@ What several instances of the [cf-api](README.md) share, in place of the files o
 instance's `--data-dir`: the state and the logins in PostgreSQL (`--state`), the packages and
 the droplets in an S3 bucket (`--blobs`); and who reconciles the wickets, one instance at a time
 ([The reconciling of the wickets](#the-reconciling-of-the-wickets)), which makes the edits the
-wickets take at once for every instance ([An edit on any instance](#an-edit-on-any-instance)).
+wickets take at once for every instance ([An edit on any instance](#an-edit-on-any-instance)) and
+does the work that outlives a request
+([The work outliving a request](#the-work-outliving-a-request)).
 The options are in the README's [Options](README.md#options).
 
 ## The state in PostgreSQL
@@ -88,7 +90,8 @@ and measured is in [.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings
 With `--state` one instance at a time reconciles the wickets: the holder of a lease, a row of the
 store (`sluice_cf_lease`) it renews every 2s for 10s, by the store's clock. Its turn is the
 watches of the wickets, the confirmations of what a wicket holds at its start, the evacuations
-and the moves, the purges, the deployments' steps and the sweeps of the bucket. The others take
+and the moves, the purges, the deployments' steps, the sweeps of the bucket, and
+[the work outliving a request](#the-work-outliving-a-request). The others take
 the lease once it lapses, trying every second; a stop lets go of it, the next taking it at once.
 Without `--state` the one process of `--data-dir` leads from its start.
 
@@ -143,3 +146,32 @@ logins) is answered by the instance it reaches.
 
 What was decided and measured is in
 [.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#an-edit-on-any-instance).
+
+## The work outliving a request
+
+A build (`cf push`, `cf restage`), a broker's operation (a provision, an update, a deprovision, a
+bind, an unbind) and an app's delete waiting for its unbinds go on after the request that asked
+for them is answered. The request writes what is asked to the store, on whichever instance it
+reaches; the instance reconciling the wickets does it, in its turn, and the next one goes on from
+what the store keeps of it. There is no lease per build or operation: the one of the wickets.
+
+- a start fails nothing and takes nothing: an instance starting beside a build under way leaves
+  it to the one whose turn it is
+- the turn over (a stop, a kill, a pause past the lease), the next takes each up as a restart of
+  one instance does: a build of source a wicket runs is followed on from the line the store kept
+  (built again only where that wicket knows it no more), a zip is staged again from the package,
+  an image's manifest read again and its rootfs asked of the wicket, which keeps it by its digest;
+  a broker's operation is sent again while the broker has not taken it (the requests are
+  idempotent) and polled on once it has; an app is deleted once its bindings are unbound
+- what the work changes of the state is made in the turn alone, refused by the store once another
+  took the lease: an instance paused past its lease ends no build, no operation and no job, and
+  has no wicket forget a build. A job is settled once, by the change that ends what it waits for
+- a provision or a bind whose outcome is unknown is undone at the broker (orphan mitigation) only
+  once the store keeps that it failed and is to be undone: an instance whose turn ended sends no
+  undo. A turn ending before the broker answered the undo, the next sends it again
+- the staging log's lines are in the instance that staged: one taking a build up says so (`Staging
+  taken up ...: its lines before are gone`) and logs from there
+- `cf push` waits 15s for a build on the instance it reached, then polls it, on any
+
+What was decided is in
+[.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#the-work-outliving-a-request).

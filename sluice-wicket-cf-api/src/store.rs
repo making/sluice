@@ -563,6 +563,10 @@ pub struct Operation {
     /// When the polling gives up, seconds since the epoch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deadline: Option<u64>,
+    /// Whether what it asked of the broker is still to be undone there (orphan mitigation):
+    /// kept as it fails, before the undo is sent, and until the broker answered it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub undo: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -621,6 +625,7 @@ impl Operation {
             job,
             user,
             deadline: None,
+            undo: false,
             created_at: at.clone(),
             updated_at: at,
         }
@@ -628,6 +633,11 @@ impl Operation {
 
     pub fn under_way(&self) -> bool {
         self.state == OperationState::InProgress
+    }
+
+    /// Whether there is work of it left (`crate::operations`): under way, or to be undone.
+    pub fn owed(&self) -> bool {
+        self.under_way() || self.undo
     }
 }
 
@@ -917,8 +927,9 @@ pub struct Build {
     pub lifecycle: Lifecycle,
     pub error: Option<String>,
     pub droplet: Option<String>,
-    /// What its staging needs to go on at the next start, a stop of the cf-api cutting it short
-    /// (`crate::staging::run`): none once it ended, and in a build staged before it was kept.
+    /// What its staging needs to go on in the next turn, a stop of the cf-api or its turn's end
+    /// cutting it short (`crate::staging::run`): none once it ended, and in a build staged
+    /// before it was kept.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub staging: Option<Staging>,
     pub created_at: String,
@@ -936,6 +947,9 @@ pub struct Staging {
     /// Its build of source on a wicket, once started.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub building: Option<Building>,
+    /// Whether an instance began it: one beginning it after that takes it up.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub taken: bool,
 }
 
 /// A build of source a wicket runs: followed from the line `after` on.
@@ -1843,8 +1857,8 @@ impl State {
 
     /// Settles what the jobs wait for that no operation under way will, failing the job: a
     /// binding's operation a stop of the cf-api cut short before it was kept. An app's delete
-    /// after its unbinds is taken up (`crate::api::Api::take_up`): an app deleted already is
-    /// waited for no more.
+    /// after its unbinds is taken up (`crate::controller::Controller::follow`): an app deleted
+    /// already is waited for no more.
     pub fn settle_unfinished_waits(&mut self) {
         let under_way: Vec<String> = self
             .instances

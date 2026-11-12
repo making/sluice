@@ -1074,7 +1074,9 @@ The state and the logins in PostgreSQL (`--state`) and the packages and droplets
 One at a time reconciles the wickets, the holder of a lease in the store, its writes fenced by
 its turn's epoch; the next takes over within 11s of its end, at once of its stop. An edit the
 wickets take at once is made by that one, whichever instance the request reaches: the others send
-it there (`--instance-url`) and relay its answer, so any instance takes any request.
+it there (`--instance-url`) and relay its answer, so any instance takes any request. A build, a
+broker's operation and an app's delete waiting for its unbinds are that one's work too, the next
+going on with them.
 
 ## Options
 

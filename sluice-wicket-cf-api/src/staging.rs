@@ -31,11 +31,14 @@
 //! dot files (but `.well-known/`) and the manifest are left out, so a `.git`, a `.env` or the
 //! env of a `manifest.yml` never reaches the wicket.
 //!
-//! A build keeps what its staging is asked for, and the build of source its wicket runs, with
-//! how far its output was taken (`crate::store::Staging`): a stop of the cf-api cutting it
-//! short, the next start takes it up ([`run`]), staging again from the package (an image's
-//! manifest read again, its rootfs asked of the wicket, which keeps it by its digest) but a
-//! build of source, followed on, built again where its wicket knows it no more.
+//! A build is staged by the instance reconciling the wickets, in its turn (`Controller::follow`),
+//! whichever took the request. It keeps what its staging is asked for, and the build of source
+//! its wicket runs, with how far its output was taken (`crate::store::Staging`): a stop of the
+//! cf-api or the turn's end cutting it short, the next turn takes it up ([`run`]), staging again
+//! from the package (an image's manifest read again, its rootfs asked of the wicket, which keeps
+//! it by its digest) but a build of source, followed on, built again where its wicket knows it
+//! no more. What a staging changes of the state is its turn's alone (`Store::lead`): one whose
+//! turn ended ends no build, and forgets none on its wicket.
 
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
@@ -78,6 +81,10 @@ const MAX_LINK: u64 = 4096;
 
 /// How often in a row a wicket may not answer for its build before the build is given up.
 const FOLLOW_TRIES: u32 = 5;
+
+/// Why a staging goes no further: this instance's turn reconciling the wickets ended, the
+/// next one's takes the build up.
+const TURN_OVER: &str = "this instance's turn is over";
 
 /// How long a staging's end waits for the CLI following its log to print the last lines
 /// ([`Logs::read_out`]): it reads 2s behind (log-cache's walk delay), every 250ms.
@@ -448,10 +455,11 @@ impl Takes {
 /// `command`, the API's URL `base`, which a build of source is told (`VCAP_APPLICATION`). A
 /// zip is staged by the buildpack detecting it, of those its app names ([`detect`]); an image's
 /// component is pulled from its registry with the package's credentials, if any, or its rootfs
-/// made by a wicket. Taken up after a restart of the cf-api, it stages again but a build of
-/// source a wicket runs, followed on from the line it got to, built again where that wicket
-/// knows it no more. Staged again where a sweep deleted a blob of its droplet before the
-/// state named it ([`Store::unswept`]): one of a digest dropped a while ago.
+/// made by a wicket. Taken up after a restart of the cf-api or in another instance's turn, it
+/// stages again but a build of source a wicket runs, followed on from the line it got to, built
+/// again where that wicket knows it no more. Staged again where a sweep deleted a blob of its
+/// droplet before the state named it ([`Store::unswept`]): one of a digest dropped a while ago.
+/// This instance's turn over, it ends here, as it is: the next turn's to take up.
 pub async fn run(
     store: &Arc<Store>,
     logs: &Logs,
@@ -459,6 +467,19 @@ pub async fn run(
     controller: &Controller,
     build: &str,
 ) {
+    let begun = |state: &mut State| {
+        let app = state.build(build)?.app.clone();
+        let staging = state.staging_mut(build)?;
+        Some((app, std::mem::replace(&mut staging.taken, true)))
+    };
+    let Some(Some((app, taken))) = store.lead(begun).await else {
+        return;
+    };
+    if taken {
+        let line = "Staging taken up where a restart of the cf-api, or the instance staging it, \
+                    left it: its lines before are gone";
+        logs.add(&app, "STG", line);
+    }
     while !staged_once(store, logs, registry, controller, build).await {}
 }
 
@@ -481,6 +502,8 @@ async fn staged_once(
         return true;
     };
     let app = app.as_str();
+    // the build of source it ends with, forgotten on its wicket once the state keeps the end
+    let building = || store.read(|state| state.build(build)?.staging.clone()?.building);
     let staged = match &package {
         Ok(package) => staged(store, logs, registry, controller, build, package, staging).await,
         Err(_) => Err("the package is gone".into()),
@@ -540,6 +563,7 @@ async fn staged_once(
                 updated_at: at.clone(),
             };
             logs.read_out(app, READ_OUT).await;
+            let building = building();
             loop {
                 let rounds = store.unswept().await;
                 match kept(store, &blobs).await {
@@ -569,27 +593,47 @@ async fn staged_once(
                     state.droplets.push(droplet.clone());
                     true
                 };
-                if store.update(named).await {
-                    break;
+                match store.lead(named).await {
+                    Some(true) => break,
+                    Some(false) => {}
+                    // the turn over
+                    None => return true,
                 }
             }
+            forget(controller, building).await;
         }
+        // the turn over: the next one's to end
+        Err(_) if !store.leads() => {}
         Err(e) => {
             logs.add(app, "STG", format!("Staging failed: {e}"));
             logs.read_out(app, READ_OUT).await;
-            store
-                .update(|state| {
-                    if let Some(staging) = state.builds.iter_mut().find(|kept| kept.guid == build) {
-                        staging.state = "FAILED".into();
-                        staging.error = Some(format!("StagingError - {e}"));
-                        staging.staging = None;
-                        staging.updated_at = at.clone();
-                    }
-                })
-                .await;
+            let building = building();
+            let failed = |state: &mut State| {
+                if let Some(staging) = state.builds.iter_mut().find(|kept| kept.guid == build) {
+                    staging.state = "FAILED".into();
+                    staging.error = Some(format!("StagingError - {e}"));
+                    staging.staging = None;
+                    staging.updated_at = at.clone();
+                }
+            };
+            if store.lead(failed).await.is_some() {
+                forget(controller, building).await;
+            }
         }
     }
     true
+}
+
+/// Has its wicket forget the build of source `building`, ended: its droplet is the wicket's to
+/// keep as any upload.
+async fn forget(controller: &Controller, building: Option<Building>) {
+    let Some(building) = building else {
+        return;
+    };
+    let named = |wicket: &&Arc<Wicket>| wicket.name == building.wicket;
+    if let Some(wicket) = controller.wickets.iter().find(named) {
+        let _ = wicket.forget_build(&building.id).await;
+    }
 }
 
 /// Keeps the component pulled of `staged`.
@@ -628,13 +672,12 @@ async fn staged(
         if let Some(staged) = follow_on(store, logs, controller, build, app, building).await {
             return staged;
         }
-        store
-            .update(|state| {
-                if let Some(staging) = state.staging_mut(build) {
-                    staging.building = None;
-                }
-            })
-            .await;
+        let built_again = |state: &mut State| {
+            if let Some(staging) = state.staging_mut(build) {
+                staging.building = None;
+            }
+        };
+        store.lead(built_again).await.ok_or(TURN_OVER)?;
     }
     let command = staging.command.as_deref();
     let (pin, named) = store.read(|state| {
@@ -949,13 +992,12 @@ async fn build(
         id,
         after: 0,
     };
-    store
-        .update(|state| {
-            if let Some(staging) = state.staging_mut(build) {
-                staging.building = Some(building.clone());
-            }
-        })
-        .await;
+    let started = |state: &mut State| {
+        if let Some(staging) = state.staging_mut(build) {
+            staging.building = Some(building.clone());
+        }
+    };
+    store.lead(started).await.ok_or(TURN_OVER)?;
     built(
         store,
         logs,
@@ -975,8 +1017,8 @@ async fn build(
 }
 
 /// Follows the build of source `building` of the build `build`, the app `app`'s, on `wicket`
-/// to its end and stages what it built ([`place`]), the build forgotten then: None where the
-/// wicket knows it no more.
+/// to its end and stages what it built ([`place`]): None where the wicket knows it no more.
+/// The wicket forgets it once the state keeps how the staging ended ([`staged_once`]).
 async fn built(
     store: &Arc<Store>,
     logs: &Logs,
@@ -986,14 +1028,11 @@ async fn built(
     wicket: &Wicket,
     building: &Building,
 ) -> Option<Result<Staged, String>> {
-    let staged = match follow(store, logs, wicket, (build, app), building).await {
-        Ok(view) => place(store, logs, controller, wicket, app, view, cnb).await,
-        Err(Some(e)) => Err(e),
-        Err(None) => return None,
-    };
-    // ended already: forgotten, its droplet the wicket's to keep as any upload
-    let _ = wicket.forget_build(&building.id).await;
-    Some(staged)
+    match follow(store, logs, wicket, (build, app), building).await {
+        Ok(view) => Some(place(store, logs, controller, wicket, app, view, cnb).await),
+        Err(Some(e)) => Some(Err(e)),
+        Err(None) => None,
+    }
 }
 
 /// Follows the build of source `building` on `wicket` from its line `after` on to its end,
@@ -1542,7 +1581,7 @@ fn listed<S: AsRef<str>>(names: &[S]) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::io::Cursor;
 
     use super::*;
@@ -1922,18 +1961,20 @@ mod tests {
 
     /// A Firecracker wicket's builds as staging uses them: any build but `lost` (one before a
     /// restart of it) ended, with the lines `one` and `two` and the droplet [`LAYER`], whose
-    /// rootfs it makes ([`rootfs_sha`]); one it starts is `new`. What it was asked, counted.
+    /// rootfs it makes ([`rootfs_sha`]), or while `held` building still, at its line `one`; one
+    /// it starts is `new`. What it was asked, counted.
     #[derive(Default)]
-    struct Builder {
-        started: std::sync::atomic::AtomicUsize,
+    pub(crate) struct Builder {
+        pub(crate) started: std::sync::atomic::AtomicUsize,
         uploaded: std::sync::atomic::AtomicUsize,
-        forgotten: std::sync::Mutex<Vec<String>>,
+        pub(crate) forgotten: std::sync::Mutex<Vec<String>>,
+        pub(crate) held: std::sync::atomic::AtomicBool,
     }
 
     const LAYER: &[u8] = b"what buildpacks built";
 
     /// The digest of the rootfs the builder makes.
-    fn rootfs_sha() -> String {
+    pub(crate) fn rootfs_sha() -> String {
         "cd".repeat(32)
     }
 
@@ -1958,7 +1999,7 @@ mod tests {
             (builder, url)
         }
 
-        async fn answer(
+        pub(crate) async fn answer(
             self: Arc<Self>,
             request: hyper::Request<sluice_wicket_server::http::Body>,
         ) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
@@ -1999,10 +2040,16 @@ mod tests {
                 (&http::Method::GET, ["", "api", "builds", _]) => {
                     let lines =
                         ["one", "two"].map(|line| json!({"stream": "stdout", "line": line}));
+                    let held = self.held.load(Ordering::Relaxed);
+                    if held {
+                        // as the wicket holds a request with no line to answer
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                    }
+                    let lines = &lines[..if held { 1 } else { 2 }];
                     json!({
-                        "state": "built",
+                        "state": if held { "building" } else { "built" },
                         "next": lines.len(),
-                        "lines": lines[at("after")..],
+                        "lines": lines[at("after").min(lines.len())..],
                         "droplet": {"sha256": sha256(LAYER), "bytes": LAYER.len()},
                         "run-image": run_image,
                         "launch": {"processes": []},
@@ -2091,6 +2138,7 @@ mod tests {
                                 base: "http://api.test".into(),
                                 command: None,
                                 building: building.clone(),
+                                taken: false,
                             }),
                             created_at: now(),
                             updated_at: now(),
@@ -2130,6 +2178,8 @@ mod tests {
             Arc::new(Logs::default()),
             std::time::Duration::ZERO,
             Some(cnb),
+            crate::osb::Client::new().unwrap(),
+            Registry::new().unwrap(),
         );
         let registry = Registry::new().unwrap();
         let runs =
@@ -2200,6 +2250,7 @@ mod tests {
                 base: "http://api.test".into(),
                 command: None,
                 building: None,
+                taken: false,
             });
         };
         store.update(again).await;

@@ -77,6 +77,13 @@
 //! the state's for every instance (`Store::observe`), each placing by it; the others list no
 //! wicket but for a request (the process stats), write no app to one, and send the edits the
 //! wickets take at once to the one whose turn it is (`crate::api`).
+//!
+//! The work that outlives a request is that turn's too, whichever instance took the request: a
+//! build's staging, a broker's operation, an app's delete once its bindings are unbound
+//! ([`Controller::follow`]). The state keeps what each is and how far it got; the instance whose
+//! turn it is does it, its changes refused once the turn is over (`Store::lead`), and the next
+//! goes on from there. One owner, the lease's, for all the work there is: no lease of its own
+//! per build or operation.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -90,9 +97,11 @@ use tokio_util::task::TaskTracker;
 use crate::blobs::Reading;
 use crate::lease::Term;
 use crate::logs::Logs;
+use crate::operations::{Operations, Target};
 use crate::placement::{Budget, Evacuated, Move};
+use crate::registry::Registry;
 use crate::services::Offer;
-use crate::staging::Cnb;
+use crate::staging::{self, Cnb};
 use crate::stop::Stop;
 use crate::store::{
     App, Blob, Built, HealthCheck, Lifetime, Outcome, Purge, ReadinessCheck, Removal, State, Store,
@@ -172,6 +181,66 @@ struct Noted {
     revision: u64,
 }
 
+/// An app's delete to end ([`Controller::delete_unbound`]).
+struct Delete {
+    /// Its job.
+    job: String,
+    /// The app, by guid and name; None: deleted already.
+    app: Option<(String, String)>,
+    /// Whether each of its bindings was unbound.
+    unbound: bool,
+}
+
+/// The work under way a turn takes up besides the wickets' ([`Controller::follow`]).
+struct Due {
+    /// The deployments taking steps, by their app and guid.
+    stepping: Vec<(String, String)>,
+    /// The builds staging.
+    builds: Vec<String>,
+    /// What the brokers' operations under way, or to be undone, are of.
+    operations: Vec<Target>,
+    /// The apps' deletes none of whose bindings is being unbound any more.
+    deletes: Vec<Delete>,
+    /// The purges to do, by store and namespace.
+    purges: BTreeSet<(String, String)>,
+}
+
+impl Due {
+    fn of(state: &State) -> Due {
+        let deployments = state.deployments.iter();
+        let builds = state.builds.iter();
+        let busy = |wait: &String| {
+            state.binding(wait).is_some_and(|binding| binding.busy())
+                || state.instance(wait).is_some_and(|instance| instance.busy())
+        };
+        let deleting = (state.jobs.iter()).filter(|job| {
+            job.operation == crate::store::APP_DELETE
+                && !job.waits.is_empty()
+                && !job.waits.iter().any(busy)
+        });
+        Due {
+            stepping: (deployments.filter(|kept| kept.stepping()))
+                .map(|kept| (kept.app.clone(), kept.guid.clone()))
+                .collect(),
+            builds: (builds.filter(|build| build.state == "STAGING" && build.staging.is_some()))
+                .map(|build| build.guid.clone())
+                .collect(),
+            operations: Operations::due(state),
+            deletes: deleting
+                .map(|job| Delete {
+                    job: job.guid.clone(),
+                    app: (job.waits.iter().find_map(|wait| state.app(wait)))
+                        .map(|app| (app.guid.clone(), app.name.clone())),
+                    unbound: job.errors.is_empty(),
+                })
+                .collect(),
+            purges: (state.purges.iter())
+                .map(|purge| (purge.store.clone(), purge.namespace.clone()))
+                .collect(),
+        }
+    }
+}
+
 /// The work of a turn reconciling the wickets: cancelled at its end, which waits for it.
 struct Work {
     cancel: CancellationToken,
@@ -227,8 +296,17 @@ pub struct Controller {
     placed_again: Mutex<BTreeSet<String>>,
     /// The work of this instance's turn reconciling the wickets, while it has one.
     work: Mutex<Option<Work>>,
-    /// The deployments whose steps this turn takes, by guid.
+    /// What a task of this turn drives, by guid: a deployment's steps, a build's staging, a
+    /// broker's operation on an instance or a binding, an app's delete after its unbinds (its
+    /// job's).
     driving: Mutex<BTreeSet<String>>,
+    /// Has the work under way looked at again ([`Controller::follow`]), with no change of the
+    /// state.
+    again: tokio::sync::Notify,
+    /// The brokers' operations, driven in this instance's turn.
+    operations: Arc<Operations>,
+    /// The registries the builds pull from.
+    registry: Registry,
     /// The purges this turn tried as they came, by store and namespace: tried again after the
     /// listings.
     purges_tried: Mutex<BTreeSet<(String, String)>>,
@@ -236,19 +314,25 @@ pub struct Controller {
 
 impl Controller {
     /// The controller of `wickets`, of which one not answering for `away_grace` is gone (0:
-    /// never), source staged by `cnb`.
+    /// never), source staged by `cnb`, the brokers asked through `osb` and the images pulled
+    /// through `registry`.
     pub fn new(
         store: Arc<Store>,
         wickets: Vec<Arc<Wicket>>,
         logs: Arc<Logs>,
         away_grace: Duration,
         cnb: Option<Cnb>,
+        osb: crate::osb::Client,
+        registry: Registry,
     ) -> Controller {
         // of several instances, one writes an app to a wicket in its turn alone
         if store.shared().is_some() {
             wickets.iter().for_each(|wicket| wicket.set_no_turn());
         }
         Controller {
+            operations: Arc::new(Operations::new(store.clone(), osb, logs.clone())),
+            registry,
+            again: tokio::sync::Notify::new(),
             store,
             wickets,
             logs,
@@ -275,7 +359,9 @@ impl Controller {
     /// Reconciles the wickets in each turn of this instance (`Store::terms`), from its begin as
     /// a start does (the deployments and moves under way taken up, every wicket watched) to its
     /// end, which stops its work, its writes carrying the turn's epoch meanwhile. What it saw of
-    /// the wickets and did not write is forgotten at the end.
+    /// the wickets and did not write is forgotten at the end. The work under way that is not of
+    /// the wickets is the turn's too ([`Controller::follow`]): one instance does it at a time,
+    /// the next going on from what the state keeps of it.
     pub async fn lead(self: Arc<Self>) {
         let mut terms = self.store.terms();
         loop {
@@ -357,58 +443,109 @@ impl Controller {
         (self.work.lock().expect("no panic under the lock")).is_some()
     }
 
-    /// Takes up, while this instance's turn lasts, the deployments under way it does not
-    /// ([`Controller::take_up`]) and tries the purges it has not as they come: the requests of
-    /// any instance make them.
+    /// Takes up, while this instance's turn lasts, the work under way it does not, as the
+    /// requests of any instance make it and as the turn before left it: the deployments
+    /// ([`Controller::take_up`]), the builds (`crate::staging::run`), the brokers' operations
+    /// (`crate::operations`) and the apps' deletes once their bindings are unbound
+    /// ([`Controller::delete_unbound`]); and tries the purges it has not as they come.
     async fn follow(self: Arc<Self>) {
         let mut changes = self.store.changes();
         loop {
-            let (stepping, purges) = self.store.read(|state| {
-                let deployments = state.deployments.iter();
-                let stepping: Vec<(String, String)> = (deployments.filter(|kept| kept.stepping()))
-                    .map(|kept| (kept.app.clone(), kept.guid.clone()))
-                    .collect();
-                let purges: BTreeSet<(String, String)> = (state.purges.iter())
-                    .map(|purge| (purge.store.clone(), purge.namespace.clone()))
-                    .collect();
-                (stepping, purges)
-            });
-            for (app, deployment) in stepping {
+            let due = self.store.read(Due::of);
+            for (app, deployment) in due.stepping {
                 self.take_up(&app, &deployment);
+            }
+            for build in due.builds {
+                let (controller, guid) = (self.clone(), build.clone());
+                let staging = async move {
+                    let (store, logs) = (&controller.store, &controller.logs);
+                    staging::run(store, logs, &controller.registry, &controller, &guid).await;
+                };
+                self.drive(&build, staging, false);
+            }
+            for target in due.operations {
+                let operations = self.operations.clone();
+                // one asked as this drove the last is looked at again
+                let guid = target.guid().to_string();
+                self.drive(&guid, operations.drive(target), true);
+            }
+            for delete in due.deletes {
+                let job = delete.job.clone();
+                self.drive(&job, self.clone().delete_unbound(delete), false);
             }
             let new = {
                 let mut tried = self.purges_tried.lock().expect("no panic under the lock");
-                let new = purges.iter().any(|purge| !tried.contains(purge));
-                *tried = purges;
+                let new = due.purges.iter().any(|purge| !tried.contains(purge));
+                *tried = due.purges;
                 new
             };
             if new {
                 let controller = self.clone();
                 self.spawn(async move { controller.purge_pending().await });
             }
-            if changes.changed().await.is_err() {
-                return;
+            tokio::select! {
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                () = self.again.notified() => {}
             }
         }
     }
 
-    /// Takes the steps of the deployment `deployment` of the app `guid` in this instance's
-    /// turn, unless it does already: none but the turn's (`crate::deployments`).
-    pub fn take_up(self: &Arc<Self>, guid: &str, deployment: &str) {
+    /// Runs `task` as work of this instance's turn on `what`, by its guid, unless a task of
+    /// the turn drives it already; `again`: what is under way is looked at again at its end.
+    fn drive(
+        self: &Arc<Self>,
+        what: &str,
+        task: impl Future<Output = ()> + Send + 'static,
+        again: bool,
+    ) {
         let work = self.work.lock().expect("no panic under the lock");
         let Some(work) = work.as_ref() else {
             return;
         };
         let mut driving = self.driving.lock().expect("no panic under the lock");
-        if !driving.insert(deployment.to_string()) {
+        if !driving.insert(what.to_string()) {
             return;
         }
-        let (controller, guid, deployment) =
-            (self.clone(), guid.to_string(), deployment.to_string());
+        let (controller, what) = (self.clone(), what.to_string());
         work.spawn(async move {
-            controller.clone().deploy(guid, deployment.clone()).await;
-            (controller.driving.lock().expect("no panic under the lock")).remove(&deployment);
+            task.await;
+            (controller.driving.lock().expect("no panic under the lock")).remove(&what);
+            if again && controller.store.leads() {
+                controller.again.notify_one();
+            }
         });
+    }
+
+    /// Takes the steps of the deployment `deployment` of the app `guid` in this instance's
+    /// turn, unless it does already: none but the turn's (`crate::deployments`).
+    pub fn take_up(self: &Arc<Self>, guid: &str, deployment: &str) {
+        let deploying = self
+            .clone()
+            .deploy(guid.to_string(), deployment.to_string());
+        self.drive(deployment, deploying, false);
+    }
+
+    /// Ends an app's delete whose bindings' unbinds ended: the app deleted where each was
+    /// unbound, left where one was not, and its job settled. The turn over meanwhile, the next
+    /// one ends it.
+    async fn delete_unbound(self: Arc<Self>, delete: Delete) {
+        if let Some((guid, name)) = delete.app.as_ref().filter(|_| delete.unbound)
+            && !self.remove(guid, name).await
+        {
+            return;
+        }
+        let job = delete.job.as_str();
+        let settled = |state: &mut State| {
+            let waits = state.job(job).map(|job| job.waits.clone());
+            for wait in waits.unwrap_or_default() {
+                state.settle(job, &wait, None);
+            }
+        };
+        self.store.lead(settled).await;
     }
 
     /// The owner the apps are put under.
@@ -2428,6 +2565,11 @@ fn sorted(list: &[String]) -> Vec<String> {
 }
 
 #[cfg(test)]
+#[path = "../tests/broker/mod.rs"]
+#[allow(dead_code)]
+mod broker;
+
+#[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::store::Running;
@@ -2970,6 +3112,8 @@ pub(crate) mod tests {
         pub(crate) writes: Mutex<Vec<(Option<u64>, bool)>>,
         pub(crate) refusing: Mutex<Option<String>>,
         unadvertised: Mutex<BTreeSet<String>>,
+        /// Its builds of source.
+        builder: Arc<crate::staging::tests::Builder>,
     }
 
     impl FakeWicket {
@@ -2985,6 +3129,7 @@ pub(crate) mod tests {
                 writes: Mutex::default(),
                 refusing: Mutex::default(),
                 unadvertised: Mutex::default(),
+                builder: Arc::default(),
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
@@ -3046,6 +3191,13 @@ pub(crate) mod tests {
             request: hyper::Request<sluice_wicket_server::http::Body>,
         ) -> hyper::Response<http_body_util::Full<bytes::Bytes>> {
             use http_body_util::BodyExt as _;
+            let path = request.uri().path();
+            if ["/api/builds", "/api/layers", "/api/images"]
+                .iter()
+                .any(|of| path.starts_with(of))
+            {
+                return self.builder.clone().answer(request).await;
+            }
             let (head, body) = request.into_parts();
             let name = head.uri.path().strip_prefix("/api/apps/");
             let epoch = (head.headers.get(sluice_wicket_console::fence::HEADER))
@@ -3169,6 +3321,8 @@ pub(crate) mod tests {
             Arc::new(Logs::default()),
             Duration::ZERO,
             None,
+            crate::osb::Client::new().unwrap(),
+            Registry::new().unwrap(),
         ));
         tokio::spawn(controller.clone().lead());
         let within = Duration::from_secs(10);
@@ -3197,16 +3351,52 @@ pub(crate) mod tests {
         }
     }
 
+    /// A broker's instance `name` being made with `parameters`, in the first space: its guid
+    /// and its job's.
+    fn provisioned(state: &mut State, name: &str, parameters: &str) -> (String, String) {
+        use crate::store::{Instance, Operation, OperationKind};
+        let guid = crate::store::guid();
+        let job = state.add_waiting_job("service_instance.create", vec![guid.clone()], None);
+        let at = crate::store::now();
+        state.instances.push(Instance {
+            guid: guid.clone(),
+            name: name.into(),
+            space: state.spaces[0].guid.clone(),
+            offering: "offering".into(),
+            plan: "plan".into(),
+            tags: Vec::new(),
+            credentials: Default::default(),
+            broker: Some("broker".into()),
+            dashboard_url: None,
+            maintenance_info: None,
+            operation: Some(Operation {
+                parameters: Some(serde_json::from_str(parameters).unwrap()),
+                ..Operation::new(OperationKind::Create, Some(job.clone()), None)
+            }),
+            created_at: at.clone(),
+            updated_at: at,
+        });
+        (guid, job)
+    }
+
     /// Two instances on one store, each a controller of the wickets: the one whose turn it is
     /// puts, the other nothing, seeing what the first saw of them. The first stopped, or only
     /// paused past its lease, the other takes the deployment and the move it had under way to
     /// their end; a wicket admits no write of the first's epoch after one of the other's, and
     /// refuses the first's late put. The first, back, leads no more.
+    ///
+    /// So with the work that is not of the wickets: a build of source a wicket runs, a broker's
+    /// operation being polled and an app's delete waiting for an unbind, under way in the
+    /// first's turn, end in the other's, each once, the build followed on from its line; an
+    /// instance starting beside them fails none. A provision whose outcome is unknown is undone
+    /// at the broker once, the first, paused, making it too.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_next_instance_takes_up_what_the_one_leading_left() {
+        use std::sync::atomic::Ordering;
+
         use crate::deployments::Asked;
-        use crate::store::Scaled;
         use crate::store::tests::{epoch, keep, leading};
+        use crate::store::{Operation, OperationKind, OperationState, Scaled};
         let _ = rustls::crypto::ring::default_provider().install_default();
         for paused in [false, true] {
             let (url, _) = crate::store::postgres_server::database().await;
@@ -3282,6 +3472,83 @@ pub(crate) mod tests {
             for name in &names {
                 fakes.insert(name.clone(), FakeWicket::start(Duration::ZERO).await);
             }
+            // a broker of one plan, a build of source a's builder runs, held at its first
+            // line, and an app to delete
+            let broker = broker::Broker::start("broker", "br0ker");
+            let builder = fakes["a"].0.builder.clone();
+            builder.held.store(true, Ordering::Relaxed);
+            let (build, building, doomed) = first
+                .update(|state| {
+                    let at = crate::store::now();
+                    let object = |value: serde_json::Value| value.as_object().unwrap().clone();
+                    let plan = crate::store::BrokerPlan {
+                        guid: "plan".into(),
+                        catalog: object(serde_json::json!({"id": "small-id", "name": "small"})),
+                        visibility: "public".into(),
+                        orgs: Vec::new(),
+                        gone: false,
+                        created_at: at.clone(),
+                        updated_at: at.clone(),
+                    };
+                    let offering = serde_json::json!({
+                        "id": broker::SERVICE, "name": "db", "bindings_retrievable": true,
+                    });
+                    state.brokers.push(crate::store::Broker {
+                        guid: "broker".into(),
+                        name: "broker".into(),
+                        url: broker.url.clone(),
+                        username: "broker".into(),
+                        password: "br0ker".into(),
+                        space: None,
+                        offerings: vec![crate::store::Offering {
+                            guid: "offering".into(),
+                            catalog: object(offering),
+                            plans: vec![plan],
+                            gone: false,
+                            created_at: at.clone(),
+                            updated_at: at.clone(),
+                        }],
+                        created_at: at.clone(),
+                        updated_at: at.clone(),
+                    });
+                    let space = state.spaces[0].guid.clone();
+                    let building = state.create_app("building", &space).guid.clone();
+                    let package = crate::store::guid();
+                    state.packages.push(crate::store::Package {
+                        guid: package.clone(),
+                        app: building.clone(),
+                        state: "READY".into(),
+                        sha256: None,
+                        docker: None,
+                        created_at: at.clone(),
+                        updated_at: at.clone(),
+                    });
+                    let build = crate::store::guid();
+                    state.builds.push(crate::store::Build {
+                        guid: build.clone(),
+                        app: building.clone(),
+                        package,
+                        state: "STAGING".into(),
+                        lifecycle: Default::default(),
+                        error: None,
+                        droplet: None,
+                        staging: Some(crate::store::Staging {
+                            base: "http://api.test".into(),
+                            command: None,
+                            building: Some(crate::store::Building {
+                                wicket: "a".into(),
+                                id: "known".into(),
+                                after: 0,
+                            }),
+                            taken: false,
+                        }),
+                        created_at: at.clone(),
+                        updated_at: at,
+                    });
+                    let doomed = state.create_app("doomed", &space).guid.clone();
+                    (build, building, doomed)
+                })
+                .await;
             // b refuses d2 and c's servers take moving's routes not: both under way
             *fakes["b"].0.refusing.lock().unwrap() = Some("d2".into());
             fakes["c"]
@@ -3295,12 +3562,24 @@ pub(crate) mod tests {
                     .map(|name| Arc::new(Wicket::new(name, 3, &fakes[name].1, None, crate::OWNER)))
                     .collect();
                 let logs = Arc::new(Logs::default());
+                let cnb = Cnb {
+                    builder: "registry.test/builder:1".into(),
+                    run_image: None,
+                    credentials: None,
+                    egress: Vec::new(),
+                    memory_mib: Cnb::MEMORY_MIB,
+                    disk_mib: Cnb::DISK_MIB,
+                    vcpus: Cnb::VCPUS,
+                    timeout: Cnb::TIMEOUT,
+                };
                 Arc::new(Controller::new(
                     store.clone(),
                     wickets,
                     logs,
                     Duration::ZERO,
-                    None,
+                    Some(cnb),
+                    crate::osb::Client::new().unwrap(),
+                    Registry::new().unwrap(),
                 ))
             };
             let (one, other) = (controller(&first), controller(&second));
@@ -3333,6 +3612,81 @@ pub(crate) mod tests {
             let outcome = second.read(|state| state.outcome(&rolling, "a").cloned());
             assert_eq!(outcome, Some(Outcome::Running));
 
+            // the first makes an instance and binds the app to it, the broker taking its time
+            // over the binding; then, the broker's operations held, unbinds it to delete the
+            // app and makes another instance
+            let operation = |store: &Store, guid: &str| {
+                store.read(|state| {
+                    let instance = state.instance(guid).map(|kept| kept.operation.clone());
+                    let binding = state.binding(guid).map(|kept| kept.operation.clone());
+                    instance.or(binding).flatten()
+                })
+            };
+            let ended = |store: &Store, guid: &str| {
+                operation(store, guid).map(|operation| (operation.state, operation.undo))
+            };
+            let job = |store: &Store, guid: &str| {
+                store.read(|state| state.job(guid).map(crate::store::Job::state))
+            };
+            let (db, _) = first.update(|state| provisioned(state, "db", "{}")).await;
+            let made = Some((OperationState::Succeeded, false));
+            until("the instance made", || ended(&first, &db) == made).await;
+            let binding = crate::store::guid();
+            first
+                .update(|state| {
+                    let at = crate::store::now();
+                    state.bindings.push(crate::store::Binding {
+                        guid: binding.clone(),
+                        name: None,
+                        app: doomed.clone(),
+                        instance: db.clone(),
+                        identifier: String::new(),
+                        credentials: Default::default(),
+                        operation: Some(Operation {
+                            parameters: Some(serde_json::json!({"async": true})),
+                            ..Operation::new(OperationKind::Create, None, None)
+                        }),
+                        created_at: at.clone(),
+                        updated_at: at,
+                    });
+                })
+                .await;
+            until("the binding made", || ended(&first, &binding) == made).await;
+            broker.hold(true);
+            let deleting = first
+                .update(|state| {
+                    let waits = vec![binding.clone(), doomed.clone()];
+                    let job = state.add_waiting_job(crate::store::APP_DELETE, waits, None);
+                    state.binding_mut(&binding).unwrap().operation = Some(Operation::new(
+                        OperationKind::Delete,
+                        Some(job.clone()),
+                        None,
+                    ));
+                    job
+                })
+                .await;
+            let (slow, making) = first
+                .update(|state| provisioned(state, "slow", r#"{"async": true}"#))
+                .await;
+            let lines = |controller: &Controller| {
+                let lines = controller.logs.read(&building, 0, None, 100, false);
+                lines.into_iter().map(|line| line.text).collect::<Vec<_>>()
+            };
+            until("both polled, the build followed", || {
+                let polled = |guid: &str| operation(&first, guid).is_some_and(|kept| kept.sent);
+                polled(&binding) && polled(&slow) && lines(&one).contains(&"one".to_string())
+            })
+            .await;
+            // an instance starting beside them fails none
+            let third = open("third").await;
+            let staging = |store: &Store| {
+                store.read(|state| state.build(&build).map(|build| build.state.clone()))
+            };
+            assert_eq!(staging(&third).as_deref(), Some("STAGING"));
+            assert_eq!(job(&third, &making), Some("POLLING"));
+            assert_eq!(job(&third, &deleting), Some("PROCESSING"));
+            drop(third);
+
             // the first stopped (killed), or its renewals paused, its turn on
             keeping_first.abort();
             if !paused {
@@ -3346,6 +3700,41 @@ pub(crate) mod tests {
                 .unwrap();
             let second_epoch = epoch(&second);
             assert!(second_epoch > first_epoch);
+            // a provision the broker makes and answers with a 500: failed, and undone there by
+            // the other alone, once
+            let (orphan, orphaned) = second
+                .update(|state| provisioned(state, "orphan", r#"{"unknown": true}"#))
+                .await;
+            let undone = Some((OperationState::Failed, false));
+            until("the provision undone", || ended(&second, &orphan) == undone).await;
+            assert_eq!(job(&second, &orphaned), Some("FAILED"));
+            // the broker and the builder go on: the other ends what the first began
+            broker.hold(false);
+            builder.held.store(false, Ordering::Relaxed);
+            until("the build, the instance and the delete ended", || {
+                staging(&second).as_deref() == Some("STAGED")
+                    && job(&second, &making) == Some("COMPLETE")
+                    && job(&second, &deleting) == Some("COMPLETE")
+            })
+            .await;
+            assert_eq!(ended(&second, &slow), made);
+            assert!(second.read(|state| state.app(&doomed).is_none()));
+            assert!(!broker.bindings().contains_key(&binding));
+            let droplet = second.read(|state| state.droplets[0].sha256.clone());
+            assert_eq!(droplet, crate::staging::tests::rootfs_sha());
+            let followed = lines(&other);
+            let following = "Following the build on the wicket a from the line 1 of its output on";
+            let taken = "Staging taken up where a restart of the cf-api, or the instance staging \
+                         it, left it: its lines before are gone";
+            assert!(
+                [taken, following, "two"]
+                    .map(String::from)
+                    .iter()
+                    .all(|line| followed.contains(line))
+                    && !followed.contains(&"one".to_string()),
+                "{followed:?}"
+            );
+            assert_eq!(builder.started.load(Ordering::Relaxed), 0, "built once");
             *fakes["b"].0.refusing.lock().unwrap() = None;
             fakes["c"].0.unadvertised.lock().unwrap().clear();
             until("the deployment finished, the index moved", || {
@@ -3383,6 +3772,11 @@ pub(crate) mod tests {
                     .unwrap();
                 until("its work ended", || !one.leads()).await;
             }
+            let undos = format!("DELETE /v2/service_instances/{orphan}");
+            let requests = broker.requests();
+            let undos = requests.iter().filter(|(request, _)| *request == undos);
+            assert_eq!(undos.count(), 1, "{requests:?}");
+            assert_eq!(*builder.forgotten.lock().unwrap(), ["known"]);
             assert_eq!(epoch(&second), second_epoch, "the other's turn goes on");
             keeping_second.abort();
         }

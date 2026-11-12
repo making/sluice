@@ -53,3 +53,13 @@ the last writer's cursor.
   tells a line's wicket and instance as the leader's would
 - `Store::changed` (one waiter) is `Store::changes` now, a receiver each: the flume's watch and the
   leader's `Controller::follow` both wait on it
+
+## From 280
+
+- a build is staged by the instance reconciling the wickets, not the one that took the `POST
+  /v3/builds` (`Controller::follow`): its `STG` lines are in that instance's ring, and a `cf push`
+  reading the log through another sees none. A takeover logs `Staging taken up ...: its lines
+  before are gone` and goes on in the next leader's ring. The brokers' operations' `API` lines
+  (`Operations::end`) likewise
+- `Logs::read_out` (a staging's end waiting for the CLI to read its last lines) looks at the
+  readers of the leader's ring alone

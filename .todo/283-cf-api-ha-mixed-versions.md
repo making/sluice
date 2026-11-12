@@ -80,3 +80,11 @@ topology record changes. A previous release's binary beside the current one in t
   read. The schema version of this item is where to refuse such a build
 - the wickets fence the writes per owner, by the epoch of a store's lease: two stores' cf-apis on
   one wicket (both owner `cf`) refuse each other's
+
+## From 280
+
+- a build before 280 stages, drives the brokers' operations and deletes an app after its unbinds
+  in the process that took the request, whatever the lease says: never one beside a 280 or later
+  on a store (two would drive one). The schema version of this item is where to refuse it
+- `Operation::undo` and `Staging::taken` are fields an older build drops when it writes the row
+  again: an undo owed is then never sent

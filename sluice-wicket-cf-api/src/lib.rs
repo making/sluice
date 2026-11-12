@@ -308,12 +308,15 @@ pub async fn serve(
         None => None,
     };
     let logs = Arc::new(logs::Logs::default());
+    let osb = osb::Client::new()?;
     let controller = Arc::new(controller::Controller::new(
         store.clone(),
         wickets(&settings),
         logs.clone(),
         settings.wicket_away_grace,
         settings.cnb.clone(),
+        osb.clone(),
+        registry::Registry::new()?,
     ));
     let flume = settings
         .flume
@@ -327,14 +330,6 @@ pub async fn serve(
         .tls_backend_preconfigured(peers)
         .build()
         .map_err(|e| format!("--instance-ca-cert: {e}"))?;
-    let osb = osb::Client::new()?;
-    let operations = Arc::new(operations::Operations::new(
-        store.clone(),
-        osb.clone(),
-        logs.clone(),
-    ));
-    // what a stop left under way
-    operations.kick();
     let api = Arc::new(api::Api {
         store: store.clone(),
         uaa,
@@ -342,18 +337,15 @@ pub async fn serve(
         security_group_editors: settings.security_group_editors.clone(),
         service_broker_editors: settings.service_broker_editors.clone(),
         osb,
-        operations,
         provider,
         tls: acceptor.is_some(),
         logs,
         controller: controller.clone(),
-        registry: registry::Registry::new()?,
         build: describe_build(),
         peers,
     });
-    // the stagings and the apps' deletes a stop left under way; the deployments and moves with
-    // the wickets, in this instance's turn reconciling them
-    api.take_up();
+    // what a stop left under way (the stagings, the brokers' operations, the apps' deletes,
+    // the deployments and moves) is taken up in this instance's turn reconciling the wickets
     let stop = controller.stop.clone();
     let lease = store.lease(settings.lease);
     let keeping = tokio::spawn(lease.clone().run());

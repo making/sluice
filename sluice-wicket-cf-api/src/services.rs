@@ -1524,7 +1524,6 @@ impl Api {
             })
             .await?;
         println!("SERVICES: creating service instance {name} through its broker");
-        self.operations.kick();
         Ok(self.located(req, &job))
     }
 
@@ -1695,7 +1694,6 @@ impl Api {
         }
         if let Some(job) = job {
             println!("SERVICES: updating service instance {name} through its broker");
-            self.operations.kick();
             return Ok(self.located(req, &job));
         }
         Ok(respond(StatusCode::OK, &view))
@@ -1764,7 +1762,6 @@ impl Api {
                 "SERVICES: deleting service instance {} through its broker",
                 instance.name
             );
-            self.operations.kick();
             return Ok(self.located(req, &job));
         }
         for binding in &dropped {
@@ -1955,7 +1952,6 @@ impl Api {
             .await?;
         if let Some(job) = job {
             // logged when the broker made it
-            self.operations.kick();
             return Ok(self.located(req, &job));
         }
         self.logs.add(
@@ -2015,7 +2011,6 @@ impl Api {
             Ok::<_, ApiError>((binding, name, user_provided, None))
         }).await?;
         if let Some(job) = job {
-            self.operations.kick();
             return Ok(self.located(req, &job));
         }
         self.logs.add(

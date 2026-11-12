@@ -56,3 +56,10 @@ A request is answered 503 (`CF-ServiceUnavailable`) while the store does not ans
 (`Store::sync`), `/healthz` too; a change under way waits for it. The store's tests run
 `postgres:18-alpine` in a container (`tests/support/postgres_server.rs`, or
 `SLUICE_CF_API_TEST_POSTGRES`): the CLI test's PostgreSQL is that one.
+## From 280
+
+`controller::tests::the_next_instance_takes_up_what_the_one_leading_left` ends a build of source,
+a broker's operation and an app's delete in the next leader's turn, against the mock wicket and
+broker, the first killed or paused. The CLI test's kill during a CNB build is the same takeover
+with the real wicket; what the unit test cannot show is `cf push` reading the staging log across
+it (281).

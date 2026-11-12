@@ -1,19 +1,24 @@
 //! The brokers' operations on their instances and bindings
 //! ([`crate::store::Operation`]): a provision, an update, a deprovision, a
-//! bind, an unbind. Each under way is driven by a task of its own
-//! ([`Operations::kick`]): it sends the request until the broker takes it --
-//! again after a restart of the cf-api: the requests are idempotent -- then,
-//! the broker answering 202, polls the last operation, as often as its
-//! `Retry-After` asks or every [`POLL`], until it succeeds, fails, or outlives
-//! its plan's `maximum_polling_duration` ([`MAX_POLLING`] without one). Its
-//! end settles its job and is in the app's log as a binding made at once is.
+//! bind, an unbind. Each under way is driven by a task of its own, work of the
+//! turn of the instance reconciling the wickets (`Controller::follow`,
+//! [`Operations::drive`]): it sends the request until the broker takes it --
+//! again in the next turn, a restart of the cf-api or another instance's: the
+//! requests are idempotent -- then, the broker answering 202, polls the last
+//! operation, as often as its `Retry-After` asks or every [`POLL`], until it
+//! succeeds, fails, or outlives its plan's `maximum_polling_duration`
+//! ([`MAX_POLLING`] without one). Its end settles its job and is in the app's
+//! log as a binding made at once is. Each of its changes is the turn's alone
+//! (`Store::lead`): an instance whose turn ended ends none.
 //!
 //! A provision or a bind whose outcome is unknown (no answer in time, a
-//! 5xx, a body not understood) is undone, once, as the specification asks
-//! (orphan mitigation): the broker may hold what the cf-api has not.
+//! 5xx, a body not understood) is undone as the specification asks (orphan
+//! mitigation): the broker may hold what the cf-api has not. That it is to be
+//! is kept as the operation fails, before the undo is sent, so an instance
+//! whose turn ended sends none, and the next turn sends one the last did not
+//! see answered.
 
-use std::collections::BTreeSet;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use http::Method;
@@ -25,10 +30,10 @@ use crate::store::{
     JobError, Operation, OperationKind, OperationState, State, Store, epoch_secs, now,
 };
 
-/// How long the first poll waits after the broker took an operation.
-const FIRST_POLL: Duration = Duration::from_secs(1);
+/// How long the first poll waits after the broker took an operation; sooner in the tests.
+const FIRST_POLL: Duration = Duration::from_millis(if cfg!(test) { 50 } else { 1000 });
 /// How often a broker giving no `Retry-After` is polled.
-const POLL: Duration = Duration::from_secs(5);
+const POLL: Duration = Duration::from_millis(if cfg!(test) { 100 } else { 5000 });
 /// The longest a broker's `Retry-After` makes a poll wait.
 const LONGEST_POLL: Duration = Duration::from_secs(3600);
 /// How long an operation of a plan with no `maximum_polling_duration` is
@@ -43,7 +48,7 @@ pub enum Target {
 }
 
 impl Target {
-    fn guid(&self) -> &str {
+    pub fn guid(&self) -> &str {
         match self {
             Target::Instance(guid) | Target::Binding(guid) => guid,
         }
@@ -54,10 +59,6 @@ pub struct Operations {
     store: Arc<Store>,
     osb: osb::Client,
     logs: Arc<Logs>,
-    /// The targets a task drives.
-    driving: Mutex<BTreeSet<Target>>,
-    /// Signalled when an operation ends.
-    ended: tokio::sync::Notify,
 }
 
 /// What the next step of a task is.
@@ -109,7 +110,7 @@ impl Work {
                 (instance, binding.operation.clone()?, Some(app))
             }
         };
-        if !operation.under_way() {
+        if !operation.owed() {
             return None;
         }
         let Some(brokered) = state.brokered_of(instance) else {
@@ -181,61 +182,29 @@ impl Work {
 enum End {
     Succeeded(Map<String, Value>),
     Failed(String),
+    /// Failed, its outcome at the broker unknown: a provision or a bind is to be undone there.
+    Orphaned(String),
 }
 
 impl Operations {
     pub fn new(store: Arc<Store>, osb: osb::Client, logs: Arc<Logs>) -> Operations {
-        Operations {
-            store,
-            osb,
-            logs,
-            driving: Mutex::default(),
-            ended: tokio::sync::Notify::new(),
-        }
+        Operations { store, osb, logs }
     }
 
-    /// Drives each operation under way that no task drives yet.
-    pub fn kick(self: &Arc<Self>) {
-        let due: Vec<Target> = self.store.read(|state| {
-            let instances = state
-                .instances
-                .iter()
-                .filter(|instance| instance.busy())
-                .map(|instance| Target::Instance(instance.guid.clone()));
-            let bindings = state
-                .bindings
-                .iter()
-                .filter(|binding| binding.busy())
-                .map(|binding| Target::Binding(binding.guid.clone()));
-            instances.chain(bindings).collect()
-        });
-        for target in due {
-            if self
-                .driving
-                .lock()
-                .expect("no panic under the lock")
-                .insert(target.clone())
-            {
-                tokio::spawn(self.clone().drive(target));
-            }
-        }
+    /// What `state` has an operation to drive of: under way, or to be undone at its broker.
+    pub fn due(state: &State) -> Vec<Target> {
+        let owed = |operation: &Option<Operation>| operation.as_ref().is_some_and(Operation::owed);
+        let instances = (state.instances.iter())
+            .filter(|instance| owed(&instance.operation))
+            .map(|instance| Target::Instance(instance.guid.clone()));
+        let bindings = (state.bindings.iter())
+            .filter(|binding| owed(&binding.operation))
+            .map(|binding| Target::Binding(binding.guid.clone()));
+        instances.chain(bindings).collect()
     }
 
-    /// Resolves once `settled` holds of the state, checked as each
-    /// operation ends.
-    pub async fn until(&self, settled: impl Fn(&State) -> bool) {
-        loop {
-            let ended = self.ended.notified();
-            tokio::pin!(ended);
-            ended.as_mut().enable();
-            if self.store.read(&settled) {
-                return;
-            }
-            ended.await;
-        }
-    }
-
-    async fn drive(self: Arc<Self>, target: Target) {
+    /// Drives the operation of `target` to its end, and one that replaced it meanwhile.
+    pub async fn drive(self: Arc<Self>, target: Target) {
         loop {
             match self.step(&target).await {
                 Next::Poll(delay) => tokio::time::sleep(delay).await,
@@ -243,30 +212,25 @@ impl Operations {
                 Next::Done => break,
             }
         }
-        self.driving
-            .lock()
-            .expect("no panic under the lock")
-            .remove(&target);
-        self.ended.notify_waiters();
-        // one asked while this drove the last
-        if self.store.read(|state| match &target {
-            Target::Instance(guid) => state.instance(guid).is_some_and(|i| i.busy()),
-            Target::Binding(guid) => state.binding(guid).is_some_and(|b| b.busy()),
-        }) {
-            self.kick();
-        }
     }
 
     async fn step(&self, target: &Target) -> Next {
         let work = match self.store.read(|state| Work::of(state, target)) {
             None => return Next::Done,
             Some(Ok(work)) => work,
-            Some(Err((operation, why))) => {
+            Some(Err((operation, why))) if operation.under_way() => {
                 self.end(target, &operation, End::Failed(why)).await;
                 return Next::Done;
             }
+            // its plan gone, its broker too: nothing to undo it at
+            Some(Err((operation, _))) => {
+                self.undone(target, &operation).await;
+                return Next::Done;
+            }
         };
-        if work.operation.sent {
+        if !work.operation.under_way() {
+            self.undo(work).await
+        } else if work.operation.sent {
             self.poll(work).await
         } else {
             self.send(work).await
@@ -362,8 +326,7 @@ impl Operations {
                     Next::Done
                 }
                 Err(e) => {
-                    self.orphan(&work);
-                    self.end(&work.target, operation, End::Failed(e)).await;
+                    self.end(&work.target, operation, End::Orphaned(e)).await;
                     Next::Done
                 }
             },
@@ -383,10 +346,9 @@ impl Operations {
                     && !work.bindings_retrievable =>
             {
                 // its credentials could never be fetched
-                self.orphan(&work);
                 let e = "The service broker responded asynchronously to a binding request, \
                          but its offering does not support fetching bindings (bindings_retrievable)";
-                self.end(&work.target, operation, End::Failed(e.into()))
+                self.end(&work.target, operation, End::Orphaned(e.into()))
                     .await;
                 Next::Done
             }
@@ -397,7 +359,7 @@ impl Operations {
                 let deadline = epoch_secs() + work.max_polling;
                 let taken = self
                     .store
-                    .update(|state| {
+                    .lead(|state| {
                         let dashboard = body.get("dashboard_url").and_then(Value::as_str);
                         if let (Target::Instance(guid), Some(url)) = (&work.target, dashboard)
                             && let Some(instance) = state.instance_mut(guid)
@@ -423,16 +385,18 @@ impl Operations {
                     })
                     .await;
                 match taken {
-                    Some(()) => Next::Poll(FIRST_POLL),
-                    None => Next::Again,
+                    Some(Some(())) => Next::Poll(FIRST_POLL),
+                    Some(None) => Next::Again,
+                    // the turn over
+                    None => Next::Done,
                 }
             }
             Err(refusal) => {
-                if creates && refusal.unknown {
-                    self.orphan(&work);
-                }
-                self.end(&work.target, operation, End::Failed(refusal.description))
-                    .await;
+                let end = match creates && refusal.unknown {
+                    true => End::Orphaned(refusal.description),
+                    false => End::Failed(refusal.description),
+                };
+                self.end(&work.target, operation, end).await;
                 Next::Done
             }
         }
@@ -517,7 +481,7 @@ impl Operations {
             (Some(OperationState::InProgress), _) => {
                 if let Some(description) = polled.description {
                     self.store
-                        .update(|state| {
+                        .lead(|state| {
                             if let Some(current) = operation_mut(state, &work.target)
                                 && current.created_at == operation.created_at
                                 && current.description != description
@@ -549,15 +513,13 @@ impl Operations {
                         Ok(fetched) => match self.check_done(&work, fetched) {
                             Ok(fetched) => body.extend(fetched),
                             Err(e) => {
-                                self.orphan(&work);
-                                self.end(&work.target, operation, End::Failed(e)).await;
+                                self.end(&work.target, operation, End::Orphaned(e)).await;
                                 return Next::Done;
                             }
                         },
                         Err(refusal) => {
-                            self.orphan(&work);
-                            self.end(&work.target, operation, End::Failed(refusal.description))
-                                .await;
+                            let end = End::Orphaned(refusal.description);
+                            self.end(&work.target, operation, end).await;
                             return Next::Done;
                         }
                     }
@@ -569,46 +531,61 @@ impl Operations {
         }
     }
 
-    /// Undoes a provision or a bind whose outcome is unknown, once, in the
-    /// background: a deprovision or an unbind the broker may refuse.
-    fn orphan(&self, work: &Work) {
-        if work.operation.kind != OperationKind::Create {
-            return;
-        }
-        let osb = self.osb.clone();
-        let endpoint = work.endpoint.clone();
-        let path = work.path();
-        let (service_id, plan_id) = (work.service_id.clone(), work.plan_id.clone());
+    /// Undoes at the broker the provision or the bind the operation of `work` failed at, its
+    /// outcome unknown: a deprovision or an unbind the broker may refuse, sent once it is kept
+    /// that it is to be ([`Operations::end`]), and owed no more once the broker answered.
+    async fn undo(&self, work: Work) -> Next {
+        let ids = [
+            ("service_id", work.service_id.as_str()),
+            ("plan_id", work.plan_id.as_str()),
+        ];
+        let undone = self
+            .osb
+            .request(
+                &work.endpoint,
+                Method::DELETE,
+                &work.path(),
+                &ids,
+                None,
+                None,
+            )
+            .await;
         let what = work.what();
-        tokio::spawn(async move {
-            let ids = [
-                ("service_id", service_id.as_str()),
-                ("plan_id", plan_id.as_str()),
-            ];
-            let undone = osb
-                .request(&endpoint, Method::DELETE, &path, &ids, None, None)
-                .await;
-            match undone {
-                Ok(_) => println!("SERVICES: undid {what} at the broker (orphan mitigation)"),
-                Err(e) => println!(
-                    "SERVICES: could not undo {what} at the broker (orphan mitigation): {}",
-                    e.description
-                ),
-            }
-        });
+        match undone {
+            Ok(_) => println!("SERVICES: undid {what} at the broker (orphan mitigation)"),
+            Err(e) => println!(
+                "SERVICES: could not undo {what} at the broker (orphan mitigation): {}",
+                e.description
+            ),
+        }
+        self.undone(&work.target, &work.operation).await;
+        Next::Done
     }
 
-    /// Records how the operation ended, unless another replaced it: on the
-    /// instance or binding (a deletion's success removes it), its job and
-    /// the logs.
+    /// The `operation` of `target` is to be undone no more.
+    async fn undone(&self, target: &Target, operation: &Operation) {
+        self.store
+            .lead(|state| {
+                if let Some(current) = operation_mut(state, target)
+                    && current.created_at == operation.created_at
+                {
+                    current.undo = false;
+                }
+            })
+            .await;
+    }
+
+    /// Records how the operation ended, unless another replaced it or this instance's turn is
+    /// over: on the instance or binding (a deletion's success removes it), its job and the
+    /// logs; and that a provision or a bind orphaned is to be undone ([`Operations::undo`]).
     async fn end(&self, target: &Target, operation: &Operation, end: End) {
         let failed = match &end {
-            End::Failed(e) => Some(e.clone()),
+            End::Failed(e) | End::Orphaned(e) => Some(e.clone()),
             End::Succeeded(_) => None,
         };
         let ended = self
             .store
-            .update(|state| {
+            .lead(|state| {
                 let current = operation_mut(state, target)?;
                 if current.created_at != operation.created_at || !current.under_way() {
                     return None;
@@ -616,10 +593,12 @@ impl Operations {
                 let at = now();
                 current.state = match &end {
                     End::Succeeded(_) => OperationState::Succeeded,
-                    End::Failed(_) => OperationState::Failed,
+                    End::Failed(_) | End::Orphaned(_) => OperationState::Failed,
                 };
+                current.undo =
+                    matches!(end, End::Orphaned(_)) && current.kind == OperationKind::Create;
                 current.description = match &end {
-                    End::Failed(e) => e.clone(),
+                    End::Failed(e) | End::Orphaned(e) => e.clone(),
                     End::Succeeded(body) => body
                         .get("description")
                         .and_then(Value::as_str)
@@ -690,7 +669,7 @@ impl Operations {
                 Some((kind, app, name))
             })
             .await;
-        let Some((kind, app, name)) = ended else {
+        let Some((kind, app, name)) = ended.flatten() else {
             return;
         };
         let line = match (&failed, target, kind) {

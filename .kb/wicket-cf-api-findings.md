@@ -198,6 +198,40 @@ test's mock wicket; `cf scale -i` of one app, 80 each):
 
 The hop is 2.2ms, on a connection kept.
 
+## The work outliving a request
+
+A build, a broker's operation and an app's delete after its unbinds are work of the turn of the
+instance reconciling the wickets ([ha.md](../sluice-wicket-cf-api/ha.md#the-work-outliving-a-request)).
+Decided against the alternatives:
+
+- the lease of the wickets, not an owner and a lease per build and operation (an instances table
+  with a heartbeat, each row naming its owner, taken once the owner's lapsed). The turn already
+  is what such an owner needs: a task cancelled at its end (`Controller::spawn`), a change the
+  store refuses once another took the lease (`Store::lead`), a takeover that is a start. A second
+  kind of owner would be a second takeover to reason about, and an app's delete is the leader's
+  either way (it writes the wickets). What it costs: the staging of every build runs on one
+  instance, and a leader's end cuts all of them at once, each taken up within the takeover (a
+  build of source goes on at the wicket meanwhile). An upload reaches the build through the
+  bucket on any instance, the one that took it too (`Store::local`): no copy is saved by staging
+  where it was uploaded
+- the request writes the row, the leader's follower takes it up from the state's changes
+  (`Controller::follow`), on the same instance too: one path, and nothing is told between
+  instances but through the store. The request's wait for a build (15s) is on the state's changes
+- every change of the work is `Store::lead`, not only its end: a paused instance's tasks run on
+  until its lease's loop is polled, and may send what is idempotent (a broker's request, a
+  build's follow) but change nothing. What is not idempotent comes after a change that is
+  refused: the wicket forgets a build once the store keeps the staging's end (before, a crash
+  between the two built again from scratch), and an undo at the broker is sent once the store
+  keeps the operation failed and to be undone (`Operation::undo`), where before it was a detached
+  task of the process deciding it
+- the undo at least once, not exactly once: a turn ending between the undo sent and the store
+  told has the next send it again; a deprovision or an unbind of what is gone is a `410`
+- an app's delete is due once none of its job's waits is an operation under way, not when "each
+  binding it listed was unbound": a binding gone another way (its instance purged) no longer
+  leaves the job waiting until a restart
+- no line of a staging is carried over: the log of the instance that staged it first holds them
+  (281)
+
 ## A stop
 
 The release binary on the host (`--wicket` unreachable), SIGTERM to its exit: idle, 11-13ms. A

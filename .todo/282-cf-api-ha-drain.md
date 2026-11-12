@@ -65,3 +65,14 @@ across a stop of the instance it talks to.
   follower 503 until edits go to the leader (279), then 200 once the store answers
 - a turn's end cancels its work (`Controller::end`): a put under way is dropped, which its wicket
   may have taken; the next leader's first write fences what comes after it
+
+## From 280
+
+- there is no lease per build or operation: the builds, the brokers' operations and the apps'
+  deletes after their unbinds are work of the turn (`Controller::follow`), so step 4 is step 2:
+  the lease released, the next leader takes them up from the state at once. A build of source
+  goes on at its wicket meanwhile; a zip's unpacking is cut and staged again by the next
+- the turn's end cancels that work and waits for it (`Controller::end`); `serve` aborts the
+  leading task after the release, without waiting. A staging cut while it waits for the CLI to
+  read its last lines (`READ_OUT`, 5s) is taken up by the next leader, which stages it again
+- a request's wait for its build (`create_build`, 15s) ends at the stop, as before
