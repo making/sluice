@@ -69,6 +69,7 @@ mod routes;
 mod wasm_host;
 
 use sluice_wicket_console::env;
+use sluice_wicket_console::fence::Fence;
 use sluice_wicket_console::identity::Identity;
 use sluice_wicket_console::leaving;
 
@@ -242,6 +243,7 @@ pub async fn run(settings: config::Settings) -> Result<(), BoxError> {
                 max_instances,
                 dir: console.dir.clone(),
                 held: reloader.held(),
+                fence: Fence::open(&console.dir)?,
             }),
         ));
     } else {

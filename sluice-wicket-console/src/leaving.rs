@@ -16,9 +16,11 @@ use std::collections::BTreeSet;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use http::StatusCode;
+use http::request::Parts;
 use serde::Serialize;
 use tokio::sync::watch;
 
+use crate::fence::Fence;
 use crate::http::{Response, error, json};
 use crate::status::Status;
 use crate::store::check_name;
@@ -141,12 +143,21 @@ pub async fn evacuate(
 }
 
 /// `PUT /api/evacuated/<owner>`: the owner moved what of its apps it could while the wicket
-/// leaves, the rest of them staying until the drain. Refused (409) unless the wicket is leaving:
-/// a wicket started again waits for no one.
-pub fn evacuated(status: &watch::Sender<Status>, owner: &str) -> Response {
+/// leaves, the rest of them staying until the drain, unless `fence` refuses its epoch. Refused
+/// (409) unless the wicket is leaving: a wicket started again waits for no one.
+pub async fn evacuated(
+    status: &watch::Sender<Status>,
+    fence: &Fence,
+    owner: &str,
+    parts: &Parts,
+) -> Response {
     if let Err(e) = check_name("owner", owner) {
         return error(StatusCode::BAD_REQUEST, e);
     }
+    let _admitted = match fence.admit(Some(owner), parts).await {
+        Ok(admitted) => admitted,
+        Err(refused) => return refused.into(),
+    };
     let mut view = None;
     let added = status.send_if_modified(|status| {
         let Some(leaving) = &mut status.leaving else {
@@ -195,8 +206,14 @@ mod tests {
     /// the bound, the apps left are given. An owner's word is refused unless leaving.
     #[tokio::test(start_paused = true)]
     async fn the_wicket_waits_for_its_apps_until_gone_said_so_or_the_bound() {
+        let dir = std::env::temp_dir().join(format!("sluice-leaving-{}", std::process::id()));
+        let fence = Fence::open(&dir).unwrap();
+        let parts = http::Request::new(()).into_parts().0;
+        let evacuated = async |status: &watch::Sender<Status>, owner: &str| {
+            evacuated(status, &fence, owner, &parts).await
+        };
         let status = watch::Sender::new(Status::default());
-        let refused = evacuated(&status, "cf");
+        let refused = evacuated(&status, "cf").await;
         assert_eq!(refused.status(), StatusCode::CONFLICT);
         let app = |owner: &str, name: &str| (owner.to_string(), name.to_string());
         let apps = Arc::new(Mutex::new(vec![app("cf", "a"), app("ops", "b")]));
@@ -218,11 +235,14 @@ mod tests {
         assert_eq!((revision, view.until - view.since), (1, 60));
         assert!(view.evacuated.is_empty());
         // cf moved what it could: its app stays, not waited for
-        assert_eq!(evacuated(&status, "cf").status(), StatusCode::OK);
+        assert_eq!(evacuated(&status, "cf").await.status(), StatusCode::OK);
         assert_eq!(leaving_view(&status).0, 2);
-        assert_eq!(evacuated(&status, "cf").status(), StatusCode::OK);
+        assert_eq!(evacuated(&status, "cf").await.status(), StatusCode::OK);
         assert_eq!(leaving_view(&status).0, 2, "said once");
-        assert_eq!(evacuated(&status, "c f").status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            evacuated(&status, "c f").await.status(),
+            StatusCode::BAD_REQUEST
+        );
         tokio::time::sleep(Duration::from_secs(5)).await;
         assert!(!leaving.is_finished(), "ops's app is still there");
         // ops's app gone, as a table published says

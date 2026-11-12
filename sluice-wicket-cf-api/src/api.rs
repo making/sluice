@@ -1481,7 +1481,8 @@ impl Api {
                 }
                 let share = self.controller.hold_share(guid, &wicket.name).await;
                 match self.trial_put(wicket, guid, desired).await {
-                    Ok(()) | Err(Failure::Unreachable(_)) => {
+                    // put by the instance whose turn it is, as it would be when back
+                    Ok(()) | Err(Failure::Unreachable(_) | Failure::Fenced { .. }) => {
                         tried.put.push((wicket.clone(), guid.clone()));
                         tried.held.push(share);
                     }
@@ -2655,11 +2656,11 @@ impl Api {
             ),
         );
         match deployment.stepping() {
-            // what changes at once: the shares of a scale it asked
+            // what changes at once: the shares of a scale it asked; the steps the turn's of the
+            // instance reconciling the wickets, this one's or another's told by the change
             true => {
                 self.controller.sync_changed(&app, &before).await;
-                let controller = self.controller.clone();
-                tokio::spawn(controller.deploy(app.clone(), deployment.guid.clone()));
+                self.controller.take_up(&app, &deployment.guid);
             }
             // the app served nothing: started
             false => self.controller.sync(&app).await,
@@ -2698,8 +2699,7 @@ impl Api {
             .map_err(ApiError::unprocessable)?;
         self.logs
             .add(&app, "API", format!("Continuing the deployment {guid}"));
-        let controller = self.controller.clone();
-        tokio::spawn(controller.deploy(app, guid.to_string()));
+        self.controller.take_up(&app, guid);
         self.deployment_view(req, guid)
     }
 

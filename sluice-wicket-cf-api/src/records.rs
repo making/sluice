@@ -3,6 +3,14 @@
 //! keyvalue homes, the wickets' stacks, the blobs' sweeps), so a change writes what it changed and another process
 //! takes what changed (`crate::postgres`).
 //!
+//! What the wickets were seen doing (`crate::controller`) is rows of its own, one per thing seen:
+//! what each wicket answered of each app's share, what each wicket listed of itself (its budget,
+//! leaving, gone, ...), whether each keyvalue store is one of them all. As what is kept whole,
+//! each is told from what was written by its body: noted aside from a change (`Store::observe`),
+//! it is written with the next one, by an instance whose turn reconciling the wickets did not end
+//! meanwhile (`crate::postgres`); one whose turn ended forgets what it did not write
+//! ([`Book::forget_observed`]). They are not in `state.json`: one process's are its own.
+//!
 //! A row is its kind, its id (an entity's guid), its body (the entity's JSON, as `state.json`
 //! holds it) and its `ord`: the rows of a kind in the order of their `ord` are the state's list
 //! of them, whose order says something (the first domain takes the default routes, the last
@@ -15,13 +23,22 @@ use std::collections::{HashMap, HashSet};
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
+use crate::placement::Observed;
 use crate::store::{
-    App, Binding, Broker, Build, Deployment, Droplet, Instance, Job, Named, Package, Role, Route,
-    SecurityGroup, Space, State, User,
+    App, Binding, Broker, Build, Deployment, Droplet, Instance, Job, Named, Outcome, Package, Role,
+    Route, SecurityGroup, Space, State, User,
 };
 
 /// The kind of the rows kept whole, their id what they are.
 pub const SINGLE: &str = "single";
+
+/// The kinds of what the wickets were seen doing: what one answered of an app's share (id
+/// `<app guid>/<wicket>`), what one listed of itself (id its name), whether a keyvalue store is
+/// one of them all (id its name).
+const OUTCOME: &str = "outcome";
+const WICKET: &str = "wicket";
+const STORE: &str = "store";
+const OBSERVED: [&str; 3] = [OUTCOME, WICKET, STORE];
 
 /// A row to write: `body` None removes it.
 #[derive(Clone, Debug, PartialEq)]
@@ -43,6 +60,8 @@ pub struct Book {
     singles: HashMap<String, String>,
     /// The rows changed aside from a transaction, to write with the next (`Store::note_kept`).
     deferred: HashSet<(&'static str, String)>,
+    /// The body of each row of what the wickets were seen doing, by kind then id, as written.
+    observed: HashMap<(&'static str, String), String>,
 }
 
 /// An entity of a list of the state.
@@ -87,7 +106,7 @@ macro_rules! lists {
             match kind {
                 $($kind => Some($kind),)*
                 SINGLE => Some(SINGLE),
-                _ => None,
+                kind => OBSERVED.into_iter().find(|observed| *observed == kind),
             }
         }
 
@@ -179,6 +198,85 @@ singles!(
     "sweep": sweep,
 );
 
+/// The rows of what `state` says the wickets were seen doing, by kind and id: their bodies.
+fn observed_rows(state: &State) -> HashMap<(&'static str, String), String> {
+    let mut rows = HashMap::new();
+    for (guid, outcomes) in &state.outcomes {
+        for (wicket, outcome) in outcomes {
+            rows.insert((OUTCOME, format!("{guid}/{wicket}")), json(outcome));
+        }
+    }
+    for name in state.wickets.observed_names() {
+        let observed = state.wickets.observed(&name);
+        if observed != Observed::default() {
+            rows.insert((WICKET, name), json(&observed));
+        }
+    }
+    for (store, one) in &state.wickets.stores {
+        rows.insert((STORE, store.clone()), json(one));
+    }
+    rows
+}
+
+/// What is written of what the wickets were seen doing: its JSON.
+fn json<T: Serialize>(value: &T) -> String {
+    serde_json::to_string(value).expect("what was seen is JSON")
+}
+
+/// Puts what the row `id` of the kind `kind` says the wickets were seen doing into `state`: none,
+/// its body None.
+fn take_observed(
+    state: &mut State,
+    kind: &str,
+    id: &str,
+    body: Option<&str>,
+) -> Result<(), String> {
+    fn parse<T: DeserializeOwned>(body: &str) -> Result<T, String> {
+        serde_json::from_str(body).map_err(|e| e.to_string())
+    }
+    match kind {
+        OUTCOME => {
+            let (guid, wicket) = id.split_once('/').ok_or("no <app>/<wicket>")?;
+            match body {
+                Some(body) => {
+                    let outcome: Outcome = parse(body)?;
+                    let outcomes = state.outcomes.entry(guid.to_string()).or_default();
+                    outcomes.insert(wicket.to_string(), outcome);
+                }
+                None => {
+                    if let Some(outcomes) = state.outcomes.get_mut(guid) {
+                        outcomes.remove(wicket);
+                        if outcomes.is_empty() {
+                            state.outcomes.remove(guid);
+                        }
+                    }
+                }
+            }
+        }
+        WICKET => {
+            let observed: Option<Observed> = body.map(parse).transpose()?;
+            let observed = observed.unwrap_or_default();
+            state.wickets.set_observed(id, observed);
+        }
+        STORE => match body {
+            Some(body) => {
+                state.wickets.stores.insert(id.to_string(), parse(body)?);
+            }
+            None => {
+                state.wickets.stores.remove(id);
+            }
+        },
+        _ => {}
+    }
+    Ok(())
+}
+
+/// Clears what `state` says the wickets were seen doing.
+fn clear_observed(state: &mut State) {
+    state.outcomes.clear();
+    state.wickets.clear_observed();
+}
+
 /// The rows a change writes, as they are found.
 struct Diff<'a> {
     book: &'a Book,
@@ -234,6 +332,32 @@ impl Diff<'_> {
         }
     }
 
+    /// What the wickets were seen doing, as `state` says it: told from what was written by its
+    /// bodies, as what is kept whole.
+    fn observed(&mut self, state: &State) {
+        let rows = observed_rows(state);
+        for ((kind, id), body) in &rows {
+            if self.book.observed.get(&(*kind, id.clone())) != Some(body) {
+                self.rows.push(Row {
+                    kind: kind.to_string(),
+                    id: id.clone(),
+                    ord: 0,
+                    body: Some(body.clone()),
+                });
+            }
+        }
+        for (kind, id) in self.book.observed.keys() {
+            if !rows.contains_key(&(*kind, id.clone())) {
+                self.rows.push(Row {
+                    kind: kind.to_string(),
+                    id: id.clone(),
+                    ord: 0,
+                    body: None,
+                });
+            }
+        }
+    }
+
     /// What is kept whole is small: told from what was written by its body, so a change aside
     /// from a transaction (`Store::note`: the flume's cursor, what a wicket listed it runs) is
     /// written with the next.
@@ -286,8 +410,15 @@ const ORDS: i64 = 1 << 24;
 
 impl Book {
     /// The rows that make the state `after` of `before` (this book's), written as the revision
-    /// `rev`: all of them with `before` None, a store's first.
-    pub fn diff(&self, before: Option<&State>, after: &State, rev: i64) -> Vec<Row> {
+    /// `rev`: all of them with `before` None, a store's first; with `observed` those of what the
+    /// wickets were seen doing too.
+    pub fn diff(
+        &self,
+        before: Option<&State>,
+        after: &State,
+        rev: i64,
+        observed: bool,
+    ) -> Vec<Row> {
         let mut diff = Diff {
             book: self,
             next: rev * ORDS,
@@ -296,6 +427,9 @@ impl Book {
         let none = State::default();
         diff_lists(before.unwrap_or(&none), after, &mut diff);
         diff_singles(after, &mut diff);
+        if observed {
+            diff.observed(after);
+        }
         debug_assert!(
             diff.next < (rev + 1) * ORDS,
             "more rows than a change orders"
@@ -313,6 +447,14 @@ impl Book {
                 if let Some(body) = &row.body {
                     self.singles.insert(row.id.clone(), body.clone());
                 }
+                continue;
+            }
+            if OBSERVED.contains(&kind) {
+                let key = (kind, row.id.clone());
+                match &row.body {
+                    Some(body) => self.observed.insert(key, body.clone()),
+                    None => self.observed.remove(&key),
+                };
                 continue;
             }
             let ords = self.ords.entry(kind).or_default();
@@ -339,8 +481,10 @@ impl Book {
         if all {
             clear_lists(state);
             clear_singles(state);
+            clear_observed(state);
             self.ords.clear();
             self.singles.clear();
+            self.observed.clear();
         }
         for row in rows {
             // what is there is the store's: nothing of it is written over
@@ -351,6 +495,14 @@ impl Book {
             };
             let taken = match kind {
                 SINGLE => take_single(state, self, row),
+                kind if OBSERVED.contains(&kind) => {
+                    let key = (kind, row.id.clone());
+                    match &row.body {
+                        Some(body) => self.observed.insert(key, body.clone()),
+                        None => self.observed.remove(&key),
+                    };
+                    take_observed(state, kind, &row.id, row.body.as_deref())
+                }
                 kind => take_listed(state, self, kind, row),
             };
             if let Err(e) = taken {
@@ -361,5 +513,16 @@ impl Book {
             }
         }
         self.rev = rev;
+    }
+
+    /// Puts back in `state` what the wickets were seen doing as written: what this process saw
+    /// and did not write is forgotten (its turn reconciling them ended).
+    pub fn forget_observed(&self, state: &mut State) {
+        clear_observed(state);
+        for ((kind, id), body) in &self.observed {
+            if let Err(e) = take_observed(state, kind, id, Some(body)) {
+                eprintln!("STATE: cannot read the {kind} {id}: {e}");
+            }
+        }
     }
 }

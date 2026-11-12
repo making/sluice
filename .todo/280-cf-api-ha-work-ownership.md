@@ -61,3 +61,12 @@ With `--state`, `fail_unfinished_builds` and `settle_unfinished_waits` run only 
 `state.json` an empty store takes (`store::kept`), not at every start: a start fails nothing of
 the store. `Api::take_up`, `Operations::kick` and `Controller::resume` still run at every
 instance's start.
+
+## From 278
+
+- the controller's lease (`crate::lease`) is the one to weigh "all of it on the leader" with:
+  `Controller::spawn` runs a task as work of the turn (cancelled at its end, which waits for it),
+  `Store::lead` makes a change only in the turn, the store refusing it once another took the
+  lease. A per-work lease would be another row; `sluice_cf_lease` is one row (`one boolean`)
+- a sweep's marker carries the epoch of its turn (`Sweeping::epoch`): one of a turn before the
+  lease's is over at once

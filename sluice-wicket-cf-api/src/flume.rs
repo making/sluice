@@ -115,10 +115,11 @@ async fn session(
     announced: &mut Option<Vec<String>>,
 ) -> Result<Infallible, BoxError> {
     let mut client = None;
+    let mut changes = store.changes();
     loop {
         let hosts = store.read(apps_by_host);
         if hosts.is_empty() {
-            store.changed().await;
+            let _ = changes.changed().await;
             continue;
         }
         let client = match &mut client {
@@ -170,7 +171,7 @@ async fn session(
                     Err(e) => break Some(BoxError::from(e)),
                 },
                 // the apps' hosts changed: watched again past the cursor
-                () = store.changed() => {
+                _ = changes.changed() => {
                     if store.read(apps_by_host) != taker.hosts {
                         break None;
                     }

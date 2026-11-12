@@ -37,6 +37,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use http::{Method, StatusCode};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 use crate::api::{Api, ApiError, Reply, Req, json as respond, no_content, space_to_develop};
@@ -78,12 +79,12 @@ const NO_BINDING_PARAMETERS: &str =
 /// capability but `keyvalue` (which a keyvalue binding grants); of several
 /// wickets, what every one does ([`Offer::common`]): a store of each one's
 /// host by its name, a shared one by its name and identity.
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct Offer {
     pub plans: Vec<Plan>,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Plan {
     pub offering: String,
     pub name: String,

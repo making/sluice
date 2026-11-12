@@ -70,6 +70,7 @@ pub mod wire;
 
 use std::sync::Arc;
 
+use sluice_wicket_console::fence::Fence;
 use sluice_wicket_console::identity::Identity;
 use sluice_wicket_console::leaving;
 use sluice_wicket_tunnel::flume::{self, Tap};
@@ -251,6 +252,7 @@ async fn serving(
     match console.zip(intake) {
         Some((console, intake)) => {
             let identity = Identity::open(&console.dir, node, describe_build())?;
+            let fence = Fence::open(&console.dir)?;
             let images = guest
                 .map(|guest| images(guest, &console.dir))
                 .transpose()?
@@ -292,6 +294,7 @@ async fn serving(
                     listen: listening,
                     identity,
                     held: reloader.held(),
+                    fence,
                 }),
             ));
         }

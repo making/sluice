@@ -44,3 +44,13 @@ stop timeout for a VM):
 `lib::tests`: a request under way at the stop is answered, a new connection refused, the lease
 released before the listener is gone; a stop past the bound ends. The CLI test of 284: `cf push`
 across a stop of the instance it talks to.
+
+## From 278
+
+- `Lease::release` runs at the end of `serve`'s stop, after the requests and the puts under way
+  and a last change writing what the leader saw: the next takes the lease within `TAKE_EVERY`
+  (1s). Step 2 moves it before the requests end
+- `/healthz` (`Controller::ready`): the leader once it listed every wicket in its turn; a
+  follower 503 until edits go to the leader (279), then 200 once the store answers
+- a turn's end cancels its work (`Controller::end`): a put under way is dropped, which its wicket
+  may have taken; the next leader's first write fences what comes after it

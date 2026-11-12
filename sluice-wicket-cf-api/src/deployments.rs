@@ -22,7 +22,10 @@
 //! deployment of an app serving nothing (stopped, at 0, without a route) starts it at once, as CC
 //! does.
 //!
-//! The state holds the progress: a restart of the cf-api takes it up ([`Controller::resume`]).
+//! The state holds the progress: a restart of the cf-api takes it up ([`Controller::resume`]), as
+//! does the next instance whose turn it is to reconcile the wickets (`crate::lease`): the steps
+//! are the turn's alone, which the instance a deployment was made on tells by the state's change
+//! ([`Controller::take_up`]).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -539,21 +542,22 @@ fn canary_target(steps: &[u64], step: u64, instances: u64) -> u64 {
 impl Controller {
     /// Takes the deployment `deployment` of the app `guid` a step at a time ([`State::step`]), each
     /// once every share it reached serves it ([`Controller::serving`]), until it is finalized or
-    /// paused, or takes no steps any more.
+    /// paused, or takes no steps any more, or the turn of this instance reconciling the wickets
+    /// ended.
     pub async fn deploy(self: Arc<Self>, guid: String, deployment: String) {
         while self.serving(&guid, &deployment).await {
             let _app = self.hold(&guid).await;
             match self
                 .store
-                .update(|state| state.step(&guid, &deployment))
+                .lead(|state| state.step(&guid, &deployment))
                 .await
             {
-                Step::None => return,
-                Step::Done(line) => {
+                None | Some(Step::None) => return,
+                Some(Step::Done(line)) => {
                     self.logs.add(&guid, "API", line);
                     return;
                 }
-                Step::Reach(wickets, line) => {
+                Some(Step::Reach(wickets, line)) => {
                     self.logs.add(&guid, "API", line);
                     self.sync_on(&guid, Some(&wickets)).await;
                 }
@@ -601,10 +605,15 @@ impl Controller {
             let changed = self.store.read(|state| {
                 (state.deployment(deployment)).is_some_and(|kept| kept.error != error)
             });
-            if changed {
-                self.store
-                    .update(|state| state.note_error(deployment, error.clone()))
-                    .await;
+            let noted = match changed {
+                true => (self.store)
+                    .lead(|state| state.note_error(deployment, error.clone()))
+                    .await
+                    .is_some(),
+                false => true,
+            };
+            if !noted {
+                return false;
             }
             if waits.is_none() {
                 return true;
@@ -663,8 +672,9 @@ impl Controller {
         self.cancel_held(&guid, &deployment).await;
     }
 
-    /// Takes up what a stop of the cf-api left under way: the deployments taking steps, those
-    /// canceling, and the indices moving to another wicket ([`Controller::resume_moves`]).
+    /// Takes up, as this instance's turn reconciling the wickets begins, what a stop of the
+    /// cf-api or the turn before left under way: the deployments taking steps, those canceling,
+    /// and the indices moving to another wicket ([`Controller::resume_moves`]).
     pub fn resume(self: &Arc<Self>) {
         self.resume_moves();
         let under_way: Vec<(String, String, bool)> = self.store.read(|state| {
@@ -676,8 +686,8 @@ impl Controller {
         });
         for (app, deployment, stepping) in under_way {
             match stepping {
-                true => tokio::spawn(self.clone().deploy(app, deployment)),
-                false => tokio::spawn(self.clone().finish_cancel(app, deployment)),
+                true => self.take_up(&app, &deployment),
+                false => self.spawn(self.clone().finish_cancel(app, deployment)),
             };
         }
     }

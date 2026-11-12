@@ -580,14 +580,21 @@ async fn every_route_serves_http_through_the_tunnel() {
         let env = tokio::time::timeout(HANG, app.get(2, "/env")).await;
         let env = env.unwrap_or_else(|_| panic!("app2.local: hung; {}", wicket.log()));
         assert_eq!(env, "GREETING=hello world\nPEM=a\nb\n");
-        let (status, removed) = console(
-            wicket.console(),
-            "DELETE",
-            "/api/apps/shop?owner=cf",
-            true,
-            Bytes::new(),
-        )
-        .await;
+        // the epoch its owner sent kept across the restart
+        let removal = |epoch| {
+            let path = "/api/apps/shop?owner=cf";
+            console_in(
+                wicket.console(),
+                "DELETE",
+                path,
+                true,
+                Some(epoch),
+                Bytes::new(),
+            )
+        };
+        let (status, fenced) = removal(6).await;
+        assert_eq!((status, &fenced["fenced"]), (409, &true.into()), "{fenced}");
+        let (status, removed) = removal(7).await;
         assert_eq!(
             (status, removed["message"].as_str()),
             (200, Some("removed app1.local, app2.local"))
@@ -1238,6 +1245,18 @@ async fn console(
     token: bool,
     body: Bytes,
 ) -> (u16, serde_json::Value) {
+    console_in(address, method, path, token, None, body).await
+}
+
+/// [`console`] of a write in its owner's turn: the epoch the turn's is.
+async fn console_in(
+    address: std::net::SocketAddr,
+    method: &str,
+    path: &str,
+    token: bool,
+    epoch: Option<u64>,
+    body: Bytes,
+) -> (u16, serde_json::Value) {
     let stream = tokio::net::TcpStream::connect(address).await.unwrap();
     let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
         .await
@@ -1249,6 +1268,9 @@ async fn console(
         .header("host", address.to_string());
     if token {
         request = request.header("authorization", format!("Bearer {CONSOLE_TOKEN}"));
+    }
+    if let Some(epoch) = epoch {
+        request = request.header("sluice-epoch", epoch);
     }
     let response = sender
         .send_request(request.body(Full::new(body)).unwrap())
@@ -1395,7 +1417,8 @@ async fn deploy(
         "{uploaded}"
     );
     assert!(dir.join(format!("uploads/{sha256}.ext4")).is_file());
-    let (status, put) = console(at, "PUT", "/api/apps/shop", true, body()).await;
+    // in the turn of its owner's epoch 7
+    let (status, put) = console_in(at, "PUT", "/api/apps/shop", true, Some(7), body()).await;
     assert_eq!(status, 200, "{put}; {}", wicket.log());
     assert_eq!(put["message"], "added app1.local, app2.local");
     let advertised = advertised_as(tunnel, &["app1.local", "app2.local"], false).await;
@@ -1488,6 +1511,9 @@ async fn deploy(
     assert_eq!(status, 409, "{refused}");
     let (status, same) = console(at, "PUT", "/api/apps/shop", true, body()).await;
     assert_eq!((status, same["message"].as_str()), (200, Some("no change")));
+    // of a turn before: refused
+    let (status, fenced) = console_in(at, "PUT", "/api/apps/shop", true, Some(6), body()).await;
+    assert_eq!((status, &fenced["fenced"]), (409, &true.into()), "{fenced}");
 
     never_listening_app(tunnel, wicket, &sha256, config).await;
     restarting_app(tunnel, wicket, &sha256, conn_id).await;

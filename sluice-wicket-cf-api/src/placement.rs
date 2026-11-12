@@ -46,6 +46,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
+use crate::services::Offer;
 use crate::store::{App, Running, State};
 use crate::wicket::Runtime;
 
@@ -89,12 +90,111 @@ pub struct Wickets {
     /// Each keyvalue store the wickets list, by name: whether it is one store of them all, else
     /// each wicket's host's own (`crate::services::Offer::stores`).
     pub stores: BTreeMap<String, bool>,
+    /// What each offers, as it last listed it: the capabilities and the keyvalue stores.
+    pub offers: BTreeMap<String, Offer>,
+    /// Those listing their start: a share put to them is held from their next start until
+    /// confirmed (`held-ms`).
+    pub holds: BTreeSet<String>,
+}
+
+/// What a wicket was seen doing, as the store keeps it for every instance: what it last listed
+/// of itself, whether it refused a share for room, is gone or a second name (a row each:
+/// `crate::records`).
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Observed {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget: Option<Budget>,
+    /// The revision it listed when it refused a share for room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full: Option<u64>,
+    /// Its flume node.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub node: Option<String>,
+    /// When it drains at the latest, leaving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub leaving: Option<u64>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gone: bool,
+    /// A second name of a wicket.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub odd: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub offer: Option<Offer>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub holds: bool,
 }
 
 impl Wickets {
     /// Whether none listed what it runs.
     pub fn none_listed(&self) -> bool {
         self.runtimes.is_empty()
+    }
+
+    /// The wickets of which something was seen.
+    pub fn observed_names(&self) -> BTreeSet<String> {
+        let names = (self.budgets.keys())
+            .chain(self.full.keys())
+            .chain(self.nodes.values())
+            .chain(self.leaving.keys())
+            .chain(self.gone.iter())
+            .chain(self.odd.iter())
+            .chain(self.offers.keys())
+            .chain(self.holds.iter());
+        names.cloned().collect()
+    }
+
+    /// What was seen of the wicket `name`.
+    pub fn observed(&self, name: &str) -> Observed {
+        let node = self.nodes.iter().find(|(_, of)| *of == name);
+        Observed {
+            budget: self.budgets.get(name).copied(),
+            full: self.full.get(name).copied(),
+            node: node.map(|(node, _)| node.clone()),
+            leaving: self.leaving.get(name).copied(),
+            gone: self.gone.contains(name),
+            odd: self.odd.contains(name),
+            offer: self.offers.get(name).cloned(),
+            holds: self.holds.contains(name),
+        }
+    }
+
+    /// Takes `observed` as what was seen of the wicket `name`.
+    pub fn set_observed(&mut self, name: &str, observed: Observed) {
+        let name = name.to_string();
+        let kept = |set: &mut BTreeSet<String>, is: bool| match is {
+            true => set.insert(name.clone()),
+            false => set.remove(&name),
+        };
+        kept(&mut self.gone, observed.gone);
+        kept(&mut self.odd, observed.odd);
+        kept(&mut self.holds, observed.holds);
+        fn put<V>(map: &mut BTreeMap<String, V>, name: &str, value: Option<V>) {
+            match value {
+                Some(value) => map.insert(name.to_string(), value),
+                None => map.remove(name),
+            };
+        }
+        put(&mut self.budgets, &name, observed.budget);
+        put(&mut self.full, &name, observed.full);
+        put(&mut self.leaving, &name, observed.leaving);
+        put(&mut self.offers, &name, observed.offer);
+        self.nodes.retain(|_, of| *of != name);
+        if let Some(node) = observed.node {
+            self.nodes.insert(node, name);
+        }
+    }
+
+    /// Forgets what was seen of every wicket.
+    pub fn clear_observed(&mut self) {
+        self.budgets.clear();
+        self.full.clear();
+        self.nodes.clear();
+        self.leaving.clear();
+        self.gone.clear();
+        self.odd.clear();
+        self.offers.clear();
+        self.holds.clear();
+        self.stores.clear();
     }
 
     /// Writes what is kept of them with the state: what each runs.
@@ -146,7 +246,7 @@ enum Pin {
 }
 
 /// What a wicket's budget leaves the apps placed on it.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq)]
 pub struct Budget {
     pub instances: u64,
     /// MiB; None: no memory budget.

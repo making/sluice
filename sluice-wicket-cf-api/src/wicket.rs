@@ -27,11 +27,18 @@
 //! PUT    /api/confirmed/<owner>                the owner's apps the body names are as it wants
 //!                                              them: those a start of the wicket holds served
 //! ```
+//!
+//! A write of an app (`PUT` / `DELETE /api/apps`, `/api/confirmed`, `/api/evacuated`, `DELETE
+//! /api/keyvalue`) carries the epoch of the owner's turn reconciling the wickets, if it has one
+//! (`crate::lease`): the wicket refuses one below the highest it saw of the owner
+//! ([`Failure::Fenced`]); a wicket predating it takes it as it took one without.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use sluice_wicket_console::fence::HEADER as EPOCH;
 
 use crate::blobs::Reading;
 
@@ -59,6 +66,8 @@ pub struct Wicket {
     pub name: String,
     /// What the log lines call it: `the wicket`, or of several `the wicket <name>`.
     pub label: String,
+    /// The epoch of the owner's turn its writes carry; 0: none.
+    epoch: AtomicU64,
 }
 
 /// The body of an app's PUT, and an app as listed: `S` its sandbox, as a wicket of a runtime has
@@ -587,6 +596,9 @@ pub enum Failure {
     },
     /// No answer, or none to act on (5xx).
     Unreachable(String),
+    /// The wicket refused the epoch the write carried, `epoch`: below the highest it saw of the
+    /// owner, whose turn another instance took (409).
+    Fenced { epoch: Option<u64>, error: String },
 }
 
 impl Failure {
@@ -617,7 +629,7 @@ impl Failure {
 impl std::fmt::Display for Failure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Failure::Refused { error, .. } => f.write_str(error),
+            Failure::Refused { error, .. } | Failure::Fenced { error, .. } => f.write_str(error),
             Failure::Unreachable(error) => write!(f, "the wicket is unreachable: {error}"),
         }
     }
@@ -633,6 +645,8 @@ struct ErrorBody {
     did_not_start: bool,
     #[serde(default)]
     no_room: bool,
+    #[serde(default)]
+    fenced: bool,
 }
 
 impl Wicket {
@@ -653,7 +667,42 @@ impl Wicket {
                 1 => "the wicket".to_string(),
                 _ => format!("the wicket {name}"),
             },
+            epoch: AtomicU64::new(0),
         }
+    }
+
+    /// The epoch of the owner's turn its writes carry from now on; None: none.
+    pub fn set_epoch(&self, epoch: Option<u64>) {
+        self.epoch.store(epoch.unwrap_or(0), Ordering::Release);
+    }
+
+    /// The epoch its writes carry.
+    pub fn epoch(&self) -> Option<u64> {
+        Some(self.epoch.load(Ordering::Acquire)).filter(|epoch| *epoch > 0)
+    }
+
+    /// `request`, a write of an app, carrying the epoch of the owner's turn, if any: the
+    /// answer of a wicket refusing it is [`Failure::Fenced`].
+    async fn write(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<(reqwest::StatusCode, bytes::Bytes), Failure> {
+        let epoch = self.epoch();
+        let request = match epoch {
+            Some(epoch) => request.header(EPOCH, epoch),
+            None => request,
+        };
+        let (status, body) = self.send(request).await?;
+        if status == reqwest::StatusCode::CONFLICT
+            && let Ok(refused) = serde_json::from_slice::<ErrorBody>(&body)
+            && refused.fenced
+        {
+            return Err(Failure::Fenced {
+                epoch,
+                error: refused.error,
+            });
+        }
+        Ok((status, body))
     }
 
     /// [`Wicket::label`] opening a sentence.
@@ -689,7 +738,7 @@ impl Wicket {
             .put(format!("{}/api/apps/{name}", self.base))
             .timeout(EDIT_TIMEOUT)
             .json(app);
-        let (status, body) = self.send(request).await?;
+        let (status, body) = self.write(request).await?;
         if !status.is_success() {
             return Err(refused(status, &body));
         }
@@ -853,7 +902,7 @@ impl Wicket {
             .client
             .put(format!("{}/api/evacuated/{owner}", self.base))
             .timeout(READ_TIMEOUT);
-        let (status, body) = self.send(request).await?;
+        let (status, body) = self.write(request).await?;
         if !status.is_success() {
             return Err(refused(status, &body));
         }
@@ -869,7 +918,7 @@ impl Wicket {
             .put(format!("{}/api/confirmed/{owner}", self.base))
             .timeout(READ_TIMEOUT)
             .json(&serde_json::json!({ "apps": names }));
-        let (status, body) = self.send(request).await?;
+        let (status, body) = self.write(request).await?;
         if !status.is_success() {
             return Err(refused(status, &body));
         }
@@ -883,7 +932,7 @@ impl Wicket {
             .client
             .delete(format!("{}/api/apps/{name}?owner={owner}", self.base))
             .timeout(EDIT_TIMEOUT);
-        let (status, body) = self.send(request).await?;
+        let (status, body) = self.write(request).await?;
         if status == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
@@ -920,17 +969,18 @@ impl Wicket {
     }
 
     /// Deletes the data of the keyvalue namespace: how many keys it held.
-    /// Refused (409) while a route maps it.
+    /// Refused (409) while a route maps it. Its owner the owner's, whose epoch it carries.
     pub async fn purge(&self, store: &str, namespace: &str) -> Result<u64, Failure> {
+        let owner: String = form_urlencoded::byte_serialize(self.owner.as_bytes()).collect();
         let request = self
             .client
             .delete(format!(
-                "{}/api/keyvalue/{}",
+                "{}/api/keyvalue/{}?owner={owner}",
                 self.base,
                 place(store, namespace)
             ))
             .timeout(EDIT_TIMEOUT);
-        let (status, body) = self.send(request).await?;
+        let (status, body) = self.write(request).await?;
         if !status.is_success() {
             return Err(refused(status, &body));
         }

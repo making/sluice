@@ -45,3 +45,11 @@ staging log through the instance that did not stage.
 
 `State::flume` is one row (`single` / `flume`) every instance writes: with several watching,
 the last writer's cursor.
+
+## From 278
+
+- what the leader saw of the wickets is the store's for every instance, the wickets' flume nodes
+  among it (`state.wickets.nodes`, rows `wicket` of `crate::records`): each instance's watch
+  tells a line's wicket and instance as the leader's would
+- `Store::changed` (one waiter) is `Store::changes` now, a receiver each: the flume's watch and the
+  leader's `Controller::follow` both wait on it

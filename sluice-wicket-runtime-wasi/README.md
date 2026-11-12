@@ -590,6 +590,12 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
   routes, for another owner's app, and for a component or files no upload kept (`"missing":
   ["<sha256>", ..]`, every digest missing); a 422 names the host whose route did not load
   (`"host"`; none when no one route failed, e.g. pools past `--max-instances`)
+- a write of an owner (`PUT` / `DELETE /api/apps`, `PUT /api/confirmed` and `/api/evacuated`,
+  `DELETE /api/keyvalue` naming it, `?owner=<owner>`) may carry the epoch of its controller's
+  turn, `sluice-epoch: <n>`: one below the highest the owner sent is refused (409, `"fenced":
+  true`), the highest kept in the console directory (`epochs.json`). So an instance of a
+  controller that lost its turn to another (`sluice-wicket-cf-api`'s lease) puts nothing over
+  what the next put. A write without it is taken as before
 - the page lists an app's routes read-only (`origin: "api"`, with `app` and `owner`, `held`
   while held), and its per-host endpoints refuse their hosts (409)
 - an app and an owner are named by 1 to 100 of `A-Z`, `a-z`, `0-9`, `.`, `_` and `-`, starting

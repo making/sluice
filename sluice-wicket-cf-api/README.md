@@ -1071,7 +1071,10 @@ docker compose up -d --force-recreate --wait wicket-b
 
 The state and the logins in PostgreSQL (`--state`) and the packages and droplets in an S3 bucket
 (`--blobs`), in place of `--data-dir`'s files, are what several instances share: [ha.md](ha.md).
-The reconciling of the wickets is one process's still: run one instance.
+One at a time reconciles the wickets, the holder of a lease in the store, its writes fenced by
+its turn's epoch; the next takes over within 11s of its end, at once of its stop. An edit is still
+tried by the instance taking it: only the one reconciling the wickets is ready (`/healthz`), so a
+balancer checking it sends that one every request.
 
 ## Options
 
@@ -1415,7 +1418,8 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
   finish, and no other begins (what it was for is taken up at the next start); then the state is
   written. Past `--stop-grace` (8s) what is left is cut, as by a kill
 - `GET /healthz`, no token: 200 once every wicket was listed (or found not answering) since the
-  start, 503 saying why not before, and from a stop on: a probe's, logged by no line
+  start, 503 saying why not before, and from a stop on: a probe's, logged by no line. Of several
+  instances on one `--state`, the one reconciling the wickets alone ([ha.md](ha.md#the-reconciling-of-the-wickets))
 - auth: see [Login](#login). Every request but the root document, `/v3`, `/v3/info`, `/healthz`
   and the UAA endpoints needs a valid token (log-cache's included), and its holder may what its
   [roles](#organizations-spaces-and-roles) say

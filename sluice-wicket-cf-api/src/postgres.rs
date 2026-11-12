@@ -15,6 +15,12 @@
 //! The logins (`crate::uaa`: the keys, the sessions, the passcodes) are tables beside it, not
 //! of the state: a login is no revision, wakes no one and waits for no change. Each of their
 //! statements is a transaction of its own, on a connection of theirs.
+//!
+//! So is the lease of the instance reconciling the wickets (`crate::lease`), a row of its own
+//! renewed on a connection of its own: a renewal is no revision either. It is taken under the
+//! revision's lock, so a change sees the lease as it is until it commits: the leader's own
+//! (`Store::lead`) is refused once another took the lease, and what an instance saw of the
+//! wickets is written by it only while it is no leader, or the one ([`Postgres::transact`]).
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -26,6 +32,7 @@ use tokio_postgres::types::ToSql;
 use tokio_postgres::{AsyncMessage, Client, Config, Statement};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
+use crate::lease::Term;
 use crate::records::{Book, Row};
 use crate::store::State;
 
@@ -98,7 +105,37 @@ CREATE TABLE IF NOT EXISTS sluice_cf_passcodes (
     identity text NOT NULL,
     expires timestamptz NOT NULL
 );
+CREATE TABLE IF NOT EXISTS sluice_cf_lease (
+    one boolean PRIMARY KEY DEFAULT true CHECK (one),
+    holder text,
+    epoch bigint NOT NULL,
+    expires timestamptz NOT NULL
+);
+INSERT INTO sluice_cf_lease (holder, epoch, expires) VALUES (NULL, 0, '-infinity')
+    ON CONFLICT DO NOTHING;
 ";
+
+/// Bound on a statement of the lease: past it its connection is taken for lost.
+const LEASE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The connection of the lease, its statements one at a time (the lease's loop alone sends them).
+struct Leasing {
+    client: Client,
+    renew: Statement,
+    due: Statement,
+    locked: Statement,
+    take: Statement,
+    release: Statement,
+}
+
+/// What a try to take the lease found.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Taken {
+    /// This instance holds it, of this epoch: a turn of its own.
+    Taken(u64),
+    /// Another instance holds it, of this epoch (none ever did: 0).
+    Held(u64),
+}
 
 /// Bound on a statement of the logins: past it their connection is taken for lost.
 const ASIDE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -144,9 +181,36 @@ impl std::fmt::Debug for PostgresSettings {
 #[derive(Default)]
 pub struct Shared {
     pub state: RwLock<State>,
-    pub changes: tokio::sync::Notify,
+    /// Moved at each change of the copy, this process's or another's.
+    pub changes: tokio::sync::watch::Sender<u64>,
     /// The revision the copy is of.
     pub rev: AtomicI64,
+    /// This instance's turn reconciling the wickets, while it has one (`crate::lease`).
+    pub term: tokio::sync::watch::Sender<Option<Term>>,
+    /// The epoch of the lease as this instance last saw it: the turn of whoever leads.
+    pub leading: tokio::sync::watch::Sender<Option<u64>>,
+}
+
+impl Shared {
+    /// The copy changed.
+    pub fn changed(&self) {
+        self.changes
+            .send_modify(|changes| *changes = changes.wrapping_add(1));
+    }
+
+    /// Ends this instance's turn of `epoch`, if it is still the one, saying `why`.
+    pub fn end_term(&self, epoch: Option<u64>, why: &str) {
+        let ended = (self.term).send_if_modified(|term| match term {
+            Some(Term { epoch: of }) if *of == epoch => {
+                *term = None;
+                true
+            }
+            _ => false,
+        });
+        if ended {
+            println!("LEASE: this instance reconciles the wickets no more: {why}");
+        }
+    }
 }
 
 /// What the one changing the copy holds: the lock of `Store::update` and `Store::note`.
@@ -177,14 +241,25 @@ pub struct Sent<R> {
     result: R,
 }
 
+/// What a transaction finds first: the revision and how far back the rows removed are kept, and
+/// the lease's holder (none before any) and epoch.
+struct Head {
+    at: (i64, i64),
+    lease: (Option<String>, u64),
+}
+
 pub struct Postgres {
     config: Config,
     tls: MakeRustlsConnect,
+    /// This instance, as the lease names its holder.
+    holder: String,
     /// The connection listening, which answers the revision too (by the statement beside
     /// it); None while it is away.
     listening: Mutex<Option<(Arc<Client>, Statement)>>,
     /// The connection of the logins; None: to open. Held to open it only.
     aside: tokio::sync::Mutex<Option<Arc<Aside>>>,
+    /// The connection of the lease; None: to open.
+    leasing: tokio::sync::Mutex<Option<Leasing>>,
 }
 
 fn failed(e: tokio_postgres::Error) -> String {
@@ -204,7 +279,8 @@ fn failed(e: tokio_postgres::Error) -> String {
 }
 
 impl Postgres {
-    pub fn new(settings: &PostgresSettings) -> Result<Postgres, String> {
+    /// The store of `settings`, for the instance `holder`.
+    pub fn new(settings: &PostgresSettings, holder: &str) -> Result<Postgres, String> {
         let mut config: Config = (settings.url.parse())
             // the error may quote the URL, with its password
             .map_err(|_| "--state: expected postgres://user:password@host:port/database")?;
@@ -219,8 +295,10 @@ impl Postgres {
         Ok(Postgres {
             config,
             tls: MakeRustlsConnect::new(tls),
+            holder: holder.to_string(),
             listening: Mutex::new(None),
             aside: tokio::sync::Mutex::new(None),
+            leasing: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -235,10 +313,11 @@ impl Postgres {
         let settings = format!("SET idle_in_transaction_session_timeout = '{IDLE_IN_TRANSACTION}'");
         client.batch_execute(&settings).await.map_err(failed)?;
         let prepare = async |sql: &str| client.prepare(sql).await.map_err(failed);
-        let head = "SELECT rev, oldest, layout FROM sluice_cf_meta";
+        let head = "SELECT m.rev, m.oldest, m.layout, l.holder, l.epoch \
+                    FROM sluice_cf_meta m LEFT JOIN sluice_cf_lease l ON true";
         Ok(Session {
             head: prepare(head).await?,
-            locked: prepare(&format!("{head} FOR UPDATE")).await?,
+            locked: prepare(&format!("{head} FOR UPDATE OF m")).await?,
             since: prepare(
                 "SELECT kind, id, ord, body FROM sluice_cf_records WHERE rev > $1 ORDER BY ord",
             )
@@ -265,8 +344,9 @@ impl Postgres {
         })
     }
 
-    /// The revision, how far back the rows removed are kept, and that this build reads them.
-    async fn head(session: &Session, locked: bool) -> Result<(i64, i64), String> {
+    /// The revision, how far back the rows removed are kept, and that this build reads them;
+    /// and the lease's holder and epoch.
+    async fn head(session: &Session, locked: bool) -> Result<Head, String> {
         let statement = match locked {
             true => &session.locked,
             false => &session.head,
@@ -279,7 +359,11 @@ impl Postgres {
                  reads {SCHEMA})"
             ));
         }
-        Ok((row.get(0), row.get(1)))
+        let epoch: Option<i64> = row.get(4);
+        Ok(Head {
+            at: (row.get(0), row.get(1)),
+            lease: (row.get(3), epoch.unwrap_or_default() as u64),
+        })
     }
 
     /// Takes what was written since the copy's revision into it, within the transaction open
@@ -309,7 +393,7 @@ impl Postgres {
         book.take(&mut state, &rows, rev, all);
         drop(state);
         shared.rev.store(rev, Ordering::Release);
-        shared.changes.notify_one();
+        shared.changed();
         Ok(())
     }
 
@@ -364,17 +448,17 @@ impl Postgres {
         }
         Postgres::execute(&session, "BEGIN").await?;
         let head = Postgres::head(&session, true).await?;
-        let empty = head.0 == 0;
+        let empty = head.at.0 == 0;
         if empty {
             let state = first()?;
-            let rows = writer.book.diff(None, &state, 1);
+            let rows = writer.book.diff(None, &state, 1, true);
             Postgres::write(&session, &rows, 1, &crate::store::guid()).await?;
             Postgres::execute(&session, "COMMIT").await?;
             writer.book.written(&rows, 1);
             *shared.state.write().expect("no panic under the lock") = state;
             shared.rev.store(1, Ordering::Release);
         } else {
-            Postgres::follow(&session, &mut writer.book, shared, head).await?;
+            Postgres::follow(&session, &mut writer.book, shared, head.at).await?;
             Postgres::execute(&session, "ROLLBACK").await?;
         }
         writer.session = Some(session);
@@ -383,17 +467,20 @@ impl Postgres {
 
     /// Changes the state by `f` in a transaction, tried again until the store answers: `f`
     /// runs once more each time, on the state as it is then, so it does nothing but change it.
+    /// `leader`: a change of the instance reconciling the wickets alone, made only while the
+    /// lease is its own turn's (None otherwise).
     pub async fn update<R>(
         &self,
         writer: &mut Writer,
         shared: &Shared,
         f: impl Fn(&mut State) -> R,
-    ) -> R {
+        leader: bool,
+    ) -> Option<R> {
         let mut sent = None;
         let mut backoff = MIN_BACKOFF;
         let mut said: Option<tokio::time::Instant> = None;
         loop {
-            let tried = self.transact(writer, shared, &f, &mut sent);
+            let tried = self.transact(writer, shared, &f, &mut sent, leader);
             let error = match tokio::time::timeout(TRY_TIMEOUT, tried).await {
                 Ok(Ok(result)) => return result,
                 Ok(Err(e)) => e,
@@ -408,14 +495,19 @@ impl Postgres {
         }
     }
 
-    /// One try of [`Postgres::update`].
+    /// One try of [`Postgres::update`]. The lease is read under the revision's lock, which its
+    /// takeover takes too: as it is until the commit. An instance whose turn it ended (another
+    /// holds the lease) has the turn end here, what it saw of the wickets and did not write
+    /// forgotten; a change of the leader alone is not made but in its turn; what an instance saw
+    /// of the wickets is written unless its turn ended.
     async fn transact<R>(
         &self,
         writer: &mut Writer,
         shared: &Shared,
         f: &impl Fn(&mut State) -> R,
         sent: &mut Option<Sent<R>>,
-    ) -> Result<R, String> {
+        leader: bool,
+    ) -> Result<Option<R>, String> {
         let session = match writer.session.take() {
             Some(session) => session,
             None => self.open(false).await?,
@@ -427,13 +519,32 @@ impl Postgres {
             let found = session.client.query_opt(&session.committed, &sent);
             if found.await.map_err(failed)?.is_some() {
                 // it was committed: taken as any other's
-                Postgres::follow(&session, &mut writer.book, shared, head).await?;
+                Postgres::follow(&session, &mut writer.book, shared, head.at).await?;
                 Postgres::execute(&session, "ROLLBACK").await?;
                 writer.session = Some(session);
-                return Ok(result);
+                return Ok(Some(result));
             }
         }
-        Postgres::follow(&session, &mut writer.book, shared, head).await?;
+        Postgres::follow(&session, &mut writer.book, shared, head.at).await?;
+        let term = *shared.term.borrow();
+        // whether the lease is this instance's turn: None without one
+        let ours = term.map(|term| {
+            let (holder, epoch) = &head.lease;
+            holder.as_deref() == Some(self.holder.as_str()) && term.epoch == Some(*epoch)
+        });
+        if let (Some(false), Some(term)) = (ours, term) {
+            let (holder, epoch) = &head.lease;
+            let holder = holder.as_deref().unwrap_or("none");
+            let why = format!("{holder} holds the lease, of epoch {epoch}");
+            shared.end_term(term.epoch, &why);
+            let mut state = shared.state.write().expect("no panic under the lock");
+            writer.book.forget_observed(&mut state);
+        }
+        if leader && ours != Some(true) {
+            Postgres::execute(&session, "ROLLBACK").await?;
+            writer.session = Some(session);
+            return Ok(None);
+        }
         let mut next = shared
             .state
             .read()
@@ -441,10 +552,12 @@ impl Postgres {
             .clone();
         let result = f(&mut next);
         next.place();
-        let rev = head.0 + 1;
+        let rev = head.at.0 + 1;
         let rows = {
             let state = shared.state.read().expect("no panic under the lock");
-            writer.book.diff(Some(&state), &next, rev)
+            writer
+                .book
+                .diff(Some(&state), &next, rev, ours != Some(false))
         };
         if rows.is_empty() {
             Postgres::execute(&session, "ROLLBACK").await?;
@@ -458,12 +571,12 @@ impl Postgres {
             *shared.state.write().expect("no panic under the lock") = next;
             shared.rev.store(rev, Ordering::Release);
             writer.session = Some(session);
-            return Ok(committed.result);
+            return Ok(Some(committed.result));
         }
         // nothing kept changed: what it changed of the rest
         *shared.state.write().expect("no panic under the lock") = next;
         writer.session = Some(session);
-        Ok(result)
+        Ok(Some(result))
     }
 
     /// Takes what the others wrote since the copy's revision.
@@ -476,7 +589,7 @@ impl Postgres {
             // the revision and its rows as of one moment
             Postgres::execute(&session, "BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY").await?;
             let head = Postgres::head(&session, false).await?;
-            Postgres::follow(&session, &mut writer.book, shared, head).await?;
+            Postgres::follow(&session, &mut writer.book, shared, head.at).await?;
             Postgres::execute(&session, "COMMIT").await?;
             writer.session = Some(session);
             Ok(())
@@ -563,6 +676,110 @@ impl Postgres {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
+    }
+
+    /// What `f` asks on the connection of the lease, opened when there is none; one that fails
+    /// or does not answer within [`LEASE_TIMEOUT`] is closed (its transaction with it).
+    async fn leased<T>(
+        &self,
+        f: impl AsyncFnOnce(&Leasing) -> Result<T, tokio_postgres::Error>,
+    ) -> Result<T, String> {
+        let mut leasing = self.leasing.lock().await;
+        let asked = async {
+            if leasing.as_ref().is_none_or(|open| open.client.is_closed()) {
+                *leasing = Some(self.open_leasing().await?);
+            }
+            let open = leasing.as_ref().expect("just opened");
+            f(open).await.map_err(failed)
+        };
+        let asked = match tokio::time::timeout(LEASE_TIMEOUT, asked).await {
+            Ok(asked) => asked,
+            Err(_) => Err("--state: no answer".to_string()),
+        };
+        if asked.is_err() {
+            *leasing = None;
+        }
+        asked
+    }
+
+    async fn open_leasing(&self) -> Result<Leasing, String> {
+        let (client, connection) = (self.config.connect(self.tls.clone()).await).map_err(failed)?;
+        tokio::spawn(connection);
+        let prepare = async |sql: &str| client.prepare(sql).await.map_err(failed);
+        Ok(Leasing {
+            renew: prepare(
+                "UPDATE sluice_cf_lease SET expires = now() + $3::bigint * interval '1 millisecond' \
+                 WHERE holder = $1 AND epoch = $2::bigint AND expires > now()",
+            )
+            .await?,
+            due: prepare("SELECT holder, epoch, expires <= now() FROM sluice_cf_lease").await?,
+            locked: prepare("SELECT 1 FROM sluice_cf_meta FOR UPDATE").await?,
+            // the epoch the store's clock in milliseconds at least: a store restored from a
+            // backup, or a new one, goes on above what the wickets were sent
+            take: prepare(
+                "UPDATE sluice_cf_lease SET holder = $1, \
+                 epoch = GREATEST(epoch + 1, (extract(epoch FROM now()) * 1000)::bigint), \
+                 expires = now() + $2::bigint * interval '1 millisecond' \
+                 WHERE expires <= now() OR holder = $1 RETURNING epoch",
+            )
+            .await?,
+            release: prepare(
+                "UPDATE sluice_cf_lease SET expires = now() WHERE holder = $1 AND epoch = $2::bigint",
+            )
+            .await?,
+            client,
+        })
+    }
+
+    /// Renews the lease of `epoch` this instance holds for `lease` more, by the store's clock:
+    /// whether it held it still.
+    pub async fn renew(&self, epoch: u64, lease: Duration) -> Result<bool, String> {
+        let (epoch, millis) = (epoch as i64, lease.as_millis() as i64);
+        let renew: [&(dyn ToSql + Sync); 3] = [&self.holder, &epoch, &millis];
+        let renewed =
+            self.leased(async |leasing| (leasing.client.execute(&leasing.renew, &renew)).await);
+        Ok(renewed.await? == 1)
+    }
+
+    /// Takes the lease for `lease`, by the store's clock, unless another instance holds it
+    /// still; under the revision's lock, so a change sees the lease as it was or as taken, never
+    /// both. Taken anew, a turn of this instance's own of the epoch after it; an epoch is the
+    /// store's clock in milliseconds at least.
+    pub async fn take(&self, lease: Duration) -> Result<Taken, String> {
+        let millis = lease.as_millis() as i64;
+        let holder = self.holder.as_str();
+        self.leased(async |leasing| {
+            let client = &leasing.client;
+            let due = client.query_one(&leasing.due, &[]).await?;
+            let (held_by, epoch, due): (Option<String>, i64, bool) =
+                (due.get(0), due.get(1), due.get(2));
+            if !due && held_by.as_deref() != Some(holder) {
+                return Ok(Taken::Held(epoch as u64));
+            }
+            client.batch_execute("BEGIN").await?;
+            client.query_one(&leasing.locked, &[]).await?;
+            let take: [&(dyn ToSql + Sync); 2] = [&holder, &millis];
+            let taken = client.query_opt(&leasing.take, &take).await?;
+            client.batch_execute("COMMIT").await?;
+            Ok(match taken {
+                Some(taken) => Taken::Taken(taken.get::<_, i64>(0) as u64),
+                // another took it meanwhile
+                None => {
+                    let held = client.query_one(&leasing.due, &[]).await?;
+                    Taken::Held(held.get::<_, i64>(1) as u64)
+                }
+            })
+        })
+        .await
+    }
+
+    /// Lets go of the lease of `epoch`, if this instance holds it: the next to try takes it.
+    pub async fn release(&self, epoch: u64) -> Result<(), String> {
+        let epoch = epoch as i64;
+        let release: [&(dyn ToSql + Sync); 2] = [&self.holder, &epoch];
+        self.leased(async |leasing| (leasing.client.execute(&leasing.release, &release)).await)
+            .await
+            .map(drop)
     }
 
     /// The connection of the logins, opened when there is none or it ended.

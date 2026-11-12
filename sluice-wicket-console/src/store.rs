@@ -7,6 +7,7 @@
 //! <dir>/<kind>/<sha256>/<name>      the files they name: components, rootfs images
 //! <dir>/uploads/<sha256><ext>       the files uploaded by digest, for UPLOAD_GRACE
 //! <dir>/wicket-id                   the wicket's id, made at its first start (`identity`)
+//! <dir>/epochs.json                 the highest epoch each owner sent (`fence`)
 //! ```
 //!
 //! A file's path names its digest, so other content is another target: its

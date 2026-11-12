@@ -62,6 +62,7 @@ use http::{Method, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sluice_wicket_console::env::Env;
+use sluice_wicket_console::fence::{Admitted, Fence};
 use sluice_wicket_console::held::{self, Held};
 use sluice_wicket_console::http::{
     Body, Edited, Intake, Received, Refusal, Response, error, json, pairs, read, receive,
@@ -133,6 +134,8 @@ pub struct Console {
     pub identity: Identity,
     /// The apps held until their owners confirm them.
     pub held: Arc<Held>,
+    /// The highest epoch each owner sent: a write of a lower one refused.
+    pub fence: Fence,
 }
 
 impl Service for Console {
@@ -208,7 +211,7 @@ impl Service for Console {
         if let Some(name) = path.strip_prefix("/api/apps/") {
             return match *method {
                 Method::PUT => self.put_app(name, parts, take()).await,
-                Method::DELETE => self.delete_app(name, query).await,
+                Method::DELETE => self.delete_app(name, parts).await,
                 _ => error(StatusCode::METHOD_NOT_ALLOWED, "an app takes PUT or DELETE"),
             };
         }
@@ -220,13 +223,13 @@ impl Service for Console {
         }
         if let Some(owner) = path.strip_prefix("/api/evacuated/") {
             return match *method {
-                Method::PUT => leaving::evacuated(&self.status, owner),
+                Method::PUT => leaving::evacuated(&self.status, &self.fence, owner, parts).await,
                 _ => error(StatusCode::METHOD_NOT_ALLOWED, "an owner's word takes PUT"),
             };
         }
         if let Some(owner) = path.strip_prefix("/api/confirmed/") {
             return match *method {
-                Method::PUT => held::confirmed(&self.held, owner, parts, take()).await,
+                Method::PUT => held::confirmed(&self.held, &self.fence, owner, parts, take()).await,
                 _ => error(StatusCode::METHOD_NOT_ALLOWED, "an owner's word takes PUT"),
             };
         }
@@ -485,32 +488,44 @@ impl Console {
         let app = serde_json::from_slice::<AppBody>(&body)
             .map_err(|e| format!("the app: {e}"))
             .and_then(|app| app_spec(name, app));
-        match app {
-            Ok(app) => {
-                let name = name.to_string();
-                let put = self.request(Edit::PutApp {
-                    name: name.clone(),
-                    app,
-                });
-                // as its owner wants it
-                edited(put.await.inspect(|_| self.held.release(&name)))
-            }
-            Err(e) => error(StatusCode::BAD_REQUEST, e),
-        }
+        let app = match app {
+            Ok(app) => app,
+            Err(e) => return error(StatusCode::BAD_REQUEST, e),
+        };
+        let admitted = match self.fence.admit(Some(&app.owner), parts).await {
+            Ok(admitted) => admitted,
+            Err(refused) => return refused.into(),
+        };
+        let name = name.to_string();
+        let put = self.request_admitted(
+            Edit::PutApp {
+                name: name.clone(),
+                app,
+            },
+            Some(admitted),
+        );
+        // as its owner wants it
+        edited(put.await.inspect(|_| self.held.release(&name)))
     }
 
-    async fn delete_app(&self, name: &str, query: Option<&str>) -> Response {
-        match owner_of(name, query) {
-            Ok(owner) => {
-                let name = name.to_string();
-                let removal = self.request(Edit::DeleteApp {
-                    name: name.clone(),
-                    owner,
-                });
-                edited(removal.await.inspect(|_| self.held.release(&name)))
-            }
-            Err(e) => error(StatusCode::BAD_REQUEST, e),
-        }
+    async fn delete_app(&self, name: &str, parts: &Parts) -> Response {
+        let owner = match owner_of(name, parts.uri.query()) {
+            Ok(owner) => owner,
+            Err(e) => return error(StatusCode::BAD_REQUEST, e),
+        };
+        let admitted = match self.fence.admit(Some(&owner), parts).await {
+            Ok(admitted) => admitted,
+            Err(refused) => return refused.into(),
+        };
+        let name = name.to_string();
+        let removal = self.request_admitted(
+            Edit::DeleteApp {
+                name: name.clone(),
+                owner,
+            },
+            Some(admitted),
+        );
+        edited(removal.await.inspect(|_| self.held.release(&name)))
     }
 
     /// The disks kept in the console's directory, and whether an app has each.
@@ -630,6 +645,16 @@ impl Console {
 
     /// Has the reloader apply `edit`: its outcome, or the answer refusing it.
     async fn request(&self, edit: Edit) -> Result<Outcome, Refusal> {
+        self.request_admitted(edit, None).await
+    }
+
+    /// [`Console::request`] of an edit its owner's fence admitted, let go of once the edit is
+    /// sent: the reloader takes the edits in the order sent.
+    async fn request_admitted(
+        &self,
+        edit: Edit,
+        admitted: Option<Admitted>,
+    ) -> Result<Outcome, Refusal> {
         let draining = || {
             Refusal::new(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -637,7 +662,9 @@ impl Console {
             )
         };
         let (reply, outcome) = oneshot::channel();
-        if self.requests.send(Request { edit, reply }).await.is_err() {
+        let sent = self.requests.send(Request { edit, reply }).await;
+        drop(admitted);
+        if sent.is_err() {
             return Err(draining());
         }
         match outcome.await {

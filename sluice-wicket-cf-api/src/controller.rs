@@ -68,6 +68,14 @@
 //! from a crash, a wicket serves no app deleted, stopped, moved or changed meanwhile. It is
 //! listed again [`MAX_PAUSE`] at most after it answers again; the cf-api down, the wicket
 //! serves what it holds once `held-ms` passed.
+//!
+//! Of several instances, one at a time reconciles the wickets, in its turn of the lease
+//! (`crate::lease`, [`Controller::lead`]): the watches, the confirmations, the evacuations and
+//! moves, the purges, the deployments' steps are its turn's, ended with it, the next taking them
+//! up from the state as a start does. Its writes carry the turn's epoch, a wicket refusing one
+//! below the highest it saw. What it saw of the wickets (their answers, budgets, offers, ...) is
+//! the state's for every instance (`Store::observe`), each placing by it; the others list no
+//! wicket but for a request (the process stats).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -75,8 +83,11 @@ use std::time::Duration;
 
 use futures_util::future::join_all;
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 
 use crate::blobs::Reading;
+use crate::lease::Term;
 use crate::logs::Logs;
 use crate::placement::{Budget, Evacuated, Move};
 use crate::services::Offer;
@@ -104,7 +115,7 @@ pub const HELD: Duration = Duration::from_secs(15);
 /// The first pause between two listings of a wicket that does not answer, and the longest: one
 /// back is listed that soon, what it holds confirmed.
 const MIN_PAUSE: Duration = Duration::from_secs(1);
-const MAX_PAUSE: Duration = Duration::from_secs(2);
+pub const MAX_PAUSE: Duration = Duration::from_secs(2);
 
 /// Why the indices on a wicket move off it.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -152,15 +163,28 @@ enum Relocated {
     Undone,
 }
 
-/// What a wicket listed of itself.
+/// What a wicket listed of itself that the leader alone keeps (the rest is the state's:
+/// [`Controller::note`]).
 struct Noted {
-    offer: Offer,
-    runtime: Runtime,
     /// None from a wicket predating it.
     id: Option<String>,
     revision: u64,
-    /// It lists its start: it holds a share put with `held-ms` from then on.
-    holds: bool,
+}
+
+/// The work of a turn reconciling the wickets: cancelled at its end, which waits for it.
+struct Work {
+    cancel: CancellationToken,
+    tasks: TaskTracker,
+}
+
+impl Work {
+    /// Runs `task` until the turn's end.
+    fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let cancel = self.cancel.clone();
+        self.tasks.spawn(async move {
+            cancel.run_until_cancelled(task).await;
+        });
+    }
 }
 
 pub struct Controller {
@@ -200,6 +224,13 @@ pub struct Controller {
     /// The apps whose indices a wicket's stack, newly listed, placed again: their shares are
     /// to apply ([`Controller::apply_placed`]).
     placed_again: Mutex<BTreeSet<String>>,
+    /// The work of this instance's turn reconciling the wickets, while it has one.
+    work: Mutex<Option<Work>>,
+    /// The deployments whose steps this turn takes, by guid.
+    driving: Mutex<BTreeSet<String>>,
+    /// The purges this turn tried as they came, by store and namespace: tried again after the
+    /// listings.
+    purges_tried: Mutex<BTreeSet<(String, String)>>,
 }
 
 impl Controller {
@@ -230,7 +261,145 @@ impl Controller {
             evacuations: Mutex::default(),
             respreading: Mutex::default(),
             placed_again: Mutex::default(),
+            work: Mutex::default(),
+            driving: Mutex::default(),
+            purges_tried: Mutex::default(),
         }
+    }
+
+    /// Reconciles the wickets in each turn of this instance (`Store::terms`), from its begin as
+    /// a start does (the deployments and moves under way taken up, every wicket watched) to its
+    /// end, which stops its work, its writes carrying the turn's epoch meanwhile. What it saw of
+    /// the wickets and did not write is forgotten at the end.
+    pub async fn lead(self: Arc<Self>) {
+        let mut terms = self.store.terms();
+        loop {
+            let term = *terms.borrow_and_update();
+            if let Some(term) = term {
+                let cancel = self.begin(term);
+                // the turn ends with this too: a stop ends the work under way
+                let _ending = cancel.clone().drop_guard();
+                loop {
+                    if terms.changed().await.is_err() {
+                        return;
+                    }
+                    if *terms.borrow() != Some(term) {
+                        break;
+                    }
+                }
+                self.end().await;
+            } else if terms.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Begins the turn `term`: its work under way. Its token, the work's end.
+    fn begin(self: &Arc<Self>, term: Term) -> CancellationToken {
+        for wicket in &self.wickets {
+            wicket.set_epoch(term.epoch);
+        }
+        let cancel = CancellationToken::new();
+        *self.work.lock().expect("no panic under the lock") = Some(Work {
+            cancel: cancel.clone(),
+            tasks: TaskTracker::new(),
+        });
+        // a turn begins as a start: what was a start's to know is learned anew
+        (self.listed_once.lock().expect("no panic under the lock")).clear();
+        self.resume();
+        self.spawn(self.clone().watch());
+        self.spawn(self.clone().follow());
+        cancel
+    }
+
+    /// Ends the turn: its work stopped and waited for, what it saw of the wickets and did not
+    /// write forgotten, its writes carrying no epoch from then on.
+    async fn end(&self) {
+        let work = (self.work.lock().expect("no panic under the lock")).take();
+        if let Some(work) = work {
+            work.cancel.cancel();
+            work.tasks.close();
+            work.tasks.wait().await;
+        }
+        for wicket in &self.wickets {
+            wicket.set_epoch(None);
+        }
+        self.store.forget_observed().await;
+        for held in [&self.respreading, &self.placed_again, &self.driving] {
+            held.lock().expect("no panic under the lock").clear();
+        }
+        (self.evacuations.lock().expect("no panic under the lock")).clear();
+        (self.did_not_start.lock().expect("no panic under the lock")).clear();
+        (self.purges_tried.lock().expect("no panic under the lock")).clear();
+        (self.listed.lock().expect("no panic under the lock")).clear();
+        (self.down.lock().expect("no panic under the lock")).clear();
+    }
+
+    /// Runs `task` as work of this instance's turn, if it has one: it ends with it.
+    pub(crate) fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) {
+        let work = self.work.lock().expect("no panic under the lock");
+        if let Some(work) = work.as_ref() {
+            work.spawn(task);
+        }
+    }
+
+    /// Whether this instance reconciles the wickets now: in a turn whose work runs.
+    pub fn leads(&self) -> bool {
+        (self.work.lock().expect("no panic under the lock")).is_some()
+    }
+
+    /// Takes up, while this instance's turn lasts, the deployments under way it does not
+    /// ([`Controller::take_up`]) and tries the purges it has not as they come: the requests of
+    /// any instance make them.
+    async fn follow(self: Arc<Self>) {
+        let mut changes = self.store.changes();
+        loop {
+            let (stepping, purges) = self.store.read(|state| {
+                let deployments = state.deployments.iter();
+                let stepping: Vec<(String, String)> = (deployments.filter(|kept| kept.stepping()))
+                    .map(|kept| (kept.app.clone(), kept.guid.clone()))
+                    .collect();
+                let purges: BTreeSet<(String, String)> = (state.purges.iter())
+                    .map(|purge| (purge.store.clone(), purge.namespace.clone()))
+                    .collect();
+                (stepping, purges)
+            });
+            for (app, deployment) in stepping {
+                self.take_up(&app, &deployment);
+            }
+            let new = {
+                let mut tried = self.purges_tried.lock().expect("no panic under the lock");
+                let new = purges.iter().any(|purge| !tried.contains(purge));
+                *tried = purges;
+                new
+            };
+            if new {
+                let controller = self.clone();
+                self.spawn(async move { controller.purge_pending().await });
+            }
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Takes the steps of the deployment `deployment` of the app `guid` in this instance's
+    /// turn, unless it does already: none but the turn's (`crate::deployments`).
+    pub fn take_up(self: &Arc<Self>, guid: &str, deployment: &str) {
+        let work = self.work.lock().expect("no panic under the lock");
+        let Some(work) = work.as_ref() else {
+            return;
+        };
+        let mut driving = self.driving.lock().expect("no panic under the lock");
+        if !driving.insert(deployment.to_string()) {
+            return;
+        }
+        let (controller, guid, deployment) =
+            (self.clone(), guid.to_string(), deployment.to_string());
+        work.spawn(async move {
+            controller.clone().deploy(guid, deployment.clone()).await;
+            (controller.driving.lock().expect("no panic under the lock")).remove(&deployment);
+        });
     }
 
     /// The owner the apps are put under.
@@ -413,11 +582,14 @@ impl Controller {
     /// What every wasm wicket offers, as each last listed it; none listed yet, the first
     /// answering now.
     pub async fn offer(&self) -> Result<Offer, Failure> {
-        let none = (self.listed.lock().expect("no panic under the lock")).is_empty();
-        if none {
-            self.list_any().await?;
+        if let Some(offered) = self.offered() {
+            return Ok(offered);
         }
-        Ok(self.offered().unwrap_or_default())
+        let listing = self.list_any().await?;
+        Ok(self.offered().unwrap_or_else(|| match listing.runtime() {
+            Runtime::Wasm => Offer::new(&listing.capabilities, &listing.keyvalue_stores),
+            Runtime::Firecracker => Offer::default(),
+        }))
     }
 
     /// The stacks the wickets run, the first configured's first ([`State::stacks`]); none known
@@ -427,18 +599,25 @@ impl Controller {
         if !known.is_empty() {
             return known;
         }
-        let _ = self.list_any().await;
-        self.store.read(State::stacks)
+        let listing = self.list_any().await;
+        let known = self.store.read(State::stacks);
+        match (known.is_empty(), listing) {
+            (true, Ok(listing)) => vec![listing.runtime()],
+            _ => known,
+        }
     }
 
-    /// Lists the wickets in turn until one answers, noting what it lists.
-    async fn list_any(&self) -> Result<(), Failure> {
+    /// Lists the wickets in turn until one answers: what it lists, noted in this instance's
+    /// turn reconciling them.
+    async fn list_any(&self) -> Result<Listing, Failure> {
         let mut failed = None;
         for wicket in &self.wickets {
             match wicket.list(None).await {
                 Ok(listing) => {
-                    self.note(wicket, &listing).await;
-                    return Ok(());
+                    if self.leads() {
+                        self.note(wicket, &listing).await;
+                    }
+                    return Ok(listing);
                 }
                 Err(e) => failed = Some(e),
             }
@@ -447,9 +626,14 @@ impl Controller {
     }
 
     /// The wicket configured before `wicket` that listed the id it lists: it is a second name.
+    /// One not listed in this turn yet by the id it listed last (`State::wicket_ids`).
     fn first_of(&self, wicket: &Wicket) -> Option<(&Wicket, String)> {
+        let kept = self.store.read(|state| state.wicket_ids.clone());
         let listed = self.listed.lock().expect("no panic under the lock");
-        let id = |wicket: &Wicket| listed.get(&wicket.name)?.id.clone();
+        let id = |wicket: &Wicket| match listed.get(&wicket.name) {
+            Some(noted) => noted.id.clone(),
+            None => kept.get(&wicket.name).cloned(),
+        };
         let its = id(wicket)?;
         let before = self
             .wickets
@@ -466,21 +650,23 @@ impl Controller {
         self.with_offers(Offer::common)
     }
 
-    /// What `f` makes of the offers of the wasm wickets listed.
+    /// What `f` makes of the offers of the wasm wickets listed, as the state keeps them.
     fn with_offers<R>(&self, f: impl FnOnce(&[&Offer]) -> R) -> R {
-        let listed = self.listed.lock().expect("no panic under the lock");
-        let offers: Vec<&Offer> = (self.wickets.iter())
-            .filter_map(|wicket| listed.get(&wicket.name))
-            .filter(|noted| noted.runtime == Runtime::Wasm)
-            .map(|noted| &noted.offer)
-            .collect();
-        f(&offers)
+        self.store.read(|state| {
+            let wasm = |wicket: &&Arc<Wicket>| {
+                state.wickets.runtimes.get(&wicket.name) == Some(&Runtime::Wasm)
+            };
+            let offers: Vec<&Offer> = (self.wickets.iter().filter(wasm))
+                .filter_map(|wicket| state.wickets.offers.get(&wicket.name))
+                .collect();
+            f(&offers)
+        })
     }
 
     /// Whether `wicket` lists the keyvalue store `store`: None before it listed anything.
     fn lists_store(&self, wicket: &Wicket, store: &str) -> Option<bool> {
-        let listed = self.listed.lock().expect("no panic under the lock");
-        Some(listed.get(&wicket.name)?.offer.has_store(store))
+        let offer = |state: &State| Some(state.wickets.offers.get(&wicket.name)?.has_store(store));
+        self.store.read(offer)
     }
 
     /// Keeps what `wicket` listed it runs: the apps are placed by it. Another stack than the
@@ -501,12 +687,15 @@ impl Controller {
         };
         let before = self
             .store
-            .update(|state| {
+            .lead(|state| {
                 let before = placements(state);
                 state.wickets.runtimes.insert(name.clone(), runs);
                 before
             })
             .await;
+        let Some(before) = before else {
+            return;
+        };
         let after = self.store.read(placements);
         let placed: Vec<String> = (after.into_iter())
             .filter(|placement| !before.contains(placement))
@@ -531,7 +720,7 @@ impl Controller {
             std::mem::take(&mut *self.placed_again.lock().expect("no panic under the lock"));
         for guid in placed {
             let controller = self.clone();
-            tokio::spawn(async move { controller.sync(&guid).await });
+            self.spawn(async move { controller.sync(&guid).await });
         }
     }
 
@@ -542,19 +731,28 @@ impl Controller {
         self.note_stack(wicket, listing.runtime()).await;
         let id = listing.wicket.as_ref().map(|listed| listed.id.clone());
         let noted = Noted {
-            offer: Offer::new(&listing.capabilities, &listing.keyvalue_stores),
-            runtime: listing.runtime(),
             id: id.clone(),
             revision: listing.revision,
-            holds: (listing.wicket.as_ref()).is_some_and(|listed| listed.since.is_some()),
         };
         let before = (self.listed.lock().expect("no panic under the lock"))
             .insert(wicket.name.clone(), noted);
+        let offer = Offer::new(&listing.capabilities, &listing.keyvalue_stores);
+        let holds = (listing.wicket.as_ref()).is_some_and(|listed| listed.since.is_some());
+        let name = &wicket.name;
+        self.store
+            .observe(|state| {
+                state.wickets.offers.insert(name.clone(), offer);
+                match holds {
+                    true => state.wickets.holds.insert(name.clone()),
+                    false => state.wickets.holds.remove(name),
+                };
+            })
+            .await;
         // which stores they share: the apps are placed by it
         let stores = self.with_offers(Offer::stores);
         let changed = self
             .store
-            .note(|state| std::mem::replace(&mut state.wickets.stores, stores.clone()) != stores)
+            .observe(|state| std::mem::replace(&mut state.wickets.stores, stores.clone()) != stores)
             .await;
         if changed {
             self.store.update(|_| ()).await;
@@ -567,12 +765,12 @@ impl Controller {
             );
         }
         let barred: BTreeMap<&String, String> = (self.wickets.iter())
-            .filter_map(|wicket| Some((&wicket.name, self.odd(wicket)?)))
+            .filter_map(|wicket| Some((&wicket.name, self.second_name(wicket)?)))
             .collect();
         let odd: BTreeSet<String> = barred.keys().map(|name| name.to_string()).collect();
         let was = self
             .store
-            .note(|state| std::mem::replace(&mut state.wickets.odd, odd.clone()))
+            .observe(|state| std::mem::replace(&mut state.wickets.odd, odd.clone()))
             .await;
         for wicket in &self.wickets {
             match (was.contains(&wicket.name), barred.get(&wicket.name)) {
@@ -608,7 +806,7 @@ impl Controller {
             .as_ref()
             .and_then(|listed| listed.node.clone());
         self.store
-            .note(|state| {
+            .observe(|state| {
                 let wickets = &mut state.wickets;
                 match budget {
                     Some(budget) => wickets.budgets.insert(wicket.name.clone(), budget),
@@ -638,10 +836,10 @@ impl Controller {
         if was.as_ref() == Some(&id) {
             return false;
         }
-        self.store
-            .update(|state| state.wicket_ids.insert(wicket.name.clone(), id.clone()))
+        let kept = (self.store)
+            .lead(|state| state.wicket_ids.insert(wicket.name.clone(), id.clone()))
             .await;
-        let Some(was) = was else {
+        let (Some(_), Some(was)) = (kept, was) else {
             return false;
         };
         println!(
@@ -653,8 +851,8 @@ impl Controller {
         true
     }
 
-    /// Why nothing is put on `wicket`: it is a second name of a wicket.
-    fn odd(&self, wicket: &Wicket) -> Option<String> {
+    /// Why nothing is put on `wicket`: it is a second name of a wicket, as it listed it.
+    fn second_name(&self, wicket: &Wicket) -> Option<String> {
         let (first, id) = self.first_of(wicket)?;
         Some(format!(
             "{} lists the id {id} of {}: a second name of one wicket",
@@ -662,9 +860,33 @@ impl Controller {
         ))
     }
 
+    /// Why nothing is put on `wicket`: it is a second name of a wicket, as the state says.
+    fn odd(&self, wicket: &Wicket) -> Option<String> {
+        let odd = self
+            .store
+            .read(|state| state.wickets.odd.contains(&wicket.name));
+        odd.then(|| {
+            let generic = || format!("{} is a second name of one wicket", wicket.label);
+            self.second_name(wicket).unwrap_or_else(generic)
+        })
+    }
+
+    /// `e`, a wicket's answer to a write, ends this instance's turn reconciling them when the
+    /// wicket refused its epoch: another instance took the lease.
+    fn fenced(&self, wicket: &Wicket, e: &Failure) {
+        if let Failure::Fenced { epoch, error } = e {
+            let why = format!("{} refused its epoch: {error}", wicket.label);
+            self.store.end_term(*epoch, &why);
+        }
+    }
+
     /// Deletes through every wicket at once the data of the deleted instances no started app
-    /// maps any more ([`Controller::purge_on`]).
+    /// maps any more ([`Controller::purge_on`]): in this instance's turn reconciling them, else
+    /// by the instance whose turn it is, told by the change of the state.
     pub async fn purge_pending(&self) {
+        if !self.leads() {
+            return;
+        }
         join_all(self.wickets.iter().map(|wicket| self.purge_on(wicket))).await;
     }
 
@@ -694,10 +916,11 @@ impl Controller {
         for purge in due {
             let same =
                 |kept: &Purge| kept.store == purge.store && kept.namespace == purge.namespace;
-            // through this wicket: gone, or none of its; of a store they share, deleted once
+            // through this wicket: gone, or none of its; of a store they share, deleted once.
+            // Whether the turn goes on
             let done = async |all: bool| {
                 self.store
-                    .update(|state| {
+                    .lead(|state| {
                         let configured = &state.wickets.configured;
                         if let Some(kept) = state.purges.iter_mut().find(|kept| same(kept)) {
                             match all {
@@ -714,10 +937,13 @@ impl Controller {
                             !done
                         });
                     })
-                    .await;
+                    .await
+                    .is_some()
             };
             if self.lists_store(wicket, &purge.store) == Some(false) {
-                done(false).await;
+                if !done(false).await {
+                    return;
+                }
                 continue;
             }
             let shared = self
@@ -755,9 +981,14 @@ impl Controller {
                     );
                     false
                 }
-                Err(_) => continue,
+                Err(e) => {
+                    self.fenced(wicket, &e);
+                    continue;
+                }
             };
-            done(shared && deleted).await;
+            if !done(shared && deleted).await {
+                return;
+            }
         }
     }
 
@@ -789,17 +1020,22 @@ impl Controller {
             match wicket.delete(&guid).await {
                 Ok(_) => println!("[{guid}] CELL: removed from {label}: the app was deleted"),
                 Err(e) if e.retried() => {
+                    self.fenced(wicket, &e);
                     println!("[{guid}] CELL: not removed from {label} yet: {e}");
                     continue;
                 }
                 Err(e) => println!("[{guid}] CELL: not removed from {label}: {e}"),
             }
-            self.store
-                .update(|state| {
+            let done = self
+                .store
+                .lead(|state| {
                     let gone = |kept: &Removal| kept.app == guid && kept.wicket == wicket.name;
                     state.removals.retain(|kept| !gone(kept))
                 })
                 .await;
+            if done.is_none() {
+                return;
+            }
         }
     }
 
@@ -820,7 +1056,7 @@ impl Controller {
                 Ok(edited) => {
                     let was = self
                         .store
-                        .note(|state| {
+                        .observe(|state| {
                             let outcomes = state.outcomes.get_mut(guid)?;
                             let was = outcomes.remove(&wicket.name);
                             if outcomes.is_empty() {
@@ -839,6 +1075,7 @@ impl Controller {
                     Ok(())
                 }
                 Err(e) => {
+                    self.fenced(wicket, &e);
                     let line = format!("Not removed from {}: {e}", wicket.label);
                     self.logs.add(guid, "CELL", line);
                     Err(e)
@@ -870,6 +1107,11 @@ impl Controller {
                 put = wicket.put(guid, &app).await;
             }
         }
+        if let Err(e @ Failure::Fenced { .. }) = &put {
+            // not the wicket's word on the share: this instance's turn is over
+            self.fenced(wicket, e);
+            return put.map(|_| ());
+        }
         let app = &app;
         {
             let mut crashed = self.did_not_start.lock().expect("no panic under the lock");
@@ -897,7 +1139,8 @@ impl Controller {
                 Outcome::Refused(error.clone()),
                 format!("{} refused the app: {error}", wicket.sentence()),
             ),
-            Err(Failure::Unreachable(e)) => (
+            // a write fenced was answered above
+            Err(Failure::Unreachable(e) | Failure::Fenced { error: e, .. }) => (
                 Outcome::Unreachable,
                 format!(
                     "{} is unreachable, the app is put when it is back: {e}",
@@ -912,7 +1155,7 @@ impl Controller {
                 .get(&wicket.name)
                 .map_or(0, |noted| noted.revision);
             self.store
-                .note(|state| state.wickets.full.insert(wicket.name.clone(), revision))
+                .observe(|state| state.wickets.full.insert(wicket.name.clone(), revision))
                 .await;
         }
         put.map(|_| ())
@@ -1084,7 +1327,7 @@ impl Controller {
     async fn record(&self, wicket: &Wicket, guid: &str, outcome: Outcome, line: &str) {
         let changed = self
             .store
-            .note(|state| {
+            .observe(|state| {
                 if state.app(guid).is_none() {
                     return false;
                 }
@@ -1198,7 +1441,7 @@ impl Controller {
                         continue;
                     };
                     let (controller, wicket, guid) = (self.clone(), wicket.clone(), guid.clone());
-                    tokio::spawn(async move {
+                    self.spawn(async move {
                         let synced = {
                             let _held = held;
                             controller.sync_held(&wicket, &guid).await
@@ -1248,8 +1491,9 @@ impl Controller {
     /// The `held-ms` of a share put to `wicket`: [`HELD`] of one listing its start, none of one
     /// predating it, which takes none.
     fn held_ms(&self, wicket: &Wicket) -> Option<u64> {
-        let listed = self.listed.lock().expect("no panic under the lock");
-        let holds = listed.get(&wicket.name).is_some_and(|noted| noted.holds);
+        let holds = self
+            .store
+            .read(|state| state.wickets.holds.contains(&wicket.name));
         holds.then_some(HELD.as_millis() as u64)
     }
 
@@ -1269,6 +1513,7 @@ impl Controller {
                 false
             }
             Err(e) => {
+                self.fenced(wicket, &e);
                 println!(
                     "CELL: {} not told its apps are as wanted: {e}",
                     wicket.label
@@ -1286,7 +1531,7 @@ impl Controller {
     }
 
     /// Watches every wicket, each apart ([`Controller::watch_one`]).
-    pub async fn watch(self: Arc<Self>) {
+    async fn watch(self: Arc<Self>) {
         let wickets = self.wickets.iter();
         join_all(wickets.map(|wicket| self.clone().watch_one(wicket.clone()))).await;
     }
@@ -1429,7 +1674,7 @@ impl Controller {
             }
         }
         let (controller, wicket) = (self.clone(), wicket.clone());
-        tokio::spawn(async move {
+        self.spawn(async move {
             controller.evacuate(&wicket, away).await;
             let mut evacuations = controller
                 .evacuations
@@ -1495,10 +1740,11 @@ impl Controller {
                     }
                     let mut evacuated = self.store.read(|state| state.evacuation(&guid, name));
                     if !evacuated.moves.is_empty() {
-                        // kept: a restart takes them up
+                        // kept: a restart, or the next turn, takes them up
                         evacuated = (self.store)
-                            .update(|state| state.evacuate(&guid, name))
-                            .await;
+                            .lead(|state| state.evacuate(&guid, name))
+                            .await
+                            .unwrap_or_default();
                     }
                     let Evacuated {
                         moves,
@@ -1562,10 +1808,13 @@ impl Controller {
                     "CELL: {} told the apps' indices left on it stay until it stops",
                     wicket.label
                 ),
-                Err(e) => println!(
-                    "CELL: {} not told the apps' indices left on it stay: {e}",
-                    wicket.label
-                ),
+                Err(e) => {
+                    self.fenced(wicket, &e);
+                    println!(
+                        "CELL: {} not told the apps' indices left on it stay: {e}",
+                        wicket.label
+                    )
+                }
             }
         }
     }
@@ -1578,7 +1827,7 @@ impl Controller {
             return;
         }
         let (controller, wicket) = (self.clone(), wicket.clone());
-        tokio::spawn(async move {
+        self.spawn(async move {
             controller.respread(&wicket).await;
             let mut respreading = controller
                 .respreading
@@ -1596,9 +1845,9 @@ impl Controller {
         loop {
             let found = self
                 .store
-                .update(|state| state.respread(&wicket.name, &skipped))
+                .lead(|state| state.respread(&wicket.name, &skipped))
                 .await;
-            let Some((guid, (index, to))) = found else {
+            let Some(Some((guid, (index, to)))) = found else {
                 return;
             };
             let line = format!(
@@ -1626,7 +1875,9 @@ impl Controller {
         });
         for (guid, moves) in moving {
             let controller = self.clone();
-            tokio::spawn(async move { controller.relocate(&guid, moves).await });
+            self.spawn(async move {
+                controller.relocate(&guid, moves).await;
+            });
         }
     }
 
@@ -1684,10 +1935,11 @@ impl Controller {
         for ((index, to), served) in served {
             match served {
                 Ok(()) => {
-                    let from = self
-                        .store
-                        .update(|state| state.moved(guid, index, &to))
-                        .await;
+                    let from = self.store.lead(|state| state.moved(guid, index, &to)).await;
+                    let Some(from) = from else {
+                        // the turn over: the next takes the move up
+                        return Relocated::Undone;
+                    };
                     if let Some(from) = from {
                         let line = format!(
                             "Index {index} runs on the wicket {to}: out of the wicket {from}'s share"
@@ -1703,8 +1955,11 @@ impl Controller {
         for ((index, to), why) in &undone {
             let at = self
                 .store
-                .update(|state| state.unmoved(guid, *index, to))
+                .lead(|state| state.unmoved(guid, *index, to))
                 .await;
+            let Some(at) = at else {
+                return Relocated::Undone;
+            };
             if let Some(at) = at {
                 let line = format!("Index {index} stays on the wicket {at}: {why}");
                 self.logs.add(guid, "CELL", line);
@@ -1824,11 +2079,16 @@ impl Controller {
         }
     }
 
-    /// Whether the API is ready: every wicket listed once (or found not answering), the state
-    /// read before; not from the stop on. Err with why not.
+    /// Whether the API is ready: the state read before, reconciling the wickets, every wicket
+    /// listed once (or found not answering) in this turn; not from the stop on. Err with why
+    /// not. An edit is tried against the wickets by the instance taking it: of several, only
+    /// the one reconciling them is ready, so a balancer checking it sends it every request.
     pub fn ready(&self) -> Result<(), String> {
         if self.stop.stopping() {
             return Err("the cf-api stops".into());
+        }
+        if !self.store.leads() {
+            return Err("another instance reconciles the wickets".into());
         }
         let listed = self.listed_once.lock().expect("no panic under the lock");
         let unlisted: Vec<&str> = (self.wickets.iter())
@@ -1863,16 +2123,19 @@ impl Controller {
         self.store.read(|state| state.wickets.gone.contains(name))
     }
 
-    /// Whether `wicket`, not answering since `since`, is gone: `--wicket-away-grace` passed, and
-    /// another wicket is configured. Placed on no more from then on, logged once.
+    /// Whether `wicket`, not answering since `since`, is gone: `--wicket-away-grace` passed, or
+    /// it was gone in the turn before, and another wicket is configured. Placed on no more from
+    /// then on, logged once.
     async fn gone(&self, wicket: &Wicket, since: Instant) -> bool {
-        if self.away_grace.is_zero() || self.wickets.len() < 2 || since.elapsed() < self.away_grace
-        {
+        if self.away_grace.is_zero() || self.wickets.len() < 2 {
+            return false;
+        }
+        if since.elapsed() < self.away_grace && !self.is_gone(&wicket.name) {
             return false;
         }
         let gone = self
             .store
-            .note(|state| state.wickets.gone.insert(wicket.name.clone()))
+            .observe(|state| state.wickets.gone.insert(wicket.name.clone()))
             .await;
         if gone {
             println!(
@@ -1889,7 +2152,7 @@ impl Controller {
     async fn placed_on_again(&self, wicket: &Wicket) {
         let gone = self
             .store
-            .note(|state| state.wickets.gone.remove(&wicket.name))
+            .observe(|state| state.wickets.gone.remove(&wicket.name))
             .await;
         if gone {
             println!(
@@ -2673,23 +2936,34 @@ mod tests {
 
     /// A wicket's app API as the controller uses it: a listing held until its revision moves,
     /// answered a little later, `PUT` and `DELETE` of an app, the latter answered after
-    /// `deleting`.
+    /// `deleting`, each fenced by its owner's epoch as a wicket fences it; a PUT of the tag
+    /// `refusing` refused, an app of `unadvertised` listed so.
     struct FakeWicket {
         apps: Mutex<BTreeMap<String, serde_json::Value>>,
         revision: tokio::sync::watch::Sender<u64>,
         /// The revision of the listing held last: the watch listed it.
         held: tokio::sync::watch::Sender<Option<u64>>,
         deleting: Duration,
+        fence: sluice_wicket_console::fence::Fence,
+        /// Each write's epoch, and whether the fence admitted it, in the order they came.
+        writes: Mutex<Vec<(Option<u64>, bool)>>,
+        refusing: Mutex<Option<String>>,
+        unadvertised: Mutex<BTreeSet<String>>,
     }
 
     impl FakeWicket {
         /// Serves it on a port of its own: its URL.
         async fn start(deleting: Duration) -> (Arc<FakeWicket>, String) {
+            let dir = std::env::temp_dir().join(format!("cf-api-fake-{}", crate::store::guid()));
             let fake = Arc::new(FakeWicket {
                 apps: Mutex::default(),
                 revision: tokio::sync::watch::Sender::new(0),
                 held: tokio::sync::watch::Sender::new(None),
                 deleting,
+                fence: sluice_wicket_console::fence::Fence::open(&dir).unwrap(),
+                writes: Mutex::default(),
+                refusing: Mutex::default(),
+                unadvertised: Mutex::default(),
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
@@ -2713,6 +2987,34 @@ mod tests {
             apps.keys().cloned().collect()
         }
 
+        /// The tag of the app `name` it serves.
+        fn tag(&self, name: &str) -> Option<String> {
+            let apps = self.apps.lock().unwrap();
+            Some(apps.get(name)?["tag"].as_str()?.to_string())
+        }
+
+        /// Whether no write was admitted after one of a higher epoch.
+        fn fenced_none(&self) -> bool {
+            let writes = self.writes.lock().unwrap();
+            let admitted = writes.iter().filter(|(_, admitted)| *admitted);
+            let mut highest = None;
+            admitted.into_iter().all(|(epoch, _)| match epoch {
+                Some(epoch) if highest.is_some_and(|highest| *epoch < highest) => false,
+                Some(epoch) => {
+                    highest = highest.max(Some(*epoch));
+                    true
+                }
+                None => true,
+            })
+        }
+
+        /// The epochs of the writes its fence refused.
+        fn refused(&self) -> Vec<Option<u64>> {
+            let writes = self.writes.lock().unwrap();
+            let refused = writes.iter().filter(|(_, admitted)| !admitted);
+            refused.map(|(epoch, _)| *epoch).collect()
+        }
+
         fn moved(&self) -> u64 {
             self.revision.send_modify(|revision| *revision += 1);
             *self.revision.borrow()
@@ -2725,7 +3027,16 @@ mod tests {
             use http_body_util::BodyExt as _;
             let (head, body) = request.into_parts();
             let name = head.uri.path().strip_prefix("/api/apps/");
-            let answer = match (head.method, name.map(str::to_string)) {
+            let epoch = (head.headers.get(sluice_wicket_console::fence::HEADER))
+                .and_then(|epoch| epoch.to_str().ok()?.parse::<u64>().ok());
+            let fenced = async |owner: &str| {
+                let admitted = self.fence.admit(Some(owner), &head).await;
+                (self.writes.lock().unwrap()).push((epoch, admitted.is_ok()));
+                admitted
+                    .err()
+                    .map(sluice_wicket_console::http::Response::from)
+            };
+            let answer = match (head.method.clone(), name.map(str::to_string)) {
                 (http::Method::GET, None) => {
                     let after = head
                         .uri
@@ -2741,12 +3052,14 @@ mod tests {
                         // after the answer to the edit that moved it
                         tokio::time::sleep(LOOK).await;
                     }
+                    let unadvertised = self.unadvertised.lock().unwrap().clone();
                     let apps: Vec<serde_json::Value> = (self.apps.lock().unwrap().iter())
                         .map(|(name, app)| {
                             let mut app = app.clone();
                             app["name"] = name.as_str().into();
                             app["deployed"] = "".into();
                             app["alive"] = serde_json::json!([]);
+                            app["advertised"] = (!unadvertised.contains(name)).into();
                             app
                         })
                         .collect();
@@ -2755,11 +3068,26 @@ mod tests {
                 }
                 (http::Method::PUT, Some(name)) => {
                     let body = body.collect().await.unwrap().to_bytes();
-                    let app = serde_json::from_slice(&body).unwrap();
+                    let app: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                    if let Some(refused) = fenced(app["owner"].as_str().unwrap()).await {
+                        return refused;
+                    }
+                    let refusing = self.refusing.lock().unwrap().clone();
+                    if refusing.is_some() && app["tag"].as_str() == refusing.as_deref() {
+                        let refused = sluice_wicket_console::http::error(
+                            http::StatusCode::UNPROCESSABLE_ENTITY,
+                            "the tag is refused",
+                        );
+                        return refused;
+                    }
                     self.apps.lock().unwrap().insert(name, app);
                     serde_json::json!({"generation": self.moved(), "message": "put"})
                 }
                 (http::Method::DELETE, Some(name)) => {
+                    let query = head.uri.query().unwrap_or_default();
+                    if let Some(refused) = fenced(query.trim_start_matches("owner=")).await {
+                        return refused;
+                    }
                     tokio::time::sleep(self.deleting).await;
                     if self.apps.lock().unwrap().remove(&name).is_none() {
                         let mut gone = hyper::Response::new(http_body_util::Full::default());
@@ -2821,7 +3149,7 @@ mod tests {
             Duration::ZERO,
             None,
         ));
-        tokio::spawn(controller.clone().watch());
+        tokio::spawn(controller.clone().lead());
         let within = Duration::from_secs(10);
         let put = async {
             while a.names().is_empty() || b.names().is_empty() {
@@ -2837,5 +3165,204 @@ mod tests {
         tokio::time::timeout(within, listed).await.unwrap().unwrap();
         assert_eq!((a.names(), b.names()), (vec![], vec![]));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Until `done` holds, 20s at most.
+    async fn until(what: &str, done: impl Fn() -> bool) {
+        let started = Instant::now();
+        while !done() {
+            assert!(started.elapsed() < Duration::from_secs(20), "{what}");
+            tokio::time::sleep(LOOK).await;
+        }
+    }
+
+    /// Two instances on one store, each a controller of the wickets: the one whose turn it is
+    /// puts, the other nothing, seeing what the first saw of them. The first stopped, or only
+    /// paused past its lease, the other takes the deployment and the move it had under way to
+    /// their end; a wicket admits no write of the first's epoch after one of the other's, and
+    /// refuses the first's late put. The first, back, leads no more.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_next_instance_takes_up_what_the_one_leading_left() {
+        use crate::deployments::Asked;
+        use crate::store::Scaled;
+        use crate::store::tests::{epoch, keep, leading};
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        for paused in [false, true] {
+            let (url, _) = crate::store::postgres_server::database().await;
+            let settings = crate::postgres::PostgresSettings {
+                url: format!("{url}?sslmode=disable"),
+                ca_pem: None,
+            };
+            let names = ["a".to_string(), "b".to_string(), "c".to_string()];
+            let runs = names
+                .iter()
+                .map(|name| (name.clone(), Runtime::Wasm))
+                .collect();
+            let localhost = ["localhost".to_string()];
+            let open = async |of: &str| {
+                let dir =
+                    std::env::temp_dir().join(format!("cf-api-{of}-{}", crate::store::guid()));
+                let store = Store::open(
+                    &dir,
+                    "o",
+                    "s",
+                    &localhost,
+                    &names,
+                    &runs,
+                    Some(&settings),
+                    None,
+                );
+                Arc::new(store.await.unwrap())
+            };
+            let (first, second) = (open("first").await, open("second").await);
+            // an app of two instances deploying d2 over d1, a wicket at a time, and an app's
+            // index moving from b to c
+            let snapshot = |tag: &str| Running {
+                droplet: tag.into(),
+                sha256: "ab".repeat(32),
+                file: "app.wasm".into(),
+                memory_mib: 64,
+                tag: Some(tag.into()),
+                ..Running::default()
+            };
+            let (rolling, moving, deployment) = first
+                .update(|state| {
+                    let space = state.spaces[0].guid.clone();
+                    let domain = state.domains[0].guid.clone();
+                    let mut started = |name: &str, placement: &[&str], tag: &str| {
+                        let app = state.create_app(name, &space);
+                        app.process.instances = placement.len() as u64;
+                        app.started = true;
+                        app.running = Some(snapshot(tag));
+                        app.placement = placement.iter().map(|on| on.to_string()).collect();
+                        let guid = app.guid.clone();
+                        let route = state.create_route(name, &domain, &space).guid.clone();
+                        state.map(&route, &guid);
+                        guid
+                    };
+                    let rolling = started("rolling", &["a", "b"], "d1");
+                    let moving = started("moving", &["b"], "m1");
+                    state.app_mut(&moving).unwrap().moving.insert(0, "c".into());
+                    let serving = state.serving(state.app(&rolling).unwrap());
+                    let asked = Asked {
+                        strategy: "rolling".into(),
+                        droplet: None,
+                        max_in_flight: 1,
+                        canary_steps: Vec::new(),
+                        scaled: Scaled::default(),
+                    };
+                    let deployed =
+                        state.deploy(&rolling, snapshot("d2"), serving, "d1".into(), &asked);
+                    (rolling, moving, deployed.0.guid)
+                })
+                .await;
+            let mut fakes = BTreeMap::new();
+            for name in &names {
+                fakes.insert(name.clone(), FakeWicket::start(Duration::ZERO).await);
+            }
+            // b refuses d2 and c's servers take moving's routes not: both under way
+            *fakes["b"].0.refusing.lock().unwrap() = Some("d2".into());
+            fakes["c"]
+                .0
+                .unadvertised
+                .lock()
+                .unwrap()
+                .insert(moving.clone());
+            let controller = |store: &Arc<Store>| {
+                let wickets = (names.iter())
+                    .map(|name| Arc::new(Wicket::new(name, 3, &fakes[name].1, None, crate::OWNER)))
+                    .collect();
+                let logs = Arc::new(Logs::default());
+                Arc::new(Controller::new(
+                    store.clone(),
+                    wickets,
+                    logs,
+                    Duration::ZERO,
+                    None,
+                ))
+            };
+            let (one, other) = (controller(&first), controller(&second));
+            let (_, keeping_first) = leading(&first).await;
+            let leading_first = tokio::spawn(one.clone().lead());
+            let (_, keeping_second) = keep(&second);
+            let _leading_second = tokio::spawn(other.clone().lead());
+            let tag = |wicket: &str, guid: &str| fakes[wicket].0.tag(guid);
+            until("d2 on a, moving on c", || {
+                tag("a", &rolling).as_deref() == Some("d2") && tag("c", &moving).is_some()
+            })
+            .await;
+            until("b refused d2", || {
+                let error =
+                    first.read(|state| state.deployment(&deployment).unwrap().error.clone());
+                error.is_some_and(|error| error.contains("the tag is refused"))
+            })
+            .await;
+            // the other put nothing, and sees what the first saw of the wickets
+            let first_epoch = epoch(&first);
+            assert!(!other.leads());
+            for (fake, _) in fakes.values() {
+                let writes = fake.writes.lock().unwrap();
+                assert!(
+                    writes.iter().all(|(epoch, _)| *epoch == first_epoch),
+                    "{writes:?}"
+                );
+            }
+            second.sync().await.unwrap();
+            let outcome = second.read(|state| state.outcome(&rolling, "a").cloned());
+            assert_eq!(outcome, Some(Outcome::Running));
+
+            // the first stopped (killed), or its renewals paused, its turn on
+            keeping_first.abort();
+            if !paused {
+                leading_first.abort();
+            }
+            let mut terms = second.terms();
+            let led = terms.wait_for(|term| term.is_some());
+            tokio::time::timeout(Duration::from_secs(10), led)
+                .await
+                .unwrap()
+                .unwrap();
+            let second_epoch = epoch(&second);
+            assert!(second_epoch > first_epoch);
+            *fakes["b"].0.refusing.lock().unwrap() = None;
+            fakes["c"].0.unadvertised.lock().unwrap().clear();
+            until("the deployment finished, the index moved", || {
+                second.read(|state| {
+                    let deployed = state.deployment(&deployment).unwrap().state;
+                    let placed = &state.app(&moving).unwrap().placement;
+                    deployed == crate::store::DeploymentState::Deployed && *placed == ["c"]
+                }) && tag("b", &rolling).as_deref() == Some("d2")
+                    && tag("b", &moving).is_none()
+            })
+            .await;
+            for (fake, _) in fakes.values() {
+                assert!(fake.fenced_none(), "{:?}", fake.writes.lock().unwrap());
+            }
+            // the first's late put refused: its turn's epoch, below the other's
+            let late = Wicket::new("b", 3, &fakes["b"].1, None, crate::OWNER);
+            late.set_epoch(first_epoch);
+            let share = second
+                .read(|state| other.desired_on(state, &rolling, "b"))
+                .unwrap();
+            let refused = late.put(&rolling, &share).await;
+            assert!(
+                matches!(refused, Err(Failure::Fenced { .. })),
+                "{refused:?}"
+            );
+            assert!(fakes["b"].0.refused().contains(&first_epoch));
+            // back, the first's turn is over: what it does put, it puts as an edit does
+            if paused {
+                let (_, _keeping) = keep(&first);
+                let mut terms = first.terms();
+                let ended = terms.wait_for(|term| term.is_none());
+                tokio::time::timeout(Duration::from_secs(10), ended)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                until("its work ended", || !one.leads()).await;
+            }
+            assert_eq!(epoch(&second), second_epoch, "the other's turn goes on");
+            keeping_second.abort();
+        }
     }
 }

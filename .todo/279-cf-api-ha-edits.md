@@ -49,3 +49,22 @@ hop, no address of its own to configure.
 The API tests with two `Api`s on one store: an edit through the follower refused by the mock
 wicket is a 422 and changes nothing; two edits of one app through both, serialized; the leader
 stopped mid-edit, the edit answered once by the next.
+
+## From 278
+
+- the lease is one row, `sluice_cf_lease` (holder: the instance's id, epoch, expiry by the
+  store's clock; `postgres.rs`: `take`, `renew`, `release`). The leader's address for a forward
+  is a column to add there, written by `take`. `Store::terms` tells this instance's turn,
+  `Controller::leads` whether its work runs
+- an edit on a follower puts without an epoch (taken as before by the wickets) and races the
+  leader's watch: its trial put undone by the leader's `fix` before its commit, and a commit
+  landing after the leader's last listing left unput until the wicket's revision moves. So a
+  follower answers `/healthz` 503 (`Controller::ready`: only the leader is ready, a balancer
+  checking it sending every request there): with edits forwarded, make the followers ready again
+  (282's `/healthz`)
+- what a follower's puts saw (outcomes, `full`) it writes itself, unfenced, the last writer of a
+  row winning (`Postgres::transact`: written unless the instance's turn ended); with edits on the
+  leader alone, only it observes
+- the deployments' steps are the leader's already: a follower's commit is taken up by the
+  leader's `Controller::follow` (`take_up`); `purge_pending` returns on a follower, the leader
+  trying the purges as they come

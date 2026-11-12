@@ -522,7 +522,8 @@ routes:
 /// seeing its env -- listed as it was put but the env's values, never shown,
 /// the page's endpoints refusing them, held at the next start until its owner
 /// confirms it (`held-ms`), until its owner removes it; the data of its
-/// keyvalue namespace is deleted only then.
+/// keyvalue namespace is deleted only then. An owner's write of an epoch below
+/// the highest it sent is refused, after a restart too.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_console_deploys_an_uploaded_component_as_a_route() {
     let hello = std::fs::read(guests().join("hello.wasm")).unwrap();
@@ -684,7 +685,9 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         serde_json::from_slice(&app(&["b.localhost", "a.localhost"], &hello)).unwrap();
     shop["held-ms"] = 60_000.into();
     let shop = shop.to_string().into_bytes();
-    let (status, _, body) = console(&at, "PUT /api/apps/shop", &[bearer], &shop).await;
+    // in the turn of its owner's epoch 7
+    let (seven, six) = ("sluice-epoch: 7", "sluice-epoch: 6");
+    let (status, _, body) = console(&at, "PUT /api/apps/shop", &[bearer, seven], &shop).await;
     assert_eq!(
         (status, body.as_str()),
         (
@@ -785,6 +788,9 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         (status, body.as_str()),
         (200, r#"{"generation":3,"message":"no change"}"#)
     );
+    let fenced = r#"{"error":"the epoch 6 of cf is below 7, the highest it sent: another of its controllers took over","fenced":true}"#;
+    let (status, _, body) = console(&at, "PUT /api/apps/shop", &[bearer, six], &again).await;
+    assert_eq!((status, body.as_str()), (409, fenced));
     // at the next start it waits for its owner's word, neither served nor advertised: another
     // owner's changes nothing, its owner's serves it
     drop(wicket);
@@ -810,7 +816,13 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
         (200, r#"{"released":[],"held":[]}"#)
     );
     assert_eq!(get(&address, "b.localhost", "/").await.0, 503);
-    let (status, _, body) = console(&at, "PUT /api/confirmed/cf", &[bearer], names).await;
+    let (status, _, body) = console(&at, "PUT /api/confirmed/cf", &[bearer, six], names).await;
+    assert_eq!(
+        (status, body.as_str()),
+        (409, fenced),
+        "kept across the restart"
+    );
+    let (status, _, body) = console(&at, "PUT /api/confirmed/cf", &[bearer, seven], names).await;
     assert_eq!(
         (status, body.as_str()),
         (200, r#"{"released":["shop"],"held":[]}"#)
@@ -982,6 +994,8 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
             r#"{"error":"the keyvalue namespace local/cf/shop is mapped by a.localhost, b.localhost"}"#
         )
     );
+    let (status, _, body) = console(&at, &format!("{purge}?owner=cf"), &[bearer, six], b"").await;
+    assert_eq!((status, body.as_str()), (409, fenced));
     for unknown in ["GET", "DELETE"] {
         let request = format!("{unknown} /api/keyvalue/nope/x");
         let (status, _, body) = console(&at, &request, &[bearer], b"").await;
@@ -991,7 +1005,10 @@ async fn the_console_deploys_an_uploaded_component_as_a_route() {
     let intruder = "DELETE /api/apps/shop?owner=intruder";
     let (status, _, _) = console(&at, intruder, &[bearer], b"").await;
     assert_eq!(status, 409);
-    let (status, _, body) = console(&at, "DELETE /api/apps/shop?owner=cf", &[bearer], b"").await;
+    let removal = "DELETE /api/apps/shop?owner=cf";
+    let (status, _, body) = console(&at, removal, &[bearer, six], b"").await;
+    assert_eq!((status, body.as_str()), (409, fenced));
+    let (status, _, body) = console(&at, removal, &[bearer, seven], b"").await;
     assert_eq!(
         (status, body.as_str()),
         (

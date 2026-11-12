@@ -33,6 +33,7 @@ impl Refusal {
                 missing: Vec::new(),
                 did_not_start: false,
                 no_room: false,
+                fenced: false,
             },
         }
     }
@@ -61,6 +62,10 @@ pub struct ErrorView {
     /// elsewhere.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub no_room: bool,
+    /// The write's epoch is below the highest its owner sent (409): another of its controllers
+    /// took over (`crate::fence`).
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub fenced: bool,
 }
 
 /// An edit the routes took: the generation serving it, and what changed.

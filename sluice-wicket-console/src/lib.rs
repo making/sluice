@@ -18,9 +18,12 @@
 //! - [`status`]: what the page shows of the reloads, and its long poll
 //! - [`leaving`]: a wicket told to stop serving on while its apps' controllers move them
 //! - [`held`]: the apps a wicket holds at its start until their controllers confirm them
+//! - [`fence`]: an owner's writes refused below the highest epoch it sent: one of its
+//!   controller's instances that lost its turn
 //! - [`settings`]: the console's options, as both wickets take them
 
 pub mod env;
+pub mod fence;
 pub mod gate;
 pub mod held;
 pub mod http;

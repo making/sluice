@@ -2185,6 +2185,7 @@ mod tests {
             let by = by.map(|instance| crate::store::Sweeping {
                 instance: instance.into(),
                 since: crate::store::epoch_secs(),
+                epoch: None,
             });
             store.update(move |state| state.sweep.by = by.clone())
         };

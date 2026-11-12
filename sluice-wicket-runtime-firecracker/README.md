@@ -627,6 +627,9 @@ digest, or made of an OCI image, first; the app names it:
   again. An upload is kept for ten minutes, a file an app named as long as an app does
 - a host the config file, a flag, a console route or another app routes is refused (409), and so
   is a change of another owner's app; the page lists an app's routes, read-only
+- a write of an owner may carry its controller's epoch (`sluice-epoch: <n>`), one below the
+  highest it sent refused (409, `"fenced": true`), as the wasm wicket's
+  ([Apps](../sluice-wicket-runtime-wasi/README.md#apps))
 
 **An image of a registry**, `PUT /api/images` with `--guest <path>`
 (`SLUICE_WICKET_RUNTIME_FIRECRACKER_GUEST`; the image sets it) and e2fsprogs' `mkfs.ext4` and

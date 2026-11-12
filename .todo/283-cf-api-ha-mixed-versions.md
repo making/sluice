@@ -64,3 +64,12 @@ topology record changes. A previous release's binary beside the current one in t
 - with `--state`, `follow_domains` and `follow_wickets` run at every start in a transaction, by
   the flags of the instance starting (`Store::open`); `State::migrate` only on the `state.json`
   an empty store takes
+
+## From 278
+
+- a build before the lease (277 and older) reconciles the wickets regardless of it: never one
+  beside a 278 or later on a store. The layout stays 1: the new rows (`outcome`, `wicket`, `store`
+  of `crate::records`) are kinds an older build leaves alone, `sluice_cf_lease` a table it does not
+  read. The schema version of this item is where to refuse such a build
+- the wickets fence the writes per owner, by the epoch of a store's lease: two stores' cf-apis on
+  one wicket (both owner `cf`) refuse each other's

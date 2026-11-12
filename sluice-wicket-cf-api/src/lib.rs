@@ -11,7 +11,8 @@
 //! and capabilities are its services. With a flume, the apps' output and requests
 //! reach their logs from the live access log the wickets feed (`flume`). Several
 //! wickets are reached through a sluice server, each advertising the hosts of the
-//! apps it runs.
+//! apps it runs. Of several instances on one store, one at a time reconciles the
+//! wickets, the holder of a lease (`lease`).
 //!
 //! ```text
 //! cf CLI --CC v3 / UAA / log-cache--> sluice-wicket-cf-api --/api/apps--> wickets
@@ -27,6 +28,7 @@ pub mod controller;
 pub mod deployments;
 mod env;
 pub mod flume;
+pub mod lease;
 pub mod logs;
 pub mod manifest;
 mod multipart;
@@ -333,11 +335,13 @@ pub async fn serve(
         registry: registry::Registry::new()?,
         build: describe_build(),
     });
-    // the deployments, the stagings and the apps' deletes a stop left under way
-    controller.resume();
+    // the stagings and the apps' deletes a stop left under way; the deployments and moves with
+    // the wickets, in this instance's turn reconciling them
     api.take_up();
     let stop = controller.stop.clone();
-    let watch = tokio::spawn(controller.watch());
+    let lease = store.lease(lease::Timing::default());
+    let keeping = tokio::spawn(lease.clone().run());
+    let leading = tokio::spawn(controller.lead());
     let sweep = tokio::spawn(store.clone().keep_swept());
     tokio::select! {
         () = api::run(listener, acceptor, api) => {}
@@ -361,13 +365,16 @@ pub async fn serve(
              and {puts} put(s) cut"
         );
     }
-    watch.abort();
+    keeping.abort();
     sweep.abort();
     if let Some(flume) = flume {
         flume.abort();
     }
-    // what was noted, the flume watch's cursor as it got
+    // what was noted, the flume watch's cursor as it got, what was seen of the wickets
     store.update(|_| ()).await;
+    // the next instance's turn at once
+    lease.release().await;
+    leading.abort();
     Ok(())
 }
 
@@ -394,7 +401,12 @@ mod tests {
             )
         );
         drop(held);
-        drop(check_data_dir(&dir).unwrap());
+        // a child another test is spawning holds a copy of the lock's file until it execs
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while let Err(e) = check_data_dir(&dir) {
+            assert!(std::time::Instant::now() < until, "{e}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

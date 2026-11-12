@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::blobs::{Blob, Spool};
 use crate::blobs::{BlobSettings, Blobs, Local, Reading};
+use crate::lease::{Lease, Term, Timing};
 use crate::postgres::{Postgres, PostgresSettings, Shared, Writer};
 use crate::staging::Buildpack;
 use crate::wicket::Runtime;
@@ -115,8 +116,9 @@ pub struct State {
     /// The sweeps of the blobs ([`Store::sweep`]).
     #[serde(default, skip_serializing_if = "Sweep::is_none")]
     pub sweep: Sweep,
-    /// What each wicket answered of each app, by guid, then by wicket; not kept: a start
-    /// lists the wickets.
+    /// What each wicket answered of each app, by guid, then by wicket: kept in the store several
+    /// instances share for every instance (`crate::records`), not in `state.json`: a start lists
+    /// the wickets.
     #[serde(skip)]
     pub outcomes: BTreeMap<String, BTreeMap<String, Outcome>>,
     /// The wickets the apps are placed on (`crate::placement`): the configuration's. Kept of
@@ -144,11 +146,15 @@ pub struct Sweep {
     pub by: Option<Sweeping>,
 }
 
-/// A sweep under way: the instance deleting, and since when (seconds since the epoch).
+/// A sweep under way: the instance deleting, since when (seconds since the epoch), and the turn
+/// of the lease it sweeps in (`crate::lease`; none of the file backend's one process, or of a
+/// build before the lease).
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Sweeping {
     pub instance: String,
     pub since: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u64>,
 }
 
 impl Sweep {
@@ -156,10 +162,17 @@ impl Sweep {
         *self == Sweep::default()
     }
 
-    /// Whether a sweep may be deleting at `now`: one begun longer ago than [`SWEEP_STALE`]
-    /// was cut short.
-    fn under_way(&self, now: u64) -> bool {
-        (self.by.as_ref()).is_some_and(|by| by.since + SWEEP_STALE.as_secs() > now)
+    /// Whether a sweep may be deleting at `now`, the lease of the epoch `leading` as last seen:
+    /// one of a turn before it was over with it (its instance stops sweeping as its turn ends),
+    /// one begun longer ago than [`SWEEP_STALE`] was cut short.
+    fn under_way(&self, now: u64, leading: Option<u64>) -> bool {
+        (self.by.as_ref()).is_some_and(|by| {
+            let ended = by
+                .epoch
+                .zip(leading)
+                .is_some_and(|(by, leading)| by < leading);
+            !ended && by.since + SWEEP_STALE.as_secs() > now
+        })
     }
 }
 
@@ -1269,7 +1282,8 @@ pub struct JobError {
 }
 
 /// What a wicket last answered of its share of an app.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "snake_case")]
 pub enum Outcome {
     Running,
     Refused(String),
@@ -1926,10 +1940,19 @@ pub struct Unnamed(HashMap<Blob, Instant>);
 /// How long a request waits for the store's revision (`Store::sync`).
 const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
+/// How long what was seen of the wickets waits to be written with what is seen after it: the
+/// answers to a listing's puts written at once.
+const OBSERVED_EVERY: Duration = Duration::from_millis(100);
+
 /// The state: a copy the reads are answered from, changed one change at a time, each written
 /// before it is seen. Kept in `state.json` of the data directory, written whole on every
 /// change: one process's (`crate::check_data_dir`); or, with `--state`, in PostgreSQL
 /// (`crate::postgres`): the store of several, the copy following what the others commit.
+///
+/// And the turn of this instance reconciling the wickets ([`Store::terms`]): the one process
+/// of a data directory's from its start, of several the lease's holder (`crate::lease`). What
+/// the instance in its turn alone changes is made in it only ([`Store::lead`]), and what the
+/// wickets were seen doing is written for every instance ([`Store::observe`]).
 ///
 /// And the blobs the state names (`crate::blobs`), in the directory or, with `--blobs`, in a
 /// bucket. One the state names no more is swept: deleted between a sweep's begin and its end,
@@ -1949,12 +1972,16 @@ pub struct Store {
     postgres: Option<Arc<Postgres>>,
     /// Follows the others' commits.
     listener: Option<tokio::task::JoinHandle<()>>,
+    /// Told what was seen of the wickets ([`Store::observe`]).
+    noted: Arc<tokio::sync::Notify>,
+    /// Writes what was seen of the wickets, as it is seen.
+    flusher: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl Drop for Store {
     fn drop(&mut self) {
-        if let Some(listener) = &self.listener {
-            listener.abort();
+        for task in [&self.listener, &self.flusher].into_iter().flatten() {
+            task.abort();
         }
     }
 }
@@ -2024,6 +2051,8 @@ impl Store {
             writer: Arc::default(),
             postgres: None,
             listener: None,
+            noted: Arc::default(),
+            flusher: None,
         };
         let follow = |state: &mut State| {
             state.follow_domains(domains);
@@ -2042,9 +2071,11 @@ impl Store {
             state.sweep.by = None;
             store.save(&state)?;
             *store.shared.state.write().expect("no panic under the lock") = state;
+            // the one process of the directory reconciles the wickets from its start
+            store.shared.term.send_replace(Some(Term { epoch: None }));
             return Ok(store);
         };
-        let postgres = Arc::new(Postgres::new(settings)?);
+        let postgres = Arc::new(Postgres::new(settings, &store.instance)?);
         let mut taken = false;
         let first = || {
             Ok(match kept(&file, domains)? {
@@ -2067,8 +2098,24 @@ impl Store {
             println!("{line}");
         }
         let (shared, writer) = (store.shared.clone(), store.writer.clone());
+        let listening = postgres.clone();
         store.listener = Some(tokio::spawn(async move {
-            postgres.keep_listening(&shared, &writer).await;
+            listening.keep_listening(&shared, &writer).await;
+        }));
+        let (shared, writer, noted) = (
+            store.shared.clone(),
+            store.writer.clone(),
+            store.noted.clone(),
+        );
+        store.flusher = Some(tokio::spawn(async move {
+            loop {
+                noted.notified().await;
+                tokio::time::sleep(OBSERVED_EVERY).await;
+                let mut writing = writer.lock().await;
+                postgres.update(&mut writing, &shared, |_| (), false).await;
+                drop(writing);
+                shared.changed();
+            }
         }));
         Ok(store)
     }
@@ -2086,9 +2133,22 @@ impl Store {
     /// seen by the reads once written. `f` does nothing but change the state it is given: with
     /// `--state` it runs again when the store did not answer, on the state as it is then.
     pub async fn update<R>(&self, f: impl Fn(&mut State) -> R) -> R {
+        let made = self.change(f, false).await;
+        made.expect("a change of any instance is made")
+    }
+
+    /// [`Store::update`] of what the instance reconciling the wickets alone changes (a
+    /// deployment's step, a move, a purge done): made in its turn only, which another taking
+    /// the lease ends, checked as it is made. None: it was not, the turn over.
+    pub async fn lead<R>(&self, f: impl Fn(&mut State) -> R) -> Option<R> {
+        self.change(f, true).await
+    }
+
+    async fn change<R>(&self, f: impl Fn(&mut State) -> R, leader: bool) -> Option<R> {
         let mut writer = self.writer.lock().await;
         let result = match &self.postgres {
-            Some(postgres) => postgres.update(&mut writer, &self.shared, f).await,
+            Some(postgres) => postgres.update(&mut writer, &self.shared, f, leader).await,
+            None if leader && !self.leads() => None,
             None => {
                 let mut state = self.shared.state.write().expect("no panic under the lock");
                 let result = f(&mut state);
@@ -2096,18 +2156,43 @@ impl Store {
                 if let Err(e) = self.save(&state) {
                     eprintln!("cannot write the state: {e}");
                 }
-                result
+                Some(result)
             }
         };
         drop(writer);
-        self.shared.changes.notify_one();
+        self.shared.changed();
         result
     }
 
-    /// Resolves after a change since the last call resolved, this process's or another's (at
-    /// once when one was made meanwhile); for one waiter.
-    pub async fn changed(&self) {
-        self.shared.changes.notified().await;
+    /// The changes of the copy, this process's or another's, as a count: each waiter has its
+    /// own, told of a change since it last looked.
+    pub fn changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.shared.changes.subscribe()
+    }
+
+    /// This instance's turn reconciling the wickets as it begins and ends: None between.
+    pub fn terms(&self) -> tokio::sync::watch::Receiver<Option<Term>> {
+        self.shared.term.subscribe()
+    }
+
+    /// Whether this instance reconciles the wickets now.
+    pub fn leads(&self) -> bool {
+        self.shared.term.borrow().is_some()
+    }
+
+    /// Ends this instance's turn of `epoch` (a wicket refused it), if it is still the one.
+    pub fn end_term(&self, epoch: Option<u64>, why: &str) {
+        self.shared.end_term(epoch, why);
+    }
+
+    /// The lease of the turns of several instances on the store, as `timing` says; of the one
+    /// process of a data directory, held from its start.
+    pub fn lease(&self, timing: Timing) -> Arc<Lease> {
+        Arc::new(Lease::new(
+            self.postgres.clone(),
+            self.shared.clone(),
+            timing,
+        ))
     }
 
     /// Has the reads see what every instance committed by now: a request's first step, failing
@@ -2130,9 +2215,30 @@ impl Store {
         }
     }
 
-    /// Changes what is not kept (the wickets' outcomes, their budgets), or of what is kept
-    /// whole (`crate::records`: the flume's cursor, the stacks the wickets list) what the next
-    /// change may write. Nothing of the state's lists, which only a change writes.
+    /// Changes what was seen of the wickets (their answers of each app's share, what they list
+    /// of themselves), written with what is seen after it, a moment later, for every instance
+    /// (`crate::records`); not in `state.json`. As [`Store::note`].
+    pub async fn observe<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
+        let result = self.note(f).await;
+        if self.postgres.is_some() {
+            self.noted.notify_one();
+        }
+        result
+    }
+
+    /// Forgets what was seen of the wickets and not written: this instance's turn reconciling
+    /// them ended, the next's sees them anew.
+    pub async fn forget_observed(&self) {
+        if self.postgres.is_some() {
+            let writer = self.writer.lock().await;
+            let mut state = self.shared.state.write().expect("no panic under the lock");
+            writer.book.forget_observed(&mut state);
+        }
+    }
+
+    /// Changes of what is kept whole (`crate::records`: the flume's cursor, the stacks the
+    /// wickets list) what the next change may write, or what is not kept at all. Nothing of
+    /// the state's lists, which only a change writes.
     pub async fn note<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         let _writer = self.writer.lock().await;
         let mut state = self.shared.state.write().expect("no panic under the lock");
@@ -2213,7 +2319,7 @@ impl Store {
             }
             let now = epoch_secs();
             let sweep = self.read(|state| state.sweep.clone());
-            if !sweep.under_way(now) {
+            if !sweep.under_way(now, *self.shared.leading.borrow()) {
                 return sweep.rounds;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -2230,11 +2336,16 @@ impl Store {
     }
 
     /// Sweeps the blobs for good: [`SWEEP_GRACE`] after a blob was first seen named by
-    /// nothing, it is deleted. Every instance does; one at a time deletes.
+    /// nothing, it is deleted. A bucket's by the instance reconciling the wickets alone, in
+    /// its turn; the directory's by its one process.
     pub async fn keep_swept(self: Arc<Self>) {
         let mut unnamed = Unnamed::default();
         loop {
             tokio::time::sleep(SWEEP_EVERY).await;
+            if self.blobs.shared() && !self.leads() {
+                unnamed = Unnamed::default();
+                continue;
+            }
             if let Err(e) = self.sweep(&mut unnamed, SWEEP_GRACE).await {
                 eprintln!("BLOBS: not swept: {e}");
             }
@@ -2264,10 +2375,13 @@ impl Store {
     }
 
     /// Deletes those of `blobs` the state does not name, between a sweep's begin and its
-    /// end; none while another instance's sweep is under way. Those deleted.
+    /// end; none while another instance's sweep is under way. A bucket's in the turn of this
+    /// instance reconciling the wickets ([`Store::lead`]), as long as it lasts. Those deleted.
     async fn sweep_of(&self, blobs: Vec<Blob>) -> Vec<Blob> {
+        let leading = || *self.shared.leading.borrow();
         // nothing to delete, no sweep cut short to end: no change of the state
-        let cut_short = |sweep: &Sweep| sweep.by.is_some() && !sweep.under_way(epoch_secs());
+        let cut_short =
+            |sweep: &Sweep| sweep.by.is_some() && !sweep.under_way(epoch_secs(), leading());
         let idle =
             |state: &State| blobs.iter().all(|blob| state.names(blob)) && !cut_short(&state.sweep);
         if self.read(idle) {
@@ -2275,34 +2389,42 @@ impl Store {
         }
         let _one = self.sweeping.lock().await;
         let began = Instant::now();
-        let unnamed = self
-            .update(|state| {
-                let now = epoch_secs();
-                let ours = |by: &Sweeping| by.instance == self.instance;
-                if state.sweep.under_way(now) && !state.sweep.by.as_ref().is_some_and(ours) {
-                    return Vec::new();
-                }
-                let unnamed: Vec<Blob> = (blobs.iter())
-                    .filter(|blob| !state.names(blob))
-                    .cloned()
-                    .collect();
-                state.sweep.by = None;
-                if !unnamed.is_empty() {
-                    state.sweep.rounds += 1;
-                    state.sweep.by = Some(Sweeping {
-                        instance: self.instance.clone(),
-                        since: now,
-                    });
-                }
-                unnamed
-            })
-            .await;
+        let shared = self.blobs.shared();
+        let term = *self.shared.term.borrow();
+        let epoch = term.and_then(|term| term.epoch);
+        let begin = |state: &mut State| {
+            let now = epoch_secs();
+            let ours = |by: &Sweeping| by.instance == self.instance;
+            if state.sweep.under_way(now, leading()) && !state.sweep.by.as_ref().is_some_and(ours) {
+                return Vec::new();
+            }
+            let unnamed: Vec<Blob> = (blobs.iter())
+                .filter(|blob| !state.names(blob))
+                .cloned()
+                .collect();
+            state.sweep.by = None;
+            if !unnamed.is_empty() {
+                state.sweep.rounds += 1;
+                state.sweep.by = Some(Sweeping {
+                    instance: self.instance.clone(),
+                    since: now,
+                    epoch,
+                });
+            }
+            unnamed
+        };
+        let unnamed = match shared {
+            true => self.lead(begin).await.unwrap_or_default(),
+            false => self.update(begin).await,
+        };
         if unnamed.is_empty() {
             return unnamed;
         }
         let mut deleted = Vec::new();
         for blob in unnamed {
-            if began.elapsed() >= SWEEP_WINDOW {
+            // the turn it began in over: the next instance's sweeps take its place
+            let over = shared && *self.shared.term.borrow() != term;
+            if began.elapsed() >= SWEEP_WINDOW || over {
                 break;
             }
             let failed = match tokio::time::timeout(SWEEP_CALL, self.blobs.delete(&blob)).await {
@@ -2419,7 +2541,7 @@ pub(crate) mod postgres_server;
 mod s3_server;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A data directory of its own, and the store opened on it: the state in the directory,
@@ -2468,6 +2590,41 @@ mod tests {
         opened.unwrap()
     }
 
+    /// The lease of the tests: a turn ends past a second of no renewal.
+    pub(crate) const TIMING: Timing = Timing {
+        lease: Duration::from_millis(1000),
+        renew_every: Duration::from_millis(200),
+        take_every: Duration::from_millis(100),
+    };
+
+    /// `store`'s lease kept, as `TIMING` says: the task keeping it.
+    pub(crate) fn keep(store: &Store) -> (Arc<Lease>, tokio::task::JoinHandle<()>) {
+        let lease = store.lease(TIMING);
+        let keeping = tokio::spawn(lease.clone().run());
+        (lease, keeping)
+    }
+
+    /// Once `store`'s turn began.
+    pub(crate) async fn led(store: &Store) {
+        let mut terms = store.terms();
+        let led = terms.wait_for(|term| term.is_some());
+        (tokio::time::timeout(Duration::from_secs(10), led).await)
+            .expect("a turn")
+            .unwrap();
+    }
+
+    /// [`keep`], once its turn began.
+    pub(crate) async fn leading(store: &Store) -> (Arc<Lease>, tokio::task::JoinHandle<()>) {
+        let kept = keep(store);
+        led(store).await;
+        kept
+    }
+
+    /// The epoch of `store`'s turn.
+    pub(crate) fn epoch(store: &Store) -> Option<u64> {
+        store.terms().borrow().and_then(|term| term.epoch)
+    }
+
     /// What a store keeps, as `state.json` has it.
     fn kept(store: &Store) -> serde_json::Value {
         store.read(|state| serde_json::to_value(state).unwrap())
@@ -2479,10 +2636,10 @@ mod tests {
 
     /// A blob is kept whole and read, as a stream and from a file, by any instance; swept
     /// once the state names it no more: in the directory at once, in a bucket (its TLS
-    /// verified against a CA given, the keys under a prefix) after the grace, a read under
-    /// way getting it all either way; what was never named after the grace in both. A sweep
-    /// is seen by who is to name a blob, and waits for another instance's under way until
-    /// that is stale.
+    /// verified against a CA given, the keys under a prefix) after the grace, by the instance
+    /// whose turn it is alone, a read under way getting it all either way; what was never named
+    /// after the grace in both. A sweep is seen by who is to name a blob, and waits for another
+    /// instance's under way until its turn ended or it is stale.
     #[tokio::test]
     async fn a_blob_is_kept_for_every_instance_and_swept_once_unnamed() {
         use http_body_util::BodyExt as _;
@@ -2502,6 +2659,11 @@ mod tests {
             } else {
                 let store = Arc::new(open(&dir, None, &["localhost"]).await);
                 (store.clone(), store)
+            };
+            // the second's turn: it alone sweeps the bucket
+            let _lease = match shared {
+                true => Some(leading(&second).await),
+                false => None,
             };
             let keep = async |blob: &Blob, bytes: &[u8]| {
                 use std::io::Write as _;
@@ -2571,9 +2733,14 @@ mod tests {
             let read = reading.body.collect().await.unwrap().to_bytes();
             assert_eq!(read, component, "shared {shared}");
             // the directory's is gone at once, the bucket's and what was never named stay
-            // for the grace
+            // for the grace, and the bucket's for an instance in no turn
             assert_eq!(second.has(&droplet).await.unwrap(), shared);
             assert!(second.has(&orphan).await.unwrap());
+            if shared {
+                let mut unnamed = Unnamed::default();
+                first.sweep(&mut unnamed, Duration::ZERO).await.unwrap();
+                assert!(first.has(&orphan).await.unwrap(), "not its turn");
+            }
             second.sweep(&mut unnamed, Duration::ZERO).await.unwrap();
             for (blob, kept) in [(&package, true), (&droplet, false), (&orphan, false)] {
                 assert_eq!(
@@ -2586,25 +2753,34 @@ mod tests {
             assert!(unnamed.0.is_empty());
 
             // another instance's sweep under way: nothing deleted, nothing named
-            let swept_by = async |since: u64| {
+            let swept_by = async |since: u64, epoch: Option<u64>| {
                 let by = Some(Sweeping {
                     instance: "another".into(),
                     since,
+                    epoch,
                 });
                 first.update(|state| state.sweep.by = by.clone()).await;
                 second.sync().await.unwrap();
             };
-            swept_by(epoch_secs()).await;
+            swept_by(epoch_secs(), None).await;
             keep(&orphan, b"never named").await;
             second.sweep(&mut unnamed, Duration::ZERO).await.unwrap();
             assert!(second.has(&orphan).await.unwrap());
             let waited = tokio::time::timeout(Duration::from_millis(300), second.unswept());
             assert!(waited.await.is_err(), "a sweep under way is waited for");
-            // cut short: taken over
-            swept_by(epoch_secs() - SWEEP_STALE.as_secs()).await;
-            second.unswept().await;
+            // cut short, stale or of a turn before the one leading: taken over
+            let mut cut_short = vec![(epoch_secs() - SWEEP_STALE.as_secs(), None)];
+            if let Some(epoch) = epoch(&second) {
+                cut_short.push((epoch_secs(), Some(epoch - 1)));
+            }
+            for (since, of) in cut_short {
+                swept_by(since, of).await;
+                second.unswept().await;
+                second.sweep(&mut unnamed, Duration::ZERO).await.unwrap();
+                assert!(!second.has(&orphan).await.unwrap(), "{of:?}");
+                keep(&orphan, b"never named").await;
+            }
             second.sweep(&mut unnamed, Duration::ZERO).await.unwrap();
-            assert!(!second.has(&orphan).await.unwrap());
             first.sync().await.unwrap();
             assert_eq!(first.read(|state| state.sweep.by.clone()), None);
             let _ = std::fs::remove_dir_all(&dir);
@@ -2681,7 +2857,9 @@ mod tests {
     /// Two instances on one PostgreSQL: a change of one is seen by the other (told of it, and
     /// at a request's start at the latest), the changes of both are one after another, none
     /// lost, and a connection lost is opened again; over TLS, the server verified, where the
-    /// test server takes it.
+    /// test server takes it. One at a time leads, its own changes and what it saw of the
+    /// wickets the other's: one paused past its lease has its turn taken, its changes refused
+    /// and what it saw since forgotten; one letting go of it has it taken at once.
     #[tokio::test(flavor = "multi_thread")]
     async fn two_instances_change_one_state() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -2711,9 +2889,12 @@ mod tests {
             })
         };
         // b is told of a's change
-        let told = b.changed();
+        let mut changes = b.changes();
         let x = app("x").await;
-        (tokio::time::timeout(std::time::Duration::from_secs(10), told).await).unwrap();
+        let told = changes.changed();
+        (tokio::time::timeout(std::time::Duration::from_secs(10), told).await)
+            .unwrap()
+            .unwrap();
         b.sync().await.unwrap();
         assert_eq!(names(&b), ["x"]);
         let y = app("y").await;
@@ -2765,6 +2946,56 @@ mod tests {
         // one starting later reads the same
         let c = open(&dir("c"), Some(&url), &["localhost"]).await;
         assert_eq!(kept(&c), kept(&a));
+
+        // a leads: b makes none of the leader's changes, and sees what a saw of the wickets
+        let (_, keeping_a) = leading(&a).await;
+        let (lease_b, keeping_b) = keep(&b);
+        tokio::time::sleep(TIMING.take_every * 3).await;
+        assert!(!b.leads());
+        let apps = |state: &mut State| state.apps.len();
+        assert_eq!((a.lead(apps).await, b.lead(apps).await), (Some(1), None));
+        let z = a.read(|state| state.apps[0].guid.clone());
+        let seen = |outcome: Outcome| {
+            let z = z.clone();
+            move |state: &mut State| {
+                let outcomes = state.outcomes.entry(z.clone()).or_default();
+                outcomes.insert("w".into(), outcome);
+            }
+        };
+        let outcome = |store: &Store| store.read(|state| state.outcome(&z, "w").cloned());
+        a.observe(seen(Outcome::Running)).await;
+        let started = Instant::now();
+        while outcome(&b) != Some(Outcome::Running) {
+            assert!(started.elapsed() < Duration::from_secs(10), "not seen by b");
+            b.sync().await.unwrap();
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // a paused past its lease, its turn on: b's turn, of a later epoch; a's change and what
+        // it saw since are not written, its turn ends, what it saw forgotten
+        keeping_a.abort();
+        let paused = Instant::now();
+        led(&b).await;
+        println!("taken over {:?} after the last renewal", paused.elapsed());
+        assert!(epoch(&b) > epoch(&a));
+        a.observe(seen(Outcome::Unreachable)).await;
+        assert_eq!(a.lead(apps).await, None);
+        assert!(!a.leads());
+        assert_eq!(outcome(&a), Some(Outcome::Running));
+        b.sync().await.unwrap();
+        assert_eq!(outcome(&b), Some(Outcome::Running));
+        // b lets go of it: a's at once
+        let (_, _keeping_a) = keep(&a);
+        keeping_b.abort();
+        let was = epoch(&b);
+        lease_b.release().await;
+        let released = Instant::now();
+        led(&a).await;
+        assert!(
+            released.elapsed() < TIMING.lease,
+            "{:?}",
+            released.elapsed()
+        );
+        assert!(epoch(&a) > was);
     }
 
     #[test]

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::watch;
 use tokio::time::Instant;
 
+use crate::fence::Fence;
 use crate::http::{Body, Response, error, json, read};
 use crate::store::check_name;
 
@@ -170,14 +171,25 @@ struct ConfirmedView {
 }
 
 /// `PUT /api/confirmed/<owner>`: the apps of `owner` the body names are as it wants them, those
-/// held served from now on. Answers those it released and those of `owner` held still.
-pub async fn confirmed(held: &Held, owner: &str, parts: &Parts, body: Body) -> Response {
+/// held served from now on, unless `fence` refuses its epoch. Answers those it released and
+/// those of `owner` held still.
+pub async fn confirmed(
+    held: &Held,
+    fence: &Fence,
+    owner: &str,
+    parts: &Parts,
+    body: Body,
+) -> Response {
     let too_large = format!(
         "a confirmation is {} KiB at most",
         MAX_CONFIRMED_BYTES >> 10
     );
-    match read(parts, body, MAX_CONFIRMED_BYTES, &too_large).await {
-        Ok(body) => confirmation(held, owner, &body),
+    let body = match read(parts, body, MAX_CONFIRMED_BYTES, &too_large).await {
+        Ok(body) => body,
+        Err(refused) => return refused.into(),
+    };
+    match fence.admit(Some(owner), parts).await {
+        Ok(_admitted) => confirmation(held, owner, &body),
         Err(refused) => refused.into(),
     }
 }

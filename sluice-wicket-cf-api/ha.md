@@ -2,8 +2,11 @@
 
 What several instances of the [cf-api](README.md) share, in place of the files of one
 instance's `--data-dir`: the state and the logins in PostgreSQL (`--state`), the packages and
-the droplets in an S3 bucket (`--blobs`). The reconciling of the wickets is one process's still:
-run one instance on them. The options are in the README's [Options](README.md#options).
+the droplets in an S3 bucket (`--blobs`); and who reconciles the wickets, one instance at a time
+([The reconciling of the wickets](#the-reconciling-of-the-wickets)). An edit is still tried
+against the wickets by the instance taking it: only the one reconciling them is ready, and a
+balancer checking `/healthz` sends it every request, the others standing by. The options are in
+the README's [Options](README.md#options).
 
 ## The state in PostgreSQL
 
@@ -80,3 +83,35 @@ affinity.
 Run against RustFS 1.0.5 (`rustfs/rustfs`) and Versity S3 Gateway 1.10.0 (`versity/versitygw`,
 its POSIX backend); what was decided
 and measured is in [.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#the-blobs-bucket).
+
+## The reconciling of the wickets
+
+With `--state` one instance at a time reconciles the wickets: the holder of a lease, a row of the
+store (`sluice_cf_lease`) it renews every 2s for 10s, by the store's clock. Its turn is the
+watches of the wickets, the confirmations of what a wicket holds at its start, the evacuations
+and the moves, the purges, the deployments' steps and the sweeps of the bucket. The others take
+the lease once it lapses, trying every second; a stop lets go of it, the next taking it at once.
+Without `--state` the one process of `--data-dir` leads from its start.
+
+- each take begins a turn of a new epoch, the store's clock in milliseconds at least: above every
+  one before, of a store restored from a backup too. The turn's writes to a wicket's app API carry
+  it (`sluice-epoch`), and the wicket refuses one below the highest it saw of the owner, after a
+  restart of it too: an instance paused or cut off past its lease puts nothing over what the next
+  one put. A write without an epoch (a cf-api predating it, or of `--data-dir`) is taken as
+  before, and a wicket predating it takes any
+- the store refuses a change only the leader makes (a deployment's step, a move placed, a purge
+  done) once another took the lease, which ends the turn; a holder that cannot renew ends it 9s
+  after the last renewal it sent that held
+- what the leader saw of the wickets is the store's, a row each, written as it is seen: their
+  answers of each app's share, their budgets, offers, the wickets leaving or gone. Every instance
+  answers `cf app` and places the apps' indices by it; the others list a wicket for a request
+  only (the process stats)
+- a takeover is a start of the cf-api to the wickets: the next leader takes up the deployments and
+  the moves under way from the state, lists every wicket and confirms what each holds. What only
+  a process knew is learned again: a share whose VMs did not start is tried once more. The lease,
+  a take's pause and a listing stay within the 15s a wicket started again holds its apps
+- `/healthz`: 200 of the leader once it listed every wicket in its turn; 503 of the others
+  (`another instance reconciles the wickets`)
+
+What was decided and measured is in
+[.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#the-reconciling-of-the-wickets).

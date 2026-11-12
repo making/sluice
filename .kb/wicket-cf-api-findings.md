@@ -112,6 +112,57 @@ one instance, the peak resident memory of the two:
 On both: an app pushed through one instance without a start and started through the
 other is staged from the bucket's package and its droplet put to the wicket from the bucket.
 
+## The reconciling of the wickets
+
+One instance at a time reconciles the wickets ([ha.md](../sluice-wicket-cf-api/ha.md#the-reconciling-of-the-wickets)).
+Decided against the alternatives:
+
+- the lease a table of its own (`sluice_cf_lease`), not a record of the state: a renewal every 2s
+  is no revision (no notice to every instance, no copy, no commit row), on a connection of its
+  own, never behind a change. Its take holds the revision's lock, so a change sees the lease as it
+  is until its commit: the store refuses a change of the leader alone once another took it
+- an epoch is the store's clock in milliseconds at least (`GREATEST(epoch + 1, ...)`): a store
+  restored from a backup, or a new one, goes on above what the wickets saw, which would refuse
+  every write of a lower one, after their restarts too (`epochs.json`)
+- what the leader saw of the wickets kept in the store, not listed again by every instance: every
+  instance places the apps' indices in its own changes (`State::place`, by the room the budgets,
+  `full`, leaving and gone leave), and a share the wicket refused shows in no listing, which
+  `cf app` and a start's wait for `RUNNING` on another instance need. A row per app and wicket
+  and per wicket, written as one changes, the noted ones of 100ms in one change: a listing's
+  answers of a wicket come back as one write
+- who writes them: whoever saw them, unless its turn ended meanwhile, what it saw then forgotten:
+  a leader cut off notes every share unreachable, which it never writes over the next one's
+- `did_not_start` not kept: a takeover is a start, which tries such a share once more, as a
+  restart of one instance does. Kept, each failed share's body (its env with it) would be in the
+  store for a try saved once a takeover. A wicket gone in the turn before is evacuated at once,
+  not after another `--wicket-away-grace`; the evacuations' and respreads' bookkeeping and the
+  strangers' lines are learned again
+- an instance not leading not ready: an edit is tried against the wickets by the instance taking
+  it, beside the leader's watch, which can undo its trial put before its commit, or miss a commit
+  landing after its last listing. Only the leader ready, a balancer checking `/healthz` sends it
+  every request
+- a wicket keeps the highest epoch per owner (two owners are two controllers), and holds an
+  owner's fence until the write is handed to its reloader: the writes reach the routes in the
+  order admitted. One without the header is taken as before, both ways (an old cf-api, an old
+  wicket ignoring the header)
+- a sweep's marker carries its turn's epoch: one of a turn before the lease's is over at once,
+  not 10 minutes on (`SWEEP_STALE`), as its instance stops deleting when its turn ends
+
+The bound: the lease (10s), a take's pause (1s) and a listing's (`MAX_PAUSE`, 2s) stay within
+`HELD` (15s), asserted at compile time: a wicket started again as the leader went holds its apps
+until the next one confirms them.
+
+Measured on one host (release build; PostgreSQL 18 in a container through
+Docker's port proxy; a wasi wicket in local mode; two instances, no app), 3 runs each:
+
+| the leader | the other leads | its `/healthz` 200 |
+|---|---|---|
+| killed (SIGKILL), 2.5s after one leads | 9.42-9.49s | 16-17ms later |
+| stopped (SIGTERM): the lease let go of | 0.44-0.49s | 16-17ms later |
+
+A kill's is the lease's lapse (10s after the last renewal, at most 2s before the kill) and a
+take's pause; a stop's the take's pause alone.
+
 ## A stop
 
 The release binary on the host (`--wicket` unreachable), SIGTERM to its exit: idle, 11-13ms. A
