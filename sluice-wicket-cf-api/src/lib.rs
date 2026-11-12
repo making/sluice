@@ -64,6 +64,9 @@ use std::sync::Arc;
 
 use tokio::net::TcpListener;
 
+/// Bound on a connection to another instance: one that is gone is found so at once.
+const PEER_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// The owner the apps are put under in the wickets.
 pub const OWNER: &str = "cf";
 
@@ -146,6 +149,10 @@ pub struct Settings {
     pub tls: Option<TlsSettings>,
     /// How long a stop waits for the requests and the puts under way.
     pub stop_grace: std::time::Duration,
+    /// PEM CA verifying the other instances (`--instance-ca-cert`); None: the webPKI roots.
+    pub instance_ca: Option<Vec<u8>>,
+    /// The timing of the lease of the instance reconciling the wickets: no option's.
+    pub lease: lease::Timing,
 }
 
 /// A wicket the apps are placed on.
@@ -312,6 +319,14 @@ pub async fn serve(
         .flume
         .clone()
         .map(|flume| tokio::spawn(flume::watch(flume, store.clone(), logs.clone())));
+    let peers = tls::client_config(settings.instance_ca.as_deref(), "--instance-ca-cert")?;
+    let peers = reqwest::Client::builder()
+        .connect_timeout(PEER_CONNECT_TIMEOUT)
+        // let go of before the other instance closes it: no edit lands on a closing one
+        .pool_idle_timeout(std::time::Duration::from_secs(30))
+        .tls_backend_preconfigured(peers)
+        .build()
+        .map_err(|e| format!("--instance-ca-cert: {e}"))?;
     let osb = osb::Client::new()?;
     let operations = Arc::new(operations::Operations::new(
         store.clone(),
@@ -334,12 +349,13 @@ pub async fn serve(
         controller: controller.clone(),
         registry: registry::Registry::new()?,
         build: describe_build(),
+        peers,
     });
     // the stagings and the apps' deletes a stop left under way; the deployments and moves with
     // the wickets, in this instance's turn reconciling them
     api.take_up();
     let stop = controller.stop.clone();
-    let lease = store.lease(lease::Timing::default());
+    let lease = store.lease(settings.lease);
     let keeping = tokio::spawn(lease.clone().run());
     let leading = tokio::spawn(controller.lead());
     let sweep = tokio::spawn(store.clone().keep_swept());
@@ -433,6 +449,8 @@ mod tests {
             service_broker_editors: security_groups::Editors::default(),
             tls,
             stop_grace: std::time::Duration::from_secs(8),
+            instance_ca: None,
+            lease: lease::Timing::default(),
         }
     }
 
@@ -668,5 +686,225 @@ mod tests {
             "stopped after {stopped:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+    /// Two instances on one store: an edit the wickets take at once, made through the one not
+    /// reconciling them, is tried and committed by the one that is, in its turn: refused by a
+    /// wicket it is a 422 and changes nothing; two of one app through both leave the wicket
+    /// and the state alike; and the one reconciling the wickets killed with an edit under way,
+    /// the edit is answered once, by the next. No write reaches the wicket but of a turn.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_edit_on_any_instance_is_made_by_the_one_reconciling_the_wickets() {
+        use crate::controller::tests::{FakeWicket, until};
+        use serde_json::{Value, json};
+
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (url, _) = store::postgres_server::database().await;
+        let (fake, wicket) = FakeWicket::start(std::time::Duration::from_millis(500)).await;
+        let dir = std::env::temp_dir().join(format!("cf-api-edits-{}", store::guid()));
+        let state = postgres::PostgresSettings {
+            url: format!("{url}?sslmode=disable"),
+            ca_pem: None,
+            instance_url: None,
+        };
+        // an app started on the wicket, of one instance, its route mapped
+        let (guid, route) = {
+            let (domains, wickets) = (["apps.test".to_string()], ["wicket".to_string()]);
+            let runs = [("wicket".to_string(), wicket::Runtime::Wasm)].into();
+            let seed = &dir.join("seed");
+            let seed = store::Store::open(
+                seed,
+                "org",
+                "space",
+                &domains,
+                &wickets,
+                &runs,
+                Some(&state),
+                None,
+            );
+            let seed = seed.await.unwrap();
+            seed.update(|state| {
+                let space = state.spaces[0].guid.clone();
+                let domain = state.domains[0].guid.clone();
+                let app = state.create_app("hello", &space);
+                app.process.instances = 1;
+                app.started = true;
+                app.running = Some(store::Running {
+                    sha256: "ab".repeat(32),
+                    file: "hello.wasm".into(),
+                    memory_mib: 64,
+                    tag: Some("t1".into()),
+                    ..store::Running::default()
+                });
+                let guid = app.guid.clone();
+                let route = state.create_route("hello", &domain, &space).guid.clone();
+                state.map(&route, &guid);
+                (guid, route)
+            })
+            .await
+        };
+        // each instance on a runtime of its own: killed with it
+        struct Running(Option<tokio::runtime::Runtime>);
+        impl Running {
+            fn kill(&mut self) {
+                if let Some(runtime) = self.0.take() {
+                    runtime.shutdown_background();
+                }
+            }
+        }
+        impl Drop for Running {
+            fn drop(&mut self) {
+                self.kill();
+            }
+        }
+        let instance = |name: &str| {
+            let (dir, wicket) = (dir.join(name), wicket.clone());
+            let (mut state, bound) = (state.clone(), tokio::sync::oneshot::channel());
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+            runtime.spawn(async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let mut settings = settings(dir, None);
+                settings.wickets[0].url = wicket;
+                state.instance_url = Some(url.clone());
+                settings.state = Some(state);
+                settings.lease = store::tests::TIMING;
+                bound.0.send(url).unwrap();
+                serve(listener, settings, std::future::pending())
+                    .await
+                    .unwrap()
+            });
+            async move { (bound.1.await.unwrap(), Running(Some(runtime))) }
+        };
+        let http = reqwest::Client::new();
+        let ready = async |api: &str| {
+            let started = Instant::now();
+            loop {
+                let health = http.get(format!("{api}/healthz")).send().await.unwrap();
+                if health.status() == 200 {
+                    return;
+                }
+                let why = health.text().await.unwrap();
+                assert!(started.elapsed() < QUIET, "{api} is not ready: {why}");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        };
+        let (leader, mut leading) = instance("leader").await;
+        ready(&leader).await;
+        // the other is ready once the lease names where the edits go
+        let (other, _following) = instance("other").await;
+        ready(&other).await;
+        let token = (http
+            .post(format!("{other}/uaa/oauth/token"))
+            .basic_auth("cf", Some("")))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body("grant_type=password&username=u&password=p");
+        let token: Value = token.send().await.unwrap().json().await.unwrap();
+        let token = format!("bearer {}", token["access_token"].as_str().unwrap());
+        let call = async |method: http::Method, api: &str, path: &str, body: Option<Value>| {
+            let request = (http.request(method, format!("{api}{path}")))
+                .header("authorization", &token)
+                .header("host", "api.apps.test");
+            let request = match body {
+                Some(body) => request.json(&body),
+                None => request,
+            };
+            let response = request.send().await.unwrap();
+            let status = response.status().as_u16();
+            let body = response.bytes().await.unwrap();
+            (status, serde_json::from_slice(&body).unwrap_or(Value::Null))
+        };
+        let instances = async |api: &str| {
+            let path = format!("/v3/apps/{guid}/processes/web");
+            call(http::Method::GET, api, &path, None).await.1["instances"].clone()
+        };
+        let served = || {
+            let apps = fake.apps.lock().unwrap();
+            apps.get(&guid)
+                .map(|app| app["sandbox"]["instances"].clone())
+        };
+        until("the app on the wicket", || served() == Some(json!(1))).await;
+        let turn = fake.writes.lock().unwrap()[0].0;
+        assert!(turn.is_some());
+
+        // refused by the wicket: a 422 through the other, nothing changed
+        let scale = format!("/v3/apps/{guid}/processes/web/actions/scale");
+        *fake.refusing.lock().unwrap() = Some("t1".into());
+        let (status, refused) = call(
+            http::Method::POST,
+            &other,
+            &scale,
+            Some(json!({"instances": 2})),
+        )
+        .await;
+        assert_eq!(status, 422, "{refused}");
+        let detail = refused["errors"][0]["detail"].as_str().unwrap();
+        assert!(detail.contains("the tag is refused"), "{detail}");
+        assert_eq!(
+            (instances(&other).await, instances(&leader).await, served()),
+            (json!(1), json!(1), Some(json!(1)))
+        );
+        *fake.refusing.lock().unwrap() = None;
+
+        // two edits of the app at once, one through each: the wicket and the state alike, the
+        // links those of the API its client reached
+        let (through_other, through_leader) = tokio::join!(
+            call(
+                http::Method::POST,
+                &other,
+                &scale,
+                Some(json!({"instances": 2}))
+            ),
+            call(
+                http::Method::POST,
+                &leader,
+                &scale,
+                Some(json!({"instances": 3}))
+            ),
+        );
+        assert_eq!((through_other.0, through_leader.0), (202, 202));
+        let link = through_other.1["links"]["self"]["href"].as_str().unwrap();
+        assert!(
+            link.starts_with("http://api.apps.test/v3/processes/"),
+            "{link}"
+        );
+        let scaled = instances(&other).await;
+        assert!(scaled == json!(2) || scaled == json!(3), "{scaled}");
+        assert_eq!(served(), Some(scaled));
+        // every write so far the leader's, of its turn
+        {
+            let writes = fake.writes.lock().unwrap();
+            assert!(
+                writes.iter().all(|write| *write == (turn, true)),
+                "{writes:?}"
+            );
+        }
+
+        // the leader killed with an edit under way, its trial at the wicket: answered once
+        // by the other, in its own turn
+        let destinations = format!("/v3/routes/{route}/destinations");
+        let mapped = call(http::Method::GET, &other, &destinations, None).await.1;
+        let destination = mapped["destinations"][0]["guid"].as_str().unwrap();
+        let unmap = format!("{destinations}/{destination}");
+        let before = fake.writes.lock().unwrap().len();
+        let unmapped = async { call(http::Method::DELETE, &other, &unmap, None).await.0 };
+        let killed = async {
+            until("the trial at the wicket", || {
+                fake.writes.lock().unwrap().len() > before
+            })
+            .await;
+            leading.kill();
+        };
+        let (unmapped, ()) = tokio::join!(unmapped, killed);
+        assert_eq!(unmapped, 204);
+        let mapped = call(http::Method::GET, &other, &destinations, None).await.1;
+        assert_eq!(mapped["destinations"], json!([]));
+        until("the app off the wicket", || served().is_none()).await;
+        assert!(fake.fenced_none(), "{:?}", fake.writes.lock().unwrap());
+        let writes = fake.writes.lock().unwrap();
+        assert!(
+            writes.iter().all(|(epoch, _)| epoch.is_some()),
+            "{writes:?}"
+        );
+        assert!(writes.iter().any(|(epoch, _)| *epoch > turn), "{writes:?}");
     }
 }

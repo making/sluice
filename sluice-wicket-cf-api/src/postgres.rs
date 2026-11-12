@@ -113,6 +113,7 @@ CREATE TABLE IF NOT EXISTS sluice_cf_lease (
 );
 INSERT INTO sluice_cf_lease (holder, epoch, expires) VALUES (NULL, 0, '-infinity')
     ON CONFLICT DO NOTHING;
+ALTER TABLE sluice_cf_lease ADD COLUMN IF NOT EXISTS address text;
 ";
 
 /// Bound on a statement of the lease: past it its connection is taken for lost.
@@ -133,8 +134,9 @@ struct Leasing {
 pub enum Taken {
     /// This instance holds it, of this epoch: a turn of its own.
     Taken(u64),
-    /// Another instance holds it, of this epoch (none ever did: 0).
-    Held(u64),
+    /// Another instance holds it, of this epoch (none ever did: 0), reached by the others at
+    /// this URL (`--instance-url`), if it gave one.
+    Held(u64, Option<String>),
 }
 
 /// Bound on a statement of the logins: past it their connection is taken for lost.
@@ -168,6 +170,9 @@ pub struct PostgresSettings {
     pub url: String,
     /// PEM CA verifying it (`--state-ca-cert`); None: the webPKI roots.
     pub ca_pem: Option<Vec<u8>>,
+    /// Where the other instances reach this one (`--instance-url`): what the lease says of its
+    /// holder.
+    pub instance_url: Option<String>,
 }
 
 impl std::fmt::Debug for PostgresSettings {
@@ -189,6 +194,9 @@ pub struct Shared {
     pub term: tokio::sync::watch::Sender<Option<Term>>,
     /// The epoch of the lease as this instance last saw it: the turn of whoever leads.
     pub leading: tokio::sync::watch::Sender<Option<u64>>,
+    /// Where the instance holding the lease is reached, as this instance last saw it held by
+    /// another (`--instance-url`); None: it gave none, or none holds it.
+    pub leader: tokio::sync::watch::Sender<Option<String>>,
 }
 
 impl Shared {
@@ -253,6 +261,8 @@ pub struct Postgres {
     tls: MakeRustlsConnect,
     /// This instance, as the lease names its holder.
     holder: String,
+    /// Where the others reach it, as the lease says of its holder.
+    address: Option<String>,
     /// The connection listening, which answers the revision too (by the statement beside
     /// it); None while it is away.
     listening: Mutex<Option<(Arc<Client>, Statement)>>,
@@ -296,6 +306,7 @@ impl Postgres {
             config,
             tls: MakeRustlsConnect::new(tls),
             holder: holder.to_string(),
+            address: settings.instance_url.clone(),
             listening: Mutex::new(None),
             aside: tokio::sync::Mutex::new(None),
             leasing: tokio::sync::Mutex::new(None),
@@ -712,12 +723,13 @@ impl Postgres {
                  WHERE holder = $1 AND epoch = $2::bigint AND expires > now()",
             )
             .await?,
-            due: prepare("SELECT holder, epoch, expires <= now() FROM sluice_cf_lease").await?,
+            due: prepare("SELECT holder, epoch, expires <= now(), address FROM sluice_cf_lease")
+                .await?,
             locked: prepare("SELECT 1 FROM sluice_cf_meta FOR UPDATE").await?,
             // the epoch the store's clock in milliseconds at least: a store restored from a
             // backup, or a new one, goes on above what the wickets were sent
             take: prepare(
-                "UPDATE sluice_cf_lease SET holder = $1, \
+                "UPDATE sluice_cf_lease SET holder = $1, address = $3, \
                  epoch = GREATEST(epoch + 1, (extract(epoch FROM now()) * 1000)::bigint), \
                  expires = now() + $2::bigint * interval '1 millisecond' \
                  WHERE expires <= now() OR holder = $1 RETURNING epoch",
@@ -743,22 +755,22 @@ impl Postgres {
 
     /// Takes the lease for `lease`, by the store's clock, unless another instance holds it
     /// still; under the revision's lock, so a change sees the lease as it was or as taken, never
-    /// both. Taken anew, a turn of this instance's own of the epoch after it; an epoch is the
-    /// store's clock in milliseconds at least.
+    /// both. Taken anew, a turn of this instance's own of the epoch after it, the lease saying
+    /// where the others reach it; an epoch is the store's clock in milliseconds at least.
     pub async fn take(&self, lease: Duration) -> Result<Taken, String> {
         let millis = lease.as_millis() as i64;
         let holder = self.holder.as_str();
         self.leased(async |leasing| {
             let client = &leasing.client;
-            let due = client.query_one(&leasing.due, &[]).await?;
+            let row = client.query_one(&leasing.due, &[]).await?;
             let (held_by, epoch, due): (Option<String>, i64, bool) =
-                (due.get(0), due.get(1), due.get(2));
+                (row.get(0), row.get(1), row.get(2));
             if !due && held_by.as_deref() != Some(holder) {
-                return Ok(Taken::Held(epoch as u64));
+                return Ok(Taken::Held(epoch as u64, row.get(3)));
             }
             client.batch_execute("BEGIN").await?;
             client.query_one(&leasing.locked, &[]).await?;
-            let take: [&(dyn ToSql + Sync); 2] = [&holder, &millis];
+            let take: [&(dyn ToSql + Sync); 3] = [&holder, &millis, &self.address];
             let taken = client.query_opt(&leasing.take, &take).await?;
             client.batch_execute("COMMIT").await?;
             Ok(match taken {
@@ -766,7 +778,7 @@ impl Postgres {
                 // another took it meanwhile
                 None => {
                     let held = client.query_one(&leasing.due, &[]).await?;
-                    Taken::Held(held.get::<_, i64>(1) as u64)
+                    Taken::Held(held.get::<_, i64>(1) as u64, held.get(3))
                 }
             })
         })

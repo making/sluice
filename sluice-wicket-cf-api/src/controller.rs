@@ -75,7 +75,8 @@
 //! up from the state as a start does. Its writes carry the turn's epoch, a wicket refusing one
 //! below the highest it saw. What it saw of the wickets (their answers, budgets, offers, ...) is
 //! the state's for every instance (`Store::observe`), each placing by it; the others list no
-//! wicket but for a request (the process stats).
+//! wicket but for a request (the process stats), write no app to one, and send the edits the
+//! wickets take at once to the one whose turn it is (`crate::api`).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
@@ -243,6 +244,10 @@ impl Controller {
         away_grace: Duration,
         cnb: Option<Cnb>,
     ) -> Controller {
+        // of several instances, one writes an app to a wicket in its turn alone
+        if store.shared().is_some() {
+            wickets.iter().for_each(|wicket| wicket.set_no_turn());
+        }
         Controller {
             store,
             wickets,
@@ -313,7 +318,8 @@ impl Controller {
     }
 
     /// Ends the turn: its work stopped and waited for, what it saw of the wickets and did not
-    /// write forgotten, its writes carrying no epoch from then on.
+    /// write forgotten; of several instances it writes no app to a wicket from then on, the one
+    /// process of a data directory with no epoch.
     async fn end(&self) {
         let work = (self.work.lock().expect("no panic under the lock")).take();
         if let Some(work) = work {
@@ -322,7 +328,10 @@ impl Controller {
             work.tasks.wait().await;
         }
         for wicket in &self.wickets {
-            wicket.set_epoch(None);
+            match self.store.shared() {
+                Some(_) => wicket.set_no_turn(),
+                None => wicket.set_epoch(None),
+            }
         }
         self.store.forget_observed().await;
         for held in [&self.respreading, &self.placed_again, &self.driving] {
@@ -440,8 +449,9 @@ impl Controller {
     /// Deletes the app `guid` (`name`): gone from every wicket first; one not taking that
     /// removes it when it does. Each share is held until the state no longer has the app: a
     /// listing of a wicket that answered first does not put it back meanwhile. The cache of
-    /// its builds of source is forgotten where a wicket keeps one.
-    pub async fn remove(&self, guid: &str, name: &str) {
+    /// its builds of source is forgotten where a wicket keeps one. Whether it is deleted: not
+    /// once this instance's turn ended, the app left to the instance whose turn it is.
+    pub async fn remove(&self, guid: &str, name: &str) -> bool {
         let _app = self.hold(guid).await;
         let built = self.store.read(|state| {
             (state.droplets.iter()).any(|droplet| droplet.app == guid && droplet.built.is_some())
@@ -463,9 +473,10 @@ impl Controller {
             (wicket.name.clone(), removed, share)
         }))
         .await;
+        // in the turn the wickets were written in: the next one's first listing is after it
         let blobs = self
             .store
-            .update(|state| {
+            .lead(|state| {
                 for (wicket, removed, _) in &removed {
                     if removed.as_ref().is_err_and(Failure::retried) {
                         state.removals.push(Removal {
@@ -477,10 +488,14 @@ impl Controller {
                 state.remove_app(guid)
             })
             .await;
+        let Some(blobs) = blobs else {
+            return false;
+        };
         self.store.delete(&blobs).await;
         self.logs.forget(guid);
         self.forget(guid);
         println!("[{guid}] API: deleted app {name}");
+        true
     }
 
     /// `guid`, deleted, is held no more.
@@ -2079,16 +2094,22 @@ impl Controller {
         }
     }
 
-    /// Whether the API is ready: the state read before, reconciling the wickets, every wicket
-    /// listed once (or found not answering) in this turn; not from the stop on. Err with why
-    /// not. An edit is tried against the wickets by the instance taking it: of several, only
-    /// the one reconciling them is ready, so a balancer checking it sends it every request.
+    /// Whether the API is ready: the state read before; reconciling the wickets, every wicket
+    /// listed once (or found not answering) in this turn; another instance reconciling them,
+    /// that one named by the lease with the URL the edits the wickets take at once are sent it
+    /// at (`crate::api`); not from the stop on. Err with why not.
     pub fn ready(&self) -> Result<(), String> {
         if self.stop.stopping() {
             return Err("the cf-api stops".into());
         }
         if !self.store.leads() {
-            return Err("another instance reconciles the wickets".into());
+            return match self.store.leader() {
+                (Some(_), Some(_)) => Ok(()),
+                (Some(_), None) => Err("another instance reconciles the wickets, and gave no \
+                                        --instance-url to send it the edits at"
+                    .into()),
+                (None, _) => Err("no instance reconciles the wickets yet".into()),
+            };
         }
         let listed = self.listed_once.lock().expect("no panic under the lock");
         let unlisted: Vec<&str> = (self.wickets.iter())
@@ -2407,7 +2428,7 @@ fn sorted(list: &[String]) -> Vec<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::store::Running;
 
@@ -2938,22 +2959,22 @@ mod tests {
     /// answered a little later, `PUT` and `DELETE` of an app, the latter answered after
     /// `deleting`, each fenced by its owner's epoch as a wicket fences it; a PUT of the tag
     /// `refusing` refused, an app of `unadvertised` listed so.
-    struct FakeWicket {
-        apps: Mutex<BTreeMap<String, serde_json::Value>>,
+    pub(crate) struct FakeWicket {
+        pub(crate) apps: Mutex<BTreeMap<String, serde_json::Value>>,
         revision: tokio::sync::watch::Sender<u64>,
         /// The revision of the listing held last: the watch listed it.
         held: tokio::sync::watch::Sender<Option<u64>>,
         deleting: Duration,
         fence: sluice_wicket_console::fence::Fence,
         /// Each write's epoch, and whether the fence admitted it, in the order they came.
-        writes: Mutex<Vec<(Option<u64>, bool)>>,
-        refusing: Mutex<Option<String>>,
+        pub(crate) writes: Mutex<Vec<(Option<u64>, bool)>>,
+        pub(crate) refusing: Mutex<Option<String>>,
         unadvertised: Mutex<BTreeSet<String>>,
     }
 
     impl FakeWicket {
         /// Serves it on a port of its own: its URL.
-        async fn start(deleting: Duration) -> (Arc<FakeWicket>, String) {
+        pub(crate) async fn start(deleting: Duration) -> (Arc<FakeWicket>, String) {
             let dir = std::env::temp_dir().join(format!("cf-api-fake-{}", crate::store::guid()));
             let fake = Arc::new(FakeWicket {
                 apps: Mutex::default(),
@@ -2994,7 +3015,7 @@ mod tests {
         }
 
         /// Whether no write was admitted after one of a higher epoch.
-        fn fenced_none(&self) -> bool {
+        pub(crate) fn fenced_none(&self) -> bool {
             let writes = self.writes.lock().unwrap();
             let admitted = writes.iter().filter(|(_, admitted)| *admitted);
             let mut highest = None;
@@ -3168,7 +3189,7 @@ mod tests {
     }
 
     /// Until `done` holds, 20s at most.
-    async fn until(what: &str, done: impl Fn() -> bool) {
+    pub(crate) async fn until(what: &str, done: impl Fn() -> bool) {
         let started = Instant::now();
         while !done() {
             assert!(started.elapsed() < Duration::from_secs(20), "{what}");
@@ -3192,6 +3213,7 @@ mod tests {
             let settings = crate::postgres::PostgresSettings {
                 url: format!("{url}?sslmode=disable"),
                 ca_pem: None,
+                instance_url: None,
             };
             let names = ["a".to_string(), "b".to_string(), "c".to_string()];
             let runs = names
@@ -3350,7 +3372,7 @@ mod tests {
                 "{refused:?}"
             );
             assert!(fakes["b"].0.refused().contains(&first_epoch));
-            // back, the first's turn is over: what it does put, it puts as an edit does
+            // back, the first's turn is over: it writes no app to a wicket
             if paused {
                 let (_, _keeping) = keep(&first);
                 let mut terms = first.terms();

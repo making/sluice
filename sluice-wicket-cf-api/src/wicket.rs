@@ -31,7 +31,8 @@
 //! A write of an app (`PUT` / `DELETE /api/apps`, `/api/confirmed`, `/api/evacuated`, `DELETE
 //! /api/keyvalue`) carries the epoch of the owner's turn reconciling the wickets, if it has one
 //! (`crate::lease`): the wicket refuses one below the highest it saw of the owner
-//! ([`Failure::Fenced`]); a wicket predating it takes it as it took one without.
+//! ([`Failure::Fenced`]); a wicket predating it takes it as it took one without. Of several
+//! instances one without a turn sends none.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -56,6 +57,9 @@ const PIECE_TIMEOUT: Duration = Duration::from_secs(120);
 /// One without is answered at once: `cf app` does not wait long to show the wicket away.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// What [`Wicket::epoch`] holds of an owner without a turn.
+const NO_TURN: u64 = u64::MAX;
+
 /// A wicket's app API, as one of the wickets configured.
 pub struct Wicket {
     client: reqwest::Client,
@@ -66,7 +70,7 @@ pub struct Wicket {
     pub name: String,
     /// What the log lines call it: `the wicket`, or of several `the wicket <name>`.
     pub label: String,
-    /// The epoch of the owner's turn its writes carry; 0: none.
+    /// The epoch of the owner's turn its writes carry; 0: none; [`NO_TURN`]: no turn, no write.
     epoch: AtomicU64,
 }
 
@@ -597,7 +601,8 @@ pub enum Failure {
     /// No answer, or none to act on (5xx).
     Unreachable(String),
     /// The wicket refused the epoch the write carried, `epoch`: below the highest it saw of the
-    /// owner, whose turn another instance took (409).
+    /// owner, whose turn another instance took (409). Or the write was not sent: this instance
+    /// has no turn.
     Fenced { epoch: Option<u64>, error: String },
 }
 
@@ -676,9 +681,15 @@ impl Wicket {
         self.epoch.store(epoch.unwrap_or(0), Ordering::Release);
     }
 
+    /// The owner has no turn from now on: of several instances, one that does not reconcile the
+    /// wickets. Its writes of an app are not sent ([`Failure::Fenced`]).
+    pub fn set_no_turn(&self) {
+        self.epoch.store(NO_TURN, Ordering::Release);
+    }
+
     /// The epoch its writes carry.
     pub fn epoch(&self) -> Option<u64> {
-        Some(self.epoch.load(Ordering::Acquire)).filter(|epoch| *epoch > 0)
+        Some(self.epoch.load(Ordering::Acquire)).filter(|epoch| *epoch > 0 && *epoch != NO_TURN)
     }
 
     /// `request`, a write of an app, carrying the epoch of the owner's turn, if any: the
@@ -687,6 +698,12 @@ impl Wicket {
         &self,
         request: reqwest::RequestBuilder,
     ) -> Result<(reqwest::StatusCode, bytes::Bytes), Failure> {
+        if self.epoch.load(Ordering::Acquire) == NO_TURN {
+            return Err(Failure::Fenced {
+                epoch: None,
+                error: "this instance does not reconcile the wickets".into(),
+            });
+        }
         let epoch = self.epoch();
         let request = match epoch {
             Some(epoch) => request.header(EPOCH, epoch),

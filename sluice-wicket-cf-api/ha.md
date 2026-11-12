@@ -3,10 +3,9 @@
 What several instances of the [cf-api](README.md) share, in place of the files of one
 instance's `--data-dir`: the state and the logins in PostgreSQL (`--state`), the packages and
 the droplets in an S3 bucket (`--blobs`); and who reconciles the wickets, one instance at a time
-([The reconciling of the wickets](#the-reconciling-of-the-wickets)). An edit is still tried
-against the wickets by the instance taking it: only the one reconciling them is ready, and a
-balancer checking `/healthz` sends it every request, the others standing by. The options are in
-the README's [Options](README.md#options).
+([The reconciling of the wickets](#the-reconciling-of-the-wickets)), which makes the edits the
+wickets take at once for every instance ([An edit on any instance](#an-edit-on-any-instance)).
+The options are in the README's [Options](README.md#options).
 
 ## The state in PostgreSQL
 
@@ -110,8 +109,37 @@ Without `--state` the one process of `--data-dir` leads from its start.
   the moves under way from the state, lists every wicket and confirms what each holds. What only
   a process knew is learned again: a share whose VMs did not start is tried once more. The lease,
   a take's pause and a listing stay within the 15s a wicket started again holds its apps
-- `/healthz`: 200 of the leader once it listed every wicket in its turn; 503 of the others
-  (`another instance reconciles the wickets`)
+- `/healthz`: 200 of the leader once it listed every wicket in its turn; of the others once the
+  lease names the leader's `--instance-url`
 
 What was decided and measured is in
 [.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#the-reconciling-of-the-wickets).
+
+## An edit on any instance
+
+An edit the wickets take at once (routes, `cf scale -i`, a start, stop or restart, a manifest, a
+deployment and its cancel and continue, the app's name and annotations), and a deletion of what
+they serve (an app, a route, a space, an organization), is made by the instance reconciling the
+wickets: tried against them, committed and answered as by one instance, a wicket's refusal a 422
+that changes nothing. Any other request (the reads, the uploads and the builds, the services, the
+logins) is answered by the instance it reaches.
+
+- give each instance `--instance-url http(s)://host:port`, where the others reach its listener;
+  the lease names its holder's. Another instance sends the request there as it came, its token
+  and the host its client asked with it, and relays the answer: the links are the API's as the
+  client reaches it. `https://` is verified against `--instance-ca-cert`, else the webPKI roots.
+  The instances are one another's clients only: no key between them, the token is checked again
+- an instance writes no app to a wicket outside its turn, and the edit's commit is refused by the
+  store once another took the lease: an edit is made in one turn or not at all, and then goes to
+  the next leader
+- while no instance takes it (a takeover: within 11s of a kill, at once of a stop) the request is
+  held, 20s at most, then answered 503 with `Retry-After`. The cf CLI tries a 503 of a `GET` again
+  at once and of a `POST` not at all
+- the leader gone with an edit under way (a kill, the network), its answer lost: the request is
+  sent again to the next, which a second time changes nothing more; but a deployment's `POST`s
+  (create, cancel, continue), answered 502: `cf app` tells whether it was made
+- a leader without `--instance-url` takes no edit of the others: they are not ready (`/healthz`
+  503) while it leads, and a balancer checking it sends that one every request
+
+What was decided and measured is in
+[.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#an-edit-on-any-instance).

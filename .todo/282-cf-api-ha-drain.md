@@ -45,6 +45,17 @@ stop timeout for a VM):
 released before the listener is gone; a stop past the bound ends. The CLI test of 284: `cf push`
 across a stop of the instance it talks to.
 
+## From 279
+
+- an edit under way whose commit finds the turn over (`Store::lead`: None) changed nothing and is
+  sent to the next leader by its handler's loop (`Api::led`), so step 2 loses none. Its trial
+  puts already at a wicket are undone by the next leader's first listing
+- a stop keeps the lease until the requests ended: the others' edits find the listener closed
+  (not sent) and are held until the take, within `api::TAKEOVER` (20s): `--stop-grace` above
+  some 18s answers them 503. Step 2 ends that wait
+- `/healthz` of a follower: 200 once the lease names the leader's `--instance-url`; it does not
+  ask the store
+
 ## From 278
 
 - `Lease::release` runs at the end of `serve`'s stop, after the requests and the puts under way

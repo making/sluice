@@ -62,6 +62,15 @@ With `--state`, `fail_unfinished_builds` and `settle_unfinished_waits` run only 
 the store. `Api::take_up`, `Operations::kick` and `Controller::resume` still run at every
 instance's start.
 
+## From 279
+
+- an app's delete after its unbinds (`Api::delete_once_unbound`) runs on the instance that took
+  the `DELETE`, the leader then (`api::edit`). `Controller::remove` deletes in a turn only
+  (`Store::lead`): the turn over meanwhile, the app stays and its job is left unsettled until a
+  start takes it up (`Api::take_up`), the CLI polling it until then. An owner for it ends that
+- an instance without a turn writes no app to a wicket (`Wicket::set_no_turn`): work that puts
+  or removes one (`Controller::remove`, `sync`) is the leader's, or waits for it
+
 ## From 278
 
 - the controller's lease (`crate::lease`) is the one to weigh "all of it on the leader" with:

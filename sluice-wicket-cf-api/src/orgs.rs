@@ -666,7 +666,9 @@ impl Api {
                 .collect())
         })?;
         for (app, name) in apps {
-            self.controller.remove(&app, &name).await;
+            if !self.controller.remove(&app, &name).await {
+                return Err(ApiError::turn_over());
+            }
         }
         let routes = self
             .store

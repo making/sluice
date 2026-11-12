@@ -37,6 +37,13 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
                               takes the directory's state
   --state-file <path>         read the URL from a file instead
   --state-ca-cert <path>      PEM CA verifying it (default the webPKI roots)
+  --instance-url <url>        with --state, where the other instances reach this one,
+                              http(s)://host:port: they send it, while it reconciles the
+                              wickets, the edits the wickets take at once (with the token
+                              of each: https where the network between them is not theirs
+                              alone). Without it the others are not ready while it does
+  --instance-ca-cert <path>   PEM CA verifying the other instances' https:// URLs (default
+                              the webPKI roots)
   --blobs <url>               the packages and the droplets in an S3 bucket in place of the
                               directory's: the blobs of several instances; s3://bucket or
                               s3://bucket/prefix
@@ -159,6 +166,8 @@ const VALUED: &[&str] = &[
     "state",
     "state-file",
     "state-ca-cert",
+    "instance-url",
+    "instance-ca-cert",
     "blobs",
     "blobs-endpoint",
     "blobs-region",
@@ -402,7 +411,13 @@ pub fn parse(
             Some(PostgresSettings {
                 url,
                 ca_pem: pem("state-ca-cert")?,
+                instance_url: instance_url(value("instance-url"))?,
             })
+        }
+        None if value("instance-url").is_some() || value("instance-ca-cert").is_some() => {
+            return Err(
+                "--instance-url and --instance-ca-cert need --state: of several instances".into(),
+            );
         }
         None => None,
     };
@@ -648,8 +663,27 @@ pub fn parse(
             service_broker_editors,
             tls,
             stop_grace: std::time::Duration::from_secs(stop_grace),
+            instance_ca: pem("instance-ca-cert")?,
+            lease: crate::lease::Timing::default(),
         },
     })))
+}
+
+/// `--instance-url`, without a path: the requests' own follow it.
+fn instance_url(given: Option<String>) -> Result<Option<String>, String> {
+    let Some(given) = given else {
+        return Ok(None);
+    };
+    let url = given.trim_end_matches('/');
+    let authority = (url.strip_prefix("http://")).or_else(|| url.strip_prefix("https://"));
+    match authority {
+        Some(authority) if !authority.is_empty() && !authority.contains(['/', '?', '#', '@']) => {
+            Ok(Some(url.to_string()))
+        }
+        _ => Err(format!(
+            "--instance-url: expected http(s)://host:port, not '{given}'"
+        )),
+    }
 }
 
 /// The name of the one wicket `--wicket <url>` gives.
@@ -760,7 +794,8 @@ mod tests {
                 "--listen 0.0.0.0:9191 --domain=c.example --flume grpcs://flume:8002 \
                  --oidc-issuer https://idp.example.com/dex --oidc-client-id cf \
                  --oidc-scopes openid,email,groups --oidc-groups-claim teams \
-                 --group-role devs=space_developer@sluice/wicket",
+                 --group-role devs=space_developer@sluice/wicket \
+                 --instance-url https://10.0.0.5:9191/",
             ),
             env,
         ));
@@ -784,6 +819,7 @@ mod tests {
         let state = config.settings.state.expect("a store");
         assert_eq!(state.url, "postgres://cf:secret@db/cf");
         assert!(!format!("{state:?}").contains("secret"));
+        assert_eq!(state.instance_url.as_deref(), Some("https://10.0.0.5:9191"));
         let blobs = config.settings.blobs.expect("a bucket");
         assert_eq!(
             (blobs.bucket.as_str(), blobs.prefix.as_str()),
@@ -994,6 +1030,14 @@ mod tests {
         assert_eq!(
             error("--wicket http://w:1 --state mysql://u:secret@db/cf"),
             "--state: expected postgres://user:password@host:port/database"
+        );
+        assert_eq!(
+            error("--wicket http://w:1 --instance-url http://10.0.0.5:9191"),
+            "--instance-url and --instance-ca-cert need --state: of several instances"
+        );
+        assert_eq!(
+            error("--wicket http://w:1 --state postgres://u@db/cf --instance-url 10.0.0.5:9191"),
+            "--instance-url: expected http(s)://host:port, not '10.0.0.5:9191'"
         );
         assert_eq!(
             error("--wicket http://w:1 --blobs s3://cf --blobs-access-key-id id"),

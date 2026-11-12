@@ -2180,6 +2180,20 @@ impl Store {
         self.shared.term.borrow().is_some()
     }
 
+    /// The turn of the instance reconciling the wickets as this one last saw the lease: its
+    /// epoch, and where the others reach it (`--instance-url`) while it is another. Told of a
+    /// change by [`Store::leaders`].
+    pub fn leader(&self) -> (Option<u64>, Option<String>) {
+        let epoch = *self.shared.leading.borrow();
+        (epoch, self.shared.leader.borrow().clone())
+    }
+
+    /// The lease as this instance sees it, as a turn's epoch: each waiter told when another
+    /// turn began.
+    pub fn leaders(&self) -> tokio::sync::watch::Receiver<Option<u64>> {
+        self.shared.leading.subscribe()
+    }
+
     /// Ends this instance's turn of `epoch` (a wicket refused it), if it is still the one.
     pub fn end_term(&self, epoch: Option<u64>, why: &str) {
         self.shared.end_term(epoch, why);
@@ -2569,6 +2583,7 @@ pub(crate) mod tests {
         let settings = url.map(|url| PostgresSettings {
             url: url.to_string(),
             ca_pem: ca,
+            instance_url: None,
         });
         let runs = BTreeMap::new();
         Store::open(

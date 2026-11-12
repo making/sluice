@@ -1072,9 +1072,9 @@ docker compose up -d --force-recreate --wait wicket-b
 The state and the logins in PostgreSQL (`--state`) and the packages and droplets in an S3 bucket
 (`--blobs`), in place of `--data-dir`'s files, are what several instances share: [ha.md](ha.md).
 One at a time reconciles the wickets, the holder of a lease in the store, its writes fenced by
-its turn's epoch; the next takes over within 11s of its end, at once of its stop. An edit is still
-tried by the instance taking it: only the one reconciling the wickets is ready (`/healthz`), so a
-balancer checking it sends that one every request.
+its turn's epoch; the next takes over within 11s of its end, at once of its stop. An edit the
+wickets take at once is made by that one, whichever instance the request reaches: the others send
+it there (`--instance-url`) and relay its answer, so any instance takes any request.
 
 ## Options
 
@@ -1092,6 +1092,8 @@ balancer checking it sends that one every request.
 | `--blobs-ca-cert <path>` | PEM CA verifying the endpoint (default the webPKI roots) |
 | `--state <url>` / `--state-file <path>` | the state in PostgreSQL in place of `--data-dir`'s `state.json` ([The state in PostgreSQL](ha.md#the-state-in-postgresql)), and the logins in place of its `jwt.key` and `sessions.json` ([The logins in the store](ha.md#the-logins-in-the-store)): `postgres://user:password@host:port/database`, with libpq's parameters (`?sslmode=require`: TLS, which a URL without takes only where the server has it) |
 | `--state-ca-cert <path>` | PEM CA verifying it (default the webPKI roots) |
+| `--instance-url <url>` | with `--state`, where the other instances reach this one, `http(s)://host:port`: where they send the edits the wickets take at once while it reconciles them ([An edit on any instance](ha.md#an-edit-on-any-instance)). Without it the others are not ready meanwhile |
+| `--instance-ca-cert <path>` | PEM CA verifying the other instances' `https://` URLs (default the webPKI roots) |
 | `--org <name>` / `--space <name>` | the organization and its space the first start makes (default `sluice` / `wicket`) |
 | `--cnb-builder <image>` | the Cloud Native Buildpacks builder staging a zip of source on a Firecracker wicket with `--guest` ([Buildpacks](#buildpacks): `cnb`); none: a zip of source fails staging |
 | `--cnb-builder-username <name>` / `--cnb-builder-password <password>` / `--cnb-builder-password-file <path>` | its registry's credentials, its run image's too where that is of the same registry |
@@ -1419,7 +1421,8 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
   written. Past `--stop-grace` (8s) what is left is cut, as by a kill
 - `GET /healthz`, no token: 200 once every wicket was listed (or found not answering) since the
   start, 503 saying why not before, and from a stop on: a probe's, logged by no line. Of several
-  instances on one `--state`, the one reconciling the wickets alone ([ha.md](ha.md#the-reconciling-of-the-wickets))
+  instances on one `--state`, the one reconciling the wickets so, the others once the lease names
+  its `--instance-url` ([ha.md](ha.md#an-edit-on-any-instance))
 - auth: see [Login](#login). Every request but the root document, `/v3`, `/v3/info`, `/healthz`
   and the UAA endpoints needs a valid token (log-cache's included), and its holder may what its
   [roles](#organizations-spaces-and-roles) say

@@ -65,6 +65,13 @@ topology record changes. A previous release's binary beside the current one in t
   the flags of the instance starting (`Store::open`); `State::migrate` only on the `state.json`
   an empty store takes
 
+## From 279
+
+- `sluice_cf_lease.address` (the holder's `--instance-url`) is written by `take`: a build
+  predating it takes the lease and leaves the address of the holder before, the others sending
+  their edits to an instance that answers them not made, until 20s passed (503). The instances'
+  `--instance-url` and `--instance-ca-cert` are settings that must agree in kind (all or none)
+
 ## From 278
 
 - a build before the lease (277 and older) reconciles the wickets regardless of it: never one

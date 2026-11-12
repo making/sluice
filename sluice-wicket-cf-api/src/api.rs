@@ -13,6 +13,15 @@
 //! stats and the log. The services are in [`crate::services`], the
 //! environment variables in [`crate::env`], the security groups, which
 //! apply at a start too, in [`crate::security_groups`].
+//!
+//! Of several instances on one store, the one reconciling the wickets (`crate::lease`) takes
+//! every edit they take at once, and a deletion of what they serve ([`edit`]): its trial
+//! against them, its locks and its commit are that instance's, the commit made in its turn or
+//! not at all. Another instance sends it the request as it came, to the URL the lease names
+//! (`--instance-url`), and relays the answer; while none takes it (a takeover under way) the
+//! request is held, [`TAKEOVER`] at most, as the cf CLI tries a 503 again at once or not at
+//! all. One whose answer was lost with its instance is sent again to the next where a second
+//! time changes nothing more ([`Edit::Twice`]).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -59,6 +68,30 @@ pub(crate) const MAX_CONNECTIONS: usize = 64;
 /// the CLI polling the build (every 3s).
 const STAGING_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
+/// How long an edit waits for an instance reconciling the wickets to take it: a lease lapsing
+/// and taken (`crate::lease`), or a stop's grace and a take.
+const TAKEOVER: std::time::Duration = std::time::Duration::from_secs(20);
+/// Between two tries to send one.
+const SEND_AGAIN: std::time::Duration = std::time::Duration::from_millis(200);
+/// Says a request was sent by another instance: one not reconciling the wickets answers it
+/// [`NOT_MADE`], sending it no further.
+const SENT_ON: &str = "sluice-sent-on";
+/// Says of a 503 that nothing was changed: its instance does not reconcile the wickets.
+const NOT_MADE: &str = "sluice-not-made";
+/// What neither a request sent on nor its answer keeps: a connection's own, the body's length
+/// and what the sender sets itself.
+const NOT_SENT_ON: [&str; 9] = [
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+    "content-length",
+    "host",
+    "x-forwarded-proto",
+];
+
 pub(crate) type Response = hyper::Response<Full<Bytes>>;
 pub(crate) type Reply = Result<Response, ApiError>;
 
@@ -71,8 +104,48 @@ struct Tried {
     held: Vec<Held>,
 }
 
+/// An edit the instance reconciling the wickets takes ([`edit`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Edit {
+    /// Made a second time it changes nothing more: sent again when its answer was lost.
+    Twice,
+    /// Made a second time it goes a step further: its answer lost, it is answered so.
+    Once,
+}
+
+/// Whether the request is an edit the wickets take at once, or a deletion of what they serve:
+/// the instance reconciling them takes it. `segments` are the path's after `/v3`. Every handler
+/// holding an app or a route (`Controller::hold`) is of one.
+fn edit(method: &Method, segments: &[&str]) -> Option<Edit> {
+    match (method, segments) {
+        (&Method::POST, ["spaces", _, "actions", "apply_manifest"])
+        | (&Method::DELETE, ["organizations" | "spaces" | "apps" | "routes", _])
+        | (&Method::PATCH, ["apps", _])
+        | (&Method::POST, ["apps", _, "processes", "web", "actions", "scale"])
+        | (&Method::POST, ["processes", _, "actions", "scale"])
+        | (&Method::POST, ["apps", _, "actions", "start" | "stop" | "restart"])
+        | (&Method::POST | &Method::PATCH, ["routes", _, "destinations"])
+        | (&Method::DELETE, ["routes", _, "destinations", _]) => Some(Edit::Twice),
+        (&Method::POST, ["deployments"])
+        | (&Method::POST, ["deployments", _, "actions", "cancel" | "continue"]) => Some(Edit::Once),
+        _ => None,
+    }
+}
+
+/// What became of an edit sent to the instance reconciling the wickets.
+enum Sent {
+    Answered(Response),
+    /// It was not made: not sent, or that instance reconciles them no more.
+    NotMade(String),
+    /// Sent, its answer lost: made or not.
+    Unknown(String),
+}
+
 /// What a request is answered while the store of `--state` does not answer.
 const AWAY: &str = "the state's store does not answer: try again";
+
+/// What an edit is answered whose instance reconciles the wickets no more.
+const TURN_OVER: &str = "another instance reconciles the wickets now: try again";
 
 /// The cookie of a sign-in under way at the provider, its name ending in the sign-in's
 /// `state`: several may be under way in one browser.
@@ -100,6 +173,8 @@ pub struct Api {
     pub registry: Registry,
     /// What `/v3/info` names as the build.
     pub build: String,
+    /// The client the edits are sent to the instance reconciling the wickets with.
+    pub peers: reqwest::Client,
 }
 
 /// An error in CC's shape.
@@ -146,6 +221,16 @@ impl ApiError {
             title: "CF-ServiceUnavailable",
             detail: detail.into(),
         }
+    }
+
+    /// An edit of the instance reconciling the wickets found this one's turn over: nothing
+    /// changed, the one whose turn it is takes it.
+    pub(crate) fn turn_over() -> ApiError {
+        ApiError::unavailable(TURN_OVER)
+    }
+
+    fn is_turn_over(&self) -> bool {
+        self.status == StatusCode::SERVICE_UNAVAILABLE && self.detail == TURN_OVER
     }
 
     pub fn bad_request(detail: impl Into<String>) -> ApiError {
@@ -613,10 +698,134 @@ impl Api {
                         }
                     }
                     ["api", "v1", rest @ ..] => self.log_cache(req, rest),
-                    ["v3", rest @ ..] => self.v3(req, rest).await,
+                    ["v3", rest @ ..] => match edit(&req.method, rest) {
+                        Some(edit) => self.led(req, rest, edit).await,
+                        None => self.v3(req, rest).await,
+                    },
                     _ => Err(ApiError::unknown(&req.method, &req.path)),
                 }
             }
+        }
+    }
+
+    /// An edit of the instance reconciling the wickets ([`edit`]): made here in this instance's
+    /// turn; else sent to the one whose turn it is and its answer relayed, held while none
+    /// takes it, [`TAKEOVER`] at most. One whose commit found the turn over changed nothing:
+    /// it goes to the next as well. One sent here is sent no further.
+    async fn led(&self, req: &Req, segments: &[&str], edit: Edit) -> Reply {
+        let sent_on = req.headers.contains_key(SENT_ON);
+        let deadline = tokio::time::Instant::now() + TAKEOVER;
+        let (mut terms, mut leaders) = (self.store.terms(), self.store.leaders());
+        let mut why = "no instance reconciles the wickets".to_string();
+        loop {
+            terms.borrow_and_update();
+            leaders.borrow_and_update();
+            // in its turn, the work of it begun
+            if self.store.leads() && self.controller.leads() {
+                match self.v3(req, segments).await {
+                    Err(e) if e.is_turn_over() => {}
+                    reply => return reply,
+                }
+            }
+            if sent_on {
+                let mut not_made: Response = ApiError::turn_over().into();
+                (not_made.headers_mut()).insert(NOT_MADE, HeaderValue::from_static("1"));
+                return Ok(not_made);
+            }
+            let (turn, leader) = self.store.leader();
+            match leader.filter(|_| !self.store.leads()) {
+                Some(leader) => match self.send_on(req, &leader, turn).await {
+                    Sent::Answered(response) => return Ok(response),
+                    Sent::NotMade(e) => why = e,
+                    Sent::Unknown(e) if edit == Edit::Once => {
+                        eprintln!("API: {} {}: {e}", req.method, req.path);
+                        return Err(ApiError {
+                            status: StatusCode::BAD_GATEWAY,
+                            code: 10001,
+                            title: "UnknownError",
+                            detail: format!(
+                                "the instance reconciling the wickets went away with the \
+                                 request under way, made or not: {e}"
+                            ),
+                        });
+                    }
+                    Sent::Unknown(e) => why = e,
+                },
+                None if turn.is_some() && !self.store.leads() => {
+                    why = "the instance reconciling the wickets gave no --instance-url".into();
+                }
+                None => {}
+            }
+            if tokio::time::Instant::now() >= deadline {
+                eprintln!("API: {} {}: not taken: {why}", req.method, req.path);
+                let detail = format!("no instance reconciling the wickets took it: {why}");
+                let mut held: Response = ApiError::unavailable(detail).into();
+                (held.headers_mut()).insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+                return Ok(held);
+            }
+            tokio::select! {
+                () = tokio::time::sleep(SEND_AGAIN) => {}
+                _ = terms.changed() => {}
+                _ = leaders.changed() => {}
+            }
+        }
+    }
+
+    /// Sends the request as it came to `leader`, the instance of the turn `turn`, for the
+    /// host and the scheme its client asked: its links are this API's as the client reaches it.
+    /// Its answer is waited for while that turn lasts.
+    async fn send_on(&self, req: &Req, leader: &str, turn: Option<u64>) -> Sent {
+        let mut url = format!("{leader}{}", req.path);
+        if !req.query.is_empty() {
+            let mut query = form_urlencoded::Serializer::new(String::new());
+            query.extend_pairs(&req.query);
+            url = format!("{url}?{}", query.finish());
+        }
+        let mut headers = req.headers.clone();
+        for name in NOT_SENT_ON {
+            headers.remove(name);
+        }
+        let (scheme, host) = req.base.split_once("://").unwrap_or(("http", &req.base));
+        headers.insert(SENT_ON, HeaderValue::from_static("1"));
+        headers.insert(
+            "x-forwarded-proto",
+            HeaderValue::from_str(scheme).expect("http or https"),
+        );
+        if let Ok(host) = HeaderValue::from_str(host) {
+            headers.insert(header::HOST, host);
+        }
+        let request = (self.peers.request(req.method.clone(), url))
+            .headers(headers)
+            .body(req.body.clone());
+        let mut leaders = self.store.leaders();
+        let answered = async {
+            let response = request.send().await.map_err(|e| (e.is_connect(), e))?;
+            let (status, headers) = (response.status(), response.headers().clone());
+            let body = response.bytes().await.map_err(|e| (false, e))?;
+            Ok::<_, (bool, reqwest::Error)>((status, headers, body))
+        };
+        let answered = tokio::select! {
+            answered = answered => answered,
+            _ = leaders.wait_for(|leading| *leading != turn) => {
+                return Sent::Unknown(format!("{leader} reconciles the wickets no more"));
+            }
+        };
+        match answered {
+            Ok((_, headers, _)) if headers.contains_key(NOT_MADE) => {
+                Sent::NotMade(format!("{leader} reconciles the wickets no more"))
+            }
+            Ok((status, headers, body)) => {
+                let mut response = hyper::Response::new(Full::new(body));
+                *response.status_mut() = status;
+                let kept = headers.iter();
+                let kept = kept.filter(|(name, _)| !NOT_SENT_ON.contains(&name.as_str()));
+                for (name, value) in kept {
+                    response.headers_mut().append(name, value.clone());
+                }
+                Sent::Answered(response)
+            }
+            Err((true, e)) => Sent::NotMade(format!("{leader} is not reached: {e}")),
+            Err((false, e)) => Sent::Unknown(format!("{leader} did not answer: {e}")),
         }
     }
 
@@ -1403,6 +1612,14 @@ impl Api {
         response
     }
 
+    /// Changes the state, in this instance's turn reconciling the wickets alone
+    /// (`Store::lead`): what an edit of that instance ([`edit`]) changes of what the wickets
+    /// serve, so the next one's first listing of them is after it. The turn over, nothing is
+    /// changed ([`ApiError::turn_over`]).
+    async fn lead<R>(&self, f: impl Fn(&mut State) -> R) -> Result<R, ApiError> {
+        (self.store.lead(f).await).ok_or_else(ApiError::turn_over)
+    }
+
     /// Changes the state as `change` says, once the wickets took the apps
     /// `guids` as they would be: a refusal changes nothing. A wicket
     /// unreachable, the change is kept: it is put when the wicket is back.
@@ -1420,7 +1637,7 @@ impl Api {
             })
         };
         let tried = self.try_placed(trial).await?;
-        let committed = self.store.update(|state| change(state)).await;
+        let committed = self.lead(|state| change(state)).await.and_then(|made| made);
         if committed.is_err() {
             self.go_back(&tried).await;
         }
@@ -1588,8 +1805,7 @@ impl Api {
         // made on the state as it is by now: all of it or, the other edits since refusing it,
         // none. An app new since the trial was not put: it is no started one
         let committed = self
-            .store
-            .update(|state| {
+            .lead(|state| {
                 if state.space(space).is_none() {
                     return Err("the space is gone".to_string());
                 }
@@ -1609,7 +1825,7 @@ impl Api {
                 *state = next;
                 Ok::<_, String>((guids, bound))
             })
-            .await;
+            .await?;
         let (guids, bound) = match committed {
             Ok(committed) => committed,
             Err(e) => {
@@ -1912,7 +2128,9 @@ impl Api {
             Ok(Some((job, brokered)))
         }).await?;
         let Some((job, unbound)) = job else {
-            self.controller.remove(guid, &app.name).await;
+            if !self.controller.remove(guid, &app.name).await {
+                return Err(ApiError::turn_over());
+            }
             return self
                 .job(req, crate::store::APP_DELETE, Vec::new(), None)
                 .await;
@@ -1941,8 +2159,9 @@ impl Api {
                 .await;
             let unbound =
                 store.read(|state| state.job(&job).is_some_and(|job| job.errors.is_empty()));
-            if unbound {
-                controller.remove(&guid, &name).await;
+            // the turn over, the app is there still: its job waits, taken up at a start
+            if unbound && !controller.remove(&guid, &name).await {
+                return;
             }
             store.update(|state| state.settle(&job, &guid, None)).await;
         });
@@ -2183,8 +2402,7 @@ impl Api {
         self.app_as(req, guid, Need::Operate)?;
         let _app = self.controller.hold(guid).await;
         let (app, superseded) = self
-            .store
-            .update(|state| {
+            .lead(|state| {
                 let running = if action == "stop" {
                     None
                 } else {
@@ -2203,7 +2421,7 @@ impl Api {
                 app.updated_at = now();
                 Ok::<_, ApiError>((app.clone(), superseded))
             })
-            .await?;
+            .await??;
         if let Some(line) = superseded {
             self.logs.add(guid, "API", line);
         }
@@ -2631,8 +2849,7 @@ impl Api {
         let _app = self.controller.hold(&app).await;
         let owner = self.controller.owner();
         let (deployment, superseded, blobs, before) = self
-            .store
-            .update(|state| {
+            .lead(|state| {
                 let found = state.app(&app).ok_or_else(|| ApiError::not_found("App"))?;
                 let before = Controller::desired(state, found, owner);
                 // all of it or none
@@ -2642,7 +2859,7 @@ impl Api {
                 *state = next;
                 Ok::<_, ApiError>((deployment, superseded, blobs, before))
             })
-            .await?;
+            .await??;
         self.store.delete(&blobs).await;
         if let Some(line) = superseded {
             self.logs.add(&app, "API", line);
@@ -2677,9 +2894,7 @@ impl Api {
     async fn cancel_deployment(&self, req: &Req, guid: &str) -> Reply {
         let app = self.deployment_as(req, guid, Need::Operate)?;
         let _app = self.controller.hold(&app).await;
-        let canceling = (self.store)
-            .update(|state| state.cancel_deployment(guid))
-            .await
+        let canceling = (self.lead(|state| state.cancel_deployment(guid)).await?)
             .map_err(ApiError::unprocessable)?;
         if canceling {
             self.logs
@@ -2693,9 +2908,7 @@ impl Api {
     async fn continue_deployment(&self, req: &Req, guid: &str) -> Reply {
         let app = self.deployment_as(req, guid, Need::Operate)?;
         let _app = self.controller.hold(&app).await;
-        (self.store)
-            .update(|state| state.continue_deployment(guid))
-            .await
+        (self.lead(|state| state.continue_deployment(guid)).await?)
             .map_err(ApiError::unprocessable)?;
         self.logs
             .add(&app, "API", format!("Continuing the deployment {guid}"));

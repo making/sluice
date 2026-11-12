@@ -137,10 +137,6 @@ Decided against the alternatives:
   store for a try saved once a takeover. A wicket gone in the turn before is evacuated at once,
   not after another `--wicket-away-grace`; the evacuations' and respreads' bookkeeping and the
   strangers' lines are learned again
-- an instance not leading not ready: an edit is tried against the wickets by the instance taking
-  it, beside the leader's watch, which can undo its trial put before its commit, or miss a commit
-  landing after its last listing. Only the leader ready, a balancer checking `/healthz` sends it
-  every request
 - a wicket keeps the highest epoch per owner (two owners are two controllers), and holds an
   owner's fence until the write is handed to its reloader: the writes reach the routes in the
   order admitted. One without the header is taken as before, both ways (an old cf-api, an old
@@ -162,6 +158,45 @@ Docker's port proxy; a wasi wicket in local mode; two instances, no app), 3 runs
 
 A kill's is the lease's lapse (10s after the last renewal, at most 2s before the kill) and a
 take's pause; a stop's the take's pause alone.
+
+## An edit on any instance
+
+The leader makes the edits the wickets take at once, the others sending them to it
+([ha.md](../sluice-wicket-cf-api/ha.md#an-edit-on-any-instance)). Decided against the
+alternatives:
+
+- the leader applies, not "the handler commits what is wanted and the leader converges": `cf
+  map-route` and `cf scale` print a wicket's refusal (422) and change nothing, which a commit ahead
+  of the wickets cannot. Tried by the instance taking it, beside the leader's watch, a trial put
+  was undone by the leader before its commit, or a commit landed after the leader's last listing
+- the request sent whole to the leader's own listener, not an endpoint between instances with a
+  key of the store: the leader authenticates the token as from any client, and a handler is the
+  same code on either path. What goes there is told by method and path (`api::edit`): the handlers
+  holding an app or a route. A request sent on (`sluice-sent-on`) is sent no further; one not
+  leading answers it 503 `sluice-not-made`, which changed nothing
+- one writer, held two ways: an instance without a turn sends no write of an app (`Wicket`'s
+  `NO_TURN`, where before it sent one without an epoch, taken by the wicket), and an edit's commit
+  is `Store::lead`, refused once another took the lease. So a turn ending under an edit (a pause
+  past the lease, 282's release before the requests end) leaves nothing half made: the commit
+  is before the takeover, whose first listing sees it, or not at all, the request going to the
+  next. A handler missing from `api::edit` answers 503 on a follower, never a write beside the
+  leader's
+- the request held for a takeover, not answered 503 at once: cf CLI v8.19.0 sends a `GET` answered
+  503 three times within 10ms and a `POST` once, `Retry-After` unread (measured against a stub)
+- an answer lost with the leader: sent again where twice is once (the CLI does so itself for all
+  but a `POST`); a deployment's `POST`s not (a second `continue` is a step further), 502
+- the lease's `address` is written by `take`: a build predating it takes the lease leaving the
+  address of the holder before (283)
+
+Measured on one host (release build, loopback; PostgreSQL 18 in a container, `fsync=off`; the
+test's mock wicket; `cf scale -i` of one app, 80 each):
+
+| the request reaches | median | p90 |
+|---|---|---|
+| the leader | 3.7-4.2ms | 4.2-4.5ms |
+| another instance | 5.9-6.5ms | 6.2-6.8ms |
+
+The hop is 2.2ms, on a connection kept.
 
 ## A stop
 

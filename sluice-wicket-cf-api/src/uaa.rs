@@ -824,6 +824,7 @@ mod tests {
         let settings = PostgresSettings {
             url: format!("{url}?sslmode=disable"),
             ca_pem: None,
+            instance_url: None,
         };
         let (domains, wickets) = (["localhost".to_string()], ["a".to_string()]);
         let runs = BTreeMap::new();

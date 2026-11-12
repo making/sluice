@@ -147,6 +147,7 @@ impl Lease {
                         Ok(Taken::Taken(epoch)) => {
                             (deadline, renewal) = (ending(sent), sent + timing.renew_every);
                             self.shared.leading.send_replace(Some(epoch));
+                            self.shared.leader.send_replace(None);
                             self.shared
                                 .term
                                 .send_replace(Some(Term { epoch: Some(epoch) }));
@@ -159,7 +160,12 @@ impl Lease {
                             followed = None;
                             continue;
                         }
-                        Ok(Taken::Held(epoch)) => {
+                        Ok(Taken::Held(epoch, address)) => {
+                            self.shared.leader.send_if_modified(|leader| {
+                                let moved = *leader != address;
+                                *leader = address;
+                                moved
+                            });
                             self.shared.leading.send_replace(Some(epoch));
                             if followed != Some(epoch) {
                                 println!(
