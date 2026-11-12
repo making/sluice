@@ -70,6 +70,8 @@ use sluice_wicket_tunnel::proto::{AccessFilter, feed_message};
 use sluice_wicket_tunnel::session::testing::{ServerTunnel, dial_address, tunnel_server};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 /// Hang guard of every wait; the first covers the boots and the snapshot.
 const HANG: Duration = Duration::from_secs(120);
 
@@ -449,11 +451,13 @@ async fn every_route_serves_http_through_the_tunnel() {
         address: dial_address(&target("booted.local")),
         listen: None,
     };
-    // the old VM counts on until a new one on the new rootfs serves
+    // the old VM counts on until a new one on the new rootfs serves; its process is told to
+    // stop then, and ends at once: a connection open on it ends with it
     let deadline = Instant::now() + HANG;
     loop {
         conn_id += 1;
-        if served(&booted.keep_alive(conn_id).await) == [1, 2, 3] {
+        let kept = booted.kept_alive(conn_id).await;
+        if kept.is_ok_and(|bodies| served(&bodies) == [1, 2, 3]) {
             break;
         }
         assert!(Instant::now() < deadline, "booted.local was not restarted");
@@ -3613,8 +3617,15 @@ impl Route<'_> {
 
     /// Three http/1.1 requests on one connection, its end awaited; their bodies.
     async fn keep_alive(&self, conn_id: i64) -> Vec<String> {
+        let kept = self.kept_alive(conn_id).await;
+        kept.unwrap_or_else(|e| panic!("{}: a connection kept alive: {e}", self.host))
+    }
+
+    /// [`Route::keep_alive`], or how the connection ended before the last answer: its VM's
+    /// process told to stop, as a route's VM replaced is.
+    async fn kept_alive(&self, conn_id: i64) -> Result<Vec<String>, BoxError> {
         let io = TokioIo::new(self.connect(conn_id));
-        let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await.unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(io).await?;
         let ended = tokio::spawn(connection.without_shutdown());
         let mut bodies = Vec::new();
         for path in ["/1", "/2", "/3"] {
@@ -3623,19 +3634,19 @@ impl Route<'_> {
                 .body(Full::new(Bytes::new()))
                 .unwrap();
             // the previous answer read does not make the connection ready at once
-            sender.ready().await.unwrap();
-            let response = sender.send_request(request).await.unwrap();
+            sender.ready().await?;
+            let response = sender.send_request(request).await?;
             assert_eq!(response.status(), 200, "{}: GET {path}", self.host);
-            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let body = response.into_body().collect().await?.to_bytes();
             bodies.push(String::from_utf8_lossy(&body).into_owned());
         }
         // the wicket's end of the connection read: its VM is done with it
         drop(sender);
-        let mut io = ended.await.unwrap().unwrap().io.into_inner();
-        io.shutdown().await.unwrap();
+        let mut io = ended.await.unwrap()?.io.into_inner();
+        io.shutdown().await?;
         let mut rest = Vec::new();
-        io.read_to_end(&mut rest).await.unwrap();
-        bodies
+        io.read_to_end(&mut rest).await?;
+        Ok(bodies)
     }
 
     /// One request on a connection of its own, h2c (prior knowledge) or
