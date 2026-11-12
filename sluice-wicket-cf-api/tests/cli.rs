@@ -2,7 +2,8 @@
 //! distribution refuses any other platform) against the cf-api and a wicket
 //! in local mode, both on a flume. The cf-api is two instances on one PostgreSQL and one
 //! bucket (containers, as the store's tests'), each of the CLI's requests sent to the next by
-//! a relay (`relay`): what one instance answers, any does. Along the way the one reconciling
+//! a relay (`relay`): what one instance answers, any does. They begin as a previous build
+//! ([`previous_binary`]), updated one at a time to the one under test. Along the way the one reconciling
 //! the wickets is killed during a deployment, a build and an app's delete, stopped during a
 //! broker's operation, each is stopped and started in turn while the CLI pushes, and their
 //! options change one instance at a time (a wicket named, the rules of who logs in); one
@@ -156,6 +157,50 @@ fn guests() -> PathBuf {
 
 fn cf_cli() -> PathBuf {
     PathBuf::from(std::env::var("SLUICE_CF_CLI").unwrap_or_else(|_| "cf8".into()))
+}
+
+/// The image of the build the instances are updated from, as an update of the image runs two
+/// builds on one store: the revision a03be0186de25032a93b0ac0c0d7335cfc11c4d3, the first of
+/// layout 2. Moved to a later one when the build under test is no more to be run beside it.
+const PREVIOUS_IMAGE: &str = "ghcr.io/making/sluice/sluice-wicket-cf-api@sha256:\
+                              2dc134a7d80a8d643d3287d4c81790e51c322c665374616ab89a303abbf30c15";
+
+/// The binary of a previous build: `SLUICE_CF_API_PREVIOUS`, else the one of [`PREVIOUS_IMAGE`]
+/// (Docker on the PATH, as for the store's container), taken once. None where that one does not
+/// run: the update is left out.
+fn previous_binary() -> Option<PathBuf> {
+    if let Some(given) = std::env::var_os("SLUICE_CF_API_PREVIOUS") {
+        return Some(PathBuf::from(given));
+    }
+    if !cfg!(target_os = "linux") {
+        eprintln!("skipped: an update from a previous build (SLUICE_CF_API_PREVIOUS names none)");
+        return None;
+    }
+    let (_, digest) = PREVIOUS_IMAGE.rsplit_once(':').unwrap();
+    let binary = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("previous-{digest}"));
+    if binary.is_file() {
+        return Some(binary);
+    }
+    let docker = |args: &[&str]| {
+        let output = Command::new("docker").args(args).output();
+        let output = output.expect("docker on the PATH");
+        let said = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "docker {args:?}: {said}");
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    };
+    let container = docker(&["create", PREVIOUS_IMAGE]);
+    let from = format!("{container}:/usr/local/bin/sluice-wicket-cf-api");
+    // whole or not there: another run of the test may take it at once
+    let taken = binary.with_extension(std::process::id().to_string());
+    docker(&["cp", &from, taken.to_str().unwrap()]);
+    docker(&["rm", &container]);
+    std::fs::rename(&taken, &binary).unwrap();
+    Some(binary)
+}
+
+/// The build under test.
+fn current_binary() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_sluice-wicket-cf-api"))
 }
 
 /// When the test process began: what the CLI's commands are told by in its output.
@@ -560,18 +605,28 @@ impl Shared {
         (env, egress)
     }
 
-    /// The `--instance-url` of the instance reconciling the wickets, if one holds the lease.
-    fn leader(&self) -> Option<String> {
+    /// The row `query` finds in the store, if one.
+    fn row(&self, query: &str) -> Option<tokio_postgres::Row> {
         self.runtime.block_on(async {
             let (client, connection) =
                 tokio_postgres::connect(&self.database, tokio_postgres::NoTls)
                     .await
                     .expect("the store");
             tokio::spawn(connection);
-            let held = "SELECT address FROM sluice_cf_lease WHERE expires > now()";
-            let held = client.query_opt(held, &[]).await.expect("the lease");
-            held.and_then(|row| row.get::<_, Option<String>>(0))
+            client.query_opt(query, &[]).await.expect("the store's row")
         })
+    }
+
+    /// The `--instance-url` of the instance reconciling the wickets, if one holds the lease.
+    fn leader(&self) -> Option<String> {
+        let held = self.row("SELECT address FROM sluice_cf_lease WHERE expires > now()");
+        held.and_then(|row| row.get::<_, Option<String>>(0))
+    }
+
+    /// The store's layout (`postgres::SCHEMA` of the build that made it or last moved it).
+    fn layout(&self) -> i32 {
+        let meta = self.row("SELECT layout FROM sluice_cf_meta");
+        meta.expect("a store").get(0)
     }
 }
 
@@ -582,26 +637,30 @@ struct Api {
     relay: Option<Relay>,
 }
 
-/// One process of it: where it listens, what started it and starts it again.
+/// One process of it: where it listens, the build and what started it and start it again.
 struct Instance {
     process: Process,
     url: String,
+    binary: PathBuf,
     args: Vec<String>,
 }
 
 impl Instance {
-    fn start(args: Vec<String>) -> Instance {
-        let (process, url) = Instance::spawn(&args);
-        Instance { process, url, args }
+    fn start(binary: &Path, args: Vec<String>) -> Instance {
+        let (process, url) = Instance::spawn(binary, &args);
+        let binary = binary.to_path_buf();
+        Instance {
+            process,
+            url,
+            binary,
+            args,
+        }
     }
 
-    /// The process of `args`, and its URL once it listens.
-    fn spawn(args: &[String]) -> (Process, String) {
+    /// The process of `binary` with `args`, and its URL once it listens.
+    fn spawn(binary: &Path, args: &[String]) -> (Process, String) {
         let args_of: Vec<&str> = args.iter().map(String::as_str).collect();
-        let process = Process::spawn(
-            Path::new(env!("CARGO_BIN_EXE_sluice-wicket-cf-api")),
-            &args_of,
-        );
+        let process = Process::spawn(binary, &args_of);
         let started = process.line("listening on ");
         let flume = args.iter().position(|arg| arg == "--flume").unwrap();
         let flume = format!("flume {})", args[flume + 1]);
@@ -695,8 +754,16 @@ impl Api {
     fn start_one(&mut self, at: usize, change: impl FnOnce(&mut Vec<String>)) {
         let instance = &mut self.instances[at];
         change(&mut instance.args);
-        (instance.process, instance.url) = Instance::spawn(&instance.args);
+        (instance.process, instance.url) = Instance::spawn(&instance.binary, &instance.args);
         instance.ready(&Http::new());
+    }
+
+    /// The instance `at` stopped and started again as the build `binary`, as an update of the
+    /// image does.
+    fn update_one(&mut self, at: usize, binary: &Path) {
+        self.stop_one(at);
+        self.instances[at].binary = binary.to_path_buf();
+        self.start_one(at, |_| {});
     }
 
     /// Each instance in turn stopped and started again, its options as `change` leaves them.
@@ -742,6 +809,19 @@ fn start_api(
     more: &[&str],
     shared: Option<&Shared>,
 ) -> (Api, String) {
+    start_api_of(current_binary(), listen, wickets, flume, data, more, shared)
+}
+
+/// [`start_api`] of the build `binary`.
+fn start_api_of(
+    binary: &Path,
+    listen: &str,
+    wickets: &[String],
+    flume: &str,
+    data: &Path,
+    more: &[&str],
+    shared: Option<&Shared>,
+) -> (Api, String) {
     let mut args = vec!["--wicket-token", TOKEN, "--flume", flume];
     args.extend_from_slice(&["--flume-token", FLUME_TOKEN]);
     for wicket in wickets {
@@ -754,7 +834,7 @@ fn start_api(
         args.extend(["--listen".into(), listen.to_string()]);
         args.extend(["--data-dir".into(), data.to_str().unwrap().to_string()]);
         args.extend_from_slice(more);
-        Instance::start(args)
+        Instance::start(binary, args)
     };
     let Some(shared) = shared else {
         let instance = on(listen, data, &[]);
@@ -1034,8 +1114,11 @@ fn the_cf_cli_deploys_to_the_wicket() {
     let api_listen = free();
     let one_wicket = [format!("http://{console}")];
     // two instances on one store and one bucket, each request of the CLI to the next
+    // of a previous build first, where there is one
     let shared = Shared::new(&dir);
-    let (mut api, url) = start_api(
+    let previous = previous_binary();
+    let (mut api, url) = start_api_of(
+        previous.as_deref().unwrap_or(current_binary()),
         &api_listen,
         &one_wicket,
         &flume_url,
@@ -1052,6 +1135,54 @@ fn the_cf_cli_deploys_to_the_wicket() {
 
     cf.ok(&["api", &url]);
     cf.ok(&["login", "-u", "me", "-p", "x"]);
+
+    // an update of the image, an instance at a time, an app of the previous build served all
+    // along
+    if let Some(previous) = &previous {
+        use sluice_wicket_cf_api::postgres::SCHEMA;
+        let layout = shared.layout();
+        assert!(layout <= SCHEMA, "a previous build of the layout {layout}");
+        cf.ok(&["push", "old", "-p", dir.join("app").to_str().unwrap()]);
+        let hammer = Hammer::start(&[&listen], "old.localhost");
+        // the build under test beside the previous one, which reconciles the wickets: an edit
+        // this one takes is made by that one
+        api.update_one(1, current_binary());
+        assert_eq!(api.leader(&shared), 0);
+        if layout < SCHEMA {
+            let waits = api.instances[1]
+                .process
+                .line("LEASE: not taken by this instance");
+            assert!(waits.contains("is of an older build"), "{waits}");
+        }
+        cf.ok(&["scale", "old", "-i", "2"]);
+        instances_come_to(&cf, "old", "2/2");
+        // the last of the previous build gone: this one's turn, the store's layout its own
+        api.update_one(0, current_binary());
+        eventually("the layout moved", || shared.layout() == SCHEMA);
+        assert_eq!(instances_shown(&cf, "old"), "2/2");
+        // which a build not reading it does not open
+        if layout < SCHEMA {
+            let mut args = api.instances[0].args.clone();
+            options_set(&mut args, "--listen", &["127.0.0.1:0"]);
+            options_set(&mut args, "--instance-url", &[]);
+            options_set(
+                &mut args,
+                "--data-dir",
+                &[dir.join("cf-old").to_str().unwrap()],
+            );
+            let old = Command::new(previous).args(&args).output().unwrap();
+            assert!(!old.status.success());
+            let why = String::from_utf8_lossy(&old.stderr);
+            assert!(why.contains("of a newer sluice-wicket-cf-api"), "{why}");
+        }
+        // what the previous build wrote and put to the wicket is this one's to remove
+        hammer.stop();
+        cf.ok(&["delete", "old", "-f"]);
+        let (status, body) = get(&listen, "old.localhost", "/", None);
+        assert_eq!(status, 404, "{body}");
+        // the flow reads the instances' lines from here
+        api.lines();
+    }
 
     // the security groups: whoever logs in reads them, nobody edits them unless named, on
     // an API that takes any credentials above all

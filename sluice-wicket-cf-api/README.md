@@ -1559,7 +1559,10 @@ flume from `../sluice-flume` (or taking `SLUICE_WICKET_RUNTIME_WASI`, `SLUICE_WI
 of the cf-api's own, and the images against a registry in the test (`tests/registry`). Along it
 the instance reconciling the wickets is killed during a deployment and a build, each instance
 stopped and started in turn during `cf push`, and a wicket named by an update one instance at a
-time; one instance on a `--data-dir` runs for what only it has. The
+time; one instance on a `--data-dir` runs for what only it has. The two instances begin as a
+previous build, updated one at a time to the one under test with an app served all along: the
+binary `SLUICE_CF_API_PREVIOUS` names, else on Linux the one of the image the test pins
+(`PREVIOUS_IMAGE`, taken with Docker); left out elsewhere. The
 integration test and the store's tests (`store::tests`) run a PostgreSQL in a container
 (`postgres:18-alpine`, Docker on
 the PATH) over TLS and without, or the one `SLUICE_CF_API_TEST_POSTGRES` names (over TLS with
