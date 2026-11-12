@@ -70,7 +70,9 @@ Decided against the alternatives:
   (`Provider::begin`)
 - a key's `made` is when it signs from, the instances reading the keys every minute: a key
   replacing another is known to all before any signs with it, with no reload on a `kid`
-  unknown (a request without a login could ask for it at will)
+  unknown (a request without a login could ask for it at will). The first key signs at once:
+  an instance starting as another made it read it by a statement begun before that one's
+  (`now()` is the statement's start), found it made later than now and did not start (CI, once)
 - the removal of the expired sessions and of those past the bound passes the rows another
   statement holds (`FOR UPDATE SKIP LOCKED`): two logins at once never wait for each other's
 

@@ -973,8 +973,9 @@ impl Postgres {
         // (SKIP LOCKED): none waits for another, in whatever order they come to them
         let opened = Arc::new(Aside {
             keys: prepare(
-                "SELECT kid, key, made <= now() FROM (\
-                 SELECT seq, kid, key, made, lead(made) OVER (ORDER BY seq) AS replaced \
+                "SELECT kid, key, made <= now() OR first FROM (\
+                 SELECT seq, kid, key, made, lead(made) OVER (ORDER BY seq) AS replaced, \
+                 lag(seq) OVER (ORDER BY seq) IS NULL AS first \
                  FROM sluice_cf_keys) AS keys \
                  WHERE replaced IS NULL OR replaced + $1::bigint * interval '1 second' > now() \
                  ORDER BY seq",
@@ -1054,7 +1055,9 @@ impl Postgres {
     }
 
     /// The keys of the tokens, oldest first: one replaced is among them for `kept` seconds
-    /// after the next was made, by the store's clock.
+    /// after the next was made, by the store's clock. One signs from when it was made, the
+    /// first at once: an instance starting as another makes it may read it by a statement
+    /// begun before that one's, to which it is made later than now.
     pub async fn keys(&self, kept: i64) -> Result<Vec<StoredKey>, String> {
         let rows = self.asked(async |aside| aside.client.query(&aside.keys, &[&kept]).await);
         Ok((rows.await?.iter())

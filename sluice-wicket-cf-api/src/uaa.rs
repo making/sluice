@@ -1028,6 +1028,16 @@ mod tests {
             let left: Vec<String> = left.iter().map(|row| row.get(0)).collect();
             assert_eq!(left.len(), 2, "{left:?}");
             assert!(left[0].ends_with("-r") && left[1] == "last", "{left:?}");
+            // the first key signs at once, for an instance starting as another made it too:
+            // its statement may have begun before that one's, and read the key all the same
+            let (url, behind) = postgres_server::database().await;
+            let dir = fresh_dir("open-second");
+            let store = store_of(&dir, &url).await;
+            let made = "INSERT INTO sluice_cf_keys (seq, kid, key, made) VALUES \
+                        (1, 'first', decode(repeat('ab', 32), 'hex'), now() + interval '1 hour')";
+            behind.batch_execute(made).await.unwrap();
+            let second = Uaa::open(&dir, Mode::Open, Some(store)).await.unwrap();
+            assert_eq!(kid(&login(&second).await), "first");
         }
     }
 
