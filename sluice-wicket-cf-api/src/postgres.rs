@@ -785,6 +785,20 @@ impl Postgres {
         .await
     }
 
+    /// The lease as another instance holds it now ([`Taken::Held`]'s), None while none does:
+    /// what an instance that takes it no more follows.
+    pub async fn held(&self) -> Result<Option<(u64, Option<String>)>, String> {
+        let holder = self.holder.as_str();
+        self.leased(async |leasing| {
+            let row = leasing.client.query_one(&leasing.due, &[]).await?;
+            let (held_by, epoch, due): (Option<String>, i64, bool) =
+                (row.get(0), row.get(1), row.get(2));
+            let another = !due && held_by.is_some_and(|held_by| held_by != holder);
+            Ok(another.then(|| (epoch as u64, row.get(3))))
+        })
+        .await
+    }
+
     /// Lets go of the lease of `epoch`, if this instance holds it: the next to try takes it.
     pub async fn release(&self, epoch: u64) -> Result<(), String> {
         let epoch = epoch as i64;

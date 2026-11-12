@@ -265,9 +265,13 @@ fn tls_acceptor(tls: &TlsSettings) -> Result<tokio_rustls::TlsAcceptor, String> 
     Ok(tokio_rustls::TlsAcceptor::from(Arc::new(config)))
 }
 
+/// How long a stop waits for its last write of the state past `--stop-grace`.
+const LAST_WRITE: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Serves the API on `listener` until `shutdown` completes, the wickets
-/// reconciled all along; then stops ([`stop`]): the listener closed, the requests and the puts
-/// under way finished within `--stop-grace`, the state written.
+/// reconciled all along; then stops ([`stop`]): the listener closed, of several instances the
+/// lease let go of, the requests and the puts under way finished within `--stop-grace`, the
+/// state written.
 pub async fn serve(
     listener: TcpListener,
     settings: Settings,
@@ -368,25 +372,39 @@ pub async fn serve(
          and {puts} put(s) under way, given {}s",
         settings.stop_grace.as_secs_f32()
     );
-    if tokio::time::timeout(settings.stop_grace, stop.drained())
-        .await
-        .is_err()
-    {
+    let grace = tokio::time::Instant::now() + settings.stop_grace;
+    let stopping = async {
+        // of several instances, the next one's turn while the requests here are answered: the
+        // edits made in this turn first, one going on sent to the next
+        if store.shared().is_some() {
+            let _ = tokio::time::timeout(settings.lease.edits_end, stop.edited()).await;
+            lease.release().await;
+        }
+        stop.drained().await;
+    };
+    if tokio::time::timeout_at(grace, stopping).await.is_err() {
         let (connections, requests, puts) = stop.under_way();
         println!(
             "API: stopped past --stop-grace: {connections} connection(s), {requests} request(s) \
              and {puts} put(s) cut"
         );
     }
-    keeping.abort();
     sweep.abort();
     for task in flume.iter().flatten() {
         task.abort();
     }
-    // what was noted, what was seen of the wickets
-    store.update(|_| ()).await;
-    // the next instance's turn at once
-    lease.release().await;
+    // what was noted, what was seen of the wickets: within the grace, or LAST_WRITE of a store
+    // slow to answer
+    let last = grace.max(tokio::time::Instant::now() + LAST_WRITE);
+    if tokio::time::timeout_at(last, store.update(|_| ()))
+        .await
+        .is_err()
+    {
+        eprintln!("API: stopped with the state's store not answering: the last notes not written");
+    }
+    // the one process's turn, and a lease not let go of above
+    let _ = tokio::time::timeout_at(last, lease.release()).await;
+    keeping.abort();
     leading.abort();
     Ok(())
 }
@@ -688,7 +706,9 @@ mod tests {
     /// reconciling them, is tried and committed by the one that is, in its turn: refused by a
     /// wicket it is a 422 and changes nothing; two of one app through both leave the wicket
     /// and the state alike; and the one reconciling the wickets killed with an edit under way,
-    /// the edit is answered once, by the next. No write reaches the wicket but of a turn.
+    /// the edit is answered once, by the next; stopped with one under way past the lease's
+    /// wait, the next takes over and makes it, answered through the one stopping. No write
+    /// reaches the wicket but of a turn.
     #[tokio::test(flavor = "multi_thread")]
     async fn an_edit_on_any_instance_is_made_by_the_one_reconciling_the_wickets() {
         use crate::controller::tests::{FakeWicket, until};
@@ -756,8 +776,9 @@ mod tests {
         let instance = |name: &str| {
             let (dir, wicket) = (dir.join(name), wicket.clone());
             let (mut state, bound) = (state.clone(), tokio::sync::oneshot::channel());
+            let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
             let runtime = tokio::runtime::Runtime::new().unwrap();
-            runtime.spawn(async move {
+            let served = runtime.spawn(async move {
                 let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
                 let url = format!("http://{}", listener.local_addr().unwrap());
                 let mut settings = settings(dir, None);
@@ -766,11 +787,14 @@ mod tests {
                 settings.state = Some(state);
                 settings.lease = store::tests::TIMING;
                 bound.0.send(url).unwrap();
-                serve(listener, settings, std::future::pending())
-                    .await
-                    .unwrap()
+                let stopped = async {
+                    if stopped.await.is_err() {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                serve(listener, settings, stopped).await.unwrap()
             });
-            async move { (bound.1.await.unwrap(), Running(Some(runtime))) }
+            async move { (bound.1.await.unwrap(), Running(Some(runtime)), stop, served) }
         };
         let http = reqwest::Client::new();
         let ready = async |api: &str| {
@@ -785,10 +809,10 @@ mod tests {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             }
         };
-        let (leader, mut leading) = instance("leader").await;
+        let (leader, mut leading, _stop, _served) = instance("leader").await;
         ready(&leader).await;
         // the other is ready once the lease names where the edits go
-        let (other, _following) = instance("other").await;
+        let (other, _following, stop, stopped) = instance("other").await;
         ready(&other).await;
         let token = (http
             .post(format!("{other}/uaa/oauth/token"))
@@ -896,6 +920,44 @@ mod tests {
         let mapped = call(http::Method::GET, &other, &destinations, None).await.1;
         assert_eq!(mapped["destinations"], json!([]));
         until("the app off the wicket", || served().is_none()).await;
+        assert!(fake.fenced_none(), "{:?}", fake.writes.lock().unwrap());
+
+        // the other, reconciling them now, stopped with an edit under way through it, longer
+        // than the lease waits for: the next takes over, makes it and answers it, through the
+        // one stopping, which ends once it answered
+        let (next, _taking, _stop, _served) = instance("next").await;
+        ready(&next).await;
+        let map = json!({"destinations": [{"app": {"guid": guid}}]});
+        let (status, mapped) = call(http::Method::POST, &other, &destinations, Some(map)).await;
+        assert_eq!(status, 200, "{mapped}");
+        until("the app on the wicket again", || served().is_some()).await;
+        let destination = mapped["destinations"][0]["guid"].as_str().unwrap();
+        let unmap = format!("{destinations}/{destination}");
+        let (turn, before) = {
+            let writes = fake.writes.lock().unwrap();
+            (writes.last().unwrap().0, writes.len())
+        };
+        let unmapped = async { call(http::Method::DELETE, &other, &unmap, None).await.0 };
+        let stopping = async {
+            until("the trial at the wicket", || {
+                fake.writes.lock().unwrap().len() > before
+            })
+            .await;
+            stop.send(()).unwrap();
+            Instant::now()
+        };
+        let (unmapped, began) = tokio::join!(unmapped, stopping);
+        assert_eq!(unmapped, 204);
+        stopped.await.unwrap();
+        let within = std::time::Duration::from_secs(4);
+        assert!(
+            began.elapsed() < within,
+            "stopped after {:?}",
+            began.elapsed()
+        );
+        let mapped = call(http::Method::GET, &next, &destinations, None).await.1;
+        assert_eq!(mapped["destinations"], json!([]));
+        until("the app off the wicket again", || served().is_none()).await;
         assert!(fake.fenced_none(), "{:?}", fake.writes.lock().unwrap());
         let writes = fake.writes.lock().unwrap();
         assert!(

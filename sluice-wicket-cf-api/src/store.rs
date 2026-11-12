@@ -2613,6 +2613,7 @@ pub(crate) mod tests {
         lease: Duration::from_millis(1000),
         renew_every: Duration::from_millis(200),
         take_every: Duration::from_millis(100),
+        edits_end: Duration::from_millis(200),
     };
 
     /// `store`'s lease kept, as `TIMING` says: the task keeping it.

@@ -71,3 +71,21 @@ it (281).
   that did not stage, and across a takeover (the lines before it are in the next leader's log)
 - each instance needs a `--data-dir` of its own for its flume node id (`flume-node`): an
   `emptyDir` makes a new node per pod, which the flume lists as disconnected until its restart
+
+## From 282
+
+- a stop of the leader lets go of the lease first (after its edits under way, 2s at most), the
+  requests answered meanwhile, an edit still under way sent to the next: `ha.md` "A stop".
+  `lib::tests::an_edit_on_any_instance_is_made_by_the_one_reconciling_the_wickets` stops the
+  leader with an edit under way; left for the CLI test: `cf push` across a stop of the instance
+  it talks to, which needs the relay to send a refused connection to the other instance
+- who takes an instance out of the routing: a Firecracker wicket's stop of a VM takes it out of
+  its route's pool first (`Route::stopping`: `Pool::halt`, then the stop notice), its open
+  connections going on until the process ends; but new connections of that route then fail at
+  that wicket (no other VM started in its place) while it still advertises the host: an update
+  one wicket at a time needs the new VM up before the old is taken out, or the host withdrawn
+  from the server first. The listener closes at the stop's begin: a balancer must send a
+  refused connection to another instance, or take the instance out before the signal (a
+  Kubernetes `preStop` sleep); no lame duck period was added
+- the last write of a stop is bounded (the grace, 1s past it at least): a store not answering
+  no longer holds the process

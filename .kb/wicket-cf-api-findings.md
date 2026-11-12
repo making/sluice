@@ -265,6 +265,25 @@ package upload under way (12 MB at 4 MB/s, SIGTERM 1s in): answered 200 at 3.0s,
 request(s) and 0 put(s) cut`). So an upgrade's gap is the 0.7-0.8s boot above plus what the
 requests under way take, `--stop-grace` (8s) at most; not measured again in a VM.
 
+Of several instances the one reconciling the wickets lets go of the lease as the stop begins,
+not at its end ([ha.md](../sluice-wicket-cf-api/ha.md#a-stop)). Decided against the alternatives:
+
+- at the stop's end, the requests answered first: the others' edits are held for as long as the
+  slowest request of the one stopping (an upload, a start waiting for a health check),
+  `--stop-grace` at most, and found its listener closed all that time
+- at once, without waiting for the edits it makes: each would be refused at its commit and made
+  again by the next leader, its trial already at the wickets; and the only instance of a store
+  would make none it has under way. Waiting 2s (`lease::EDITS_END`) lets the short ones end in
+  their turn, and holds the others' that much longer at most
+- an instance that let go of the lease follows it on (`Postgres::held`) and takes it no more: its
+  edits under way need the next leader's `--instance-url`
+
+Measured as [the takeover](#the-reconciling-of-the-wickets) (two instances, no app), the leader
+stopped with a request under way whose body ends 3s later, 3 runs: the other leads 0.01-0.03s
+after the signal (its tries, every second, fell there: 1s at most), the request is answered 2.96s
+after it and the process gone 2.97-2.98s after it. Before, the other led once the request was
+answered.
+
 What the CLI (8.19.0) does in that gap: a request refused (`connect: connection refused`) is sent
 3 times in 35ms in all, then `FAILED` (`CF_TRACE=true cf curl /v3/apps` against a closed port). So
 a `cf push` across a restart of the cf-api gets through only when none of its requests falls in

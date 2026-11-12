@@ -93,7 +93,8 @@ store (`sluice_cf_lease`) it renews every 2s for 10s, by the store's clock. Its 
 watches of the wickets, the confirmations of what a wicket holds at its start, the evacuations
 and the moves, the purges, the deployments' steps, the sweeps of the bucket, and
 [the work outliving a request](#the-work-outliving-a-request). The others take
-the lease once it lapses, trying every second; a stop lets go of it, the next taking it at once.
+the lease once it lapses, trying every second; [a stop](#a-stop) lets go of it, the next taking
+it at once.
 Without `--state` the one process of `--data-dir` leads from its start.
 
 - each take begins a turn of a new epoch, the store's clock in milliseconds at least: above every
@@ -136,8 +137,8 @@ logins) is answered by the instance it reaches.
 - an instance writes no app to a wicket outside its turn, and the edit's commit is refused by the
   store once another took the lease: an edit is made in one turn or not at all, and then goes to
   the next leader
-- while no instance takes it (a takeover: within 11s of a kill, at once of a stop) the request is
-  held, 20s at most, then answered 503 with `Retry-After`. The cf CLI tries a 503 of a `GET` again
+- while no instance takes it (a takeover: within 11s of a kill, within 3s of a stop) the request
+  is held, 20s at most, then answered 503 with `Retry-After`. The cf CLI tries a 503 of a `GET` again
   at once and of a `POST` not at all
 - the leader gone with an edit under way (a kill, the network), its answer lost: the request is
   sent again to the next, which a second time changes nothing more; but a deployment's `POST`s
@@ -176,6 +177,30 @@ what the store keeps of it. There is no lease per build or operation: the one of
 
 What was decided is in
 [.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#the-work-outliving-a-request).
+
+## A stop
+
+An instance stopped (SIGTERM, SIGINT, stdin's end) loses no request it took: its listener closes,
+the requests under way are answered within `--stop-grace` (8s), each connection closed after its
+answer ([Behavior](README.md#behavior)). What several add:
+
+- the one reconciling the wickets lets go of the lease first, once the edits it is making ended,
+  2s at most: the next takes it within a second, while the requests of the one stopping are still
+  answered. The turn's work under way (a put to a wicket, a build's staging, a broker's
+  operation) is cut there and taken up by the next, as after a kill
+- an edit still under way then is not committed (the store refuses it), is sent to the next
+  leader and its answer relayed, as an edit of any other instance: made once, answered by the
+  one that took the request
+- the others' edits are held meanwhile and made by the next leader: none is sent to an instance
+  that stops, whose listener is closed
+- `/healthz` answers 503 from the stop on, on the connections it still has; a new connection is
+  refused. Whoever routes to the instances takes it out by either, or before the signal: a
+  request sent to the closed listener was not taken, and is safe to send to another instance
+- the last instance of a store stopped, an edit longer than those 2s is not made (the request
+  cut at `--stop-grace`): no instance takes the lease
+
+What was decided and measured is in
+[.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#a-stop).
 
 ## The logs
 

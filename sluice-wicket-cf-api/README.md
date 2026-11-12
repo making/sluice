@@ -1072,7 +1072,8 @@ docker compose up -d --force-recreate --wait wicket-b
 The state and the logins in PostgreSQL (`--state`) and the packages and droplets in an S3 bucket
 (`--blobs`), in place of `--data-dir`'s files, are what several instances share: [ha.md](ha.md).
 One at a time reconciles the wickets, the holder of a lease in the store, its writes fenced by
-its turn's epoch; the next takes over within 11s of its end, at once of its stop. An edit the
+its turn's epoch; the next takes over within 11s of its end, at once of its stop, the requests
+under way there answered meanwhile ([a stop](ha.md#a-stop)). An edit the
 wickets take at once is made by that one, whichever instance the request reaches: the others send
 it there (`--instance-url`) and relay its answer, so any instance takes any request. A build, a
 broker's operation and an app's delete waiting for its unbinds are that one's work too, the next
@@ -1123,7 +1124,7 @@ going on with them.
 | `--service-broker-editor <claim>=<pattern>` | who may register, update and delete the [service brokers](#service-brokers) and set who sees their plans, nobody without it: as `--security-group-editor` |
 | `--service-broker-editor-client <id>` | a client of `--client-credentials` who may too; repeatable |
 | `--tls-cert <path>` / `--tls-key <path>` | serve TLS: the certificate chain and its private key, PEM. Without them, behind a TLS proxy, `X-Forwarded-Proto: https` makes the links `https` |
-| `--stop-grace <secs>` | how long a stop (SIGTERM, SIGINT, stdin's end) waits for the requests and the wickets' puts under way, the listener closed ([Behavior](#behavior); default 8: within the 10s a Firecracker wicket gives a VM's process) |
+| `--stop-grace <secs>` | how long a stop (SIGTERM, SIGINT, stdin's end) waits for the requests and the wickets' puts under way, the listener closed ([Behavior](#behavior), of several instances [a stop](ha.md#a-stop); default 8: within the 10s a Firecracker wicket gives a VM's process) |
 | `--exit-on-stdin-close` | exit when stdin reaches its end (a parent's child process) |
 
 Each option also reads `SLUICE_WICKET_CF_API_<NAME>` from the environment; another variable of that
@@ -1423,7 +1424,8 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
   connection too; a request under way is answered, saying `connection: close`, a build's waiting
   for its staging at once (`STAGING`, the CLI polling it); the puts to the wickets under way
   finish, and no other begins (what it was for is taken up at the next start); then the state is
-  written. Past `--stop-grace` (8s) what is left is cut, as by a kill
+  written. Past `--stop-grace` (8s) what is left is cut, as by a kill. Of several instances the
+  one reconciling the wickets hands over first ([ha.md](ha.md#a-stop))
 - `GET /healthz`, no token: 200 once every wicket was listed (or found not answering) since the
   start, 503 saying why not before, and from a stop on: a probe's, logged by no line. Of several
   instances on one `--state`, the one reconciling the wickets so, the others once the lease names

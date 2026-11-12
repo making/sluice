@@ -69,7 +69,7 @@ pub(crate) const MAX_CONNECTIONS: usize = 64;
 const STAGING_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// How long an edit waits for an instance reconciling the wickets to take it: a lease lapsing
-/// and taken (`crate::lease`), or a stop's grace and a take.
+/// and taken (`crate::lease`); a stop's take is at once.
 const TAKEOVER: std::time::Duration = std::time::Duration::from_secs(20);
 /// Between two tries to send one.
 const SEND_AGAIN: std::time::Duration = std::time::Duration::from_millis(200);
@@ -719,7 +719,8 @@ impl Api {
             leaders.borrow_and_update();
             // in its turn, the work of it begun
             if self.store.leads() && self.controller.leads() {
-                match self.v3(req, segments).await {
+                let made = self.controller.stop.edit(self.v3(req, segments));
+                match made.await {
                     Err(e) if e.is_turn_over() => {}
                     reply => return reply,
                 }

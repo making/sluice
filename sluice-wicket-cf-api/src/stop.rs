@@ -1,7 +1,10 @@
 //! The cf-api's stop (SIGTERM, stdin's end): no new connection; each connection answers the
 //! request under way and closes, an idle one at once; the requests' handlers and the
 //! controller's puts under way finish, and no other put begins (`crate::serve` waits for them
-//! within `--stop-grace`).
+//! within `--stop-grace`). Of several instances, the one reconciling the wickets lets go of the
+//! lease first, once the edits it makes ended or `crate::lease::EDITS_END` passed: the next
+//! takes over while the requests are answered, its turn's puts cut as its turn ends, an edit
+//! still under way sent to the next (`crate::api`).
 
 use std::future::Future;
 
@@ -20,6 +23,7 @@ pub struct Stop {
     began: CancellationToken,
     connections: TaskTracker,
     requests: TaskTracker,
+    edits: TaskTracker,
     puts: TaskTracker,
 }
 
@@ -29,6 +33,7 @@ impl Stop {
         self.began.cancel();
         self.connections.close();
         self.requests.close();
+        self.edits.close();
         self.puts.close();
     }
 
@@ -50,6 +55,18 @@ impl Stop {
     /// A task it spawns is not of it.
     pub fn request<F: Future>(&self, handling: F) -> impl Future<Output = F::Output> + use<F> {
         self.requests.track_future(REQUEST.scope((), handling))
+    }
+
+    /// `making` as an edit made in this instance's turn: the lease is let go of after it
+    /// ([`Stop::edited`]).
+    pub fn edit<F: Future>(&self, making: F) -> impl Future<Output = F::Output> + use<F> {
+        self.edits.track_future(making)
+    }
+
+    /// Ready once the stop began and the edits under way in this instance's turn ended.
+    pub async fn edited(&self) {
+        self.began.cancelled().await;
+        self.edits.wait().await;
     }
 
     /// A put to a wicket begins: the stop waits for it while the token is held. Once the stop

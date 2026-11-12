@@ -15,6 +15,7 @@
 //! it, so a takeover is a start of the cf-api to the wickets.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::time::Instant;
@@ -31,6 +32,11 @@ pub const RENEW_EVERY: Duration = Duration::from_secs(2);
 /// How often another instance tries to take it.
 pub const TAKE_EVERY: Duration = Duration::from_secs(1);
 
+/// How long its holder's stop waits, before it lets go of it, for the edits under way in its
+/// turn: one made there is not made again by the next instance, and the others' are held no
+/// longer for it.
+pub const EDITS_END: Duration = Duration::from_secs(2);
+
 const _: () = assert!(
     LEASE.as_millis() + TAKE_EVERY.as_millis() + MAX_PAUSE.as_millis() <= HELD.as_millis(),
     "a wicket's hold outlasts a takeover"
@@ -46,12 +52,14 @@ pub struct Term {
     pub epoch: Option<u64>,
 }
 
-/// The lease's timing: [`LEASE`], [`RENEW_EVERY`], [`TAKE_EVERY`] but in the tests.
+/// The lease's timing: [`LEASE`], [`RENEW_EVERY`], [`TAKE_EVERY`], [`EDITS_END`] but in the
+/// tests.
 #[derive(Clone, Copy, Debug)]
 pub struct Timing {
     pub lease: Duration,
     pub renew_every: Duration,
     pub take_every: Duration,
+    pub edits_end: Duration,
 }
 
 impl Default for Timing {
@@ -60,6 +68,7 @@ impl Default for Timing {
             lease: LEASE,
             renew_every: RENEW_EVERY,
             take_every: TAKE_EVERY,
+            edits_end: EDITS_END,
         }
     }
 }
@@ -70,6 +79,8 @@ pub struct Lease {
     postgres: Option<Arc<Postgres>>,
     shared: Arc<Shared>,
     timing: Timing,
+    /// Let go of for good ([`Lease::release`]): never taken again, only followed.
+    left: AtomicBool,
 }
 
 impl Lease {
@@ -78,13 +89,15 @@ impl Lease {
             postgres,
             shared,
             timing,
+            left: AtomicBool::new(false),
         }
     }
 
     /// Keeps the lease: renewed while this instance's turn lasts (ended before it lapses when it
     /// cannot be), taken whenever it lapsed otherwise. Each turn begins and ends in the store's
     /// terms (`Store::terms`); one ended elsewhere (the store or a wicket found another took the
-    /// lease) is taken as ended.
+    /// lease) is taken as ended. Once let go of ([`Lease::release`]) it is only followed: who
+    /// holds it, for the edits under way to be sent there.
     pub async fn run(self: Arc<Self>) {
         let Some(postgres) = &self.postgres else {
             return;
@@ -143,8 +156,20 @@ impl Lease {
                 Some(Term { epoch: None }) => return,
                 None => {
                     let sent = Instant::now();
-                    match postgres.take(timing.lease).await {
-                        Ok(Taken::Taken(epoch)) => {
+                    let left = || self.left.load(Ordering::Acquire);
+                    let taken = match left() {
+                        false => postgres.take(timing.lease).await.map(Some),
+                        true => (postgres.held().await)
+                            .map(|held| held.map(|(epoch, address)| Taken::Held(epoch, address))),
+                    };
+                    match taken {
+                        // let go of as it was taken
+                        Ok(Some(Taken::Taken(epoch))) if left() => {
+                            if let Err(e) = postgres.release(epoch).await {
+                                warn("not let go of (it lapses)", &e);
+                            }
+                        }
+                        Ok(Some(Taken::Taken(epoch))) => {
                             (deadline, renewal) = (ending(sent), sent + timing.renew_every);
                             self.shared.leading.send_replace(Some(epoch));
                             self.shared.leader.send_replace(None);
@@ -160,14 +185,14 @@ impl Lease {
                             followed = None;
                             continue;
                         }
-                        Ok(Taken::Held(epoch, address)) => {
+                        Ok(Some(Taken::Held(epoch, address))) => {
                             self.shared.leader.send_if_modified(|leader| {
                                 let moved = *leader != address;
                                 *leader = address;
                                 moved
                             });
                             self.shared.leading.send_replace(Some(epoch));
-                            if followed != Some(epoch) {
+                            if followed != Some(epoch) && !left() {
                                 println!(
                                     "LEASE: another instance reconciles the wickets (epoch \
                                      {epoch}): taken over once its lease lapses"
@@ -175,6 +200,7 @@ impl Lease {
                                 followed = Some(epoch);
                             }
                         }
+                        Ok(None) => {}
                         Err(e) => warn("not taken", &e),
                     }
                     tokio::time::sleep_until(sent + timing.take_every).await;
@@ -183,9 +209,10 @@ impl Lease {
         }
     }
 
-    /// Lets go of the lease this instance holds, if any, its turn ended: another instance takes
-    /// it at once.
+    /// Lets go of the lease for good, its turn ended if this instance holds it: another
+    /// instance takes it at once, this one never again.
     pub async fn release(&self) {
+        self.left.store(true, Ordering::Release);
         let term = *self.shared.term.borrow();
         let Some(Term { epoch }) = term else {
             return;
