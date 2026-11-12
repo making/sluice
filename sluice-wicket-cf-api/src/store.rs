@@ -2077,6 +2077,11 @@ impl Store {
         f(&self.shared.state.read().expect("no panic under the lock"))
     }
 
+    /// The store several instances share (`--state`), for what they keep beside the state.
+    pub fn shared(&self) -> Option<Arc<Postgres>> {
+        self.postgres.clone()
+    }
+
     /// Changes the state, its apps placed as they are by then (`State::place`), and writes it:
     /// seen by the reads once written. `f` does nothing but change the state it is given: with
     /// `--state` it runs again when the store did not answer, on the state as it is then.
@@ -2407,7 +2412,7 @@ pub fn rfc3339(secs: u64) -> String {
 
 #[cfg(test)]
 #[path = "../tests/support/postgres_server.rs"]
-mod postgres_server;
+pub(crate) mod postgres_server;
 
 #[cfg(test)]
 #[path = "../tests/support/s3_server.rs"]

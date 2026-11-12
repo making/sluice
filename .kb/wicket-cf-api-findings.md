@@ -47,6 +47,33 @@ a copy, compared with the one before for the rows to write); the file's is the w
 written and synced. Both grow with the state, not with the change; no cache of the reads is
 needed.
 
+## The logins' store
+
+With `--state`, the key, the sessions and the passcodes in tables of their own
+(`sluice_cf_keys`, `sluice_cf_sessions`, `sluice_cf_passcodes`), not records of the state.
+Decided against the alternatives:
+
+- not of the state: a login or a refresh would be a revision, taking the lock every change
+  waits for, waking every instance's watchers (`Store::changed`) and copying the state with
+  10000 sessions in it for each change. Nothing of the state depends on a login. Each of their
+  statements is a transaction of its own (a refresh: one `DELETE ... RETURNING` feeding the
+  `INSERT` of the next session, so one of two at once gets it and none is lost between), on a
+  connection of theirs, pipelined
+- what a request reads of its token's login (the ID token's claims, for `--group-role` and the
+  editors) is one query by the session's key, sent with the revision's: not cached, as a
+  refresh on another instance ends it
+- the sign-in under way at the provider in a cookie, not a row: nothing to sweep, no bound to
+  keep (`MAX_PENDING` was a process's), and the callback is then the browser's that began it,
+  which a row by `state` alone does not say. Sealed (HMAC), not encrypted: the PKCE verifier in
+  it is the browser's own secret. The key sealing is derived from the tokens' key, so what is
+  sealed is no token's signature. The wickets' consoles keep theirs in the process
+  (`Provider::begin`)
+- a key's `made` is when it signs from, the instances reading the keys every minute: a key
+  replacing another is known to all before any signs with it, with no reload on a `kid`
+  unknown (a request without a login could ask for it at will)
+- the removal of the expired sessions and of those past the bound passes the rows another
+  statement holds (`FOR UPDATE SKIP LOCKED`): two logins at once never wait for each other's
+
 ## The blobs' bucket
 
 `--blobs` (an S3 bucket) beside the directory's files. Decided:

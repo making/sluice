@@ -532,7 +532,7 @@ fn security_group_file(dir: &Path, name: &str, rules: &Value) -> String {
 }
 
 /// HTTP(S) requests of the test to the cf-api (its certificate self-signed)
-/// and the mock provider, redirects not followed.
+/// and the mock provider, redirects not followed, cookies kept as a browser does.
 struct Http(reqwest::blocking::Client);
 
 impl Http {
@@ -543,6 +543,7 @@ impl Http {
             reqwest::blocking::Client::builder()
                 .danger_accept_invalid_certs(true)
                 .redirect(reqwest::redirect::Policy::none())
+                .cookie_store(true)
                 .build()
                 .unwrap(),
         )
@@ -595,6 +596,10 @@ fn passcode_page(http: &Http, api: &str) -> (u16, String) {
     }
     let (status, callback, _) = http.get(&authorize, None);
     assert_eq!(status, 302, "{authorize}");
+    // the sign-in is the browser's that began it: another's callback finishes none
+    let (status, _, page) = Http::new().get(&callback, None);
+    assert_eq!(status, 400, "{page}");
+    assert!(page.contains("not begun in this browser"), "{page}");
     let (status, _, page) = http.get(&callback, None);
     (status, page)
 }

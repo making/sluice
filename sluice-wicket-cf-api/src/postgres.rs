@@ -11,6 +11,10 @@
 //! and a request first asks the store for the revision (`Store::sync`), so it sees what any
 //! instance answered before it began. A row removed stays, without a body, for the processes
 //! yet to take it, until [`KEPT`] revisions later: a process further behind reads all again.
+//!
+//! The logins (`crate::uaa`: the keys, the sessions, the passcodes) are tables beside it, not
+//! of the state: a login is no revision, wakes no one and waits for no change. Each of their
+//! statements is a transaction of its own, on a connection of theirs.
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -77,7 +81,48 @@ CREATE TABLE IF NOT EXISTS sluice_cf_commits (
     writer text NOT NULL,
     at timestamptz NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS sluice_cf_keys (
+    seq integer PRIMARY KEY,
+    kid text NOT NULL UNIQUE,
+    key bytea NOT NULL,
+    made timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS sluice_cf_sessions (
+    jti text PRIMARY KEY,
+    subject text NOT NULL,
+    expires timestamptz NOT NULL
+);
+CREATE INDEX IF NOT EXISTS sluice_cf_sessions_expires ON sluice_cf_sessions (expires, jti);
+CREATE TABLE IF NOT EXISTS sluice_cf_passcodes (
+    code text PRIMARY KEY,
+    identity text NOT NULL,
+    expires timestamptz NOT NULL
+);
 ";
+
+/// Bound on a statement of the logins: past it their connection is taken for lost.
+const ASIDE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The connection of the logins, its statements sent as they come, none waiting for another.
+struct Aside {
+    client: Client,
+    keys: Statement,
+    first_key: Statement,
+    put_session: Statement,
+    rotate_session: Statement,
+    session: Statement,
+    drop_session: Statement,
+    put_passcode: Statement,
+    take_passcode: Statement,
+}
+
+/// A key of the tokens, as the store has it.
+pub struct StoredKey {
+    pub kid: String,
+    pub key: Vec<u8>,
+    /// Whether it signs by now: one made ahead of time is verified only until then.
+    pub signs: bool,
+}
 
 /// The store of the state (`--state`).
 #[derive(Clone)]
@@ -138,6 +183,8 @@ pub struct Postgres {
     /// The connection listening, which answers the revision too (by the statement beside
     /// it); None while it is away.
     listening: Mutex<Option<(Arc<Client>, Statement)>>,
+    /// The connection of the logins; None: to open. Held to open it only.
+    aside: tokio::sync::Mutex<Option<Arc<Aside>>>,
 }
 
 fn failed(e: tokio_postgres::Error) -> String {
@@ -173,6 +220,7 @@ impl Postgres {
             config,
             tls: MakeRustlsConnect::new(tls),
             listening: Mutex::new(None),
+            aside: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -515,5 +563,193 @@ impl Postgres {
             tokio::time::sleep(backoff).await;
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
+    }
+
+    /// The connection of the logins, opened when there is none or it ended.
+    async fn aside(&self) -> Result<Arc<Aside>, String> {
+        let mut aside = self.aside.lock().await;
+        if let Some(open) = aside.as_ref().filter(|open| !open.client.is_closed()) {
+            return Ok(open.clone());
+        }
+        let (client, connection) = (self.config.connect(self.tls.clone()).await).map_err(failed)?;
+        tokio::spawn(connection);
+        let prepare = async |sql: &str| client.prepare(sql).await.map_err(failed);
+        // a statement that removes rows others may remove too passes those they hold
+        // (SKIP LOCKED): none waits for another, in whatever order they come to them
+        let opened = Arc::new(Aside {
+            keys: prepare(
+                "SELECT kid, key, made <= now() FROM (\
+                 SELECT seq, kid, key, made, lead(made) OVER (ORDER BY seq) AS replaced \
+                 FROM sluice_cf_keys) AS keys \
+                 WHERE replaced IS NULL OR replaced + $1::bigint * interval '1 second' > now() \
+                 ORDER BY seq",
+            )
+            .await?,
+            first_key: prepare(
+                "WITH first AS (INSERT INTO sluice_cf_keys (seq, kid, key) VALUES (1, $1, $2) \
+                 ON CONFLICT DO NOTHING RETURNING seq) \
+                 INSERT INTO sluice_cf_sessions (jti, subject, expires) \
+                 SELECT kept.jti, kept.subject, to_timestamp(kept.expires::double precision) \
+                 FROM first, UNNEST($3::text[], $4::text[], $5::bigint[]) \
+                 AS kept (jti, subject, expires) \
+                 ON CONFLICT DO NOTHING",
+            )
+            .await?,
+            put_session: prepare(
+                "WITH evicted AS (DELETE FROM sluice_cf_sessions WHERE jti IN (\
+                 SELECT jti FROM sluice_cf_sessions WHERE expires <= now() OR jti IN (\
+                 SELECT jti FROM sluice_cf_sessions WHERE expires > now() \
+                 ORDER BY expires DESC, jti OFFSET $4::bigint) \
+                 FOR UPDATE SKIP LOCKED)) \
+                 INSERT INTO sluice_cf_sessions (jti, subject, expires) \
+                 VALUES ($1, $2, now() + $3::bigint * interval '1 second')",
+            )
+            .await?,
+            rotate_session: prepare(
+                "WITH taken AS (DELETE FROM sluice_cf_sessions \
+                 WHERE jti = $1 AND expires > now() RETURNING subject) \
+                 INSERT INTO sluice_cf_sessions (jti, subject, expires) \
+                 SELECT $2::text, subject, now() + $3::bigint * interval '1 second' FROM taken \
+                 RETURNING subject",
+            )
+            .await?,
+            session: prepare(
+                "SELECT subject FROM sluice_cf_sessions WHERE jti = $1 AND expires > now()",
+            )
+            .await?,
+            drop_session: prepare("DELETE FROM sluice_cf_sessions WHERE jti = $1").await?,
+            put_passcode: prepare(
+                "WITH gone AS (DELETE FROM sluice_cf_passcodes WHERE code IN (\
+                 SELECT code FROM sluice_cf_passcodes WHERE expires <= now() \
+                 FOR UPDATE SKIP LOCKED)) \
+                 INSERT INTO sluice_cf_passcodes (code, identity, expires) \
+                 SELECT $1::text, $2::text, now() + $3::bigint * interval '1 second' \
+                 WHERE (SELECT count(*) FROM sluice_cf_passcodes WHERE expires > now()) \
+                 < $4::bigint \
+                 ON CONFLICT DO NOTHING",
+            )
+            .await?,
+            take_passcode: prepare(
+                "DELETE FROM sluice_cf_passcodes WHERE code = $1 AND expires > now() \
+                 RETURNING identity",
+            )
+            .await?,
+            client,
+        });
+        *aside = Some(opened.clone());
+        Ok(opened)
+    }
+
+    /// What `f` asks on the connection of the logins.
+    async fn asked<T>(
+        &self,
+        f: impl AsyncFnOnce(&Aside) -> Result<T, tokio_postgres::Error>,
+    ) -> Result<T, String> {
+        let asked = async {
+            let aside = self.aside().await?;
+            f(&aside).await.map_err(failed)
+        };
+        match tokio::time::timeout(ASIDE_TIMEOUT, asked).await {
+            Ok(asked) => asked,
+            Err(_) => {
+                *self.aside.lock().await = None;
+                Err("--state: no answer".to_string())
+            }
+        }
+    }
+
+    /// The keys of the tokens, oldest first: one replaced is among them for `kept` seconds
+    /// after the next was made, by the store's clock.
+    pub async fn keys(&self, kept: i64) -> Result<Vec<StoredKey>, String> {
+        let rows = self.asked(async |aside| aside.client.query(&aside.keys, &[&kept]).await);
+        Ok((rows.await?.iter())
+            .map(|row| StoredKey {
+                kid: row.get(0),
+                key: row.get(1),
+                signs: row.get(2),
+            })
+            .collect())
+    }
+
+    /// Makes `key` the first, with the `sessions` (their `jti`, subject and expiry in seconds
+    /// since the epoch) signed with it, unless there is a key: one of several instances
+    /// starting makes it.
+    pub async fn first_key(
+        &self,
+        kid: &str,
+        key: &[u8],
+        sessions: &[(String, String, i64)],
+    ) -> Result<(), String> {
+        let jtis: Vec<&str> = sessions.iter().map(|(jti, _, _)| jti.as_str()).collect();
+        let subjects: Vec<&str> = sessions
+            .iter()
+            .map(|(_, subject, _)| subject.as_str())
+            .collect();
+        let expiries: Vec<i64> = sessions.iter().map(|(_, _, expires)| *expires).collect();
+        let first: [&(dyn ToSql + Sync); 5] = [&kid, &key, &jtis, &subjects, &expiries];
+        self.asked(async |aside| aside.client.execute(&aside.first_key, &first).await)
+            .await
+            .map(drop)
+    }
+
+    /// Keeps the session `jti` for `secs`, the expired ones removed and of the others the
+    /// `most` expiring last kept.
+    pub async fn put_session(
+        &self,
+        jti: &str,
+        subject: &str,
+        secs: i64,
+        most: i64,
+    ) -> Result<(), String> {
+        let put: [&(dyn ToSql + Sync); 4] = [&jti, &subject, &secs, &most];
+        self.asked(async |aside| aside.client.execute(&aside.put_session, &put).await)
+            .await
+            .map(drop)
+    }
+
+    /// Makes the session `old` the session `new`, good for `secs`: its subject, to the one
+    /// of those asking at once who gets it; None: there is none, or no more.
+    pub async fn rotate_session(
+        &self,
+        old: &str,
+        new: &str,
+        secs: i64,
+    ) -> Result<Option<String>, String> {
+        let rotated: [&(dyn ToSql + Sync); 3] = [&old, &new, &secs];
+        let row = self
+            .asked(async |aside| (aside.client.query_opt(&aside.rotate_session, &rotated)).await);
+        Ok(row.await?.map(|row| row.get(0)))
+    }
+
+    /// The subject of the session `jti`.
+    pub async fn session(&self, jti: &str) -> Result<Option<String>, String> {
+        let row = self.asked(async |aside| aside.client.query_opt(&aside.session, &[&jti]).await);
+        Ok(row.await?.map(|row| row.get(0)))
+    }
+
+    pub async fn drop_session(&self, jti: &str) -> Result<(), String> {
+        self.asked(async |aside| aside.client.execute(&aside.drop_session, &[&jti]).await)
+            .await
+            .map(drop)
+    }
+
+    /// Keeps the passcode `code` for `secs`; false: it is taken, or `most` wait already.
+    pub async fn put_passcode(
+        &self,
+        code: &str,
+        identity: &str,
+        secs: i64,
+        most: i64,
+    ) -> Result<bool, String> {
+        let put: [&(dyn ToSql + Sync); 4] = [&code, &identity, &secs, &most];
+        let put = self.asked(async |aside| aside.client.execute(&aside.put_passcode, &put).await);
+        Ok(put.await? == 1)
+    }
+
+    /// Takes the passcode `code`: its identity, to one of those asking at once.
+    pub async fn take_passcode(&self, code: &str) -> Result<Option<String>, String> {
+        let row = self
+            .asked(async |aside| (aside.client.query_opt(&aside.take_passcode, &[&code])).await);
+        Ok(row.await?.map(|row| row.get(0)))
     }
 }

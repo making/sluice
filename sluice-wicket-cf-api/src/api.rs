@@ -34,7 +34,7 @@ use crate::deployments;
 use crate::env;
 use crate::logs::{self, Logs};
 use crate::manifest;
-use crate::oidc::Provider;
+use crate::oidc::{Provider, SignIn};
 use crate::registry::{Reference, Registry};
 use crate::roles::{Access, Need};
 use crate::security_groups;
@@ -70,6 +70,13 @@ struct Tried {
     /// Their puts, held until the edit is committed or gone back on.
     held: Vec<Held>,
 }
+
+/// What a request is answered while the store of `--state` does not answer.
+const AWAY: &str = "the state's store does not answer: try again";
+
+/// The cookie of a sign-in under way at the provider, its name ending in the sign-in's
+/// `state`: several may be under way in one browser.
+const SIGN_IN_COOKIE: &str = "sluice-cf-sign-in-";
 
 pub struct Api {
     pub store: Arc<Store>,
@@ -237,6 +244,8 @@ pub(crate) struct Req {
     pub(crate) base: String,
     /// What the holder of its token may; why not without a valid one.
     access: Result<Access, ApiError>,
+    /// What its token's login says of its holder ([`Uaa::identity`]).
+    pub(crate) identity: Option<Value>,
 }
 
 impl Req {
@@ -315,15 +324,26 @@ impl Api {
         let (parts, body) = request.into_parts();
         let path = parts.uri.path().to_string();
         // what any instance answered before this request is seen by it
-        if let Err(e) = self.store.sync().await {
-            eprintln!("API: {} {path}: {e}", parts.method);
-            return ApiError::unavailable("the state's store does not answer: try again").into();
-        }
-        let access = self.token(&parts.headers).map(|token| {
-            let identity = self.uaa.identity(&token);
+        // and what its token's login says, asked at once
+        let token = self.token(&parts.headers);
+        let identity = async {
+            match &token {
+                Ok(token) => self.uaa.identity(token).await,
+                Err(_) => Ok(None),
+            }
+        };
+        let identity = match tokio::join!(self.store.sync(), identity) {
+            (Ok(()), Ok(identity)) => identity,
+            (Err(e), _) | (_, Err(e)) => {
+                eprintln!("API: {} {path}: {e}", parts.method);
+                return ApiError::unavailable(AWAY).into();
+            }
+        };
+        let access = token.map(|token| {
             self.store
                 .read(|state| Access::of(state, &token, identity.as_ref(), &self.policy))
         });
+        let identity = identity.filter(|_| access.is_ok());
         let authenticated = access.is_ok();
         if authenticated {
             body.admit();
@@ -379,6 +399,7 @@ impl Api {
             base: format!("{scheme}://{host}"),
             path,
             access,
+            identity,
         };
         let response = match self.dispatch(&req).await {
             Ok(response) => response,
@@ -434,12 +455,16 @@ impl Api {
                             .map(|(client, secret)| (client.to_string(), secret.to_string()))
                     });
                 let issuer = format!("{base}/uaa/oauth/token");
-                match self.uaa.grant(&req.body, basic, &issuer) {
+                match self.uaa.grant(&req.body, basic, &issuer).await {
                     Ok(tokens) => Ok(json(StatusCode::OK, &tokens)),
-                    Err(e) => Ok(json(
+                    Err(uaa::Refusal::Denied(e)) => Ok(json(
                         StatusCode::UNAUTHORIZED,
                         &json!({"error": "unauthorized", "error_description": e}),
                     )),
+                    Err(uaa::Refusal::Unavailable(e)) => {
+                        eprintln!("API: {} {}: {e}", req.method, req.path);
+                        Err(ApiError::unavailable(AWAY))
+                    }
                 }
             }
             (&Method::GET, ["uaa", "token_keys"]) => Ok(json(StatusCode::OK, &json!({"keys": []}))),
@@ -463,8 +488,15 @@ impl Api {
                         "<p>This API has no OpenID Provider configured: <code>cf login</code> takes any credentials.</p>".into(),
                     ));
                 };
-                match provider.begin(&format!("{base}/uaa/callback")).await {
-                    Ok(location) => Ok(redirect(&location)),
+                // the sign-in begun goes with the browser, sealed: the callback may reach
+                // another instance, and no other browser finishes it
+                match provider.begin_kept(&format!("{base}/uaa/callback")).await {
+                    Ok((location, sign_in)) => {
+                        let kept = serde_json::to_vec(&sign_in).expect("plain data");
+                        let kept = format!("{}={}", sign_in.state, self.uaa.seal(&kept));
+                        let age = crate::oidc::PENDING_TTL.as_secs();
+                        Ok(with_sign_in(redirect(&location), base, &kept, age))
+                    }
                     Err(e) => Ok(page(
                         StatusCode::BAD_GATEWAY,
                         "The provider is unreachable",
@@ -494,10 +526,33 @@ impl Api {
                         "<p>The provider sent no code and state: start again at <a href=\"passcode\">passcode</a>.</p>".into(),
                     ));
                 };
-                match provider
-                    .finish(code, state, &format!("{base}/uaa/callback"))
-                    .await
-                {
+                let name = format!("{SIGN_IN_COOKIE}{state}");
+                let sign_in = (req.headers.get_all(header::COOKIE).iter())
+                    .filter_map(|cookies| cookies.to_str().ok())
+                    .flat_map(|cookies| cookies.split(';'))
+                    .filter_map(|cookie| cookie.trim().split_once('='))
+                    .find(|(cookie, _)| *cookie == name)
+                    .and_then(|(_, sealed)| self.uaa.unseal(sealed))
+                    .and_then(|kept| serde_json::from_slice::<SignIn>(&kept).ok());
+                let finished = match &sign_in {
+                    Some(sign_in) => {
+                        let callback = format!("{base}/uaa/callback");
+                        (provider.finish_kept(code, state, sign_in, &callback)).await
+                    }
+                    None => Err("this sign-in was not begun in this browser, or took too \
+                                 long: start again at /uaa/passcode"
+                        .to_string()),
+                };
+                // good once: the browser keeps it no longer. Only one this API sealed: the
+                // `state` of any other is whatever the request says
+                let gone = sign_in
+                    .as_ref()
+                    .map(|sign_in| format!("{}=", sign_in.state));
+                let answered = |page: Response| match &gone {
+                    Some(gone) => Ok(with_sign_in(page, base, gone, 0)),
+                    None => Ok(page),
+                };
+                match finished {
                     Ok(identity) => {
                         let user = identity.user_name.clone();
                         // what the groups give: who sees less than expected tells why
@@ -506,8 +561,8 @@ impl Api {
                             .read(|state| self.policy.explain_groups(state, &identity.claims))
                             .map(|groups| format!("<p class=\"hint\">{}</p>", escape(&groups)))
                             .unwrap_or_default();
-                        match self.uaa.passcode(identity) {
-                            Ok(passcode) => Ok(page(
+                        match self.uaa.passcode(identity).await {
+                            Ok(passcode) => answered(page(
                                 StatusCode::OK,
                                 "Temporary Authentication Code",
                                 format!(
@@ -516,7 +571,7 @@ impl Api {
                                     uaa::PASSCODE_TTL.as_secs() / 60
                                 ),
                             )),
-                            Err(e) => Ok(page(
+                            Err(e) => answered(page(
                                 StatusCode::SERVICE_UNAVAILABLE,
                                 "No code",
                                 format!("<p>{}</p>", escape(&e)),
@@ -529,7 +584,7 @@ impl Api {
                         } else {
                             StatusCode::BAD_REQUEST
                         };
-                        Ok(page(
+                        answered(page(
                             status,
                             if status == StatusCode::FORBIDDEN {
                                 "Not allowed"
@@ -2940,6 +2995,22 @@ const ICON: &str = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg'
 
 /// What the consoles' style has not: the passcode, a literal value large enough to read off.
 const STYLE: &str = ".panel{max-width:44rem}.passcode{display:flex;flex-wrap:wrap;align-items:center;gap:1rem;margin:1.5rem 0}.passcode code{padding:.4rem 1rem .25rem;border:1px solid var(--hair);background:var(--paper-raised);font-size:var(--step-4);letter-spacing:.12em;user-select:all}";
+
+/// `response` with the cookie of a sign-in under way: `kept` its name's end and its value,
+/// for `age` seconds (0: no longer). The callback's alone, and no script's.
+fn with_sign_in(mut response: Response, base: &str, kept: &str, age: u64) -> Response {
+    let secure = match base.starts_with("https://") {
+        true => "; Secure",
+        false => "",
+    };
+    let cookie = format!(
+        "{SIGN_IN_COOKIE}{kept}; Path=/uaa/callback; Max-Age={age}; HttpOnly; SameSite=Lax{secure}"
+    );
+    if let Ok(cookie) = header::HeaderValue::from_str(&cookie) {
+        response.headers_mut().append(header::SET_COOKIE, cookie);
+    }
+    response
+}
 
 fn redirect(location: &str) -> Response {
     hyper::Response::builder()

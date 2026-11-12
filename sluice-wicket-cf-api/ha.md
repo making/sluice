@@ -1,8 +1,8 @@
 # sluice-wicket-cf-api: several instances
 
 What several instances of the [cf-api](README.md) share, in place of the files of one
-instance's `--data-dir`: the state in PostgreSQL (`--state`), the packages and the droplets in
-an S3 bucket (`--blobs`). The logins and the reconciling of the wickets are one process's still:
+instance's `--data-dir`: the state and the logins in PostgreSQL (`--state`), the packages and
+the droplets in an S3 bucket (`--blobs`). The reconciling of the wickets is one process's still:
 run one instance on them. The options are in the README's [Options](README.md#options).
 
 ## The state in PostgreSQL
@@ -27,6 +27,33 @@ run one instance on them. The options are in the README's [Options](README.md#op
 
 Run against PostgreSQL 18; what it costs is in
 [.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#the-states-store).
+
+## The logins in the store
+
+With `--state` the [logins](README.md#login) are the store's too, in place of `--data-dir`'s
+`jwt.key` and `sessions.json`: a token of one instance is good on every other, with no session
+affinity.
+
+- the key the tokens are signed with is a row (`sluice_cf_keys`), made by the first instance to
+  start. A store with none takes `--data-dir`'s `jwt.key` and the logins of its `sessions.json`,
+  once (`UAA: ... taken into the store`): the tokens issued before stay good. The files stay as
+  they were and are written no more
+- a login is a row (`sluice_cf_sessions`): a refresh token is good once among all instances, one
+  of two refreshes at once getting the new pair. The expired go as logins are made, 10000 kept
+  at most, those expiring last
+- a passcode of `cf login --sso` is a row (`sluice_cf_passcodes`): shown by one instance, taken
+  by any, once; 1000 wait at most
+- the sign-in under way at the provider is no row: the browser keeps it between `/uaa/passcode`
+  and `/uaa/callback`, in a cookie sealed with a key of the tokens' key's (10 minutes, the
+  callback's alone, `HttpOnly`), so any instance finishes it, and only for the browser that
+  began it. Without `--state` too
+- the expiries are by the store's clock; a token's own (12 hours, 30 days) by the clock of the
+  instance verifying it: keep them in step
+- a token names its key (`kid`) and each instance reads the keys every minute, so a key can be
+  replaced with no login lost: a row added with the next `seq` and a `made` some minutes ahead
+  signs from then on, every instance knowing it by then; the one before verifies for 30 days
+  more (a refresh token's life)
+- while the store does not answer, a login and a refresh are answered 503, as any request
 
 ## The blobs in a bucket
 

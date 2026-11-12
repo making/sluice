@@ -10,7 +10,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
@@ -23,7 +23,7 @@ use sha2::{Digest, Sha256};
 pub mod mock;
 
 /// How long a sign-in may take between the redirect and the callback.
-const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
+pub const PENDING_TTL: Duration = Duration::from_secs(10 * 60);
 /// Sign-ins under way at most.
 const MAX_PENDING: usize = 1000;
 /// How long a request to the provider may take.
@@ -73,18 +73,24 @@ struct Discovery {
     basic_auth: bool,
 }
 
-/// A sign-in under way: the browser was sent to the provider.
-struct Pending {
+/// A sign-in under way: the browser was sent to the provider. Kept by the [`Provider`] that
+/// began it ([`Provider::begin`]) or by its caller ([`Provider::begin_kept`]), as it is here:
+/// another process on the same settings may then finish it.
+#[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
+pub struct SignIn {
+    /// The authorization request's `state`: the callback names it.
+    pub state: String,
     verifier: String,
     nonce: String,
-    since: Instant,
+    /// When it is too late to finish, in seconds since the epoch.
+    expires: u64,
 }
 
 pub struct Provider {
     pub settings: OidcSettings,
     http: reqwest::Client,
     discovered: tokio::sync::Mutex<Option<Arc<Discovery>>>,
-    pending: Mutex<HashMap<String, Pending>>,
+    pending: Mutex<HashMap<String, SignIn>>,
 }
 
 /// An HTTP client verifying servers against `ca_pem` (a PEM CA, the error
@@ -181,33 +187,35 @@ impl Provider {
     /// Where to send the browser: the authorization request, its state kept
     /// for the callback at `redirect_uri`.
     pub async fn begin(&self, redirect_uri: &str) -> Result<String, String> {
-        let discovery = self.discover().await?;
-        let state = random();
-        let verifier = random();
-        let nonce = random();
-        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-        {
-            let mut pending = self.pending.lock().expect("no panic held it");
-            pending.retain(|_, p| p.since.elapsed() < PENDING_TTL);
-            if pending.len() >= MAX_PENDING {
-                return Err("too many sign-ins under way: try again later".into());
-            }
-            pending.insert(
-                state.clone(),
-                Pending {
-                    verifier,
-                    nonce: nonce.clone(),
-                    since: Instant::now(),
-                },
-            );
+        let (location, sign_in) = self.begin_kept(redirect_uri).await?;
+        let mut pending = self.pending.lock().expect("no panic held it");
+        let now = epoch_secs();
+        pending.retain(|_, p| p.expires > now);
+        if pending.len() >= MAX_PENDING {
+            return Err("too many sign-ins under way: try again later".into());
         }
+        pending.insert(sign_in.state.clone(), sign_in);
+        Ok(location)
+    }
+
+    /// As [`Provider::begin`], the sign-in begun the caller's to keep until the callback
+    /// ([`Provider::finish_kept`]), out of anyone else's reach: it holds the PKCE verifier.
+    pub async fn begin_kept(&self, redirect_uri: &str) -> Result<(String, SignIn), String> {
+        let discovery = self.discover().await?;
+        let sign_in = SignIn {
+            state: random(),
+            verifier: random(),
+            nonce: random(),
+            expires: epoch_secs() + PENDING_TTL.as_secs(),
+        };
+        let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(sign_in.verifier.as_bytes()));
         let query = form_urlencoded::Serializer::new(String::new())
             .append_pair("response_type", "code")
             .append_pair("client_id", &self.settings.client_id)
             .append_pair("redirect_uri", redirect_uri)
             .append_pair("scope", &self.settings.scopes.join(" "))
-            .append_pair("state", &state)
-            .append_pair("nonce", &nonce)
+            .append_pair("state", &sign_in.state)
+            .append_pair("nonce", &sign_in.nonce)
             .append_pair("code_challenge", &challenge)
             .append_pair("code_challenge_method", "S256")
             .finish();
@@ -216,10 +224,8 @@ impl Provider {
         } else {
             '?'
         };
-        Ok(format!(
-            "{}{separator}{query}",
-            discovery.authorization_endpoint
-        ))
+        let location = format!("{}{separator}{query}", discovery.authorization_endpoint);
+        Ok((location, sign_in))
     }
 
     /// The callback: `code` exchanged for the ID token, which must be the
@@ -235,8 +241,23 @@ impl Provider {
             .lock()
             .expect("no panic held it")
             .remove(state)
-            .filter(|p| p.since.elapsed() < PENDING_TTL)
-            .ok_or("this sign-in is unknown or took too long: start again at /uaa/passcode")?;
+            .ok_or(UNKNOWN)?;
+        self.finish_kept(code, state, &pending, redirect_uri).await
+    }
+
+    /// As [`Provider::finish`], of the sign-in the caller kept.
+    pub async fn finish_kept(
+        &self,
+        code: &str,
+        state: &str,
+        pending: &SignIn,
+        redirect_uri: &str,
+    ) -> Result<Identity, String> {
+        if !constant_time_eq(state.as_bytes(), pending.state.as_bytes())
+            || pending.expires <= epoch_secs()
+        {
+            return Err(UNKNOWN.into());
+        }
         let discovery = self.discover().await?;
         let mut form = vec![
             ("grant_type", "authorization_code"),
@@ -315,6 +336,8 @@ impl Provider {
         })
     }
 }
+
+const UNKNOWN: &str = "this sign-in is unknown or took too long: start again at /uaa/passcode";
 
 /// The rules of `<claim>=<pattern>` values, each possibly several
 /// comma-separated: one claim's patterns are alternatives, distinct claims

@@ -62,9 +62,9 @@ webpki-roots = "1"
 
 [dev-dependencies]
 # the integration test's certificate of the cf-api's own TLS, its requests to it and its
-# OpenID Provider
+# OpenID Provider, as a browser keeping the sign-in's cookie
 rcgen = "0.14"
-reqwest = { version = "0.13", default-features = false, features = ["blocking"] }
+reqwest = { version = "0.13", default-features = false, features = ["blocking", "cookies"] }
 sluice-wicket-oidc = { path = "../sluice-wicket-oidc", features = ["mock"] }
 # paused time for the bound on a quiet connection
 tokio = { version = "1", features = ["test-util"] }

@@ -289,7 +289,7 @@ pub async fn serve(
         },
         None => uaa::Mode::Open,
     };
-    let uaa = uaa::Uaa::open(&settings.data_dir, mode)?;
+    let uaa = uaa::Uaa::open(&settings.data_dir, mode, store.shared()).await?;
     let provider = match &settings.oidc {
         Some(oidc) => Some(oidc::Provider::new(oidc.clone())?),
         None => None,

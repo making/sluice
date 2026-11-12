@@ -1069,9 +1069,9 @@ docker compose up -d --force-recreate --wait wicket-b
 
 ## Several instances
 
-The state in PostgreSQL (`--state`) and the packages and droplets in an S3 bucket (`--blobs`),
-in place of `--data-dir`'s files, are what several instances share: [ha.md](ha.md). The logins
-and the reconciling of the wickets are one process's still: run one instance.
+The state and the logins in PostgreSQL (`--state`) and the packages and droplets in an S3 bucket
+(`--blobs`), in place of `--data-dir`'s files, are what several instances share: [ha.md](ha.md).
+The reconciling of the wickets is one process's still: run one instance.
 
 ## Options
 
@@ -1082,12 +1082,12 @@ and the reconciling of the wickets are one process's still: run one instance.
 | `--wicket-token <token>` / `--wicket-token-file <path>` | their `--console-token`, one for all |
 | `--wicket-away-grace <secs>` | of several wickets, one not answering that long is gone: placed on no more, the indices on it started on the others, until it has answered as long again ([Several wickets](#several-wickets); default 30, 0 = never) |
 | `--domain <name>` | a shared domain; repeatable (or comma-separated): the first takes the default and random routes (default `localhost`). Through a sluice server, a suffix whose wildcard DNS reaches it |
-| `--data-dir <path>` | the state and the blobs (default `cf-api`), one process's (an exclusive `flock` of its `.lock`: a second start on it fails): `state.json` (written by a rename on every change; not with `--state`), `jwt.key` and `sessions.json` (the logins), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app), `droplets/<sha256>.tar` (a static site's files, a droplet buildpacks built); with `--blobs` of these the uploads and the blobs being made only |
+| `--data-dir <path>` | the state and the blobs (default `cf-api`), one process's (an exclusive `flock` of its `.lock`: a second start on it fails): `state.json` (written by a rename on every change; not with `--state`), `jwt.key` and `sessions.json` (the logins; not with `--state`), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app), `droplets/<sha256>.tar` (a static site's files, a droplet buildpacks built); with `--blobs` of these the uploads and the blobs being made only |
 | `--blobs <url>` | the packages and the droplets in an S3 bucket in place of `--data-dir`'s ([The blobs in a bucket](ha.md#the-blobs-in-a-bucket)): `s3://bucket` or `s3://bucket/prefix` |
 | `--blobs-endpoint <url>` / `--blobs-region <name>` | the bucket's S3 endpoint, `http(s)://host[:port]`, addressed by path (default AWS), and its region (default `us-east-1`) |
 | `--blobs-access-key-id <id>` / `--blobs-secret-access-key <key>` / `--blobs-secret-access-key-file <path>` | its credentials (required with `--blobs`) |
 | `--blobs-ca-cert <path>` | PEM CA verifying the endpoint (default the webPKI roots) |
-| `--state <url>` / `--state-file <path>` | the state in PostgreSQL in place of `--data-dir`'s `state.json` ([The state in PostgreSQL](ha.md#the-state-in-postgresql)): `postgres://user:password@host:port/database`, with libpq's parameters (`?sslmode=require`: TLS, which a URL without takes only where the server has it) |
+| `--state <url>` / `--state-file <path>` | the state in PostgreSQL in place of `--data-dir`'s `state.json` ([The state in PostgreSQL](ha.md#the-state-in-postgresql)), and the logins in place of its `jwt.key` and `sessions.json` ([The logins in the store](ha.md#the-logins-in-the-store)): `postgres://user:password@host:port/database`, with libpq's parameters (`?sslmode=require`: TLS, which a URL without takes only where the server has it) |
 | `--state-ca-cert <path>` | PEM CA verifying it (default the webPKI roots) |
 | `--org <name>` / `--space <name>` | the organization and its space the first start makes (default `sluice` / `wicket`) |
 | `--cnb-builder <image>` | the Cloud Native Buildpacks builder staging a zip of source on a Firecracker wicket with `--guest` ([Buildpacks](#buildpacks): `cnb`); none: a zip of source fails staging |
@@ -1433,8 +1433,9 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
 The cf-api is its own UAA: `POST /uaa/oauth/token` answers a JWT (HS256) signed with the key in
 `--data-dir` (`jwt.key`), good for 12 hours, with a refresh token good for 30 days and once: a
 refresh answers a new pair and the old refresh token is spent (`sessions.json` keeps the logins,
-so they outlive a restart). Who gets a token is said at the start, one or the other, or it does
-not start:
+so they outlive a restart). With `--state` the key and the logins are the store's, every
+instance's ([The logins in the store](ha.md#the-logins-in-the-store)). Who gets a token is said
+at the start, one or the other, or it does not start:
 
 - with `--any-credentials`, anyone: the password, client_credentials and refresh_token grants
   take any credentials (`cf login -u me -p x`). The listener then binds a loopback address only,
@@ -1447,7 +1448,8 @@ not start:
   - `cf login --sso` asks for a code and names where to get one, `<API URL>/uaa/passcode`
     (`cf login` without `--sso`, and `-u -p`, are refused with that hint). The page sends the
     browser to the provider (authorization code flow with PKCE and a nonce) and the callback,
-    `<API URL>/uaa/callback`, exchanges the code for the ID token. The token comes straight from
+    `<API URL>/uaa/callback`, exchanges the code for the ID token, for the browser that began
+    the sign-in within the last 10 minutes (a cookie keeps it meanwhile). The token comes straight from
     the provider's token endpoint, over TLS and against the client's secret, so its claims are
     taken as they come (OpenID Connect Core 3.1.3.7, item 6) once `iss`, `aud`, `exp` and the
     nonce check out; the `--oidc-claim` rules then say who may log in (`403` with the claim

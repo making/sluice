@@ -63,6 +63,13 @@ Every instance sweeps the blobs (`Store::keep_swept`), one at a time deleting: `
 `SWEEP_STALE`). The leader alone is to sweep, under the lease here (the store's clock); what a
 droplet's naming checks (`sweep.rounds`, `Store::unswept`) stays.
 
+## From 277
+
+The logins need no leader: the expired sessions and passcodes go as new ones are made
+(`postgres.rs`: `put_session`, `put_passcode`), in the statement making them, and every
+instance reads the keys on its own (`uaa.rs`: `KEYS_EVERY`). Nothing of them to move under the
+lease.
+
 ## From 275
 
 - `Store::update` is one transaction after another over every instance (the lock of

@@ -614,9 +614,8 @@ impl Api {
         option: &str,
     ) -> Result<String, ApiError> {
         let token = self.claims(req)?;
-        let identity = self.uaa.identity(&token);
         editors
-            .check(&token, identity.as_ref(), option)
+            .check(&token, req.identity.as_ref(), option)
             .map_err(|why| ApiError::not_authorized(&why))?;
         Ok(token.name().to_string())
     }
