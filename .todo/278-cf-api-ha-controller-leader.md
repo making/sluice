@@ -55,3 +55,16 @@ a new cf-api on an old wicket and an old one on a new wicket both work.
 puts nothing; the leader stopped (and one only paused past its lease), the other takes a
 deployment and a move under way to their end; a put with an old epoch refused by the wicket
 (the wickets' own tests, both runtimes).
+
+## From 275
+
+- `Store::update` is one transaction after another over every instance (the lock of
+  `sluice_cf_meta`'s row), `Store::changed` wakes on any instance's commit, `Store::sync` brings
+  the copy to the store's revision. The lease is a row written through it; for the store's clock,
+  a statement of its own in `postgres.rs` (`now()`), not a field of the state
+- the placement stayed in the transaction: `State::place` runs in `Store::update`, on the room
+  the committing process observed (`Wickets::budgets`, `full`, `leaving`, `gone`, not kept). Two
+  instances place by two views of the room: decide here whether the leader alone places (the
+  others writing the count) or the room is kept
+- `Store::note` (what is not kept) is one process's: `outcomes` and `placement::Wickets` are
+  not in the rows. It panics in a debug build when it changes a list of the state

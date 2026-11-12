@@ -1167,13 +1167,14 @@ impl Api {
                     .map(|offering| respond(StatusCode::OK, &offering))
                     .ok_or_else(|| ApiError::not_found("Service offering"))
             }
-            (&Method::DELETE, ["service_offerings", guid]) => match self.delete_offering(req, guid)
-            {
-                Some(deleted) => deleted.map(|()| no_content()),
-                None => Err(ApiError::unprocessable(
-                    "the offerings of sluice-wicket follow the wicket's keyvalue stores and capabilities",
-                )),
-            },
+            (&Method::DELETE, ["service_offerings", guid]) => {
+                match self.delete_offering(req, guid).await {
+                    Some(deleted) => deleted.map(|()| no_content()),
+                    None => Err(ApiError::unprocessable(
+                        "the offerings of sluice-wicket follow the wicket's keyvalue stores and capabilities",
+                    )),
+                }
+            }
             (_, ["service_offerings", ..]) => Err(ApiError::unprocessable(
                 "an offering follows its broker's catalog: cf update-service-broker fetches it again",
             )),
@@ -1190,7 +1191,7 @@ impl Api {
                     .ok_or_else(|| ApiError::not_found("Service plan"))
             }
             (_, ["service_plans", guid, "visibility", rest @ ..]) => {
-                match self.plan_visibility(req, guid, rest) {
+                match self.plan_visibility(req, guid, rest).await {
                     Some(reply) => reply,
                     None if req.method == Method::GET && rest.is_empty() => {
                         Ok(respond(StatusCode::OK, &json!({"type": "public"})))
@@ -1389,7 +1390,7 @@ impl Api {
             .read(|state| space_to_develop(access, state, &space))?;
         match body["type"].as_str() {
             Some("managed") => {}
-            Some(USER_PROVIDED) => return self.create_user_provided(req, &body, &space),
+            Some(USER_PROVIDED) => return self.create_user_provided(req, &body, &space).await,
             _ => {
                 return Err(ApiError::unprocessable(
                     "type is managed (cf create-service) or user-provided (cf create-user-provided-service)",
@@ -1403,7 +1404,9 @@ impl Api {
             .ok_or_else(|| ApiError::unprocessable("relationships.service_plan names the plan"))?;
         let tags = tags(&body["tags"])?;
         if self.store.read(|state| state.brokered(wanted).is_some()) {
-            return self.create_brokered(req, &body, &space, name, wanted, tags);
+            return self
+                .create_brokered(req, &body, &space, name, wanted, tags)
+                .await;
         }
         no_parameters(&body["parameters"])?;
         let offer = self.controller.offer().await.map_err(|e| {
@@ -1416,30 +1419,33 @@ impl Api {
             .iter()
             .find(|plan| plan_guid(&plan.offering, &plan.name) == wanted)
             .ok_or_else(invalid_plan)?;
-        let instance = self.store.update(|state| {
-            space_to_develop(access, state, &space)?;
-            if state.instance_named(&space, &name).is_some() {
-                return Err(name_taken(&name));
-            }
-            let at = now();
-            let instance = Instance {
-                guid: guid(),
-                name: name.clone(),
-                space: space.clone(),
-                offering: plan.offering.clone(),
-                plan: plan.name.clone(),
-                tags,
-                credentials: Map::new(),
-                broker: None,
-                dashboard_url: None,
-                maintenance_info: None,
-                operation: None,
-                created_at: at.clone(),
-                updated_at: at,
-            };
-            state.instances.push(instance.clone());
-            Ok(instance)
-        })?;
+        let instance = self
+            .store
+            .update(|state| {
+                space_to_develop(access, state, &space)?;
+                if state.instance_named(&space, &name).is_some() {
+                    return Err(name_taken(&name));
+                }
+                let at = now();
+                let instance = Instance {
+                    guid: guid(),
+                    name: name.clone(),
+                    space: space.clone(),
+                    offering: plan.offering.clone(),
+                    plan: plan.name.clone(),
+                    tags: tags.clone(),
+                    credentials: Map::new(),
+                    broker: None,
+                    dashboard_url: None,
+                    maintenance_info: None,
+                    operation: None,
+                    created_at: at.clone(),
+                    updated_at: at,
+                };
+                state.instances.push(instance.clone());
+                Ok(instance)
+            })
+            .await?;
         println!(
             "SERVICES: created service instance {} ({} {})",
             instance.name, instance.offering, instance.plan
@@ -1453,11 +1459,12 @@ impl Api {
                 format!("/v3/service_instances/{}", instance.guid),
             )),
         )
+        .await
     }
 
     /// A broker's instance: made by its broker, the job settled when it is
     /// (`crate::operations`); its plan one the space sees.
-    fn create_brokered(
+    async fn create_brokered(
         &self,
         req: &Req,
         body: &Value,
@@ -1469,48 +1476,52 @@ impl Api {
         let parameters = object_parameters(&body["parameters"]).map_err(ApiError::unprocessable)?;
         let user = self.claims(req)?.user_id;
         let access = req.access()?;
-        let job = self.store.update(|state| {
-            space_to_develop(access, state, space)?;
-            if state.instance_named(space, &name).is_some() {
-                return Err(name_taken(&name));
-            }
-            let brokered = state.brokered(plan).ok_or_else(invalid_plan)?;
-            let org = state.space(space).map_or("", |space| space.org.as_str());
-            if !brokered.plan.visible(brokered.broker, org, space) || brokered.offering.gone {
-                return Err(invalid_plan());
-            }
-            let (offering, broker) = (brokered.offering.guid.clone(), brokered.broker.guid.clone());
-            let maintenance_info = brokered.plan.maintenance_info().cloned();
-            let guid = guid();
-            let job = state.add_waiting_job(
-                "service_instance.create",
-                vec![guid.clone()],
-                Some((
-                    "service_instances".into(),
-                    format!("/v3/service_instances/{guid}"),
-                )),
-            );
-            let mut operation =
-                Operation::new(OperationKind::Create, Some(job.clone()), Some(user));
-            operation.parameters = parameters;
-            let at = now();
-            state.instances.push(Instance {
-                guid,
-                name: name.clone(),
-                space: space.to_string(),
-                offering,
-                plan: plan.to_string(),
-                tags,
-                credentials: Map::new(),
-                broker: Some(broker),
-                dashboard_url: None,
-                maintenance_info,
-                operation: Some(operation),
-                created_at: at.clone(),
-                updated_at: at,
-            });
-            Ok(job)
-        })?;
+        let job = self
+            .store
+            .update(|state| {
+                space_to_develop(access, state, space)?;
+                if state.instance_named(space, &name).is_some() {
+                    return Err(name_taken(&name));
+                }
+                let brokered = state.brokered(plan).ok_or_else(invalid_plan)?;
+                let org = state.space(space).map_or("", |space| space.org.as_str());
+                if !brokered.plan.visible(brokered.broker, org, space) || brokered.offering.gone {
+                    return Err(invalid_plan());
+                }
+                let (offering, broker) =
+                    (brokered.offering.guid.clone(), brokered.broker.guid.clone());
+                let maintenance_info = brokered.plan.maintenance_info().cloned();
+                let guid = guid();
+                let job = state.add_waiting_job(
+                    "service_instance.create",
+                    vec![guid.clone()],
+                    Some((
+                        "service_instances".into(),
+                        format!("/v3/service_instances/{guid}"),
+                    )),
+                );
+                let mut operation =
+                    Operation::new(OperationKind::Create, Some(job.clone()), Some(user.clone()));
+                operation.parameters = parameters.clone();
+                let at = now();
+                state.instances.push(Instance {
+                    guid,
+                    name: name.clone(),
+                    space: space.to_string(),
+                    offering,
+                    plan: plan.to_string(),
+                    tags: tags.clone(),
+                    credentials: Map::new(),
+                    broker: Some(broker),
+                    dashboard_url: None,
+                    maintenance_info,
+                    operation: Some(operation),
+                    created_at: at.clone(),
+                    updated_at: at,
+                });
+                Ok(job)
+            })
+            .await?;
         println!("SERVICES: creating service instance {name} through its broker");
         self.operations.kick();
         Ok(self.located(req, &job))
@@ -1518,37 +1529,40 @@ impl Api {
 
     /// A user-provided instance: its credentials, no plan; answered at once,
     /// as CC does (201, no job).
-    fn create_user_provided(&self, req: &Req, body: &Value, space: &str) -> Reply {
+    async fn create_user_provided(&self, req: &Req, body: &Value, space: &str) -> Reply {
         let name = body["name"].as_str().unwrap_or_default().to_string();
         check_name("the name", &name).map_err(ApiError::unprocessable)?;
         user_provided_only(body)?;
         let credentials = user_credentials(&body["credentials"])?.unwrap_or_default();
         let tags = tags(&body["tags"])?;
         let access = req.access()?;
-        let view = self.store.update(|state| {
-            space_to_develop(access, state, space)?;
-            if state.instance_named(space, &name).is_some() {
-                return Err(name_taken(&name));
-            }
-            let at = now();
-            let instance = Instance {
-                guid: guid(),
-                name: name.clone(),
-                space: space.to_string(),
-                offering: USER_PROVIDED.into(),
-                plan: String::new(),
-                tags,
-                credentials,
-                broker: None,
-                dashboard_url: None,
-                maintenance_info: None,
-                operation: None,
-                created_at: at.clone(),
-                updated_at: at,
-            };
-            state.instances.push(instance.clone());
-            Ok(instance_view(&req.base, state, &instance))
-        })?;
+        let view = self
+            .store
+            .update(|state| {
+                space_to_develop(access, state, space)?;
+                if state.instance_named(space, &name).is_some() {
+                    return Err(name_taken(&name));
+                }
+                let at = now();
+                let instance = Instance {
+                    guid: guid(),
+                    name: name.clone(),
+                    space: space.to_string(),
+                    offering: USER_PROVIDED.into(),
+                    plan: String::new(),
+                    tags: tags.clone(),
+                    credentials: credentials.clone(),
+                    broker: None,
+                    dashboard_url: None,
+                    maintenance_info: None,
+                    operation: None,
+                    created_at: at.clone(),
+                    updated_at: at,
+                };
+                state.instances.push(instance.clone());
+                Ok(instance_view(&req.base, state, &instance))
+            })
+            .await?;
         println!("SERVICES: created user-provided service instance {name}");
         Ok(respond(StatusCode::CREATED, &view))
     }
@@ -1645,13 +1659,13 @@ impl Api {
             let changed = credentials
                 .as_ref()
                 .is_some_and(|credentials| *credentials != instance.credentials);
-            if let Some(credentials) = credentials {
-                instance.credentials = credentials;
+            if let Some(credentials) = &credentials {
+                instance.credentials.clone_from(credentials);
             }
             instance.updated_at = now();
             if let (Some(job), Some(update)) = (&job, update) {
                 let mut operation =
-                    Operation::new(OperationKind::Update, Some(job.clone()), Some(user));
+                    Operation::new(OperationKind::Update, Some(job.clone()), Some(user.clone()));
                 operation.plan = update.plan;
                 operation.maintenance_info = update.maintenance_info;
                 operation.parameters = update.parameters;
@@ -1668,7 +1682,7 @@ impl Api {
                 false => Vec::new(),
             };
             Ok((instance_view(&req.base, state, &instance), instance.name, bound, job))
-        })?;
+        }).await?;
         for app in &bound {
             self.logs.add(
                 app,
@@ -1729,7 +1743,7 @@ impl Api {
                 let job = state.add_waiting_job("service_instance.delete", vec![guid.to_string()], None);
                 let deleted = state.instance_mut(guid).expect("found above");
                 deleted.operation =
-                    Some(Operation::new(OperationKind::Delete, Some(job.clone()), Some(user)));
+                    Some(Operation::new(OperationKind::Delete, Some(job.clone()), Some(user.clone())));
                 return Ok((instance, Vec::new(), Some(job)));
             }
             state.bindings.retain(|binding| binding.instance != guid);
@@ -1743,7 +1757,7 @@ impl Api {
                 });
             }
             Ok((instance, bound, None))
-        })?;
+        }).await?;
         if let Some(job) = job {
             println!(
                 "SERVICES: deleting service instance {} through its broker",
@@ -1768,6 +1782,7 @@ impl Api {
             return Ok(no_content());
         }
         self.job(req, "service_instance.delete", Vec::new(), None)
+            .await
     }
 
     /// A broker's instance's parameters, as its broker gives them if its
@@ -1884,56 +1899,59 @@ impl Api {
         let name = body["name"].as_str().map(String::from);
         let user = self.claims(req)?.user_id;
         let access = req.access()?;
-        let (binding, instance_name, user_provided, job) = self.store.update(|state| {
-            let space = state
-                .app(app)
-                .filter(|app| access.can(state, &app.space, Need::Read))
-                .map(|app| app.space.clone())
-                .ok_or_else(|| {
-                    ApiError::unprocessable(format!("The app could not be found: {app}"))
-                })?;
-            access.check(state, &space, Need::Develop, "App")?;
-            let (instance_name, user_provided) = state
-                .instance(instance)
-                .filter(|instance| instance.space == space)
-                .map(|instance| (instance.name.clone(), instance.user_provided()))
-                .ok_or_else(|| {
-                    ApiError::unprocessable(format!(
-                        "The service instance could not be found: {instance}"
-                    ))
-                })?;
-            let binding = match bind(state, app, instance, name.clone(), &body["parameters"]) {
-                Ok(binding) => binding,
-                Err(Unbound::Already) => {
-                    return Err(ApiError {
-                        status: StatusCode::UNPROCESSABLE_ENTITY,
-                        code: 90003,
-                        title: "CF-ServiceBindingAppServiceTaken",
-                        detail: "The app is already bound to the service instance.".into(),
-                    });
-                }
-                Err(Unbound::Busy(e)) => return Err(busy(e)),
-                Err(Unbound::Refused(e)) => return Err(ApiError::unprocessable(e)),
-            };
-            let job = binding.operation.is_some().then(|| {
-                let job = state.add_waiting_job(
-                    "service_bindings.create",
-                    vec![binding.guid.clone()],
-                    Some((
-                        "service_credential_binding".into(),
-                        format!("/v3/service_credential_bindings/{}", binding.guid),
-                    )),
-                );
-                let operation = state
-                    .binding_mut(&binding.guid)
-                    .and_then(|binding| binding.operation.as_mut())
-                    .expect("just bound");
-                operation.job = Some(job.clone());
-                operation.user = Some(user);
-                job
-            });
-            Ok((binding, instance_name, user_provided, job))
-        })?;
+        let (binding, instance_name, user_provided, job) = self
+            .store
+            .update(|state| {
+                let space = state
+                    .app(app)
+                    .filter(|app| access.can(state, &app.space, Need::Read))
+                    .map(|app| app.space.clone())
+                    .ok_or_else(|| {
+                        ApiError::unprocessable(format!("The app could not be found: {app}"))
+                    })?;
+                access.check(state, &space, Need::Develop, "App")?;
+                let (instance_name, user_provided) = state
+                    .instance(instance)
+                    .filter(|instance| instance.space == space)
+                    .map(|instance| (instance.name.clone(), instance.user_provided()))
+                    .ok_or_else(|| {
+                        ApiError::unprocessable(format!(
+                            "The service instance could not be found: {instance}"
+                        ))
+                    })?;
+                let binding = match bind(state, app, instance, name.clone(), &body["parameters"]) {
+                    Ok(binding) => binding,
+                    Err(Unbound::Already) => {
+                        return Err(ApiError {
+                            status: StatusCode::UNPROCESSABLE_ENTITY,
+                            code: 90003,
+                            title: "CF-ServiceBindingAppServiceTaken",
+                            detail: "The app is already bound to the service instance.".into(),
+                        });
+                    }
+                    Err(Unbound::Busy(e)) => return Err(busy(e)),
+                    Err(Unbound::Refused(e)) => return Err(ApiError::unprocessable(e)),
+                };
+                let job = binding.operation.is_some().then(|| {
+                    let job = state.add_waiting_job(
+                        "service_bindings.create",
+                        vec![binding.guid.clone()],
+                        Some((
+                            "service_credential_binding".into(),
+                            format!("/v3/service_credential_bindings/{}", binding.guid),
+                        )),
+                    );
+                    let operation = state
+                        .binding_mut(&binding.guid)
+                        .and_then(|binding| binding.operation.as_mut())
+                        .expect("just bound");
+                    operation.job = Some(job.clone());
+                    operation.user = Some(user.clone());
+                    job
+                });
+                Ok((binding, instance_name, user_provided, job))
+            })
+            .await?;
         if let Some(job) = job {
             // logged when the broker made it
             self.operations.kick();
@@ -1962,6 +1980,7 @@ impl Api {
                 format!("/v3/service_credential_bindings/{}", binding.guid),
             )),
         )
+        .await
     }
 
     /// At once, but a broker's binding: its broker's to delete (202).
@@ -1988,12 +2007,12 @@ impl Api {
                 let job = state.add_waiting_job("service_bindings.delete", vec![guid.to_string()], None);
                 let unbound = state.binding_mut(guid).expect("found above");
                 unbound.operation =
-                    Some(Operation::new(OperationKind::Delete, Some(job.clone()), Some(user)));
+                    Some(Operation::new(OperationKind::Delete, Some(job.clone()), Some(user.clone())));
                 return Ok((binding, name, user_provided, Some(job)));
             }
             state.bindings.retain(|kept| kept.guid != guid);
             Ok::<_, ApiError>((binding, name, user_provided, None))
-        })?;
+        }).await?;
         if let Some(job) = job {
             self.operations.kick();
             return Ok(self.located(req, &job));
@@ -2009,6 +2028,7 @@ impl Api {
             return Ok(no_content());
         }
         self.job(req, "service_bindings.delete", Vec::new(), None)
+            .await
     }
 }
 

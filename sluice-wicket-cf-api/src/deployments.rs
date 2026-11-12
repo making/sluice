@@ -543,7 +543,11 @@ impl Controller {
     pub async fn deploy(self: Arc<Self>, guid: String, deployment: String) {
         while self.serving(&guid, &deployment).await {
             let _app = self.hold(&guid).await;
-            match self.store.update(|state| state.step(&guid, &deployment)) {
+            match self
+                .store
+                .update(|state| state.step(&guid, &deployment))
+                .await
+            {
                 Step::None => return,
                 Step::Done(line) => {
                     self.logs.add(&guid, "API", line);
@@ -599,7 +603,8 @@ impl Controller {
             });
             if changed {
                 self.store
-                    .update(|state| state.note_error(deployment, error));
+                    .update(|state| state.note_error(deployment, error.clone()))
+                    .await;
             }
             if waits.is_none() {
                 return true;
@@ -647,7 +652,7 @@ impl Controller {
             return;
         }
         self.sync(guid).await;
-        if let Some(line) = self.store.update(|state| state.canceled(deployment)) {
+        if let Some(line) = self.store.update(|state| state.canceled(deployment)).await {
             self.logs.add(guid, "API", line);
         }
     }

@@ -40,3 +40,8 @@ grows by every staging line; only if the flume cannot carry them.
 `flume::tests` with two watches on one flume (sluice-wicket-tunnel's test flume): a line added
 on one instance read from the other, in one order on both; the CLI test of 284 reads a push's
 staging log through the instance that did not stage.
+
+## From 275
+
+`State::flume` is one row (`single` / `flume`) every instance writes: with several watching,
+the last writer's cursor.

@@ -460,7 +460,8 @@ jobs:
   # and a wicket in local mode on a flume: the test builds the wicket (debug), its example
   # guests (the nightly toolchain examples/ pins), sluice-wicket-site (the cf-api's build
   # embeds it; the nightly it pins) and the flume with cargo, so their targets are cached too.
-  # Its wickets share a redis-server's keyvalue store.
+  # Its wickets share a redis-server's keyvalue store; the tests of the state's store run a
+  # PostgreSQL in a container (the runner's Docker).
   sluice-wicket-cf-api:
     needs: changes
     if: needs.changes.outputs.cf-api == 'true'

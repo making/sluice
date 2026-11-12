@@ -385,7 +385,7 @@ fn check_name(state: &State, name: &str, of: Option<&str>) -> Result<(), ApiErro
 
 impl Api {
     /// `/v3/security_groups*`.
-    pub(crate) fn security_groups(&self, req: &Req, segments: &[&str]) -> Reply {
+    pub(crate) async fn security_groups(&self, req: &Req, segments: &[&str]) -> Reply {
         let base = req.base.as_str();
         let found = |group: Option<SecurityGroup>| {
             let group = group.ok_or_else(|| ApiError::not_found("Security group"))?;
@@ -407,23 +407,26 @@ impl Api {
             (&Method::POST, ["security_groups"]) => {
                 let body: Create = req.json()?;
                 rules_of(&body.rules)?;
-                let group = self.store.update(|state| {
-                    check_name(state, &body.name, None)?;
-                    let at = now();
-                    let group = SecurityGroup {
-                        guid: guid(),
-                        name: body.name.clone(),
-                        rules: body.rules.clone(),
-                        running: body.globally_enabled.running.unwrap_or(false),
-                        staging: body.globally_enabled.staging.unwrap_or(false),
-                        running_spaces: body.relationships.running_spaces.guids(state)?,
-                        staging_spaces: body.relationships.staging_spaces.guids(state)?,
-                        created_at: at.clone(),
-                        updated_at: at,
-                    };
-                    state.security_groups.push(group.clone());
-                    Ok::<_, ApiError>(group)
-                })?;
+                let group = self
+                    .store
+                    .update(|state| {
+                        check_name(state, &body.name, None)?;
+                        let at = now();
+                        let group = SecurityGroup {
+                            guid: guid(),
+                            name: body.name.clone(),
+                            rules: body.rules.clone(),
+                            running: body.globally_enabled.running.unwrap_or(false),
+                            staging: body.globally_enabled.staging.unwrap_or(false),
+                            running_spaces: body.relationships.running_spaces.guids(state)?,
+                            staging_spaces: body.relationships.staging_spaces.guids(state)?,
+                            created_at: at.clone(),
+                            updated_at: at,
+                        };
+                        state.security_groups.push(group.clone());
+                        Ok::<_, ApiError>(group)
+                    })
+                    .await?;
                 Ok(respond(
                     StatusCode::CREATED,
                     &views::security_group(base, &group),
@@ -434,29 +437,36 @@ impl Api {
                 if let Some(rules) = &body.rules {
                     rules_of(rules)?;
                 }
-                found(self.edit_security_group(guid, |state, group| {
-                    if let Some(name) = &body.name {
-                        check_name(state, name, Some(&group.guid))?;
-                        group.name.clone_from(name);
-                    }
-                    if let Some(rules) = &body.rules {
-                        group.rules.clone_from(rules);
-                    }
-                    group.running = body.globally_enabled.running.unwrap_or(group.running);
-                    group.staging = body.globally_enabled.staging.unwrap_or(group.staging);
-                    Ok(())
-                })?)
+                found(
+                    self.edit_security_group(guid, |state, group| {
+                        if let Some(name) = &body.name {
+                            check_name(state, name, Some(&group.guid))?;
+                            group.name.clone_from(name);
+                        }
+                        if let Some(rules) = &body.rules {
+                            group.rules.clone_from(rules);
+                        }
+                        group.running = body.globally_enabled.running.unwrap_or(group.running);
+                        group.staging = body.globally_enabled.staging.unwrap_or(group.staging);
+                        Ok(())
+                    })
+                    .await?,
+                )
             }
             (&Method::DELETE, ["security_groups", guid]) => {
-                let found = self.store.update(|state| {
-                    let before = state.security_groups.len();
-                    state.security_groups.retain(|group| group.guid != *guid);
-                    state.security_groups.len() != before
-                });
+                let found = self
+                    .store
+                    .update(|state| {
+                        let before = state.security_groups.len();
+                        state.security_groups.retain(|group| group.guid != *guid);
+                        state.security_groups.len() != before
+                    })
+                    .await;
                 if !found {
                     return Err(ApiError::not_found("Security group"));
                 }
                 self.job(req, "security_group.delete", Vec::new(), None)
+                    .await
             }
             (
                 &Method::POST,
@@ -468,15 +478,17 @@ impl Api {
                 ],
             ) => {
                 let body: Spaces = req.json()?;
-                let group = self.edit_security_group(guid, |state, group| {
-                    let spaces = spaces_of(group, kind);
-                    for space in body.guids(state)? {
-                        if !spaces.contains(&space) {
-                            spaces.push(space);
+                let group = self
+                    .edit_security_group(guid, |state, group| {
+                        let spaces = spaces_of(group, kind);
+                        for space in body.guids(state)? {
+                            if !spaces.contains(&space) {
+                                spaces.push(space);
+                            }
                         }
-                    }
-                    Ok(())
-                })?;
+                        Ok(())
+                    })
+                    .await?;
                 let mut group = group.ok_or_else(|| ApiError::not_found("Security group"))?;
                 let path = format!("/v3/security_groups/{guid}/relationships/{kind}");
                 let data: Vec<Value> = spaces_of(&mut group, kind)
@@ -498,10 +510,12 @@ impl Api {
                     space,
                 ],
             ) => {
-                let group = self.edit_security_group(guid, |_, group| {
-                    spaces_of(group, kind).retain(|kept| kept != space);
-                    Ok(())
-                })?;
+                let group = self
+                    .edit_security_group(guid, |_, group| {
+                        spaces_of(group, kind).retain(|kept| kept != space);
+                        Ok(())
+                    })
+                    .await?;
                 group.ok_or_else(|| ApiError::not_found("Security group"))?;
                 Ok(no_content())
             }
@@ -568,21 +582,23 @@ impl Api {
     }
 
     /// Changes the group `guid` as `change` says: it as it is now, None when there is none.
-    fn edit_security_group(
+    async fn edit_security_group(
         &self,
         guid: &str,
         change: impl Fn(&State, &mut SecurityGroup) -> Result<(), ApiError>,
     ) -> Result<Option<SecurityGroup>, ApiError> {
-        self.store.update(|state| {
-            let Some(at) = state.security_groups.iter().position(|g| g.guid == guid) else {
-                return Ok(None);
-            };
-            let mut group = state.security_groups[at].clone();
-            change(state, &mut group)?;
-            group.updated_at = now();
-            state.security_groups[at] = group.clone();
-            Ok(Some(group))
-        })
+        self.store
+            .update(|state| {
+                let Some(at) = state.security_groups.iter().position(|g| g.guid == guid) else {
+                    return Ok(None);
+                };
+                let mut group = state.security_groups[at].clone();
+                change(state, &mut group)?;
+                group.updated_at = now();
+                state.security_groups[at] = group.clone();
+                Ok(Some(group))
+            })
+            .await
     }
 
     /// The name of who edits, if they may.

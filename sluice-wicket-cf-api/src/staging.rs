@@ -516,27 +516,31 @@ pub async fn run(
                 updated_at: at.clone(),
             };
             logs.read_out(app, READ_OUT).await;
-            store.update(|state| {
-                if let Some(staging) = state.builds.iter_mut().find(|kept| kept.guid == build) {
-                    staging.state = "STAGED".into();
-                    staging.droplet = Some(droplet.guid.clone());
-                    staging.staging = None;
-                    staging.updated_at = at;
-                }
-                state.droplets.push(droplet);
-            });
+            store
+                .update(|state| {
+                    if let Some(staging) = state.builds.iter_mut().find(|kept| kept.guid == build) {
+                        staging.state = "STAGED".into();
+                        staging.droplet = Some(droplet.guid.clone());
+                        staging.staging = None;
+                        staging.updated_at = at.clone();
+                    }
+                    state.droplets.push(droplet.clone());
+                })
+                .await;
         }
         Err(e) => {
             logs.add(app, "STG", format!("Staging failed: {e}"));
             logs.read_out(app, READ_OUT).await;
-            store.update(|state| {
-                if let Some(staging) = state.builds.iter_mut().find(|kept| kept.guid == build) {
-                    staging.state = "FAILED".into();
-                    staging.error = Some(format!("StagingError - {e}"));
-                    staging.staging = None;
-                    staging.updated_at = at;
-                }
-            });
+            store
+                .update(|state| {
+                    if let Some(staging) = state.builds.iter_mut().find(|kept| kept.guid == build) {
+                        staging.state = "FAILED".into();
+                        staging.error = Some(format!("StagingError - {e}"));
+                        staging.staging = None;
+                        staging.updated_at = at.clone();
+                    }
+                })
+                .await;
         }
     }
 }
@@ -556,11 +560,13 @@ async fn staged(
         if let Some(staged) = follow_on(store, logs, controller, build, app, building).await {
             return staged;
         }
-        store.update(|state| {
-            if let Some(staging) = state.staging_mut(build) {
-                staging.building = None;
-            }
-        });
+        store
+            .update(|state| {
+                if let Some(staging) = state.staging_mut(build) {
+                    staging.building = None;
+                }
+            })
+            .await;
     }
     let command = staging.command.as_deref();
     let (pin, named) = store.read(|state| {
@@ -860,11 +866,13 @@ async fn build(
         id,
         after: 0,
     };
-    store.update(|state| {
-        if let Some(staging) = state.staging_mut(build) {
-            staging.building = Some(building.clone());
-        }
-    });
+    store
+        .update(|state| {
+            if let Some(staging) = state.staging_mut(build) {
+                staging.building = Some(building.clone());
+            }
+        })
+        .await;
     built(
         store,
         logs,
@@ -942,12 +950,12 @@ async fn follow(
         if view.next != after {
             after = view.next;
             // written with the next change: lines taken twice at most after a crash
-            store.note(|state| {
-                let staging = state.staging_mut(build);
-                if let Some(building) = staging.and_then(|staging| staging.building.as_mut()) {
+            let followed = |staging: &mut Staging| {
+                if let Some(building) = &mut staging.building {
                     building.after = after;
                 }
-            });
+            };
+            store.note_staging(build, followed).await;
         }
         match view.state.as_str() {
             "building" => {}
@@ -1948,9 +1956,11 @@ mod tests {
             ("w".to_string(), Runtime::Firecracker),
             ("v".to_string(), Runtime::Wasm),
         ];
-        let open = || {
+        let open = async || {
             let localhost = ["localhost".to_string()];
-            Store::open(&dir, "o", "s", &localhost, &names, &runs.clone().into()).unwrap()
+            let runs = runs.clone().into();
+            let store = Store::open(&dir, "o", "s", &localhost, &names, &runs, None);
+            store.await.unwrap()
         };
         let building = |id: &str, after| crate::store::Building {
             wicket: "w".into(),
@@ -1963,47 +1973,51 @@ mod tests {
             ("on", source.clone(), Some(building("known", 1))),
             ("lost", source, Some(building("lost", 2))),
         ];
-        let store = open();
+        let store = open().await;
         let mut builds = Vec::new();
         for (name, zip, building) in cut {
             let package = guid();
             let write = |file: &mut std::fs::File| file.write_all(&zip).map_err(|e| e.to_string());
             store.make_package(&package, write).unwrap();
-            builds.push(store.update(|state| {
-                let space = state.spaces[0].guid.clone();
-                let app = state.create_app(name, &space).guid.clone();
-                state.packages.push(Package {
-                    guid: package.clone(),
-                    app: app.clone(),
-                    state: "READY".into(),
-                    sha256: None,
-                    docker: None,
-                    created_at: now(),
-                    updated_at: now(),
-                });
-                let build = crate::store::Build {
-                    guid: guid(),
-                    app: app.clone(),
-                    package,
-                    state: "STAGING".into(),
-                    lifecycle: Default::default(),
-                    error: None,
-                    droplet: None,
-                    staging: Some(Staging {
-                        base: "http://api.test".into(),
-                        command: None,
-                        building,
-                    }),
-                    created_at: now(),
-                    updated_at: now(),
-                };
-                state.builds.push(build.clone());
-                (build.guid, app)
-            }));
+            builds.push(
+                store
+                    .update(|state| {
+                        let space = state.spaces[0].guid.clone();
+                        let app = state.create_app(name, &space).guid.clone();
+                        state.packages.push(Package {
+                            guid: package.clone(),
+                            app: app.clone(),
+                            state: "READY".into(),
+                            sha256: None,
+                            docker: None,
+                            created_at: now(),
+                            updated_at: now(),
+                        });
+                        let build = crate::store::Build {
+                            guid: guid(),
+                            app: app.clone(),
+                            package: package.clone(),
+                            state: "STAGING".into(),
+                            lifecycle: Default::default(),
+                            error: None,
+                            droplet: None,
+                            staging: Some(Staging {
+                                base: "http://api.test".into(),
+                                command: None,
+                                building: building.clone(),
+                            }),
+                            created_at: now(),
+                            updated_at: now(),
+                        };
+                        state.builds.push(build.clone());
+                        (build.guid, app)
+                    })
+                    .await,
+            );
         }
         drop(store);
 
-        let store = Arc::new(open());
+        let store = Arc::new(open().await);
         let logs = Logs::default();
         let cnb = Cnb {
             builder: "registry.test/builder:1".into(),

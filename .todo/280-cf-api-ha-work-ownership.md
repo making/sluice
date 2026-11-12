@@ -54,3 +54,10 @@ cannot go on fails with today's message.
 (`tests/broker`): the owner stopped mid-build and mid-poll, the other finishing both, the job
 `COMPLETE` once, the broker called for an undo once; an instance starting beside a build under
 way fails nothing.
+
+## From 275
+
+With `--state`, `fail_unfinished_builds` and `settle_unfinished_waits` run only on the
+`state.json` an empty store takes (`store::kept`), not at every start: a start fails nothing of
+the store. `Api::take_up`, `Operations::kick` and `Controller::resume` still run at every
+instance's start.

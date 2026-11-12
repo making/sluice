@@ -132,6 +132,15 @@ impl ApiError {
         }
     }
 
+    pub fn unavailable(detail: impl Into<String>) -> ApiError {
+        ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: 10015,
+            title: "CF-ServiceUnavailable",
+            detail: detail.into(),
+        }
+    }
+
     pub fn bad_request(detail: impl Into<String>) -> ApiError {
         ApiError {
             status: StatusCode::BAD_REQUEST,
@@ -305,6 +314,11 @@ impl Api {
     async fn handle(&self, request: hyper::Request<Body>) -> Response {
         let (parts, body) = request.into_parts();
         let path = parts.uri.path().to_string();
+        // what any instance answered before this request is seen by it
+        if let Err(e) = self.store.sync().await {
+            eprintln!("API: {} {path}: {e}", parts.method);
+            return ApiError::unavailable("the state's store does not answer: try again").into();
+        }
         let access = self.token(&parts.headers).map(|token| {
             let identity = self.uaa.identity(&token);
             self.store
@@ -993,7 +1007,7 @@ impl Api {
                 }),
                 None,
             ),
-            (&Method::POST, ["packages"]) => self.create_package(req),
+            (&Method::POST, ["packages"]) => self.create_package(req).await,
             (&Method::GET, ["packages", guid]) => {
                 let package = self.package_as(req, guid, Need::Read)?;
                 Ok(json(StatusCode::OK, &views::package(base, &package)))
@@ -1015,16 +1029,18 @@ impl Api {
             }
             (&Method::DELETE, ["packages", guid]) => {
                 self.package_as(req, guid, Need::Operate)?;
-                let found = store.update(|state| {
-                    let found = state.package(guid).is_some();
-                    state.packages.retain(|package| package.guid != *guid);
-                    found
-                });
+                let found = store
+                    .update(|state| {
+                        let found = state.package(guid).is_some();
+                        state.packages.retain(|package| package.guid != *guid);
+                        found
+                    })
+                    .await;
                 if !found {
                     return Err(ApiError::not_found("Package"));
                 }
                 store.delete(&[crate::store::Blob::Package(guid.to_string())]);
-                self.job(req, "package.delete", Vec::new(), None)
+                self.job(req, "package.delete", Vec::new(), None).await
             }
             (&Method::POST, ["resource_matches"]) => {
                 Ok(json(StatusCode::CREATED, &json!({"resources": []})))
@@ -1085,7 +1101,7 @@ impl Api {
                     listing(routes.map(|route| views::route(base, state, route)).collect(), included)
                 })
             }
-            (&Method::POST, ["routes"]) => self.create_route(req),
+            (&Method::POST, ["routes"]) => self.create_route(req).await,
             (&Method::GET, ["routes", guid]) | (&Method::PATCH, ["routes", guid]) => {
                 let route = self.route_as(req, guid, Need::Read)?;
                 Ok(json(
@@ -1159,7 +1175,7 @@ impl Api {
                     ..,
                 ],
             ) => self.services(req, segments).await,
-            (_, ["security_groups", ..]) => self.security_groups(req, segments),
+            (_, ["security_groups", ..]) => self.security_groups(req, segments).await,
             (&Method::POST, ["service_route_bindings"]) => {
                 Err(ApiError::unprocessable("route services are not supported"))
             }
@@ -1304,7 +1320,7 @@ impl Api {
     }
 
     /// A job done (or failed with `errors`), answered 202 with its location.
-    pub(crate) fn job(
+    pub(crate) async fn job(
         &self,
         req: &Req,
         operation: &str,
@@ -1313,7 +1329,8 @@ impl Api {
     ) -> Reply {
         let guid = self
             .store
-            .update(|state| state.add_job(operation, errors, resource));
+            .update(|state| state.add_job(operation, errors.clone(), resource.clone()))
+            .await;
         Ok(self.located(req, &guid))
     }
 
@@ -1346,7 +1363,7 @@ impl Api {
             })
         };
         let tried = self.try_placed(trial).await?;
-        let committed = self.store.update(|state| change(state));
+        let committed = self.store.update(|state| change(state)).await;
         if committed.is_err() {
             self.go_back(&tried).await;
         }
@@ -1459,12 +1476,14 @@ impl Api {
         ) {
             Ok(manifest) => manifest,
             Err(e) => {
-                return self.job(
-                    req,
-                    "space.apply_manifest",
-                    vec![ApiError::unprocessable(e).job_error()],
-                    None,
-                );
+                return self
+                    .job(
+                        req,
+                        "space.apply_manifest",
+                        vec![ApiError::unprocessable(e).job_error()],
+                        None,
+                    )
+                    .await;
             }
         };
         // a stack it pins is one the wickets run
@@ -1482,12 +1501,14 @@ impl Api {
             match manifest::apply(&mut trial, space, &manifest) {
                 Ok(guids) => guids,
                 Err(e) => {
-                    return self.job(
-                        req,
-                        "space.apply_manifest",
-                        vec![ApiError::unprocessable(e).job_error()],
-                        None,
-                    );
+                    return self
+                        .job(
+                            req,
+                            "space.apply_manifest",
+                            vec![ApiError::unprocessable(e).job_error()],
+                            None,
+                        )
+                        .await;
                 }
             }
         };
@@ -1501,41 +1522,48 @@ impl Api {
         let tried = match self.try_placed(trial).await {
             Ok(tried) => tried,
             Err(refused) => {
-                return self.job(req, "space.apply_manifest", vec![refused.job_error()], None);
+                return self
+                    .job(req, "space.apply_manifest", vec![refused.job_error()], None)
+                    .await;
             }
         };
         // made on the state as it is by now: all of it or, the other edits since refusing it,
         // none. An app new since the trial was not put: it is no started one
-        let committed = self.store.update(|state| {
-            if state.space(space).is_none() {
-                return Err("the space is gone".to_string());
-            }
-            let mut next = state.clone();
-            let guids = manifest::apply(&mut next, space, &manifest)?;
-            // the bindings `services:` made: a broker's is its broker's to make
-            let bound: Vec<(String, String, Option<String>)> = next
-                .bindings
-                .iter()
-                .filter(|binding| state.binding(&binding.guid).is_none())
-                .filter_map(|binding| {
-                    let instance = next.instance(&binding.instance)?;
-                    let brokered = binding.operation.is_some().then(|| binding.guid.clone());
-                    Some((binding.app.clone(), instance.name.clone(), brokered))
-                })
-                .collect();
-            *state = next;
-            Ok::<_, String>((guids, bound))
-        });
+        let committed = self
+            .store
+            .update(|state| {
+                if state.space(space).is_none() {
+                    return Err("the space is gone".to_string());
+                }
+                let mut next = state.clone();
+                let guids = manifest::apply(&mut next, space, &manifest)?;
+                // the bindings `services:` made: a broker's is its broker's to make
+                let bound: Vec<(String, String, Option<String>)> = next
+                    .bindings
+                    .iter()
+                    .filter(|binding| state.binding(&binding.guid).is_none())
+                    .filter_map(|binding| {
+                        let instance = next.instance(&binding.instance)?;
+                        let brokered = binding.operation.is_some().then(|| binding.guid.clone());
+                        Some((binding.app.clone(), instance.name.clone(), brokered))
+                    })
+                    .collect();
+                *state = next;
+                Ok::<_, String>((guids, bound))
+            })
+            .await;
         let (guids, bound) = match committed {
             Ok(committed) => committed,
             Err(e) => {
                 self.go_back(&tried).await;
-                return self.job(
-                    req,
-                    "space.apply_manifest",
-                    vec![ApiError::unprocessable(e).job_error()],
-                    None,
-                );
+                return self
+                    .job(
+                        req,
+                        "space.apply_manifest",
+                        vec![ApiError::unprocessable(e).job_error()],
+                        None,
+                    )
+                    .await;
             }
         };
         let mut warnings = Vec::new();
@@ -1568,23 +1596,26 @@ impl Api {
             }
         }
         let user = self.claims(req)?.user_id;
-        let job = self.store.update(|state| {
-            let job = state.add_waiting_job(
-                "space.apply_manifest",
-                brokered.clone(),
-                Some(("space".into(), format!("/v3/spaces/{space}"))),
-            );
-            for binding in &brokered {
-                if let Some(operation) = state
-                    .binding_mut(binding)
-                    .and_then(|binding| binding.operation.as_mut())
-                {
-                    operation.job = Some(job.clone());
-                    operation.user = Some(user.clone());
+        let job = self
+            .store
+            .update(|state| {
+                let job = state.add_waiting_job(
+                    "space.apply_manifest",
+                    brokered.clone(),
+                    Some(("space".into(), format!("/v3/spaces/{space}"))),
+                );
+                for binding in &brokered {
+                    if let Some(operation) = state
+                        .binding_mut(binding)
+                        .and_then(|binding| binding.operation.as_mut())
+                    {
+                        operation.job = Some(job.clone());
+                        operation.user = Some(user.clone());
+                    }
                 }
-            }
-            job
-        });
+                job
+            })
+            .await;
         self.operations.kick();
         Ok(warned(self.located(req, &job), &warnings))
     }
@@ -1634,39 +1665,42 @@ impl Api {
         let access = req.access()?;
         // a stack it pins is one the wickets run
         self.controller.stacks().await;
-        let view = self.store.update(|state| {
-            space_to_develop(access, state, space)?;
-            if state.app_named(space, name).is_some() {
-                return Err(ApiError {
-                    status: StatusCode::UNPROCESSABLE_ENTITY,
-                    code: 10016,
-                    title: "CF-UniquenessError",
-                    detail: format!("App with the name '{name}' already exists."),
-                });
-            }
-            let pin = pin(state, &body)?.flatten();
-            let guid = state.create_app(name, space).guid.clone();
-            let app = state.app_mut(&guid).expect("just created");
-            app.env = env;
-            app.lifecycle = lifecycle.unwrap_or_default();
-            app.pin = pin;
-            let runtime = state.stack_of(state.app(&guid).expect("just created"));
-            let app = state.app_mut(&guid).expect("just created");
-            if let Err(refused) = apply_metadata(app, &body["metadata"], runtime) {
-                state.apps.retain(|app| app.guid != guid);
-                return Err(refused);
-            }
-            let app = state.app_mut(&guid).expect("just created");
-            if let Some(buildpacks) = body["lifecycle"]["data"]["buildpacks"].as_array() {
-                app.buildpacks = buildpacks
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(String::from)
-                    .collect();
-            }
-            let app = state.app(&guid).expect("just created");
-            Ok(views::app(&req.base, state, app))
-        })?;
+        let view = self
+            .store
+            .update(|state| {
+                space_to_develop(access, state, space)?;
+                if state.app_named(space, name).is_some() {
+                    return Err(ApiError {
+                        status: StatusCode::UNPROCESSABLE_ENTITY,
+                        code: 10016,
+                        title: "CF-UniquenessError",
+                        detail: format!("App with the name '{name}' already exists."),
+                    });
+                }
+                let pin = pin(state, &body)?.flatten();
+                let guid = state.create_app(name, space).guid.clone();
+                let app = state.app_mut(&guid).expect("just created");
+                app.env = env.clone();
+                app.lifecycle = lifecycle.unwrap_or_default();
+                app.pin = pin;
+                let runtime = state.stack_of(state.app(&guid).expect("just created"));
+                let app = state.app_mut(&guid).expect("just created");
+                if let Err(refused) = apply_metadata(app, &body["metadata"], runtime) {
+                    state.apps.retain(|app| app.guid != guid);
+                    return Err(refused);
+                }
+                let app = state.app_mut(&guid).expect("just created");
+                if let Some(buildpacks) = body["lifecycle"]["data"]["buildpacks"].as_array() {
+                    app.buildpacks = buildpacks
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(String::from)
+                        .collect();
+                }
+                let app = state.app(&guid).expect("just created");
+                Ok(views::app(&req.base, state, app))
+            })
+            .await?;
         Ok(json(StatusCode::CREATED, &view))
     }
 
@@ -1746,14 +1780,17 @@ impl Api {
             .as_object()
             .ok_or_else(|| ApiError::unprocessable("Var must be an object"))?;
         self.app_as(req, guid, Need::Develop)?;
-        let app = self.store.update(|state| {
-            let app = state
-                .app_mut(guid)
-                .ok_or_else(|| ApiError::not_found("App"))?;
-            app.env = env::merged(&app.env, var)?;
-            app.updated_at = now();
-            Ok::<_, ApiError>(app.clone())
-        })?;
+        let app = self
+            .store
+            .update(|state| {
+                let app = state
+                    .app_mut(guid)
+                    .ok_or_else(|| ApiError::not_found("App"))?;
+                app.env = env::merged(&app.env, var)?;
+                app.updated_at = now();
+                Ok::<_, ApiError>(app.clone())
+            })
+            .await?;
         self.logs.add(
             guid,
             "API",
@@ -1815,10 +1852,12 @@ impl Api {
                 ));
             }
             Ok(Some((job, brokered)))
-        })?;
+        }).await?;
         let Some((job, unbound)) = job else {
             self.controller.remove(guid, &app.name).await;
-            return self.job(req, crate::store::APP_DELETE, Vec::new(), None);
+            return self
+                .job(req, crate::store::APP_DELETE, Vec::new(), None)
+                .await;
         };
         self.operations.kick();
         self.delete_once_unbound(&job, guid, &app.name, unbound);
@@ -1847,7 +1886,7 @@ impl Api {
             if unbound {
                 controller.remove(&guid, &name).await;
             }
-            store.update(|state| state.settle(&job, &guid, None));
+            store.update(|state| state.settle(&job, &guid, None)).await;
         });
     }
 
@@ -1901,69 +1940,78 @@ impl Api {
     async fn patch_process(&self, req: &Req, process: &str) -> Reply {
         let body: Value = req.json()?;
         let app = self.app_of_process(req, process, Need::Operate)?;
-        let view = self.store.update(|state| {
-            let runtime = state.stack_of(&app);
-            let app = state
-                .app_mut(&app.guid)
-                .ok_or_else(|| ApiError::not_found("Process"))?;
-            let given = &body["readiness_health_check"];
-            if given.is_object() {
-                let mut readiness = app.process.readiness_health_check.clone();
-                if let Some(kind) = given["type"].as_str() {
-                    readiness.kind = kind.to_string();
+        let view = self
+            .store
+            .update(|state| {
+                let runtime = state.stack_of(&app);
+                let app = state
+                    .app_mut(&app.guid)
+                    .ok_or_else(|| ApiError::not_found("Process"))?;
+                let given = &body["readiness_health_check"];
+                if given.is_object() {
+                    let mut readiness = app.process.readiness_health_check.clone();
+                    if let Some(kind) = given["type"].as_str() {
+                        readiness.kind = kind.to_string();
+                    }
+                    if let Some(data) = given["data"].as_object() {
+                        let seconds = |key: &str| data.get(key).and_then(Value::as_u64);
+                        readiness.invocation_timeout = seconds("invocation_timeout");
+                        readiness.interval = seconds("interval");
+                        readiness.endpoint = data
+                            .get("endpoint")
+                            .and_then(Value::as_str)
+                            .map(String::from);
+                    }
+                    let lifetime = manifest::check_annotations(
+                        &app.annotations,
+                        app.process.instances,
+                        runtime,
+                    )?;
+                    manifest::check_readiness(&readiness, &lifetime, runtime)?;
+                    app.process.readiness_health_check = readiness;
                 }
-                if let Some(data) = given["data"].as_object() {
-                    let seconds = |key: &str| data.get(key).and_then(Value::as_u64);
-                    readiness.invocation_timeout = seconds("invocation_timeout");
-                    readiness.interval = seconds("interval");
-                    readiness.endpoint = data
-                        .get("endpoint")
-                        .and_then(Value::as_str)
-                        .map(String::from);
+                let given = &body["health_check"];
+                if given.is_object() {
+                    let mut liveness = app.process.health_check.clone();
+                    if let Some(kind) = given["type"].as_str() {
+                        liveness.kind = kind.to_string();
+                        if kind != "http" {
+                            liveness.endpoint = None;
+                        }
+                    }
+                    if let Some(data) = given["data"].as_object() {
+                        let seconds = |key: &str| data.get(key).map(Value::as_u64);
+                        if let Some(timeout) = seconds("timeout") {
+                            liveness.timeout = timeout;
+                        }
+                        if let Some(timeout) = seconds("invocation_timeout") {
+                            liveness.invocation_timeout = timeout;
+                        }
+                        if let Some(interval) = seconds("interval") {
+                            liveness.interval = interval;
+                        }
+                        if let Some(endpoint) = data.get("endpoint") {
+                            liveness.endpoint = endpoint.as_str().map(String::from);
+                        }
+                    }
+                    let lifetime = manifest::check_annotations(
+                        &app.annotations,
+                        app.process.instances,
+                        runtime,
+                    )?;
+                    manifest::check_liveness(&liveness, &lifetime, runtime)?;
+                    app.process.health_check = liveness;
                 }
-                let lifetime =
-                    manifest::check_annotations(&app.annotations, app.process.instances, runtime)?;
-                manifest::check_readiness(&readiness, &lifetime, runtime)?;
-                app.process.readiness_health_check = readiness;
-            }
-            let given = &body["health_check"];
-            if given.is_object() {
-                let mut liveness = app.process.health_check.clone();
-                if let Some(kind) = given["type"].as_str() {
-                    liveness.kind = kind.to_string();
-                    if kind != "http" {
-                        liveness.endpoint = None;
-                    }
+                if let Some(command) = body.get("command") {
+                    app.process.command = command
+                        .as_str()
+                        .map(String::from)
+                        .filter(|command| !command.is_empty());
                 }
-                if let Some(data) = given["data"].as_object() {
-                    let seconds = |key: &str| data.get(key).map(Value::as_u64);
-                    if let Some(timeout) = seconds("timeout") {
-                        liveness.timeout = timeout;
-                    }
-                    if let Some(timeout) = seconds("invocation_timeout") {
-                        liveness.invocation_timeout = timeout;
-                    }
-                    if let Some(interval) = seconds("interval") {
-                        liveness.interval = interval;
-                    }
-                    if let Some(endpoint) = data.get("endpoint") {
-                        liveness.endpoint = endpoint.as_str().map(String::from);
-                    }
-                }
-                let lifetime =
-                    manifest::check_annotations(&app.annotations, app.process.instances, runtime)?;
-                manifest::check_liveness(&liveness, &lifetime, runtime)?;
-                app.process.health_check = liveness;
-            }
-            if let Some(command) = body.get("command") {
-                app.process.command = command
-                    .as_str()
-                    .map(String::from)
-                    .filter(|command| !command.is_empty());
-            }
-            app.process.updated_at = now();
-            Ok::<_, ApiError>(views::process(&req.base, app))
-        })?;
+                app.process.updated_at = now();
+                Ok::<_, ApiError>(views::process(&req.base, app))
+            })
+            .await?;
         Ok(json(StatusCode::OK, &view))
     }
 
@@ -2052,7 +2100,7 @@ impl Api {
                 None => return Err(ApiError::not_found("Droplet")),
             }
             Ok(state.set_current_droplet(guid, &droplet))
-        })?;
+        }).await?;
         self.store.delete(&blobs);
         self.logs
             .add(guid, "API", format!("Set the current droplet to {droplet}"));
@@ -2076,25 +2124,28 @@ impl Api {
     async fn lifecycle(&self, req: &Req, guid: &str, action: &str) -> Reply {
         self.app_as(req, guid, Need::Operate)?;
         let _app = self.controller.hold(guid).await;
-        let (app, superseded) = self.store.update(|state| {
-            let running = if action == "stop" {
-                None
-            } else {
-                Some(snapshot(state, guid, &req.base)?)
-            };
-            state.app(guid).ok_or_else(|| ApiError::not_found("App"))?;
-            let superseded = state.supersede(guid);
-            let app = state.app_mut(guid).expect("found above");
-            match running {
-                Some(running) => {
-                    app.running = Some(running);
-                    app.started = true;
+        let (app, superseded) = self
+            .store
+            .update(|state| {
+                let running = if action == "stop" {
+                    None
+                } else {
+                    Some(snapshot(state, guid, &req.base)?)
+                };
+                state.app(guid).ok_or_else(|| ApiError::not_found("App"))?;
+                let superseded = state.supersede(guid);
+                let app = state.app_mut(guid).expect("found above");
+                match running {
+                    Some(running) => {
+                        app.running = Some(running);
+                        app.started = true;
+                    }
+                    None => app.started = false,
                 }
-                None => app.started = false,
-            }
-            app.updated_at = now();
-            Ok::<_, ApiError>((app.clone(), superseded))
-        })?;
+                app.updated_at = now();
+                Ok::<_, ApiError>((app.clone(), superseded))
+            })
+            .await?;
         if let Some(line) = superseded {
             self.logs.add(guid, "API", line);
         }
@@ -2115,7 +2166,7 @@ impl Api {
     /// A bits package awaits its upload; a docker one, its image and the
     /// credentials it is pulled with, is ready at once: the app's older
     /// packages go.
-    fn create_package(&self, req: &Req) -> Reply {
+    async fn create_package(&self, req: &Req) -> Reply {
         let body: Value = req.json()?;
         let docker = match body["type"].as_str().unwrap_or("bits") {
             "bits" => None,
@@ -2131,27 +2182,30 @@ impl Api {
             .ok_or_else(|| ApiError::unprocessable("relationships.app names the app"))?;
         self.app_as(req, app, Need::Operate)?;
         let image = docker.as_ref().map(|docker| docker.image.clone());
-        let (view, blobs) = self.store.update(|state| {
-            let at = now();
-            let ready = docker.is_some();
-            let package = Package {
-                guid: guid(),
-                app: app.to_string(),
-                state: if ready { "READY" } else { "AWAITING_UPLOAD" }.into(),
-                sha256: None,
-                docker,
-                created_at: at.clone(),
-                updated_at: at,
-            };
-            let view = views::package(&req.base, &package);
-            state.packages.push(package);
-            let blobs = if ready {
-                state.keep_newest_package(app)
-            } else {
-                Vec::new()
-            };
-            (view, blobs)
-        });
+        let (view, blobs) = self
+            .store
+            .update(|state| {
+                let at = now();
+                let ready = docker.is_some();
+                let package = Package {
+                    guid: guid(),
+                    app: app.to_string(),
+                    state: if ready { "READY" } else { "AWAITING_UPLOAD" }.into(),
+                    sha256: None,
+                    docker: docker.clone(),
+                    created_at: at.clone(),
+                    updated_at: at,
+                };
+                let view = views::package(&req.base, &package);
+                state.packages.push(package);
+                let blobs = if ready {
+                    state.keep_newest_package(app)
+                } else {
+                    Vec::new()
+                };
+                (view, blobs)
+            })
+            .await;
         self.store.delete(&blobs);
         if let Some(image) = image {
             self.logs
@@ -2200,20 +2254,23 @@ impl Api {
             .map_err(|e| ApiError::from(format!("the upload: {e}")))?
         };
         let (bytes, sha256) = copied.map_err(ApiError::bad_request)?;
-        let updated = self.store.update(|state| {
-            if !newest(state) {
-                return None;
-            }
-            let blobs = state.keep_newest_package(&package.app);
-            let package = state
-                .packages
-                .iter_mut()
-                .find(|package| package.guid == guid)?;
-            package.state = "READY".into();
-            package.sha256 = Some(sha256);
-            package.updated_at = now();
-            Some((views::package(&req.base, package), blobs))
-        });
+        let updated = self
+            .store
+            .update(|state| {
+                if !newest(state) {
+                    return None;
+                }
+                let blobs = state.keep_newest_package(&package.app);
+                let package = state
+                    .packages
+                    .iter_mut()
+                    .find(|package| package.guid == guid)?;
+                package.state = "READY".into();
+                package.sha256 = Some(sha256.clone());
+                package.updated_at = now();
+                Some((views::package(&req.base, package), blobs))
+            })
+            .await;
         let Some((view, blobs)) = updated else {
             self.store.delete(&[Blob::Package(guid.to_string())]);
             return Err(replaced());
@@ -2269,15 +2326,17 @@ impl Api {
         };
         let guid = build.guid.clone();
         // the app is what it was staged as last
-        self.store.update(|state| {
-            if let Some(app) = state.app_mut(&build.app) {
-                app.lifecycle = lifecycle;
-            }
-            state.builds.push(build);
-            if state.builds.len() > 1000 {
-                state.builds.remove(0);
-            }
-        });
+        self.store
+            .update(|state| {
+                if let Some(app) = state.app_mut(&build.app) {
+                    app.lifecycle = lifecycle;
+                }
+                state.builds.push(build.clone());
+                if state.builds.len() > 1000 {
+                    state.builds.remove(0);
+                }
+            })
+            .await;
         let staging = tokio::spawn({
             let (store, logs, registry, controller) = (
                 self.store.clone(),
@@ -2307,7 +2366,7 @@ impl Api {
 
     // --- routes
 
-    fn create_route(&self, req: &Req) -> Reply {
+    async fn create_route(&self, req: &Req) -> Reply {
         let body: Value = req.json()?;
         if body["path"].as_str().is_some_and(|path| !path.is_empty()) {
             return Err(ApiError::unprocessable("a route with a path is not served"));
@@ -2324,24 +2383,27 @@ impl Api {
             .as_str()
             .unwrap_or_default();
         let access = req.access()?;
-        let view = self.store.update(|state| {
-            if state.space(space).is_none() || !access.can(state, space, Need::Read) {
-                return Err(ApiError::unprocessable(
-                    "Invalid space. Ensure that the space exists and you have access to it.",
-                ));
-            }
-            access.check(state, space, Need::Operate, "Space")?;
-            if state.domain(&domain).is_none() {
-                return Err(ApiError::unprocessable(
-                    "Invalid domain. Ensure that the domain exists and you have access to it.",
-                ));
-            }
-            if state.route_at(&host, &domain).is_some() {
-                return Err(ApiError::unprocessable("Route already exists."));
-            }
-            let route = state.create_route(&host, &domain, space).clone();
-            Ok(views::route(&req.base, state, &route))
-        })?;
+        let view = self
+            .store
+            .update(|state| {
+                if state.space(space).is_none() || !access.can(state, space, Need::Read) {
+                    return Err(ApiError::unprocessable(
+                        "Invalid space. Ensure that the space exists and you have access to it.",
+                    ));
+                }
+                access.check(state, space, Need::Operate, "Space")?;
+                if state.domain(&domain).is_none() {
+                    return Err(ApiError::unprocessable(
+                        "Invalid domain. Ensure that the domain exists and you have access to it.",
+                    ));
+                }
+                if state.route_at(&host, &domain).is_some() {
+                    return Err(ApiError::unprocessable("Route already exists."));
+                }
+                let route = state.create_route(&host, &domain, space).clone();
+                Ok(views::route(&req.base, state, &route))
+            })
+            .await?;
         Ok(json(StatusCode::CREATED, &view))
     }
 
@@ -2361,9 +2423,10 @@ impl Api {
             .await?;
         }
         self.store
-            .update(|state| state.routes.retain(|kept| kept.guid != guid));
+            .update(|state| state.routes.retain(|kept| kept.guid != guid))
+            .await;
         self.controller.forget(guid);
-        self.job(req, "route.delete", Vec::new(), None)
+        self.job(req, "route.delete", Vec::new(), None).await
     }
 
     /// Maps the destinations' app (one: a route serves one app) at once;
@@ -2511,15 +2574,19 @@ impl Api {
         let asked = deployments::Asked::parse(&body).map_err(ApiError::unprocessable)?;
         let _app = self.controller.hold(&app).await;
         let owner = self.controller.owner();
-        let (deployment, superseded, blobs, before) = self.store.update(|state| {
-            let found = state.app(&app).ok_or_else(|| ApiError::not_found("App"))?;
-            let before = Controller::desired(state, found, owner);
-            // all of it or none
-            let mut next = state.clone();
-            let (deployment, superseded, blobs) = deploy_on(&mut next, &app, &asked, &req.base)?;
-            *state = next;
-            Ok::<_, ApiError>((deployment, superseded, blobs, before))
-        })?;
+        let (deployment, superseded, blobs, before) = self
+            .store
+            .update(|state| {
+                let found = state.app(&app).ok_or_else(|| ApiError::not_found("App"))?;
+                let before = Controller::desired(state, found, owner);
+                // all of it or none
+                let mut next = state.clone();
+                let (deployment, superseded, blobs) =
+                    deploy_on(&mut next, &app, &asked, &req.base)?;
+                *state = next;
+                Ok::<_, ApiError>((deployment, superseded, blobs, before))
+            })
+            .await?;
         self.store.delete(&blobs);
         if let Some(line) = superseded {
             self.logs.add(&app, "API", line);
@@ -2556,6 +2623,7 @@ impl Api {
         let _app = self.controller.hold(&app).await;
         let canceling = (self.store)
             .update(|state| state.cancel_deployment(guid))
+            .await
             .map_err(ApiError::unprocessable)?;
         if canceling {
             self.logs
@@ -2571,6 +2639,7 @@ impl Api {
         let _app = self.controller.hold(&app).await;
         (self.store)
             .update(|state| state.continue_deployment(guid))
+            .await
             .map_err(ApiError::unprocessable)?;
         self.logs
             .add(&app, "API", format!("Continuing the deployment {guid}"));

@@ -155,12 +155,15 @@ impl Api {
                     return Err(ApiError::not_authorized("an admin's"));
                 }
                 let name = name_of(&req.json()?)?;
-                let view = self.store.update(|state| {
-                    if state.org_named(&name).is_some() {
-                        return Err(org_taken(&name));
-                    }
-                    Ok(views::org(base, state.create_org(&name)))
-                })?;
+                let view = self
+                    .store
+                    .update(|state| {
+                        if state.org_named(&name).is_some() {
+                            return Err(org_taken(&name));
+                        }
+                        Ok(views::org(base, state.create_org(&name)))
+                    })
+                    .await?;
                 println!("ORGS: {}: created organization {name}", access.name);
                 Ok(respond(StatusCode::CREATED, &view))
             }
@@ -174,26 +177,29 @@ impl Api {
                 .ok_or_else(org_not_found),
             (&Method::PATCH, ["organizations", guid]) => {
                 let body: Value = req.json()?;
-                let view = self.store.update(|state| {
-                    if state.org(guid).is_none() || !access.sees_org(state, guid) {
-                        return Err(org_not_found());
-                    }
-                    if !access.manages_org(guid) {
-                        return Err(ApiError::not_authorized("an organization manager's"));
-                    }
-                    if !body["name"].is_null() {
-                        let name = name_of(&body)?;
-                        if state
-                            .org_named(&name)
-                            .is_some_and(|other| other.guid != *guid)
-                        {
-                            return Err(org_taken(&name));
+                let view = self
+                    .store
+                    .update(|state| {
+                        if state.org(guid).is_none() || !access.sees_org(state, guid) {
+                            return Err(org_not_found());
                         }
-                        let org = state.orgs.iter_mut().find(|org| org.guid == *guid);
-                        org.expect("found above").name = name;
-                    }
-                    Ok(views::org(base, state.org(guid).expect("found above")))
-                })?;
+                        if !access.manages_org(guid) {
+                            return Err(ApiError::not_authorized("an organization manager's"));
+                        }
+                        if !body["name"].is_null() {
+                            let name = name_of(&body)?;
+                            if state
+                                .org_named(&name)
+                                .is_some_and(|other| other.guid != *guid)
+                            {
+                                return Err(org_taken(&name));
+                            }
+                            let org = state.orgs.iter_mut().find(|org| org.guid == *guid);
+                            org.expect("found above").name = name;
+                        }
+                        Ok(views::org(base, state.org(guid).expect("found above")))
+                    })
+                    .await?;
                 Ok(respond(StatusCode::OK, &view))
             }
             (&Method::DELETE, ["organizations", guid]) => self.delete_org(req, guid).await,
@@ -278,7 +284,7 @@ impl Api {
                         return Err(space_taken());
                     }
                     Ok(views::space(base, state.create_space(&name, org)))
-                })?;
+                }).await?;
                 println!("ORGS: {}: created space {name}", access.name);
                 Ok(respond(StatusCode::CREATED, &view))
             }
@@ -294,22 +300,25 @@ impl Api {
                 .map(|space| respond(StatusCode::OK, &space)),
             (&Method::PATCH, ["spaces", guid]) => {
                 let body: Value = req.json()?;
-                let view = self.store.update(|state| {
-                    let space = state.space(guid).cloned().ok_or_else(space_not_found)?;
-                    access.check(state, guid, Need::Manage, "Space")?;
-                    if !body["name"].is_null() {
-                        let name = name_of(&body)?;
-                        if state
-                            .space_named(&space.org, &name)
-                            .is_some_and(|other| other.guid != *guid)
-                        {
-                            return Err(space_taken());
+                let view = self
+                    .store
+                    .update(|state| {
+                        let space = state.space(guid).cloned().ok_or_else(space_not_found)?;
+                        access.check(state, guid, Need::Manage, "Space")?;
+                        if !body["name"].is_null() {
+                            let name = name_of(&body)?;
+                            if state
+                                .space_named(&space.org, &name)
+                                .is_some_and(|other| other.guid != *guid)
+                            {
+                                return Err(space_taken());
+                            }
+                            let found = state.spaces.iter_mut().find(|space| space.guid == *guid);
+                            found.expect("found above").name = name;
                         }
-                        let found = state.spaces.iter_mut().find(|space| space.guid == *guid);
-                        found.expect("found above").name = name;
-                    }
-                    Ok(views::space(base, state.space(guid).expect("found above")))
-                })?;
+                        Ok(views::space(base, state.space(guid).expect("found above")))
+                    })
+                    .await?;
                 Ok(respond(StatusCode::OK, &view))
             }
             (&Method::DELETE, ["spaces", guid]) => self.delete_space(req, guid).await,
@@ -392,18 +401,21 @@ impl Api {
                 })
                 .map(|role| respond(StatusCode::OK, &role))
                 .ok_or_else(|| ApiError::not_found("Role")),
-            (&Method::POST, ["roles"]) => self.create_role(req),
+            (&Method::POST, ["roles"]) => self.create_role(req).await,
             (&Method::DELETE, ["roles", guid]) => {
-                let role = self.store.update(|state| {
-                    let role = state
-                        .role(guid)
-                        .filter(|role| role_seen(access, state, role))
-                        .cloned()
-                        .ok_or_else(|| ApiError::not_found("Role"))?;
-                    may_give(access, state, &role)?;
-                    state.roles.retain(|kept| kept.guid != *guid);
-                    Ok::<_, ApiError>(role)
-                })?;
+                let role = self
+                    .store
+                    .update(|state| {
+                        let role = state
+                            .role(guid)
+                            .filter(|role| role_seen(access, state, role))
+                            .cloned()
+                            .ok_or_else(|| ApiError::not_found("Role"))?;
+                        may_give(access, state, &role)?;
+                        state.roles.retain(|kept| kept.guid != *guid);
+                        Ok::<_, ApiError>(role)
+                    })
+                    .await?;
                 println!(
                     "ORGS: {}: removed the role {} of {} at {}",
                     access.name,
@@ -411,7 +423,7 @@ impl Api {
                     role.user,
                     role.at
                 );
-                self.job(req, "role.delete", Vec::new(), None)
+                self.job(req, "role.delete", Vec::new(), None).await
             }
             (&Method::GET, ["users"]) => {
                 let items = self.store.read(|state| {
@@ -447,7 +459,7 @@ impl Api {
 
     /// A role given: to a user by its name (and origin), or by its guid, a client's id among
     /// them; in a space, to one with a role in its organization, as CC asks.
-    fn create_role(&self, req: &Req) -> Reply {
+    async fn create_role(&self, req: &Req) -> Reply {
         let access = req.access()?;
         let body: Value = req.json()?;
         let kind = body["type"]
@@ -555,7 +567,7 @@ impl Api {
             }
             state.roles.push(role.clone());
             Ok(role_view(&req.base, &role))
-        })?;
+        }).await?;
         println!(
             "ORGS: {}: gave {} the role {} at {at}",
             access.name,
@@ -578,7 +590,7 @@ impl Api {
         })?;
         self.empty(std::slice::from_ref(&space.guid)).await?;
         println!("ORGS: {}: deleted space {}", access.name, space.name);
-        self.job(req, "space.delete", Vec::new(), None)
+        self.job(req, "space.delete", Vec::new(), None).await
     }
 
     /// Deletes the organization, its spaces and what they hold, by an admin.
@@ -602,23 +614,25 @@ impl Api {
             Ok((org, spaces))
         })?;
         self.empty(&spaces).await?;
-        self.store.update(|state| {
-            state.roles.retain(|role| role.at != *guid);
-            for plan in state
-                .brokers
-                .iter_mut()
-                .flat_map(|broker| &mut broker.offerings)
-                .flat_map(|offering| &mut offering.plans)
-            {
-                plan.orgs.retain(|kept| kept != guid);
-                if plan.visibility == "organization" && plan.orgs.is_empty() {
-                    plan.visibility = "admin".into();
+        self.store
+            .update(|state| {
+                state.roles.retain(|role| role.at != *guid);
+                for plan in state
+                    .brokers
+                    .iter_mut()
+                    .flat_map(|broker| &mut broker.offerings)
+                    .flat_map(|offering| &mut offering.plans)
+                {
+                    plan.orgs.retain(|kept| kept != guid);
+                    if plan.visibility == "organization" && plan.orgs.is_empty() {
+                        plan.visibility = "admin".into();
+                    }
                 }
-            }
-            state.orgs.retain(|kept| kept.guid != *guid);
-        });
+                state.orgs.retain(|kept| kept.guid != *guid);
+            })
+            .await;
         println!("ORGS: {}: deleted organization {}", access.name, org.name);
-        self.job(req, "organization.delete", Vec::new(), None)
+        self.job(req, "organization.delete", Vec::new(), None).await
     }
 
     /// Deletes the spaces and what they hold: their apps (gone from the wicket), routes,
@@ -654,52 +668,56 @@ impl Api {
         for (app, name) in apps {
             self.controller.remove(&app, &name).await;
         }
-        let routes = self.store.update(|state| {
-            if let Some(app) = state.apps.iter().find(|app| ours(&app.space)) {
-                return Err(ApiError::unprocessable(format!(
-                    "app {} was pushed meanwhile: delete again",
-                    app.name
-                )));
-            }
-            let routes: Vec<String> = state
-                .routes
-                .iter()
-                .filter(|route| ours(&route.space))
-                .map(|route| route.guid.clone())
-                .collect();
-            state.routes.retain(|route| !ours(&route.space));
-            let gone: Vec<_> = state
-                .instances
-                .iter()
-                .filter(|instance| ours(&instance.space))
-                .cloned()
-                .collect();
-            for instance in &gone {
-                if instance.offering == crate::services::KEYVALUE {
-                    state.purges.push(Purge {
-                        store: instance.plan.clone(),
-                        namespace: crate::services::namespace(&instance.guid),
-                        instance: instance.name.clone(),
-                        purged: Vec::new(),
-                    });
+        let routes = self
+            .store
+            .update(|state| {
+                if let Some(app) = state.apps.iter().find(|app| ours(&app.space)) {
+                    return Err(ApiError::unprocessable(format!(
+                        "app {} was pushed meanwhile: delete again",
+                        app.name
+                    )));
                 }
-            }
-            let gone: BTreeSet<String> = gone.into_iter().map(|instance| instance.guid).collect();
-            state
-                .bindings
-                .retain(|binding| !gone.contains(&binding.instance));
-            state.instances.retain(|instance| !ours(&instance.space));
-            state
-                .brokers
-                .retain(|broker| !broker.space.as_deref().is_some_and(ours));
-            for group in &mut state.security_groups {
-                group.running_spaces.retain(|space| !ours(space));
-                group.staging_spaces.retain(|space| !ours(space));
-            }
-            state.roles.retain(|role| !ours(&role.at));
-            state.spaces.retain(|space| !ours(&space.guid));
-            Ok::<_, ApiError>(routes)
-        })?;
+                let routes: Vec<String> = state
+                    .routes
+                    .iter()
+                    .filter(|route| ours(&route.space))
+                    .map(|route| route.guid.clone())
+                    .collect();
+                state.routes.retain(|route| !ours(&route.space));
+                let gone: Vec<_> = state
+                    .instances
+                    .iter()
+                    .filter(|instance| ours(&instance.space))
+                    .cloned()
+                    .collect();
+                for instance in &gone {
+                    if instance.offering == crate::services::KEYVALUE {
+                        state.purges.push(Purge {
+                            store: instance.plan.clone(),
+                            namespace: crate::services::namespace(&instance.guid),
+                            instance: instance.name.clone(),
+                            purged: Vec::new(),
+                        });
+                    }
+                }
+                let gone: BTreeSet<String> =
+                    gone.into_iter().map(|instance| instance.guid).collect();
+                state
+                    .bindings
+                    .retain(|binding| !gone.contains(&binding.instance));
+                state.instances.retain(|instance| !ours(&instance.space));
+                state
+                    .brokers
+                    .retain(|broker| !broker.space.as_deref().is_some_and(ours));
+                for group in &mut state.security_groups {
+                    group.running_spaces.retain(|space| !ours(space));
+                    group.staging_spaces.retain(|space| !ours(space));
+                }
+                state.roles.retain(|role| !ours(&role.at));
+                state.spaces.retain(|space| !ours(&space.guid));
+                Ok::<_, ApiError>(routes)
+            })
+            .await?;
         for route in routes {
             self.controller.forget(&route);
         }

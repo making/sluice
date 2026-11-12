@@ -53,6 +53,11 @@ prost = "0.14"
 # matches tonic's tls-ring
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
+# the state in PostgreSQL (--state): its TLS verified against the webPKI roots unless a CA is
+# given
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
+tokio-postgres-rustls = "0.14"
+webpki-roots = "1"
 
 [dev-dependencies]
 # the integration test's certificate of the cf-api's own TLS, its requests to it and its

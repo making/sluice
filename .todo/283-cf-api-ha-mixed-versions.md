@@ -53,3 +53,14 @@ Store tests: a row written by a "newer" shape survives an update by an older one
 newer schema refused. Two instances with different `--wicket`s: no index moves until the
 topology record changes. A previous release's binary beside the current one in the CLI test of
 284, once there is a release to take.
+
+## From 275
+
+- `sluice_cf_meta.layout` is the rows' layout (1): a build refuses a store of a newer one
+  (`postgres::SCHEMA`). Nothing moves it yet
+- a row of a kind a build does not know is left alone (`records::known`); one it cannot read is
+  logged and left out of its copy; a field it does not know is dropped when it writes the row
+  again (the body is the entity's JSON, written whole): the merge is to do
+- with `--state`, `follow_domains` and `follow_wickets` run at every start in a transaction, by
+  the flags of the instance starting (`Store::open`); `State::migrate` only on the `state.json`
+  an empty store takes

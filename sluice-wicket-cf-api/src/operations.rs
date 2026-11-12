@@ -262,7 +262,7 @@ impl Operations {
             None => return Next::Done,
             Some(Ok(work)) => work,
             Some(Err((operation, why))) => {
-                self.end(target, &operation, End::Failed(why));
+                self.end(target, &operation, End::Failed(why)).await;
                 return Next::Done;
             }
         };
@@ -357,22 +357,24 @@ impl Operations {
         match answer {
             Ok(Answer::Done(body)) => match self.check_done(&work, body) {
                 Ok(body) => {
-                    self.end(&work.target, operation, End::Succeeded(body));
+                    self.end(&work.target, operation, End::Succeeded(body))
+                        .await;
                     Next::Done
                 }
                 Err(e) => {
                     self.orphan(&work);
-                    self.end(&work.target, operation, End::Failed(e));
+                    self.end(&work.target, operation, End::Failed(e)).await;
                     Next::Done
                 }
             },
             Ok(Answer::Gone) if operation.kind == OperationKind::Delete => {
-                self.end(&work.target, operation, End::Succeeded(Map::new()));
+                self.end(&work.target, operation, End::Succeeded(Map::new()))
+                    .await;
                 Next::Done
             }
             Ok(Answer::Gone) => {
                 let e = "The service broker returned an invalid response: 410 Gone".to_string();
-                self.end(&work.target, operation, End::Failed(e));
+                self.end(&work.target, operation, End::Failed(e)).await;
                 Next::Done
             }
             Ok(Answer::Accepted { .. })
@@ -384,7 +386,8 @@ impl Operations {
                 self.orphan(&work);
                 let e = "The service broker responded asynchronously to a binding request, \
                          but its offering does not support fetching bindings (bindings_retrievable)";
-                self.end(&work.target, operation, End::Failed(e.into()));
+                self.end(&work.target, operation, End::Failed(e.into()))
+                    .await;
                 Next::Done
             }
             Ok(Answer::Accepted {
@@ -392,30 +395,33 @@ impl Operations {
                 body,
             }) => {
                 let deadline = epoch_secs() + work.max_polling;
-                let taken = self.store.update(|state| {
-                    let dashboard = body.get("dashboard_url").and_then(Value::as_str);
-                    if let (Target::Instance(guid), Some(url)) = (&work.target, dashboard)
-                        && let Some(instance) = state.instance_mut(guid)
-                    {
-                        instance.dashboard_url = Some(url.to_string());
-                    }
-                    let current = operation_mut(state, &work.target)?;
-                    if current.created_at != operation.created_at {
-                        return None;
-                    }
-                    current.sent = true;
-                    current.parameters = None;
-                    current.broker_operation = broker_operation;
-                    current.deadline = Some(deadline);
-                    current.updated_at = now();
-                    let job = current.job.clone();
-                    if let Some(job) = job.as_deref().and_then(|job| state.job_mut(job))
-                        && job.operation.starts_with("service_")
-                    {
-                        job.polling = true;
-                    }
-                    Some(())
-                });
+                let taken = self
+                    .store
+                    .update(|state| {
+                        let dashboard = body.get("dashboard_url").and_then(Value::as_str);
+                        if let (Target::Instance(guid), Some(url)) = (&work.target, dashboard)
+                            && let Some(instance) = state.instance_mut(guid)
+                        {
+                            instance.dashboard_url = Some(url.to_string());
+                        }
+                        let current = operation_mut(state, &work.target)?;
+                        if current.created_at != operation.created_at {
+                            return None;
+                        }
+                        current.sent = true;
+                        current.parameters = None;
+                        current.broker_operation = broker_operation.clone();
+                        current.deadline = Some(deadline);
+                        current.updated_at = now();
+                        let job = current.job.clone();
+                        if let Some(job) = job.as_deref().and_then(|job| state.job_mut(job))
+                            && job.operation.starts_with("service_")
+                        {
+                            job.polling = true;
+                        }
+                        Some(())
+                    })
+                    .await;
                 match taken {
                     Some(()) => Next::Poll(FIRST_POLL),
                     None => Next::Again,
@@ -425,7 +431,8 @@ impl Operations {
                 if creates && refusal.unknown {
                     self.orphan(&work);
                 }
-                self.end(&work.target, operation, End::Failed(refusal.description));
+                self.end(&work.target, operation, End::Failed(refusal.description))
+                    .await;
                 Next::Done
             }
         }
@@ -462,7 +469,7 @@ impl Operations {
                 work.what(),
                 work.max_polling
             );
-            self.end(&work.target, operation, End::Failed(e));
+            self.end(&work.target, operation, End::Failed(e)).await;
             return Next::Done;
         }
         let mut query = vec![
@@ -481,7 +488,8 @@ impl Operations {
                 description,
                 ..
             }) => {
-                self.end(&work.target, operation, End::Failed(description));
+                self.end(&work.target, operation, End::Failed(description))
+                    .await;
                 return Next::Done;
             }
             Err(refusal) => {
@@ -501,21 +509,24 @@ impl Operations {
             // gone: a deletion's success, else no answer yet
             (None, OperationKind::Delete)
             | (Some(OperationState::Succeeded), OperationKind::Delete) => {
-                self.end(&work.target, operation, End::Succeeded(Map::new()));
+                self.end(&work.target, operation, End::Succeeded(Map::new()))
+                    .await;
                 Next::Done
             }
             (None, _) => Next::Poll(again),
             (Some(OperationState::InProgress), _) => {
                 if let Some(description) = polled.description {
-                    self.store.update(|state| {
-                        if let Some(current) = operation_mut(state, &work.target)
-                            && current.created_at == operation.created_at
-                            && current.description != description
-                        {
-                            current.description = description;
-                            current.updated_at = now();
-                        }
-                    });
+                    self.store
+                        .update(|state| {
+                            if let Some(current) = operation_mut(state, &work.target)
+                                && current.created_at == operation.created_at
+                                && current.description != description
+                            {
+                                current.description = description.clone();
+                                current.updated_at = now();
+                            }
+                        })
+                        .await;
                 }
                 Next::Poll(again)
             }
@@ -523,7 +534,7 @@ impl Operations {
                 let e = polled
                     .description
                     .unwrap_or_else(|| format!("the service broker failed {}", work.what()));
-                self.end(&work.target, operation, End::Failed(e));
+                self.end(&work.target, operation, End::Failed(e)).await;
                 Next::Done
             }
             (Some(OperationState::Succeeded), _) => {
@@ -539,18 +550,20 @@ impl Operations {
                             Ok(fetched) => body.extend(fetched),
                             Err(e) => {
                                 self.orphan(&work);
-                                self.end(&work.target, operation, End::Failed(e));
+                                self.end(&work.target, operation, End::Failed(e)).await;
                                 return Next::Done;
                             }
                         },
                         Err(refusal) => {
                             self.orphan(&work);
-                            self.end(&work.target, operation, End::Failed(refusal.description));
+                            self.end(&work.target, operation, End::Failed(refusal.description))
+                                .await;
                             return Next::Done;
                         }
                     }
                 }
-                self.end(&work.target, operation, End::Succeeded(body));
+                self.end(&work.target, operation, End::Succeeded(body))
+                    .await;
                 Next::Done
             }
         }
@@ -588,90 +601,95 @@ impl Operations {
     /// Records how the operation ended, unless another replaced it: on the
     /// instance or binding (a deletion's success removes it), its job and
     /// the logs.
-    fn end(&self, target: &Target, operation: &Operation, end: End) {
+    async fn end(&self, target: &Target, operation: &Operation, end: End) {
         let failed = match &end {
             End::Failed(e) => Some(e.clone()),
             End::Succeeded(_) => None,
         };
-        let ended = self.store.update(|state| {
-            let current = operation_mut(state, target)?;
-            if current.created_at != operation.created_at || !current.under_way() {
-                return None;
-            }
-            let at = now();
-            current.state = match &end {
-                End::Succeeded(_) => OperationState::Succeeded,
-                End::Failed(_) => OperationState::Failed,
-            };
-            current.description = match &end {
-                End::Failed(e) => e.clone(),
-                End::Succeeded(body) => body
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            };
-            current.sent = true;
-            current.parameters = None;
-            current.updated_at = at.clone();
-            let job = current.job.clone();
-            let kind = current.kind;
-            let removed = matches!(end, End::Succeeded(_)) && kind == OperationKind::Delete;
-            let mut app = None;
-            let mut name = String::new();
-            match target {
-                Target::Instance(guid) => {
-                    let instance = state.instance_mut(guid).expect("its operation found");
-                    name.clone_from(&instance.name);
-                    if let (End::Succeeded(body), OperationKind::Create | OperationKind::Update) =
-                        (&end, kind)
-                    {
-                        if let Some(url) = body.get("dashboard_url").and_then(Value::as_str) {
-                            instance.dashboard_url = Some(url.to_string());
+        let ended = self
+            .store
+            .update(|state| {
+                let current = operation_mut(state, target)?;
+                if current.created_at != operation.created_at || !current.under_way() {
+                    return None;
+                }
+                let at = now();
+                current.state = match &end {
+                    End::Succeeded(_) => OperationState::Succeeded,
+                    End::Failed(_) => OperationState::Failed,
+                };
+                current.description = match &end {
+                    End::Failed(e) => e.clone(),
+                    End::Succeeded(body) => body
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                };
+                current.sent = true;
+                current.parameters = None;
+                current.updated_at = at.clone();
+                let job = current.job.clone();
+                let kind = current.kind;
+                let removed = matches!(end, End::Succeeded(_)) && kind == OperationKind::Delete;
+                let mut app = None;
+                let mut name = String::new();
+                match target {
+                    Target::Instance(guid) => {
+                        let instance = state.instance_mut(guid).expect("its operation found");
+                        name.clone_from(&instance.name);
+                        if let (
+                            End::Succeeded(body),
+                            OperationKind::Create | OperationKind::Update,
+                        ) = (&end, kind)
+                        {
+                            if let Some(url) = body.get("dashboard_url").and_then(Value::as_str) {
+                                instance.dashboard_url = Some(url.to_string());
+                            }
+                            let operation = instance.operation.as_ref().expect("found");
+                            if let Some(plan) = operation.plan.clone() {
+                                instance.plan = plan;
+                            }
+                            if let Some(info) = operation.maintenance_info.clone() {
+                                instance.maintenance_info = Some(info);
+                            }
+                            instance.updated_at = at;
                         }
-                        let operation = instance.operation.as_ref().expect("found");
-                        if let Some(plan) = operation.plan.clone() {
-                            instance.plan = plan;
+                        if removed {
+                            state.instances.retain(|instance| instance.guid != *guid);
                         }
-                        if let Some(info) = operation.maintenance_info.clone() {
-                            instance.maintenance_info = Some(info);
-                        }
-                        instance.updated_at = at;
                     }
-                    if removed {
-                        state.instances.retain(|instance| instance.guid != *guid);
+                    Target::Binding(guid) => {
+                        let binding = state.binding_mut(guid).expect("its operation found");
+                        app = Some(binding.app.clone());
+                        let instance = binding.instance.clone();
+                        if let (End::Succeeded(body), OperationKind::Create) = (&end, kind) {
+                            binding.credentials = body
+                                .get("credentials")
+                                .and_then(Value::as_object)
+                                .cloned()
+                                .unwrap_or_default();
+                            binding.updated_at = at;
+                        }
+                        if removed {
+                            state.bindings.retain(|binding| binding.guid != *guid);
+                        }
+                        name = state
+                            .instance(&instance)
+                            .map_or_else(String::new, |instance| instance.name.clone());
                     }
                 }
-                Target::Binding(guid) => {
-                    let binding = state.binding_mut(guid).expect("its operation found");
-                    app = Some(binding.app.clone());
-                    let instance = binding.instance.clone();
-                    if let (End::Succeeded(body), OperationKind::Create) = (&end, kind) {
-                        binding.credentials = body
-                            .get("credentials")
-                            .and_then(Value::as_object)
-                            .cloned()
-                            .unwrap_or_default();
-                        binding.updated_at = at;
-                    }
-                    if removed {
-                        state.bindings.retain(|binding| binding.guid != *guid);
-                    }
-                    name = state
-                        .instance(&instance)
-                        .map_or_else(String::new, |instance| instance.name.clone());
+                if let Some(job) = &job {
+                    let error = failed.as_ref().map(|e| JobError {
+                        code: 10009,
+                        title: "CF-UnableToPerform".into(),
+                        detail: format!("{} failed: {e}", doing(target, kind, &name)),
+                    });
+                    state.settle(job, target.guid(), error);
                 }
-            }
-            if let Some(job) = &job {
-                let error = failed.as_ref().map(|e| JobError {
-                    code: 10009,
-                    title: "CF-UnableToPerform".into(),
-                    detail: format!("{} failed: {e}", doing(target, kind, &name)),
-                });
-                state.settle(job, target.guid(), error);
-            }
-            Some((kind, app, name))
-        });
+                Some((kind, app, name))
+            })
+            .await;
         let Some((kind, app, name)) = ended else {
             return;
         };

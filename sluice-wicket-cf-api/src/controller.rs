@@ -293,17 +293,20 @@ impl Controller {
             (wicket.name.clone(), removed, share)
         }))
         .await;
-        let blobs = self.store.update(|state| {
-            for (wicket, removed, _) in &removed {
-                if removed.as_ref().is_err_and(Failure::retried) {
-                    state.removals.push(Removal {
-                        app: guid.to_string(),
-                        wicket: wicket.clone(),
-                    });
+        let blobs = self
+            .store
+            .update(|state| {
+                for (wicket, removed, _) in &removed {
+                    if removed.as_ref().is_err_and(Failure::retried) {
+                        state.removals.push(Removal {
+                            app: guid.to_string(),
+                            wicket: wicket.clone(),
+                        });
+                    }
                 }
-            }
-            state.remove_app(guid)
-        });
+                state.remove_app(guid)
+            })
+            .await;
         self.store.delete(&blobs);
         self.logs.forget(guid);
         self.forget(guid);
@@ -433,7 +436,7 @@ impl Controller {
         for wicket in &self.wickets {
             match wicket.list(None).await {
                 Ok(listing) => {
-                    self.note(wicket, &listing);
+                    self.note(wicket, &listing).await;
                     return Ok(());
                 }
                 Err(e) => failed = Some(e),
@@ -482,7 +485,7 @@ impl Controller {
     /// Keeps what `wicket` listed it runs: the apps are placed by it. Another stack than the
     /// name had, or its first, places the apps' indices again, logged; their shares are to
     /// apply ([`Controller::apply_placed`]).
-    fn note_stack(&self, wicket: &Wicket, runs: Runtime) {
+    async fn note_stack(&self, wicket: &Wicket, runs: Runtime) {
         let name = &wicket.name;
         let was = self
             .store
@@ -495,11 +498,14 @@ impl Controller {
             apps.map(|app| (app.guid.clone(), app.placement.clone()))
                 .collect()
         };
-        let before = self.store.update(|state| {
-            let before = placements(state);
-            state.wickets.runtimes.insert(name.clone(), runs);
-            before
-        });
+        let before = self
+            .store
+            .update(|state| {
+                let before = placements(state);
+                state.wickets.runtimes.insert(name.clone(), runs);
+                before
+            })
+            .await;
         let after = self.store.read(placements);
         let placed: Vec<String> = (after.into_iter())
             .filter(|placement| !before.contains(placement))
@@ -531,8 +537,8 @@ impl Controller {
     /// Notes what `wicket` listed: what it offers and runs apps as, which wicket it is, its
     /// budget. One placed on no more (a second name of one) or again is logged. Whether it is
     /// another wicket than the name had: its apps are put again.
-    fn note(&self, wicket: &Wicket, listing: &Listing) -> bool {
-        self.note_stack(wicket, listing.runtime());
+    async fn note(&self, wicket: &Wicket, listing: &Listing) -> bool {
+        self.note_stack(wicket, listing.runtime()).await;
         let id = listing.wicket.as_ref().map(|listed| listed.id.clone());
         let noted = Noted {
             offer: Offer::new(&listing.capabilities, &listing.keyvalue_stores),
@@ -547,9 +553,10 @@ impl Controller {
         let stores = self.with_offers(Offer::stores);
         let changed = self
             .store
-            .note(|state| std::mem::replace(&mut state.wickets.stores, stores.clone()) != stores);
+            .note(|state| std::mem::replace(&mut state.wickets.stores, stores.clone()) != stores)
+            .await;
         if changed {
-            self.store.update(|_| ());
+            self.store.update(|_| ()).await;
         }
         if id.is_none() && before.is_none_or(|before| before.id.is_some()) {
             println!(
@@ -564,7 +571,8 @@ impl Controller {
         let odd: BTreeSet<String> = barred.keys().map(|name| name.to_string()).collect();
         let was = self
             .store
-            .note(|state| std::mem::replace(&mut state.wickets.odd, odd.clone()));
+            .note(|state| std::mem::replace(&mut state.wickets.odd, odd.clone()))
+            .await;
         for wicket in &self.wickets {
             match (was.contains(&wicket.name), barred.get(&wicket.name)) {
                 (false, Some(why)) => println!("CELL: {} is put on no more: {why}", wicket.label),
@@ -598,26 +606,28 @@ impl Controller {
             .wicket
             .as_ref()
             .and_then(|listed| listed.node.clone());
-        self.store.note(|state| {
-            let wickets = &mut state.wickets;
-            match budget {
-                Some(budget) => wickets.budgets.insert(wicket.name.clone(), budget),
-                None => wickets.budgets.remove(&wicket.name),
-            };
-            wickets.nodes.retain(|_, of| *of != wicket.name);
-            if let Some(node) = node {
-                wickets.nodes.insert(node, wicket.name.clone());
-            }
-            // its revision moved since it refused a share for room: it may have some
-            let full = wickets.full.get(&wicket.name);
-            if full.is_some_and(|revision| *revision != listing.revision) {
-                wickets.full.remove(&wicket.name);
-            }
-            match &listing.leaving {
-                Some(leaving) => wickets.leaving.insert(wicket.name.clone(), leaving.until),
-                None => wickets.leaving.remove(&wicket.name),
-            };
-        });
+        self.store
+            .note(|state| {
+                let wickets = &mut state.wickets;
+                match budget {
+                    Some(budget) => wickets.budgets.insert(wicket.name.clone(), budget),
+                    None => wickets.budgets.remove(&wicket.name),
+                };
+                wickets.nodes.retain(|_, of| *of != wicket.name);
+                if let Some(node) = node {
+                    wickets.nodes.insert(node, wicket.name.clone());
+                }
+                // its revision moved since it refused a share for room: it may have some
+                let full = wickets.full.get(&wicket.name);
+                if full.is_some_and(|revision| *revision != listing.revision) {
+                    wickets.full.remove(&wicket.name);
+                }
+                match &listing.leaving {
+                    Some(leaving) => wickets.leaving.insert(wicket.name.clone(), leaving.until),
+                    None => wickets.leaving.remove(&wicket.name),
+                };
+            })
+            .await;
         let Some(id) = id else {
             return false;
         };
@@ -628,7 +638,8 @@ impl Controller {
             return false;
         }
         self.store
-            .update(|state| state.wicket_ids.insert(wicket.name.clone(), id.clone()));
+            .update(|state| state.wicket_ids.insert(wicket.name.clone(), id.clone()))
+            .await;
         let Some(was) = was else {
             return false;
         };
@@ -683,27 +694,29 @@ impl Controller {
             let same =
                 |kept: &Purge| kept.store == purge.store && kept.namespace == purge.namespace;
             // through this wicket: gone, or none of its; of a store they share, deleted once
-            let done = |all: bool| {
-                self.store.update(|state| {
-                    let configured = &state.wickets.configured;
-                    if let Some(kept) = state.purges.iter_mut().find(|kept| same(kept)) {
-                        match all {
-                            true => kept.purged.clone_from(configured),
-                            false => kept.purged.push(wicket.name.clone()),
+            let done = async |all: bool| {
+                self.store
+                    .update(|state| {
+                        let configured = &state.wickets.configured;
+                        if let Some(kept) = state.purges.iter_mut().find(|kept| same(kept)) {
+                            match all {
+                                true => kept.purged.clone_from(configured),
+                                false => kept.purged.push(wicket.name.clone()),
+                            }
                         }
-                    }
-                    let homes = &mut state.homes;
-                    state.purges.retain(|kept| {
-                        let done = configured.iter().all(|name| kept.purged.contains(name));
-                        if done {
-                            homes.remove(&format!("{}/{}", kept.store, kept.namespace));
-                        }
-                        !done
-                    });
-                });
+                        let homes = &mut state.homes;
+                        state.purges.retain(|kept| {
+                            let done = configured.iter().all(|name| kept.purged.contains(name));
+                            if done {
+                                homes.remove(&format!("{}/{}", kept.store, kept.namespace));
+                            }
+                            !done
+                        });
+                    })
+                    .await;
             };
             if self.lists_store(wicket, &purge.store) == Some(false) {
-                done(false);
+                done(false).await;
                 continue;
             }
             let shared = self
@@ -743,7 +756,7 @@ impl Controller {
                 }
                 Err(_) => continue,
             };
-            done(shared && deleted);
+            done(shared && deleted).await;
         }
     }
 
@@ -780,10 +793,12 @@ impl Controller {
                 }
                 Err(e) => println!("[{guid}] CELL: not removed from {label}: {e}"),
             }
-            self.store.update(|state| {
-                let gone = |kept: &Removal| kept.app == guid && kept.wicket == wicket.name;
-                state.removals.retain(|kept| !gone(kept))
-            });
+            self.store
+                .update(|state| {
+                    let gone = |kept: &Removal| kept.app == guid && kept.wicket == wicket.name;
+                    state.removals.retain(|kept| !gone(kept))
+                })
+                .await;
         }
     }
 
@@ -802,14 +817,17 @@ impl Controller {
             (self.did_not_start.lock().expect("no panic under the lock")).remove(&share);
             return match wicket.delete(guid).await {
                 Ok(edited) => {
-                    let was = self.store.note(|state| {
-                        let outcomes = state.outcomes.get_mut(guid)?;
-                        let was = outcomes.remove(&wicket.name);
-                        if outcomes.is_empty() {
-                            state.outcomes.remove(guid);
-                        }
-                        was
-                    });
+                    let was = self
+                        .store
+                        .note(|state| {
+                            let outcomes = state.outcomes.get_mut(guid)?;
+                            let was = outcomes.remove(&wicket.name);
+                            if outcomes.is_empty() {
+                                state.outcomes.remove(guid);
+                            }
+                            was
+                        })
+                        .await;
                     if let Some(edited) = edited.filter(|_| was.is_some()) {
                         self.logs.add(
                             guid,
@@ -828,7 +846,8 @@ impl Controller {
         };
         if let Some(why) = self.odd(wicket) {
             let line = format!("{} took none of the app: {why}", wicket.sentence());
-            self.record(wicket, guid, Outcome::Refused(why.clone()), &line);
+            self.record(wicket, guid, Outcome::Refused(why.clone()), &line)
+                .await;
             return Err(Failure::refused(409, why));
         }
         let mut app = app.clone();
@@ -885,22 +904,23 @@ impl Controller {
                 ),
             ),
         };
-        self.record(wicket, guid, outcome, &line);
+        self.record(wicket, guid, outcome, &line).await;
         if put.as_ref().is_err_and(Failure::no_room) {
             // no room there until its revision moves
             let revision = (self.listed.lock().expect("no panic under the lock"))
                 .get(&wicket.name)
                 .map_or(0, |noted| noted.revision);
             self.store
-                .note(|state| state.wickets.full.insert(wicket.name.clone(), revision));
+                .note(|state| state.wickets.full.insert(wicket.name.clone(), revision))
+                .await;
         }
         put.map(|_| ())
     }
 
     /// Passes an index of the app `guid` from `wicket`, which refused its share for room, to a
     /// wicket with room, logged: whether one had.
-    pub fn pass(&self, guid: &str, wicket: &str) -> bool {
-        let Some(line) = self.store.update(|state| state.pass(guid, wicket)) else {
+    pub async fn pass(&self, guid: &str, wicket: &str) -> bool {
+        let Some(line) = self.store.update(|state| state.pass(guid, wicket)).await else {
             return false;
         };
         self.logs.add(guid, "CELL", line);
@@ -989,17 +1009,19 @@ impl Controller {
         self.logs.add(guid, "CELL", line);
         if made.sha256 != sha256 {
             let on = wicket.name.as_str();
-            self.store.update(|state| {
-                for droplet in &mut state.droplets {
-                    if droplet.sha256_on(on) == sha256 {
-                        droplet.made_as(on, &made.sha256);
+            self.store
+                .update(|state| {
+                    for droplet in &mut state.droplets {
+                        if droplet.sha256_on(on) == sha256 {
+                            droplet.made_as(on, &made.sha256);
+                        }
                     }
-                }
-                let running = state.apps.iter_mut().flat_map(App::snapshots_mut);
-                for running in running.filter(|running| running.sha256_on(on) == sha256) {
-                    running.made_as(on, &made.sha256);
-                }
-            });
+                    let running = state.apps.iter_mut().flat_map(App::snapshots_mut);
+                    for running in running.filter(|running| running.sha256_on(on) == sha256) {
+                        running.made_as(on, &made.sha256);
+                    }
+                })
+                .await;
             app.component.sha256 = made.sha256;
         }
         Ok(())
@@ -1062,14 +1084,17 @@ impl Controller {
     }
 
     /// Records the outcome of `wicket`'s share, logging it when it changed.
-    fn record(&self, wicket: &Wicket, guid: &str, outcome: Outcome, line: &str) {
-        let changed = self.store.note(|state| {
-            if state.app(guid).is_none() {
-                return false;
-            }
-            let outcomes = state.outcomes.entry(guid.to_string()).or_default();
-            outcomes.insert(wicket.name.clone(), outcome.clone()) != Some(outcome)
-        });
+    async fn record(&self, wicket: &Wicket, guid: &str, outcome: Outcome, line: &str) {
+        let changed = self
+            .store
+            .note(|state| {
+                if state.app(guid).is_none() {
+                    return false;
+                }
+                let outcomes = state.outcomes.entry(guid.to_string()).or_default();
+                outcomes.insert(wicket.name.clone(), outcome.clone()) != Some(outcome)
+            })
+            .await;
         if changed {
             self.logs.add(guid, "CELL", line);
         }
@@ -1104,10 +1129,13 @@ impl Controller {
                 synced.is_err_and(|e| e.no_room()).then_some(&wicket.name)
             }))
             .await;
-            let passed = full
-                .into_iter()
-                .flatten()
-                .any(|wicket| self.pass(guid, wicket));
+            let mut passed = false;
+            for wicket in full.into_iter().flatten() {
+                if self.pass(guid, wicket).await {
+                    passed = true;
+                    break;
+                }
+            }
             if !passed {
                 return;
             }
@@ -1138,7 +1166,7 @@ impl Controller {
     /// share under a put or an edit is theirs, one whose VMs did not start as it is wanted is not
     /// tried again. The apps of the owner it holds that are as wanted, or the state does not
     /// know (left as they are), are to be confirmed to it ([`Controller::confirm`]): their names.
-    fn fix(self: &Arc<Self>, wicket: &Arc<Wicket>, listed: &[ListedApp]) -> Vec<String> {
+    async fn fix(self: &Arc<Self>, wicket: &Arc<Wicket>, listed: &[ListedApp]) -> Vec<String> {
         let owner = &wicket.owner;
         let held_ms = self.held_ms(wicket);
         let wanted: Vec<(String, Option<AppBody>)> = self.store.read(|state| {
@@ -1160,7 +1188,7 @@ impl Controller {
             match (desired, listed) {
                 (Some(desired), Some(listed)) if same(&listed.app, desired) => {
                     let line = format!("Found in {} as wanted", wicket.label);
-                    self.record(wicket, guid, Outcome::Running, &line);
+                    self.record(wicket, guid, Outcome::Running, &line).await;
                     if listed.held {
                         confirmed.push(guid.clone());
                     }
@@ -1179,7 +1207,7 @@ impl Controller {
                             controller.sync_held(&wicket, &guid).await
                         };
                         if synced.is_err_and(|e| e.no_room())
-                            && controller.pass(&guid, &wicket.name)
+                            && controller.pass(&guid, &wicket.name).await
                         {
                             controller.sync(&guid).await;
                         }
@@ -1294,7 +1322,7 @@ impl Controller {
             };
             let Some(listed) = listed else {
                 steady = None;
-                self.placed_on_again(&wicket);
+                self.placed_on_again(&wicket).await;
                 if std::mem::take(&mut away) {
                     self.start_respread(&wicket);
                 }
@@ -1303,12 +1331,12 @@ impl Controller {
             let listing = match listed {
                 Ok(listing) => listing,
                 Err(e) => {
-                    self.unreachable(&wicket, &e);
+                    self.unreachable(&wicket, &e).await;
                     self.came_back(&wicket);
                     away = true;
                     steady = None;
                     let since = *unanswered.get_or_insert_with(Instant::now);
-                    if self.gone(&wicket, since) {
+                    if self.gone(&wicket, since).await {
                         self.start_evacuation(&wicket, Away::Gone, false);
                     }
                     // back, it is looked at whatever its revision: a wicket restarted
@@ -1335,7 +1363,7 @@ impl Controller {
             let another = self.note(&wicket, &listing);
             self.came_back(&wicket);
             self.apply_placed();
-            let moved = another || after != Some(listing.revision);
+            let moved = another.await || after != Some(listing.revision);
             after = Some(listing.revision);
             let pending = self.store.read(|state| {
                 (state.purges.iter()).any(|purge| !purge.purged.contains(&wicket.name))
@@ -1345,7 +1373,7 @@ impl Controller {
                 continue;
             }
             if moved {
-                let held = self.fix(&wicket, &listing.apps);
+                let held = self.fix(&wicket, &listing.apps).await;
                 if self.confirm(&wicket, &held).await {
                     // listed again at once, what it holds confirmed then
                     after = None;
@@ -1468,15 +1496,18 @@ impl Controller {
                     if !on() {
                         return false;
                     }
+                    let mut evacuated = self.store.read(|state| state.evacuation(&guid, name));
+                    if !evacuated.moves.is_empty() {
+                        // kept: a restart takes them up
+                        evacuated = (self.store)
+                            .update(|state| state.evacuate(&guid, name))
+                            .await;
+                    }
                     let Evacuated {
                         moves,
                         stay,
                         why: nowhere,
-                    } = self.store.note(|state| state.evacuate(&guid, name));
-                    if !moves.is_empty() {
-                        // kept: a restart takes them up
-                        self.store.update(|_| ());
-                    }
+                    } = evacuated;
                     for (index, to) in &moves {
                         let line = format!("Index {index} moves to the wicket {to}: {why}");
                         self.logs.add(&guid, "CELL", line);
@@ -1568,7 +1599,8 @@ impl Controller {
         loop {
             let found = self
                 .store
-                .update(|state| state.respread(&wicket.name, &skipped));
+                .update(|state| state.respread(&wicket.name, &skipped))
+                .await;
             let Some((guid, (index, to))) = found else {
                 return;
             };
@@ -1655,7 +1687,10 @@ impl Controller {
         for ((index, to), served) in served {
             match served {
                 Ok(()) => {
-                    let from = self.store.update(|state| state.moved(guid, index, &to));
+                    let from = self
+                        .store
+                        .update(|state| state.moved(guid, index, &to))
+                        .await;
                     if let Some(from) = from {
                         let line = format!(
                             "Index {index} runs on the wicket {to}: out of the wicket {from}'s share"
@@ -1669,7 +1704,10 @@ impl Controller {
             }
         }
         for ((index, to), why) in &undone {
-            let at = self.store.update(|state| state.unmoved(guid, *index, to));
+            let at = self
+                .store
+                .update(|state| state.unmoved(guid, *index, to))
+                .await;
             if let Some(at) = at {
                 let line = format!("Index {index} stays on the wicket {at}: {why}");
                 self.logs.add(guid, "CELL", line);
@@ -1762,7 +1800,7 @@ impl Controller {
     }
 
     /// Every share placed on `wicket` is `STARTING` until it answers ([`Controller::answered`]).
-    fn unreachable(&self, wicket: &Wicket, e: &Failure) {
+    async fn unreachable(&self, wicket: &Wicket, e: &Failure) {
         (self.down.lock().expect("no panic under the lock")).insert(wicket.name.clone());
         let owner = self.owner();
         let guids: Vec<String> = self.store.read(|state| {
@@ -1776,7 +1814,8 @@ impl Controller {
             wicket.sentence()
         );
         for guid in guids {
-            self.record(wicket, &guid, Outcome::Unreachable, &line);
+            self.record(wicket, &guid, Outcome::Unreachable, &line)
+                .await;
         }
     }
 
@@ -1829,14 +1868,15 @@ impl Controller {
 
     /// Whether `wicket`, not answering since `since`, is gone: `--wicket-away-grace` passed, and
     /// another wicket is configured. Placed on no more from then on, logged once.
-    fn gone(&self, wicket: &Wicket, since: Instant) -> bool {
+    async fn gone(&self, wicket: &Wicket, since: Instant) -> bool {
         if self.away_grace.is_zero() || self.wickets.len() < 2 || since.elapsed() < self.away_grace
         {
             return false;
         }
         let gone = self
             .store
-            .note(|state| state.wickets.gone.insert(wicket.name.clone()));
+            .note(|state| state.wickets.gone.insert(wicket.name.clone()))
+            .await;
         if gone {
             println!(
                 "CELL: {} has not answered for {}s: placed on no more, the apps' indices on it \
@@ -1849,10 +1889,11 @@ impl Controller {
     }
 
     /// `wicket`, gone, has answered for `--wicket-away-grace`: placed on again.
-    fn placed_on_again(&self, wicket: &Wicket) {
+    async fn placed_on_again(&self, wicket: &Wicket) {
         let gone = self
             .store
-            .note(|state| state.wickets.gone.remove(&wicket.name));
+            .note(|state| state.wickets.gone.remove(&wicket.name))
+            .await;
         if gone {
             println!(
                 "CELL: {} has answered for {}s: placed on again",
@@ -2749,24 +2790,28 @@ mod tests {
         let wickets = ["a".to_string(), "b".to_string()];
         let runs = wickets.iter().cloned().map(|name| (name, Runtime::Wasm));
         let localhost = ["localhost".into()];
-        let store = Store::open(&dir, "o", "s", &localhost, &wickets, &runs.collect()).unwrap();
-        let guid = store.update(|state| {
-            let space = state.spaces[0].guid.clone();
-            let domain = state.domains[0].guid.clone();
-            let app = state.create_app("hello", &space);
-            app.process.instances = 2;
-            app.started = true;
-            app.running = Some(Running {
-                sha256: "ab".repeat(32),
-                file: "hello.wasm".into(),
-                memory_mib: 64,
-                ..Running::default()
-            });
-            let guid = app.guid.clone();
-            let route = state.create_route("hello", &domain, &space).guid.clone();
-            state.map(&route, &guid);
-            guid
-        });
+        let runs = runs.collect();
+        let store = Store::open(&dir, "o", "s", &localhost, &wickets, &runs, None);
+        let store = store.await.unwrap();
+        let guid = store
+            .update(|state| {
+                let space = state.spaces[0].guid.clone();
+                let domain = state.domains[0].guid.clone();
+                let app = state.create_app("hello", &space);
+                app.process.instances = 2;
+                app.started = true;
+                app.running = Some(Running {
+                    sha256: "ab".repeat(32),
+                    file: "hello.wasm".into(),
+                    memory_mib: 64,
+                    ..Running::default()
+                });
+                let guid = app.guid.clone();
+                let route = state.create_route("hello", &domain, &space).guid.clone();
+                state.map(&route, &guid);
+                guid
+            })
+            .await;
         let shares =
             store.read(|state| Controller::desired(state, state.app(&guid).unwrap(), crate::OWNER));
         assert_eq!(shares.keys().collect::<Vec<_>>(), ["a", "b"]);

@@ -1066,6 +1066,28 @@ docker compose up -d --force-recreate --wait wicket-a
 docker compose up -d --force-recreate --wait wicket-b
 ```
 
+## The state in PostgreSQL
+
+`--state postgres://user:password@host:5432/database` keeps the state in PostgreSQL in place of
+`state.json`: the store several instances are to share. The packages, the droplets, the logins
+and the reconciling of the wickets are one process's still: run one instance on it.
+
+- its tables (`sluice_cf_records`: a row per organization, app, route, package, ..., its JSON as
+  `state.json` has it; `sluice_cf_meta`: the revision; `sluice_cf_commits`: who committed each)
+  are made at the first start, in the schema of the user's `search_path`
+- an empty store takes `--data-dir`'s `state.json`, once (`STATE: ... taken into the store`); the
+  file stays as it was and is written no more. Nothing writes a store back to a file
+- a change is a transaction holding the revision's lock: it sees every change before it, of any
+  instance, and writes the rows it changed. It is answered once committed; while the store does
+  not answer a change waits for it, and a new request is answered 503 (`/healthz` too)
+- the reads are answered from a copy in memory, brought to the store's revision at each
+  request's start (one query) and as the others commit (`LISTEN`)
+- TLS as the URL says (`sslmode=require`; libpq's default `prefer` goes on without where the
+  server has none), the server verified against `--state-ca-cert`, else the webPKI roots
+
+Run against PostgreSQL 18; what it costs is in
+[.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#the-states-store).
+
 ## Options
 
 | option | |
@@ -1075,7 +1097,9 @@ docker compose up -d --force-recreate --wait wicket-b
 | `--wicket-token <token>` / `--wicket-token-file <path>` | their `--console-token`, one for all |
 | `--wicket-away-grace <secs>` | of several wickets, one not answering that long is gone: placed on no more, the indices on it started on the others, until it has answered as long again ([Several wickets](#several-wickets); default 30, 0 = never) |
 | `--domain <name>` | a shared domain; repeatable (or comma-separated): the first takes the default and random routes (default `localhost`). Through a sluice server, a suffix whose wildcard DNS reaches it |
-| `--data-dir <path>` | the state and the blobs (default `cf-api`), one process's (an exclusive `flock` of its `.lock`: a second start on it fails): `state.json` (written by a rename on every change), `jwt.key` and `sessions.json` (the logins), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app), `droplets/<sha256>.tar` (a static site's files, a droplet buildpacks built) |
+| `--data-dir <path>` | the state and the blobs (default `cf-api`), one process's (an exclusive `flock` of its `.lock`: a second start on it fails): `state.json` (written by a rename on every change; not with `--state`), `jwt.key` and `sessions.json` (the logins), `packages/<guid>.zip` (the newest per app), `droplets/<sha256>.wasm` (the current and the previous per app), `droplets/<sha256>.tar` (a static site's files, a droplet buildpacks built) |
+| `--state <url>` / `--state-file <path>` | the state in PostgreSQL in place of `--data-dir`'s `state.json` ([The state in PostgreSQL](#the-state-in-postgresql)): `postgres://user:password@host:port/database`, with libpq's parameters |
+| `--state-ca-cert <path>` | PEM CA verifying it (default the webPKI roots) |
 | `--org <name>` / `--space <name>` | the organization and its space the first start makes (default `sluice` / `wicket`) |
 | `--cnb-builder <image>` | the Cloud Native Buildpacks builder staging a zip of source on a Firecracker wicket with `--guest` ([Buildpacks](#buildpacks): `cnb`); none: a zip of source fails staging |
 | `--cnb-builder-username <name>` / `--cnb-builder-password <password>` / `--cnb-builder-password-file <path>` | its registry's credentials, its run image's too where that is of the same registry |
@@ -1512,7 +1536,9 @@ PATH, never a `cf` that may be the Tanzu one -- against the cf-api and a wicket 
 on a flume, then two, building the wicket and its example guests from `../sluice-wicket-runtime-wasi` and the
 flume from `../sluice-flume` (or taking `SLUICE_WICKET_RUNTIME_WASI`, `SLUICE_WICKET_GUESTS` and
 `SLUICE_FLUME`); the login through a provider runs against a mock of one in the test, with TLS
-of the cf-api's own, and the images against a registry in the test (`tests/registry`). Where
+of the cf-api's own, and the images against a registry in the test (`tests/registry`). The
+store's tests (`store::tests`) run a PostgreSQL in a container (`postgres:18-alpine`, Docker on
+the PATH), or the one `SLUICE_CF_API_TEST_POSTGRES` names. Where
 `/dev/kvm` is usable, with Firecracker and a guest kernel (as the wicket's VM test finds them), a
 second test runs against `../sluice-wicket-runtime-firecracker` (`sg kvm -c 'cargo test'` until
 the `kvm` group is in the login), source staged by a sample buildpack where the lifecycle and

@@ -163,7 +163,7 @@ async fn session(
                 event = events.message() => match event {
                     Ok(Some(event)) => {
                         if let Some(body) = event.body {
-                            taker.take(body);
+                            taker.take(body).await;
                         }
                     }
                     Ok(None) => break Some("the flume ended the watch".into()),
@@ -175,10 +175,10 @@ async fn session(
                         break None;
                     }
                 }
-                _ = keep.tick() => taker.keep(),
+                _ = keep.tick() => taker.keep().await,
             }
         };
-        taker.keep();
+        taker.keep().await;
         if let Some(e) = ended {
             return Err(e);
         }
@@ -211,7 +211,7 @@ struct Taker<'a> {
 }
 
 impl Taker<'_> {
-    fn take(&mut self, event: watch_event::Body) {
+    async fn take(&mut self, event: watch_event::Body) {
         match event {
             watch_event::Body::Hello(hello) => {
                 if hello.reset {
@@ -219,13 +219,13 @@ impl Taker<'_> {
                 }
                 if self.epoch != hello.epoch {
                     // a position of another run: none until a line of this one
-                    self.store.note(|state| state.flume = None);
+                    self.store.note(|state| state.flume = None).await;
                     self.moved = true;
                     self.epoch = hello.epoch;
                 }
             }
             watch_event::Body::Record(record) => {
-                self.advance(record.seq);
+                self.advance(record.seq).await;
                 let Some(event) = record.event else {
                     return;
                 };
@@ -255,7 +255,7 @@ impl Taker<'_> {
             }
             watch_event::Body::Gap(gap) => {
                 if gap.seq > 0 {
-                    self.advance(gap.seq);
+                    self.advance(gap.seq).await;
                 }
                 let dropped = gap.dropped;
                 match gap.cause() {
@@ -271,19 +271,19 @@ impl Taker<'_> {
     }
 
     /// Moves the cursor to the line `seq` of the flume.
-    fn advance(&mut self, seq: u64) {
+    async fn advance(&mut self, seq: u64) {
         let cursor = FlumeCursor {
             epoch: self.epoch,
             seq,
         };
-        self.store.note(|state| state.flume = Some(cursor));
+        self.store.note(|state| state.flume = Some(cursor)).await;
         self.moved = true;
     }
 
     /// Writes the cursor moved.
-    fn keep(&mut self) {
+    async fn keep(&mut self) {
         if std::mem::take(&mut self.moved) {
-            self.store.update(|_| ());
+            self.store.update(|_| ()).await;
         }
     }
 
@@ -458,30 +458,38 @@ mod tests {
     /// wicket's place. The lines lost reach every app watched -- a sluice
     /// node's drops none of them, a wicket's those it holds indices of -- and
     /// the cursor follows the lines taken, of the flume's run at hand.
-    #[test]
-    fn lines_reach_the_app_of_their_host_and_losses_every_app() {
+    #[tokio::test]
+    async fn lines_reach_the_app_of_their_host_and_losses_every_app() {
         let dir = std::env::temp_dir().join(format!("sluice-cf-api-flume-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let localhost = ["localhost".to_string()];
         let wickets = ["a".to_string(), "b".to_string()];
-        let store = Store::open(&dir, "o", "s", &localhost, &wickets, &BTreeMap::new()).unwrap();
-        store.update(|state| {
-            state.flume = Some(FlumeCursor { epoch: 1, seq: 9 });
-        });
+        let runs = BTreeMap::new();
+        let store = Store::open(&dir, "o", "s", &localhost, &wickets, &runs, None);
+        let store = store.await.unwrap();
+        store
+            .update(|state| {
+                state.flume = Some(FlumeCursor { epoch: 1, seq: 9 });
+            })
+            .await;
         // its index 0 on a, 1 on b
-        let scaled = store.update(|state| {
-            let space = state.spaces[0].guid.clone();
-            let app = state.create_app("scaled", &space);
-            app.process.instances = 2;
-            app.guid.clone()
-        });
-        store.note(|state| {
-            state.wickets.nodes = [
-                ("wicket:a".to_string(), "a".to_string()),
-                ("wicket:b".to_string(), "b".to_string()),
-            ]
-            .into()
-        });
+        let scaled = store
+            .update(|state| {
+                let space = state.spaces[0].guid.clone();
+                let app = state.create_app("scaled", &space);
+                app.process.instances = 2;
+                app.guid.clone()
+            })
+            .await;
+        store
+            .note(|state| {
+                state.wickets.nodes = [
+                    ("wicket:a".to_string(), "a".to_string()),
+                    ("wicket:b".to_string(), "b".to_string()),
+                ]
+                .into()
+            })
+            .await;
         let logs = Logs::default();
         let mut taker = Taker {
             store: &store,
@@ -495,19 +503,25 @@ mod tests {
             epoch: 1,
             moved: false,
         };
-        taker.take(watch_event::Body::Hello(WatchHello {
-            epoch: 2,
-            reset: true,
-            build: None,
-        }));
+        taker
+            .take(watch_event::Body::Hello(WatchHello {
+                epoch: 2,
+                reset: true,
+                build: None,
+            }))
+            .await;
         assert_eq!(store.read(|state| state.flume), None, "another run's");
-        taker.take(event(
-            1,
-            "stdout",
-            "a.localhost",
-            &[("instance", "1"), ("line", "out")],
-        ));
-        taker.take(event(2, "stderr", "hi.localhost", &[("line", "err")]));
+        taker
+            .take(event(
+                1,
+                "stdout",
+                "a.localhost",
+                &[("instance", "1"), ("line", "out")],
+            ))
+            .await;
+        taker
+            .take(event(2, "stderr", "hi.localhost", &[("line", "err")]))
+            .await;
         let response = |seq: u64, host: &str, status: &str, instance: Option<&str>| {
             let mut fields = vec![
                 ("method", "GET"),
@@ -522,18 +536,28 @@ mod tests {
             fields.extend(instance.map(|instance| ("instance", instance)));
             event(seq, "response", host, &fields)
         };
-        taker.take(response(3, "b.localhost", "200", Some("1")));
-        taker.take(response(4, "b.localhost", "503", None));
-        taker.take(event(
-            5,
-            "stdout",
-            "c.localhost",
-            &[("line", "not watched")],
-        ));
-        taker.take(gap("node-0", watch_gap::Cause::NodeDropped));
-        taker.take(gap("wicket:x", watch_gap::Cause::NodeDropped));
-        taker.take(gap("wicket:b", watch_gap::Cause::NodeDropped));
-        taker.take(gap("", watch_gap::Cause::Behind));
+        taker
+            .take(response(3, "b.localhost", "200", Some("1")))
+            .await;
+        taker.take(response(4, "b.localhost", "503", None)).await;
+        taker
+            .take(event(
+                5,
+                "stdout",
+                "c.localhost",
+                &[("line", "not watched")],
+            ))
+            .await;
+        taker
+            .take(gap("node-0", watch_gap::Cause::NodeDropped))
+            .await;
+        taker
+            .take(gap("wicket:x", watch_gap::Cause::NodeDropped))
+            .await;
+        taker
+            .take(gap("wicket:b", watch_gap::Cause::NodeDropped))
+            .await;
+        taker.take(gap("", watch_gap::Cause::Behind)).await;
 
         let lost = |text: &str| ("LGR", 0, Stream::Err, text.to_string());
         let restarted = lost("Lines may be missing: the flume restarted");
@@ -579,20 +603,26 @@ mod tests {
         );
         // b's instance past its share, a's request of one past it, b's request: named as
         // `cf app` lists them, each request by its wicket's router
-        taker.take(of(
-            "wicket:b",
-            event(
-                6,
-                "stdout",
-                "scaled.localhost",
-                &[("instance", "3"), ("line", "past")],
-            ),
-        ));
-        taker.take(response(7, "scaled.localhost", "200", Some("5")));
-        taker.take(of(
-            "wicket:b",
-            response(8, "scaled.localhost", "200", Some("0")),
-        ));
+        taker
+            .take(of(
+                "wicket:b",
+                event(
+                    6,
+                    "stdout",
+                    "scaled.localhost",
+                    &[("instance", "3"), ("line", "past")],
+                ),
+            ))
+            .await;
+        taker
+            .take(response(7, "scaled.localhost", "200", Some("5")))
+            .await;
+        taker
+            .take(of(
+                "wicket:b",
+                response(8, "scaled.localhost", "200", Some("0")),
+            ))
+            .await;
         let of_scaled = lines(&logs, &scaled);
         let shown: Vec<_> = (of_scaled.iter())
             .map(|(source, index, _, text)| (*source, *index, text.rsplit(' ').next().unwrap()))

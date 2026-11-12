@@ -37,3 +37,10 @@ A blob store interface: the directory (one instance) and an S3-compatible bucket
 The blob tests against both backends (an S3 mock in process or MinIO as a child process); a
 package uploaded through one `Store` staged through another; a droplet dropped while it is read
 is still read.
+
+## From 275
+
+`Store::open` still sweeps `--data-dir` (`.upload` / `.tmp` / `.droplet`) with `--state` too: the
+directory is one process's (its `flock`), so the sweep is of its own files until the blobs leave
+it. `Store::update`'s closures are `Fn`, run again on a connection lost: one returning `Vec<Blob>`
+is safe, the delete after it is what moves to the leader.

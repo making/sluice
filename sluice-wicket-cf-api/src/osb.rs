@@ -374,7 +374,7 @@ fn quoted(bytes: &[u8]) -> String {
 
 /// An offering of a catalog, less its plans, and its plans: the objects as
 /// the broker gave them.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct CatalogOffering {
     pub offering: Map<String, Value>,
     pub plans: Vec<Map<String, Value>>,

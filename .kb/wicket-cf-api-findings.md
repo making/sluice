@@ -12,6 +12,41 @@ The cf-api in a VM of the wicket, on its disk (its README,
 - its VM killed: the API back in 782ms, an app answering throughout (16 of 16 requests), its state
   there
 
+## The state's store
+
+`--state` (PostgreSQL) beside the directory's `state.json`. Decided against the alternatives:
+
+- a row per entity, but one lock for every change (the revision's row, `SELECT ... FOR UPDATE`),
+  not a version per row: the changes are closures over the whole state (`State::place` over all
+  apps, a droplet's blob dropped when no app's droplet names it, a name unique in its space), so
+  two of them on two rows are not independent, and a version per row would let through what one
+  process's lock never did. Under the one lock a change runs once, on the state as it is, and is
+  tried again only for a connection lost; what a row per entity gives is the write (the rows
+  changed) and the others' catch-up (the rows of a later revision)
+- the reads from a copy in memory, not from the store: every handler reads through closures
+  over `&State`. The copy is
+  never ahead (a change is in it once committed) and a request first asks for the revision, so
+  it sees what any instance answered before it
+
+Measured on one host (release build, PostgreSQL 18 in a container with its default `fsync`,
+through Docker's port proxy; 1000 apps, each with a route, a package, a build and a droplet:
+5000 rows):
+
+| | `state.json` | PostgreSQL |
+|---|---|---|
+| an edit of one app (median / p99) | 27.7 / 64.4 ms | 8.2 / 17.7 ms |
+| a request's revision query | none | 0.25 / 0.31 ms |
+| a read of every app (`cf apps`' walk) | 8 us | 8 us |
+| the 5000 rows written at once | 48 ms | 205 ms |
+| a second instance's start (all rows read) | | 127 ms |
+| an edit seen by the other instance | | 10.4 / 15.0 ms |
+| an edit, two instances editing at once | | 8.4 ms each |
+
+An edit in PostgreSQL is its commit plus a copy of the state (7 ms of the 8: the change runs on
+a copy, compared with the one before for the rows to write); the file's is the whole document
+written and synced. Both grow with the state, not with the change; no cache of the reads is
+needed.
+
 ## A stop
 
 The release binary on the host (`--wicket` unreachable), SIGTERM to its exit: idle, 11-13ms. A

@@ -457,6 +457,15 @@ impl State {
     /// nowhere to go stay, as they all do with its keyvalue data there. Of a started app only, its
     /// indices moving already moving on.
     pub fn evacuate(&mut self, guid: &str, from: &str) -> Evacuated {
+        let evacuated = self.evacuation(guid, from);
+        if let Some(app) = self.app_mut(guid) {
+            app.moving.extend(evacuated.moves.iter().cloned());
+        }
+        evacuated
+    }
+
+    /// What [`State::evacuate`] would make of the indices of the app `guid` on `from`.
+    pub fn evacuation(&self, guid: &str, from: &str) -> Evacuated {
         let Some(app) = self.app(guid).filter(|app| takes_room(app)) else {
             return Evacuated::default();
         };
@@ -499,8 +508,6 @@ impl State {
                 None => stay.push(index),
             }
         }
-        let app = self.app_mut(guid).expect("read above");
-        app.moving.extend(moves.iter().cloned());
         Evacuated { moves, stay, why }
     }
 

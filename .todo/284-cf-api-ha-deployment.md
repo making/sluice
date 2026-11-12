@@ -48,3 +48,10 @@ it has. Added to it:
   time
 
 CI: PostgreSQL and the S3 mock for the job running it.
+
+## From 275
+
+A request is answered 503 (`CF-ServiceUnavailable`) while the store does not answer within 5s
+(`Store::sync`), `/healthz` too; a change under way waits for it. The store's tests run
+`postgres:18-alpine` in a container (`tests/support/postgres_server.rs`, or
+`SLUICE_CF_API_TEST_POSTGRES`): the CLI test's PostgreSQL is that one.

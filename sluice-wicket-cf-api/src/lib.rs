@@ -35,6 +35,8 @@ pub mod osb;
 pub use sluice_wicket_oidc as oidc;
 pub mod orgs;
 pub mod placement;
+pub mod postgres;
+mod records;
 pub mod registry;
 pub mod roles;
 pub mod security_groups;
@@ -113,6 +115,9 @@ pub struct Settings {
     pub domains: Vec<String>,
     /// The state, the packages and the droplets.
     pub data_dir: PathBuf,
+    /// The store of the state in place of the directory's (`crate::postgres`): several
+    /// instances'.
+    pub state: Option<postgres::PostgresSettings>,
     pub org: String,
     pub space: String,
     /// The builder staging source (`crate::staging`); None: no source is staged.
@@ -259,14 +264,18 @@ pub async fn serve(
     // what the wickets answering run: an index on a wicket no --wicket names any more is
     // placed again by it at once
     let runs = controller::stacks_of(&wickets(&settings)).await;
-    let store = Arc::new(store::Store::open(
-        &settings.data_dir,
-        &settings.org,
-        &settings.space,
-        &settings.domains,
-        &names,
-        &runs,
-    )?);
+    let store = Arc::new(
+        store::Store::open(
+            &settings.data_dir,
+            &settings.org,
+            &settings.space,
+            &settings.domains,
+            &names,
+            &runs,
+            settings.state.as_ref(),
+        )
+        .await?,
+    );
     let mode = match &settings.oidc {
         Some(oidc) => uaa::Mode::Provider {
             clients: settings.clients.clone(),
@@ -350,7 +359,7 @@ pub async fn serve(
         flume.abort();
     }
     // what was noted, the flume watch's cursor as it got
-    store.update(|_| ());
+    store.update(|_| ()).await;
     Ok(())
 }
 
@@ -391,6 +400,7 @@ mod tests {
             wicket_away_grace: std::time::Duration::ZERO,
             domains: vec!["apps.test".into()],
             data_dir,
+            state: None,
             org: "org".into(),
             space: "space".into(),
             cnb: None,

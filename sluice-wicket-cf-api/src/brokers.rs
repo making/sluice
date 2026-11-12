@@ -463,12 +463,14 @@ impl Api {
         let catalog = match self.osb.catalog(&endpoint).await {
             Ok(catalog) => catalog,
             Err(e) => {
-                return self.job(
-                    req,
-                    "service_broker.catalog.synchronize",
-                    vec![failed(e)],
-                    None,
-                );
+                return self
+                    .job(
+                        req,
+                        "service_broker.catalog.synchronize",
+                        vec![failed(e)],
+                        None,
+                    )
+                    .await;
             }
         };
         let at = now();
@@ -485,13 +487,15 @@ impl Api {
         };
         reconcile(&mut broker, catalog, &BTreeSet::new());
         let path = format!("/v3/service_brokers/{}", broker.guid);
-        self.store.update(|state| {
-            if taken(state, &name, None) {
-                return Err(name_taken(&name));
-            }
-            state.brokers.push(broker.clone());
-            Ok(())
-        })?;
+        self.store
+            .update(|state| {
+                if taken(state, &name, None) {
+                    return Err(name_taken(&name));
+                }
+                state.brokers.push(broker.clone());
+                Ok(())
+            })
+            .await?;
         println!(
             "SERVICE BROKERS: {editor}: registered {name} at {} ({} offering(s))",
             broker.url,
@@ -503,6 +507,7 @@ impl Api {
             Vec::new(),
             Some(("service_brokers".into(), path)),
         )
+        .await
     }
 
     /// A new name applies at once (200); a new URL or new credentials fetch
@@ -517,18 +522,21 @@ impl Api {
             return Err(name_taken(name));
         }
         if given.url.is_none() && given.credentials.is_none() {
-            let view = self.store.update(|state| {
-                let broker = state
-                    .brokers
-                    .iter_mut()
-                    .find(|broker| broker.guid == guid)
-                    .ok_or_else(|| ApiError::not_found("Service broker"))?;
-                if let Some(name) = given.name {
-                    broker.name = name;
-                    broker.updated_at = now();
-                }
-                Ok::<_, ApiError>(view(&req.base, broker))
-            })?;
+            let view = self
+                .store
+                .update(|state| {
+                    let broker = state
+                        .brokers
+                        .iter_mut()
+                        .find(|broker| broker.guid == guid)
+                        .ok_or_else(|| ApiError::not_found("Service broker"))?;
+                    if let Some(name) = &given.name {
+                        broker.name.clone_from(name);
+                        broker.updated_at = now();
+                    }
+                    Ok::<_, ApiError>(view(&req.base, broker))
+                })
+                .await?;
             println!("SERVICE BROKERS: {editor}: renamed {}", view["name"]);
             return Ok(respond(StatusCode::OK, &view));
         }
@@ -545,70 +553,89 @@ impl Api {
         }
         let catalog = match self.osb.catalog(&endpoint).await {
             Ok(catalog) => catalog,
-            Err(e) => return self.job(req, "service_broker.update", vec![failed(e)], None),
-        };
-        let (name, warnings) = self.store.update(|state| {
-            let in_use = in_use(state);
-            let broker = state
-                .brokers
-                .iter_mut()
-                .find(|broker| broker.guid == guid)
-                .ok_or_else(|| ApiError::not_found("Service broker"))?;
-            if let Some(name) = given.name {
-                broker.name = name;
+            Err(e) => {
+                return self
+                    .job(req, "service_broker.update", vec![failed(e)], None)
+                    .await;
             }
-            broker.url = endpoint.url;
-            broker.username = endpoint.username;
-            broker.password = endpoint.password;
-            let warnings = reconcile(broker, catalog, &in_use);
-            Ok::<_, ApiError>((broker.name.clone(), warnings))
-        })?;
+        };
+        let (name, warnings) = self
+            .store
+            .update(|state| {
+                let in_use = in_use(state);
+                let broker = state
+                    .brokers
+                    .iter_mut()
+                    .find(|broker| broker.guid == guid)
+                    .ok_or_else(|| ApiError::not_found("Service broker"))?;
+                if let Some(name) = &given.name {
+                    broker.name.clone_from(name);
+                }
+                broker.url = endpoint.url.clone();
+                broker.username = endpoint.username.clone();
+                broker.password = endpoint.password.clone();
+                let warnings = reconcile(broker, catalog.clone(), &in_use);
+                Ok::<_, ApiError>((broker.name.clone(), warnings))
+            })
+            .await?;
         println!("SERVICE BROKERS: {editor}: updated {name} and its catalog");
-        let job = self.store.update(|state| {
-            let job = state.add_job(
-                "service_broker.update",
-                Vec::new(),
-                Some((
-                    "service_brokers".into(),
-                    format!("/v3/service_brokers/{guid}"),
-                )),
-            );
-            state.job_mut(&job).expect("just added").warnings = warnings;
-            job
-        });
+        let job = self
+            .store
+            .update(|state| {
+                let job = state.add_job(
+                    "service_broker.update",
+                    Vec::new(),
+                    Some((
+                        "service_brokers".into(),
+                        format!("/v3/service_brokers/{guid}"),
+                    )),
+                );
+                state.job_mut(&job).expect("just added").warnings = warnings.clone();
+                job
+            })
+            .await;
         Ok(self.located(req, &job))
     }
 
     /// Refused while its plans have instances, as on CC.
     async fn delete_broker(&self, req: &Req, guid: &str) -> Reply {
         let editor = self.editor(req, &self.service_broker_editors, EDITORS)?;
-        let name = self.store.update(|state| {
-            let broker = state
-                .broker(guid)
-                .ok_or_else(|| ApiError::not_found("Service broker"))?;
-            let instances: Vec<&str> = state
-                .instances
-                .iter()
-                .filter(|instance| instance.broker.as_deref() == Some(guid))
-                .map(|instance| instance.name.as_str())
-                .collect();
-            if !instances.is_empty() {
-                return Err(ApiError::unprocessable(format!(
-                    "Can not remove brokers that have associated service instances: {}",
-                    instances.join(", ")
-                )));
-            }
-            let name = broker.name.clone();
-            state.brokers.retain(|broker| broker.guid != guid);
-            Ok(name)
-        })?;
+        let name = self
+            .store
+            .update(|state| {
+                let broker = state
+                    .broker(guid)
+                    .ok_or_else(|| ApiError::not_found("Service broker"))?;
+                let instances: Vec<&str> = state
+                    .instances
+                    .iter()
+                    .filter(|instance| instance.broker.as_deref() == Some(guid))
+                    .map(|instance| instance.name.as_str())
+                    .collect();
+                if !instances.is_empty() {
+                    return Err(ApiError::unprocessable(format!(
+                        "Can not remove brokers that have associated service instances: {}",
+                        instances.join(", ")
+                    )));
+                }
+                let name = broker.name.clone();
+                state.brokers.retain(|broker| broker.guid != guid);
+                Ok(name)
+            })
+            .await?;
         println!("SERVICE BROKERS: {editor}: deleted {name}");
         self.job(req, "service_broker.delete", Vec::new(), None)
+            .await
     }
 
     /// `/v3/service_plans/<guid>/visibility[/<org>]` of a broker's plan;
     /// `None`: not one.
-    pub(crate) fn plan_visibility(&self, req: &Req, plan: &str, rest: &[&str]) -> Option<Reply> {
+    pub(crate) async fn plan_visibility(
+        &self,
+        req: &Req,
+        plan: &str,
+        rest: &[&str],
+    ) -> Option<Reply> {
         let found = self.store.read(|state| {
             state.brokered(plan).map(|brokered| {
                 (
@@ -619,8 +646,8 @@ impl Api {
         })?;
         let reply = match (&req.method, rest) {
             (&Method::GET, []) => Ok(respond(StatusCode::OK, &found.0)),
-            (&Method::POST | &Method::PATCH, []) => self.set_visibility(req, plan, found.1),
-            (&Method::DELETE, [org]) => self.unset_visibility(req, plan, org),
+            (&Method::POST | &Method::PATCH, []) => self.set_visibility(req, plan, found.1).await,
+            (&Method::DELETE, [org]) => self.unset_visibility(req, plan, org).await,
             _ => Err(ApiError::unknown(&req.method, &req.path)),
         };
         Some(reply)
@@ -628,7 +655,7 @@ impl Api {
 
     /// `public`, `admin`, or `organization`, of the organizations named: appended to those
     /// before (POST) or replacing them (PATCH).
-    fn set_visibility(&self, req: &Req, plan: &str, space_scoped: bool) -> Reply {
+    async fn set_visibility(&self, req: &Req, plan: &str, space_scoped: bool) -> Reply {
         let editor = self.editor(req, &self.service_broker_editors, EDITORS)?;
         if space_scoped {
             return Err(ApiError::unprocessable(
@@ -660,52 +687,59 @@ impl Api {
             }
         };
         let append = req.method == Method::POST;
-        let view = self.store.update(|state| {
-            if let Some(unknown) = named.iter().find(|guid| state.org(guid).is_none()) {
-                return Err(ApiError::unprocessable(format!(
-                    "Could not find Organizations with guids: [\"{unknown}\"]"
-                )));
-            }
-            let plan = plan_mut(state, plan).ok_or_else(|| ApiError::not_found("Service plan"))?;
-            match wanted.as_str() {
-                "organization" => {
-                    if !append || plan.visibility != "organization" {
-                        plan.orgs.clear();
-                    }
-                    for org in &named {
-                        if !plan.orgs.contains(org) {
-                            plan.orgs.push(org.clone());
+        let view = self
+            .store
+            .update(|state| {
+                if let Some(unknown) = named.iter().find(|guid| state.org(guid).is_none()) {
+                    return Err(ApiError::unprocessable(format!(
+                        "Could not find Organizations with guids: [\"{unknown}\"]"
+                    )));
+                }
+                let plan =
+                    plan_mut(state, plan).ok_or_else(|| ApiError::not_found("Service plan"))?;
+                match wanted.as_str() {
+                    "organization" => {
+                        if !append || plan.visibility != "organization" {
+                            plan.orgs.clear();
+                        }
+                        for org in &named {
+                            if !plan.orgs.contains(org) {
+                                plan.orgs.push(org.clone());
+                            }
                         }
                     }
+                    _ => plan.orgs.clear(),
                 }
-                _ => plan.orgs.clear(),
-            }
-            plan.visibility.clone_from(&wanted);
-            plan.updated_at = now();
-            let plan = plan.clone();
-            Ok::<_, ApiError>(visibility_view(state, &plan))
-        })?;
+                plan.visibility.clone_from(&wanted);
+                plan.updated_at = now();
+                let plan = plan.clone();
+                Ok::<_, ApiError>(visibility_view(state, &plan))
+            })
+            .await?;
         println!("SERVICE BROKERS: {editor}: plan {plan} visible to {wanted}");
         Ok(respond(StatusCode::OK, &view))
     }
 
     /// The organization's access removed: an organization's plan of none is no one's (`admin`).
-    fn unset_visibility(&self, req: &Req, plan: &str, org: &str) -> Reply {
+    async fn unset_visibility(&self, req: &Req, plan: &str, org: &str) -> Reply {
         let editor = self.editor(req, &self.service_broker_editors, EDITORS)?;
-        self.store.update(|state| {
-            if state.org(org).is_none() {
-                return Err(ApiError::not_found("Organization"));
-            }
-            let plan = plan_mut(state, plan).ok_or_else(|| ApiError::not_found("Service plan"))?;
-            if plan.visibility == "organization" {
-                plan.orgs.retain(|kept| kept != org);
-                if plan.orgs.is_empty() {
-                    plan.visibility = "admin".into();
+        self.store
+            .update(|state| {
+                if state.org(org).is_none() {
+                    return Err(ApiError::not_found("Organization"));
                 }
-                plan.updated_at = now();
-            }
-            Ok(())
-        })?;
+                let plan =
+                    plan_mut(state, plan).ok_or_else(|| ApiError::not_found("Service plan"))?;
+                if plan.visibility == "organization" {
+                    plan.orgs.retain(|kept| kept != org);
+                    if plan.orgs.is_empty() {
+                        plan.visibility = "admin".into();
+                    }
+                    plan.updated_at = now();
+                }
+                Ok(())
+            })
+            .await?;
         println!(
             "SERVICE BROKERS: {editor}: plan {plan} no longer visible to the organization {org}"
         );
@@ -715,7 +749,11 @@ impl Api {
     /// `DELETE /v3/service_offerings/<guid>` of a broker's offering:
     /// refused while it has instances, or with `purge=true` dropping them
     /// and their bindings, the broker not asked. `None`: not one.
-    pub(crate) fn delete_offering(&self, req: &Req, guid: &str) -> Option<Result<(), ApiError>> {
+    pub(crate) async fn delete_offering(
+        &self,
+        req: &Req,
+        guid: &str,
+    ) -> Option<Result<(), ApiError>> {
         self.store.read(|state| {
             state
                 .brokers
@@ -728,7 +766,7 @@ impl Api {
                 })
                 .then_some(())
         })?;
-        let deleted = (|| {
+        let deleted = async {
             let editor = self.editor(req, &self.service_broker_editors, EDITORS)?;
             let purge = req.q("purge") == Some("true");
             let (name, dropped) = self.store.update(|state| {
@@ -781,7 +819,7 @@ impl Api {
                     broker.offerings.retain(|offering| offering.guid != guid);
                 }
                 Ok::<_, ApiError>((name, dropped))
-            })?;
+            }).await?;
             for (app, instance) in dropped {
                 self.logs.add(
                     &app,
@@ -793,7 +831,8 @@ impl Api {
             }
             println!("SERVICE BROKERS: {editor}: deleted service offering {name}");
             Ok(())
-        })();
+        }
+        .await;
         Some(deleted)
     }
 }

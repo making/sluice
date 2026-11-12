@@ -3,8 +3,9 @@
 //! on a wicket: `crate::placement`) and environment variables, the routes,
 //! packages, builds, droplets, deployments and jobs, the service brokers
 //! registered with their catalogs, the service instances and their bindings.
-//! In memory, written by a rename to `state.json` in the
-//! data directory on every change; the blobs next to it
+//! Kept in `state.json` in the data directory, written by a rename on every change, or with
+//! `--state` in the store several instances share (`crate::postgres`); the blobs in the
+//! directory
 //! (`packages/<guid>.zip`, `droplets/<sha256>.wasm`, a static site's files
 //! `droplets/<sha256>.tar`). Every file is its
 //! owner's only (0600): the state holds the apps' environment and the
@@ -13,11 +14,13 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
+use crate::postgres::{Postgres, PostgresSettings, Shared, Writer};
 use crate::staging::Buildpack;
 use crate::wicket::Runtime;
 
@@ -1879,25 +1882,62 @@ pub enum Blob {
     Files(String),
 }
 
-/// The state under a lock, written to the data directory on every change.
+/// How long a request waits for the store's revision (`Store::sync`).
+const SYNC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// The state: a copy the reads are answered from, changed one change at a time, each written
+/// before it is seen. Kept in `state.json` of the data directory, written whole on every
+/// change: one process's (`crate::check_data_dir`); or, with `--state`, in PostgreSQL
+/// (`crate::postgres`): the store of several, the copy following what the others commit.
 pub struct Store {
     dir: PathBuf,
-    state: Mutex<State>,
-    /// Signalled on every change written (`changed`).
-    changes: tokio::sync::Notify,
+    shared: Arc<Shared>,
+    /// Held by the one changing the copy.
+    writer: Arc<tokio::sync::Mutex<Writer>>,
+    postgres: Option<Arc<Postgres>>,
+    /// Follows the others' commits.
+    listener: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for Store {
+    fn drop(&mut self) {
+        if let Some(listener) = &self.listener {
+            listener.abort();
+        }
+    }
+}
+
+/// The state `file` keeps, as a start takes it: None without the file.
+fn kept(file: &Path, domains: &[String]) -> Result<Option<State>, String> {
+    match std::fs::read(file) {
+        Ok(json) => {
+            let mut state: State =
+                serde_json::from_slice(&json).map_err(|e| format!("{}: {e}", file.display()))?;
+            state.migrate();
+            state.follow_domains(domains);
+            state.fail_unfinished_builds();
+            state.settle_unfinished_waits();
+            Ok(Some(state))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(format!("{}: {e}", file.display())),
+    }
 }
 
 impl Store {
-    /// Opens the data directory: the state kept there, else a new one, its apps placed on the
-    /// `wickets` configured (`State::follow_wickets`, logged), of which those answering now run
-    /// `runs`, by name: an index is placed on a wicket of its app's stack.
-    pub fn open(
+    /// Opens the data directory and the state: the one kept in the directory, or with
+    /// `postgres` the store's (an empty store takes the directory's `state.json`, once); else
+    /// a new one. Its apps are placed on the `wickets` configured (`State::follow_wickets`,
+    /// logged), of which those answering now run `runs`, by name: an index is placed on a
+    /// wicket of its app's stack.
+    pub async fn open(
         dir: &Path,
         org: &str,
         space: &str,
         domains: &[String],
         wickets: &[String],
         runs: &BTreeMap<String, Runtime>,
+        postgres: Option<&PostgresSettings>,
     ) -> Result<Store, String> {
         for sub in ["packages", "droplets"] {
             std::fs::create_dir_all(dir.join(sub))
@@ -1918,59 +1958,138 @@ impl Store {
             }
         }
         let file = dir.join("state.json");
-        let mut state = match std::fs::read(&file) {
-            Ok(json) => {
-                let mut state: State = serde_json::from_slice(&json)
-                    .map_err(|e| format!("{}: {e}", file.display()))?;
-                state.migrate();
-                state.follow_domains(domains);
-                state.fail_unfinished_builds();
-                state.settle_unfinished_waits();
-                state
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => State::new(org, space, domains),
-            Err(e) => return Err(format!("{}: {e}", file.display())),
+        let mut store = Store {
+            dir: dir.to_path_buf(),
+            shared: Arc::default(),
+            writer: Arc::default(),
+            postgres: None,
+            listener: None,
         };
-        state.wickets.runtimes.extend(runs.clone());
-        for line in state.follow_wickets(wickets) {
+        let follow = |state: &mut State| {
+            state.follow_domains(domains);
+            state.wickets.runtimes.extend(runs.clone());
+            state.follow_wickets(wickets)
+        };
+        let Some(settings) = postgres else {
+            let mut state = match kept(&file, domains)? {
+                Some(state) => state,
+                None => State::new(org, space, domains),
+            };
+            for line in follow(&mut state) {
+                println!("{line}");
+            }
+            store.save(&state)?;
+            *store.shared.state.write().expect("no panic under the lock") = state;
+            return Ok(store);
+        };
+        let postgres = Arc::new(Postgres::new(settings)?);
+        let mut taken = false;
+        let first = || {
+            Ok(match kept(&file, domains)? {
+                Some(state) => {
+                    taken = true;
+                    state
+                }
+                None => State::new(org, space, domains),
+            })
+        };
+        let mut writer = store.writer.lock().await;
+        (postgres.load(&mut writer, &store.shared, first)).await?;
+        drop(writer);
+        if taken {
+            println!("STATE: {} taken into the store", file.display());
+        }
+        store.postgres = Some(postgres.clone());
+        // as the flags of this process have them: the same on every instance
+        for line in store.update(follow).await {
             println!("{line}");
         }
-        let store = Store {
-            dir: dir.to_path_buf(),
-            state: Mutex::new(state),
-            changes: tokio::sync::Notify::new(),
-        };
-        store.read(|state| store.save(state))?;
+        let (shared, writer) = (store.shared.clone(), store.writer.clone());
+        store.listener = Some(tokio::spawn(async move {
+            postgres.keep_listening(&shared, &writer).await;
+        }));
         Ok(store)
     }
 
     pub fn read<R>(&self, f: impl FnOnce(&State) -> R) -> R {
-        f(&self.state.lock().expect("no panic under the lock"))
+        f(&self.shared.state.read().expect("no panic under the lock"))
     }
 
-    /// Changes the state, its apps placed as they are by then (`State::place`), and writes it.
-    pub fn update<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
-        let mut state = self.state.lock().expect("no panic under the lock");
-        let result = f(&mut state);
-        state.place();
-        if let Err(e) = self.save(&state) {
-            eprintln!("cannot write the state: {e}");
-        }
-        drop(state);
-        self.changes.notify_one();
+    /// Changes the state, its apps placed as they are by then (`State::place`), and writes it:
+    /// seen by the reads once written. `f` does nothing but change the state it is given: with
+    /// `--state` it runs again when the store did not answer, on the state as it is then.
+    pub async fn update<R>(&self, f: impl Fn(&mut State) -> R) -> R {
+        let mut writer = self.writer.lock().await;
+        let result = match &self.postgres {
+            Some(postgres) => postgres.update(&mut writer, &self.shared, f).await,
+            None => {
+                let mut state = self.shared.state.write().expect("no panic under the lock");
+                let result = f(&mut state);
+                state.place();
+                if let Err(e) = self.save(&state) {
+                    eprintln!("cannot write the state: {e}");
+                }
+                result
+            }
+        };
+        drop(writer);
+        self.shared.changes.notify_one();
         result
     }
 
-    /// Resolves after an `update` since the last call resolved (at once
-    /// when one was made meanwhile); for one waiter.
+    /// Resolves after a change since the last call resolved, this process's or another's (at
+    /// once when one was made meanwhile); for one waiter.
     pub async fn changed(&self) {
-        self.changes.notified().await;
+        self.shared.changes.notified().await;
     }
 
-    /// Changes what is not kept (the wickets' outcomes, their budgets), or what is kept with the
-    /// next change written (how far a build of source was followed).
-    pub fn note<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
-        f(&mut self.state.lock().expect("no panic under the lock"))
+    /// Has the reads see what every instance committed by now: a request's first step, failing
+    /// while the store does not answer. Nothing to do without `--state`.
+    pub async fn sync(&self) -> Result<(), String> {
+        let Some(postgres) = &self.postgres else {
+            return Ok(());
+        };
+        let synced = async {
+            let ours = self.shared.rev.load(Ordering::Acquire);
+            if (postgres.rev().await).is_ok_and(|rev| rev <= ours) {
+                return Ok(());
+            }
+            let mut writer = self.writer.lock().await;
+            postgres.catch_up(&mut writer, &self.shared).await
+        };
+        match tokio::time::timeout(SYNC_TIMEOUT, synced).await {
+            Ok(synced) => synced,
+            Err(_) => Err("--state: no answer".to_string()),
+        }
+    }
+
+    /// Changes what is not kept (the wickets' outcomes, their budgets), or of what is kept
+    /// whole (`crate::records`: the flume's cursor, the stacks the wickets list) what the next
+    /// change may write. Nothing of the state's lists, which only a change writes.
+    pub async fn note<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
+        let _writer = self.writer.lock().await;
+        let mut state = self.shared.state.write().expect("no panic under the lock");
+        #[cfg(debug_assertions)]
+        let before = state.clone();
+        let result = f(&mut state);
+        #[cfg(debug_assertions)]
+        assert!(
+            crate::records::same_lists(&before, &state),
+            "a note changed what only an update writes"
+        );
+        result
+    }
+
+    /// Changes what the staging of the build `guid` under way keeps, written with the next
+    /// change (how far a build of source was followed: lines taken twice at most after a
+    /// crash).
+    pub async fn note_staging(&self, guid: &str, f: impl FnOnce(&mut Staging)) {
+        let mut writer = self.writer.lock().await;
+        let mut state = self.shared.state.write().expect("no panic under the lock");
+        if let Some(staging) = state.staging_mut(guid) {
+            f(staging);
+            writer.book.defer("build", guid);
+        }
     }
 
     fn save(&self, state: &State) -> Result<(), String> {
@@ -2182,8 +2301,168 @@ pub fn rfc3339(secs: u64) -> String {
 }
 
 #[cfg(test)]
+#[path = "../tests/support/postgres_server.rs"]
+mod postgres_server;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A data directory of its own, and the store opened on it: the state in the directory,
+    /// or in the database `url`; the first `domains` flag takes the default routes.
+    async fn open(dir: &Path, url: Option<&str>, domains: &[&str]) -> Store {
+        let domains: Vec<String> = domains.iter().map(|name| name.to_string()).collect();
+        let wickets = ["a".to_string(), "b".to_string()];
+        let settings = url.map(|url| PostgresSettings {
+            url: url.to_string(),
+            ca_pem: None,
+        });
+        let runs = BTreeMap::new();
+        let store = Store::open(dir, "o", "s", &domains, &wickets, &runs, settings.as_ref());
+        store.await.unwrap()
+    }
+
+    /// What a store keeps, as `state.json` has it.
+    fn kept(store: &Store) -> serde_json::Value {
+        store.read(|state| serde_json::to_value(state).unwrap())
+    }
+
+    fn names(store: &Store) -> Vec<String> {
+        store.read(|state| state.apps.iter().map(|app| app.name.clone()).collect())
+    }
+
+    /// What a change wrote is read at the next start, the lists in their order, with what was
+    /// noted aside from a change before it: in the directory, and in PostgreSQL, whose empty
+    /// store takes the directory's state, once.
+    #[tokio::test]
+    async fn a_change_is_kept_for_the_next_start() {
+        let (url, _) = postgres_server::database().await;
+        for url in [None, Some(url.as_str())] {
+            let dir = std::env::temp_dir().join(format!("cf-api-store-{}", guid()));
+            // as the release before left it: the directory's state
+            let store = open(&dir, None, &["localhost"]).await;
+            let build = (store.update(|state| {
+                let space = state.spaces[0].guid.clone();
+                let app = state.create_app("first", &space).guid.clone();
+                state.builds.push(Build {
+                    guid: guid(),
+                    app,
+                    package: "p".into(),
+                    state: "STAGING".into(),
+                    lifecycle: Lifecycle::Buildpack,
+                    error: None,
+                    droplet: None,
+                    staging: Some(Staging::default()),
+                    created_at: now(),
+                    updated_at: now(),
+                });
+                state.builds[0].guid.clone()
+            }))
+            .await;
+            drop(store);
+            let store = open(&dir, url, &["localhost"]).await;
+            assert_eq!(names(&store), ["first"]);
+            let second = (store.update(|state| {
+                let space = state.spaces[0].guid.clone();
+                state.create_app("second", &space).guid.clone()
+            }))
+            .await;
+            // written with the next change
+            let followed = |staging: &mut Staging| staging.command = Some("followed".into());
+            store.note_staging(&build, followed).await;
+            store
+                .note(|state| state.flume = Some(FlumeCursor { epoch: 1, seq: 7 }))
+                .await;
+            let moved = store.update(|state| state.app_mut(&second).unwrap().started = true);
+            moved.await;
+            let was = kept(&store);
+            drop(store);
+            // the first flag's domain goes before the one there was
+            let store = open(&dir, url, &["apps.example.com", "localhost"]).await;
+            let domains: Vec<String> =
+                store.read(|state| state.domains.iter().map(|d| d.name.clone()).collect());
+            assert_eq!(domains, ["apps.example.com", "localhost"]);
+            let mut is = kept(&store);
+            assert_eq!(is["domains"][1], was["domains"][0]);
+            is["domains"] = was["domains"].clone();
+            assert_eq!(is, was);
+            assert_eq!(names(&store), ["first", "second"]);
+            assert_eq!(is["flume"]["seq"], 7);
+            assert_eq!(is["builds"][0]["staging"]["command"], "followed");
+            drop(store);
+            let store = open(&dir, url, &["apps.example.com", "localhost"]).await;
+            let mut again = kept(&store);
+            again["domains"] = was["domains"].clone();
+            assert_eq!(again, was);
+        }
+    }
+
+    /// Two instances on one PostgreSQL: a change of one is seen by the other (told of it, and
+    /// at a request's start at the latest), the changes of both are one after another, none
+    /// lost, and a connection lost is opened again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn two_instances_change_one_state() {
+        let (url, behind) = postgres_server::database().await;
+        let dir = |of: &str| std::env::temp_dir().join(format!("cf-api-store-{of}-{}", guid()));
+        let a = open(&dir("a"), Some(&url), &["localhost"]).await;
+        let b = open(&dir("b"), Some(&url), &["localhost"]).await;
+        assert_eq!(kept(&a), kept(&b));
+        let app = |name: &'static str| {
+            a.update(move |state| {
+                let space = state.spaces[0].guid.clone();
+                state.create_app(name, &space).guid.clone()
+            })
+        };
+        // b is told of a's change
+        let told = b.changed();
+        let x = app("x").await;
+        (tokio::time::timeout(std::time::Duration::from_secs(10), told).await).unwrap();
+        b.sync().await.unwrap();
+        assert_eq!(names(&b), ["x"]);
+        let y = app("y").await;
+        // both edit one app, and each another, at once
+        let scale = async |store: &Store, guid: &str, key: &str| {
+            for _ in 0..20 {
+                (store.update(|state| {
+                    state.app_mut(&x).unwrap().process.instances += 1;
+                    let app = state.app_mut(guid).unwrap();
+                    *app.env.entry(key.to_string()).or_default() += "+";
+                }))
+                .await;
+            }
+        };
+        tokio::join!(scale(&a, &x, "A"), scale(&b, &y, "B"));
+        a.sync().await.unwrap();
+        b.sync().await.unwrap();
+        assert_eq!(kept(&a), kept(&b));
+        a.read(|state| {
+            assert_eq!(state.app(&x).unwrap().process.instances, 41);
+            assert_eq!(state.app(&x).unwrap().env["A"].len(), 20);
+            assert_eq!(state.app(&y).unwrap().env["B"].len(), 20);
+            // each index placed by whoever wrote the count
+            assert_eq!(state.app(&x).unwrap().placement.len(), 41);
+        });
+        // their connections ended under them: a change waits for a new one
+        let ended = "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
+                     WHERE datname = current_database() AND pid <> pg_backend_pid()";
+        behind.batch_execute(ended).await.unwrap();
+        a.update(|state| state.remove_app(&x)).await;
+        app("z").await;
+        b.sync().await.unwrap();
+        assert_eq!(names(&b), ["y", "z"]);
+        assert_eq!(kept(&a), kept(&b));
+        // the rows removed are swept: one behind them reads all again
+        let swept = "DELETE FROM sluice_cf_records WHERE body IS NULL; \
+                     UPDATE sluice_cf_meta SET oldest = rev + 1";
+        behind.batch_execute(swept).await.unwrap();
+        a.update(|state| state.remove_app(&y)).await;
+        b.sync().await.unwrap();
+        assert_eq!(names(&b), ["z"]);
+        assert_eq!(kept(&a), kept(&b));
+        // one starting later reads the same
+        let c = open(&dir("c"), Some(&url), &["localhost"]).await;
+        assert_eq!(kept(&c), kept(&a));
+    }
 
     #[test]
     fn the_current_droplet_keeps_the_previous_the_packages_the_newest_and_a_restart_what_it_takes_up()

@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::flume::FlumeSettings;
 use crate::oidc::{OidcSettings, parse_rules};
+use crate::postgres::PostgresSettings;
 use crate::security_groups::Editors;
 use crate::{Settings, TlsSettings, WicketSettings};
 
@@ -27,6 +28,12 @@ usage: sluice-wicket-cf-api --wicket <url> [options]
   --domain <name>             a shared domain; repeatable (or comma-separated): the first
                               takes the default and random routes (default localhost)
   --data-dir <path>           the state, the packages and the droplets (default cf-api)
+  --state <url>               the state in PostgreSQL in place of the directory's: the store of
+                              several instances; postgres://user:password@host:port/database
+                              (libpq's parameters, as sslmode=require). An empty one takes
+                              the directory's state
+  --state-file <path>         read the URL from a file instead
+  --state-ca-cert <path>      PEM CA verifying it (default the webPKI roots)
   --org <name>                the organization made at the first start (default sluice)
   --space <name>              and its space (default wicket)
   --cnb-builder <image>       the Cloud Native Buildpacks builder staging a zip of source on a
@@ -135,6 +142,9 @@ const VALUED: &[&str] = &[
     "wicket-away-grace",
     "domain",
     "data-dir",
+    "state",
+    "state-file",
+    "state-ca-cert",
     "org",
     "space",
     "cnb-builder",
@@ -362,6 +372,19 @@ pub fn parse(
         }
         None => None,
     };
+    let state = match secret("state")? {
+        Some(url) => {
+            if !url.starts_with("postgres://") && !url.starts_with("postgresql://") {
+                // not quoted: it may hold a password
+                return Err("--state: expected postgres://user:password@host:port/database".into());
+            }
+            Some(PostgresSettings {
+                url,
+                ca_pem: pem("state-ca-cert")?,
+            })
+        }
+        None => None,
+    };
     let flume = match value("flume") {
         Some(url) => {
             if !url.starts_with("grpc://") && !url.starts_with("grpcs://") {
@@ -537,6 +560,7 @@ pub fn parse(
             wicket_away_grace: std::time::Duration::from_secs(wicket_away_grace),
             domains,
             data_dir: PathBuf::from(value("data-dir").unwrap_or_else(|| "cf-api".to_string())),
+            state,
             org: value("org").unwrap_or_else(|| "sluice".to_string()),
             space: value("space").unwrap_or_else(|| "wicket".to_string()),
             cnb,
@@ -649,6 +673,7 @@ mod tests {
             "SLUICE_WICKET_CF_API_SERVICE_BROKER_EDITOR" => Some("email=*@example.com".to_string()),
             "SLUICE_WICKET_CF_API_GROUP_ROLE" => Some("ops=admin".to_string()),
             "SLUICE_WICKET_CF_API_ADMIN_CLIENT" => Some("robot".to_string()),
+            "SLUICE_WICKET_CF_API_STATE" => Some("postgres://cf:secret@db/cf".to_string()),
             _ => None,
         };
         let config = serve(parse(
@@ -677,6 +702,9 @@ mod tests {
         assert_eq!(config.settings.stop_grace.as_secs(), 8);
         assert_eq!(config.settings.domains, ["c.example"]);
         assert_eq!(config.settings.data_dir, PathBuf::from("cf-api"));
+        let state = config.settings.state.expect("a store");
+        assert_eq!(state.url, "postgres://cf:secret@db/cf");
+        assert!(!format!("{state:?}").contains("secret"));
         assert_eq!(config.settings.org, "sluice");
         assert!(!config.exit_on_stdin_close);
         let flume = config.settings.flume.expect("a flume");
@@ -874,6 +902,10 @@ mod tests {
         );
         assert!(error("--wicket http://w:1 --colour").contains("--colour"));
         assert!(error("--wicket").contains("needs a value"));
+        assert_eq!(
+            error("--wicket http://w:1 --state mysql://u:secret@db/cf"),
+            "--state: expected postgres://user:password@host:port/database"
+        );
         assert!(
             error("--wicket http://w:1 --flume grpc://f:1")
                 .contains("--flume-token (or --flume-token-file) is required")
