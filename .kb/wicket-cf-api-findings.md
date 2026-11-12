@@ -256,6 +256,38 @@ The flume is the bus of the cf-api's own lines too
   for the time of the staging, none otherwise. Against a call to the leader's `--instance-url`:
   nothing is told between instances but through the store and the flume
 
+## An update of several instances
+
+Two builds and two sets of flags on one store
+([ha.md](../sluice-wicket-cf-api/ha.md#an-update)). Decided against the alternatives:
+
+- the oldest build reconciles the wickets, against a new build writing as the old one until all
+  are new: the second needs every build to keep the bodies of the one before (the wickets' app
+  API, the rows), the first only an order of the builds. The order is the newest layout a build
+  reads (`postgres::SCHEMA`), not its build time: an old source built again is newer by the
+  clock. So `SCHEMA` moves with what an older build would undo, not with the rows' shape alone
+- the layout moved by the one reconciling the wickets once every instance says it reads it,
+  under the revision's lock; a build checks the layout in every transaction, so one that does not
+  say itself (before layout 2) is refused at its next change. Layout 2 changes no row: it is the
+  fence against those builds (they reconcile the wickets whatever the lease says, 278 and 280)
+- the topology the store's, taken from flags when an instance having them takes the lease, which
+  needs them to be the store's already or every instance's. Against the flags of whoever leads:
+  the apps go back and forth as the lease passes between two sets of flags. Against a record an
+  admin call changes: the wickets' clients (URL, token) of every instance made anew at run time,
+  and flags that then say nothing. The wickets' URLs stay each instance's
+- an instance says itself on the lease's connection, as often and for as long as the lease:
+  one killed is off the store when its lease lapsed, no later
+- what a build does not read of a row kept as the pair (the body taken, the body as this build
+  writes what it read), only of the rows where the two differ; merged into the body at the
+  write. A list's items are told apart by position: kept only while the list is as it was read
+- the rows kept whole and those of what the wickets were seen doing compared as this build
+  writes them, not as they were taken: two builds writing one value in two ways do not write it
+  over each other at every change
+- a start refused for `--blobs` and `--flume` only: without them several are wrong in silence (a
+  package one instance cannot read, a log per instance). The rest is logged: an update changes it
+- a start refused is tried for the lease's time first: a supervisor starting an instance again
+  after a kill finds its row still there
+
 ## A stop
 
 The release binary on the host (`--wicket` unreachable), SIGTERM to its exit: idle, 11-13ms. A

@@ -21,6 +21,11 @@
 //! revision's lock, so a change sees the lease as it is until it commits: the leader's own
 //! (`Store::lead`) is refused once another took the lease, and what an instance saw of the
 //! wickets is written by it only while it is no leader, or the one ([`Postgres::transact`]).
+//!
+//! And the instances on the store (`crate::instances`), a row each while it says so, on the
+//! lease's connection. The rows' layout is a number of the store ([`SCHEMA`]): a build does not
+//! open a store of a layout newer than its own, and the instance reconciling the wickets moves it
+//! to its build's once every instance reads that one ([`Postgres::migrate`]).
 
 use std::convert::Infallible;
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -32,12 +37,22 @@ use tokio_postgres::types::ToSql;
 use tokio_postgres::{AsyncMessage, Client, Config, Statement};
 use tokio_postgres_rustls::MakeRustlsConnect;
 
+use crate::instances::{Member, Peer};
 use crate::lease::Term;
 use crate::records::{Book, Row};
 use crate::store::State;
 
-/// The rows' layout this build reads and writes.
-const SCHEMA: i32 = 1;
+/// The newest rows' layout this build reads, and the one it moves a store to: moved with a
+/// change of the rows' shape an older build cannot read, and of what a build writes to the
+/// store or puts to the wickets that an older one would undo. A build reads the layouts before
+/// its own and writes them as they are, until the store is moved to its own. 2: the instances
+/// say themselves and one alone does the turn's work; no build before it beside one.
+pub const SCHEMA: i32 = 2;
+
+/// What moves a store from each layout to the next, the first from 1: the cursor of the logs
+/// before they were one through the flume.
+const MIGRATIONS: [&str; SCHEMA as usize - 1] =
+    ["DELETE FROM sluice_cf_records WHERE kind = 'single' AND id = 'flume'"];
 
 /// The channel a commit notifies its revision on.
 const CHANNEL: &str = "sluice_cf";
@@ -65,6 +80,11 @@ const MAX_BACKOFF: Duration = Duration::from_secs(5);
 /// How often a store not answering is said.
 const WARN_EVERY: Duration = Duration::from_secs(30);
 
+/// The tables, made where there are none: a new store is of this build's layout.
+fn tables() -> String {
+    TABLES.replace("$SCHEMA", &SCHEMA.to_string())
+}
+
 const TABLES: &str = "
 SELECT pg_advisory_xact_lock(hashtext('sluice_cf'));
 CREATE TABLE IF NOT EXISTS sluice_cf_meta (
@@ -73,7 +93,7 @@ CREATE TABLE IF NOT EXISTS sluice_cf_meta (
     rev bigint NOT NULL,
     oldest bigint NOT NULL
 );
-INSERT INTO sluice_cf_meta (layout, rev, oldest) VALUES (1, 0, 0) ON CONFLICT DO NOTHING;
+INSERT INTO sluice_cf_meta (layout, rev, oldest) VALUES ($SCHEMA, 0, 0) ON CONFLICT DO NOTHING;
 CREATE TABLE IF NOT EXISTS sluice_cf_records (
     kind text NOT NULL,
     id text NOT NULL,
@@ -114,7 +134,23 @@ CREATE TABLE IF NOT EXISTS sluice_cf_lease (
 INSERT INTO sluice_cf_lease (holder, epoch, expires) VALUES (NULL, 0, '-infinity')
     ON CONFLICT DO NOTHING;
 ALTER TABLE sluice_cf_lease ADD COLUMN IF NOT EXISTS address text;
+CREATE TABLE IF NOT EXISTS sluice_cf_instances (
+    id text PRIMARY KEY,
+    build text NOT NULL,
+    reads integer NOT NULL,
+    address text,
+    topology text NOT NULL,
+    settings text NOT NULL,
+    started timestamptz NOT NULL DEFAULT now(),
+    expires timestamptz NOT NULL
+);
 ";
+
+/// The store's layout, and each other instance saying it is on the store (none: one row, its
+/// instance NULL); `$1`: this instance.
+const PEERS: &str = "SELECT m.layout, i.id, i.build, i.reads, i.topology, i.settings \
+     FROM sluice_cf_meta m \
+     LEFT JOIN sluice_cf_instances i ON i.id <> $1 AND i.expires > now()";
 
 /// Bound on a statement of the lease: past it its connection is taken for lost.
 const LEASE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -127,6 +163,36 @@ struct Leasing {
     locked: Statement,
     take: Statement,
     release: Statement,
+    beat: Statement,
+    peers: Statement,
+    leave: Statement,
+}
+
+/// The store's layout and the other instances on it.
+pub struct Roll {
+    pub layout: i32,
+    pub peers: Vec<Peer>,
+}
+
+impl Roll {
+    /// Of the rows `beat` or `peers` answer.
+    fn of(rows: &[tokio_postgres::Row]) -> Roll {
+        let peers = rows.iter().filter_map(|row| {
+            let id = row.get::<_, Option<String>>(1)?;
+            let (topology, settings): (String, String) = (row.get(4), row.get(5));
+            Some(Peer {
+                id,
+                build: row.get(2),
+                reads: row.get(3),
+                topology: serde_json::from_str(&topology).ok(),
+                settings: serde_json::from_str(&settings).unwrap_or_default(),
+            })
+        });
+        Roll {
+            layout: rows.first().map_or(SCHEMA, |row| row.get(0)),
+            peers: peers.collect(),
+        }
+    }
 }
 
 /// What a try to take the lease found.
@@ -318,7 +384,7 @@ impl Postgres {
         let (client, connection) = (self.config.connect(self.tls.clone()).await).map_err(failed)?;
         tokio::spawn(connection);
         if make {
-            let tables = format!("BEGIN; {TABLES} COMMIT");
+            let tables = format!("BEGIN; {} COMMIT", tables());
             client.batch_execute(&tables).await.map_err(failed)?;
         }
         let settings = format!("SET idle_in_transaction_session_timeout = '{IDLE_IN_TRANSACTION}'");
@@ -366,8 +432,8 @@ impl Postgres {
         let schema: i32 = row.get(2);
         if schema > SCHEMA {
             return Err(format!(
-                "--state: written by a newer sluice-wicket-cf-api (schema {schema}, this one \
-                 reads {SCHEMA})"
+                "--state: of a newer sluice-wicket-cf-api (layout {schema}, this one reads \
+                 {SCHEMA})"
             ));
         }
         let epoch: Option<i64> = row.get(4);
@@ -462,6 +528,7 @@ impl Postgres {
         let empty = head.at.0 == 0;
         if empty {
             let state = first()?;
+            // nothing there to keep: the rows as this build writes them
             let rows = writer.book.diff(None, &state, 1, true);
             Postgres::write(&session, &rows, 1, &crate::store::guid()).await?;
             Postgres::execute(&session, "COMMIT").await?;
@@ -574,7 +641,7 @@ impl Postgres {
             Postgres::execute(&session, "ROLLBACK").await?;
         } else {
             let token = crate::store::guid();
-            Postgres::write(&session, &rows, rev, &token).await?;
+            Postgres::write(&session, &writer.book.as_written(&rows), rev, &token).await?;
             *sent = Some(Sent { rev, token, result });
             Postgres::execute(&session, "COMMIT").await?;
             writer.book.written(&rows, rev);
@@ -739,8 +806,82 @@ impl Postgres {
                 "UPDATE sluice_cf_lease SET expires = now() WHERE holder = $1 AND epoch = $2::bigint",
             )
             .await?,
+            beat: prepare(&format!(
+                "WITH gone AS (DELETE FROM sluice_cf_instances WHERE expires <= now() AND id <> $1), \
+                 here AS (INSERT INTO sluice_cf_instances \
+                 (id, build, reads, address, topology, settings, expires) \
+                 VALUES ($1, $2, $3, $4, $5, $6, now() + $7::bigint * interval '1 millisecond') \
+                 ON CONFLICT (id) DO UPDATE SET expires = EXCLUDED.expires) {PEERS}"
+            ))
+            .await?,
+            peers: prepare(PEERS).await?,
+            leave: prepare("DELETE FROM sluice_cf_instances WHERE id = $1").await?,
             client,
         })
+    }
+
+    /// Says this instance is on the store for `lease` more, by the store's clock, as `member`
+    /// has it; those that said so no more are off it. The store's layout and the others on it.
+    pub async fn beat(&self, member: &Member, lease: Duration) -> Result<Roll, String> {
+        let millis = lease.as_millis() as i64;
+        let topology = serde_json::to_string(&member.topology).expect("a topology is JSON");
+        let settings = serde_json::to_string(&member.settings).expect("the settings are JSON");
+        let said: [&(dyn ToSql + Sync); 7] = [
+            &self.holder,
+            &member.build,
+            &member.reads,
+            &member.address,
+            &topology,
+            &settings,
+            &millis,
+        ];
+        let rows = self.leased(async |leasing| leasing.client.query(&leasing.beat, &said).await);
+        Ok(Roll::of(&rows.await?))
+    }
+
+    /// The store's layout and the other instances on it.
+    pub async fn peers(&self) -> Result<Roll, String> {
+        let rows = self
+            .leased(async |leasing| (leasing.client.query(&leasing.peers, &[&self.holder])).await);
+        Ok(Roll::of(&rows.await?))
+    }
+
+    /// This instance is on the store no more.
+    pub async fn leave(&self) -> Result<(), String> {
+        self.leased(async |leasing| (leasing.client.execute(&leasing.leave, &[&self.holder])).await)
+            .await
+            .map(drop)
+    }
+
+    /// Moves the store's layout to this build's, unless an instance on it does not read that
+    /// one: under the revision's lock, so every change is of one layout. Whether it moved; a
+    /// build that does not read it is refused from then on, at its next change or request.
+    pub async fn migrate(&self) -> Result<bool, String> {
+        self.leased(async |leasing| {
+            let client = &leasing.client;
+            client.batch_execute("BEGIN").await?;
+            let layout = "SELECT layout FROM sluice_cf_meta FOR UPDATE";
+            let layout: i32 = client.query_one(layout, &[]).await?.get(0);
+            let behind = "SELECT count(*) FROM sluice_cf_instances \
+                          WHERE expires > now() AND reads < $1";
+            let behind: i64 = client.query_one(behind, &[&SCHEMA]).await?.get(0);
+            if layout >= SCHEMA || behind > 0 {
+                client.batch_execute("ROLLBACK").await?;
+                return Ok(false);
+            }
+            for step in &MIGRATIONS[(layout.max(1) - 1) as usize..] {
+                client.batch_execute(step).await?;
+            }
+            let moved = format!("UPDATE sluice_cf_meta SET layout = {SCHEMA}; COMMIT");
+            client.batch_execute(&moved).await?;
+            Ok(true)
+        })
+        .await
+    }
+
+    /// Where the others reach this instance (`--instance-url`).
+    pub fn address(&self) -> Option<String> {
+        self.address.clone()
     }
 
     /// Renews the lease of `epoch` this instance holds for `lease` more, by the store's clock:

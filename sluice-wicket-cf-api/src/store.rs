@@ -22,7 +22,8 @@ use serde::{Deserialize, Serialize};
 
 pub use crate::blobs::{Blob, Spool};
 use crate::blobs::{BlobSettings, Blobs, Local, Reading};
-use crate::lease::{Lease, Term, Timing};
+use crate::instances::{Member, Topology};
+use crate::lease::{Lease, Seat, Term, Timing};
 use crate::postgres::{Postgres, PostgresSettings, Shared, Writer};
 use crate::staging::Buildpack;
 use crate::wicket::Runtime;
@@ -1979,6 +1980,7 @@ pub struct Store {
     noted: Arc<tokio::sync::Notify>,
     /// Writes what was seen of the wickets, as it is seen.
     flusher: Option<tokio::task::JoinHandle<()>>,
+    flags: Arc<Flags>,
 }
 
 impl Drop for Store {
@@ -1986,6 +1988,35 @@ impl Drop for Store {
         for task in [&self.listener, &self.flusher].into_iter().flatten() {
             task.abort();
         }
+    }
+}
+
+/// The topology as an instance's flags have it: the state's of the one process of a data
+/// directory at its start, of several instances the store's once one of these flags takes the
+/// lease (`crate::instances`).
+pub struct Flags {
+    /// `--wicket`'s names, in their order.
+    pub wickets: Vec<String>,
+    /// `--domain`'s.
+    pub domains: Vec<String>,
+    /// What the wickets answering at the start run, by name.
+    runs: BTreeMap<String, Runtime>,
+}
+
+impl Flags {
+    pub fn topology(&self) -> Topology {
+        Topology {
+            wickets: self.wickets.clone(),
+            domains: self.domains.clone(),
+        }
+    }
+
+    /// Makes them the topology of `state`: the domains followed, the apps placed on the wickets
+    /// (`State::follow_wickets`, the lines saying so).
+    pub fn follow(&self, state: &mut State) -> Vec<String> {
+        state.follow_domains(&self.domains);
+        state.wickets.runtimes.extend(self.runs.clone());
+        state.follow_wickets(&self.wickets)
     }
 }
 
@@ -2009,9 +2040,11 @@ fn kept(file: &Path, domains: &[String]) -> Result<Option<State>, String> {
 impl Store {
     /// Opens the data directory and the state: the one kept in the directory, or with
     /// `postgres` the store's (an empty store takes the directory's `state.json`, once); else
-    /// a new one. Its apps are placed on the `wickets` configured (`State::follow_wickets`,
-    /// logged), of which those answering now run `runs`, by name: an index is placed on a
-    /// wicket of its app's stack. The blobs are the directory's, or with `bucket` that one's.
+    /// a new one. The directory's apps are placed on the `wickets` configured
+    /// (`State::follow_wickets`, logged), of which those answering now run `runs`, by name: an
+    /// index is placed on a wicket of its app's stack. A store's are by the store's topology,
+    /// these flags' only where it has none yet: made theirs in a turn of this instance
+    /// (`crate::lease`). The blobs are the directory's, or with `bucket` that one's.
     #[allow(clippy::too_many_arguments)]
     pub async fn open(
         dir: &Path,
@@ -2056,18 +2089,19 @@ impl Store {
             listener: None,
             noted: Arc::default(),
             flusher: None,
+            flags: Arc::new(Flags {
+                wickets: wickets.to_vec(),
+                domains: domains.to_vec(),
+                runs: runs.clone(),
+            }),
         };
-        let follow = |state: &mut State| {
-            state.follow_domains(domains);
-            state.wickets.runtimes.extend(runs.clone());
-            state.follow_wickets(wickets)
-        };
+        let flags = store.flags.clone();
         let Some(settings) = postgres else {
             let mut state = match kept(&file, domains)? {
                 Some(state) => state,
                 None => State::new(org, space, domains),
             };
-            for line in follow(&mut state) {
+            for line in flags.follow(&mut state) {
                 println!("{line}");
             }
             // the one process's, cut short
@@ -2096,8 +2130,13 @@ impl Store {
             println!("STATE: {} taken into the store", file.display());
         }
         store.postgres = Some(postgres.clone());
-        // as the flags of this process have them: the same on every instance
-        for line in store.update(follow).await {
+        // a store without a topology (a new one, one of a build before it was the store's)
+        // takes the flags of this instance
+        let first = |state: &mut State| match state.wickets.configured.is_empty() {
+            true => flags.follow(state),
+            false => Vec::new(),
+        };
+        for line in store.update(first).await {
             println!("{line}");
         }
         let (shared, writer) = (store.shared.clone(), store.writer.clone());
@@ -2202,14 +2241,23 @@ impl Store {
         self.shared.end_term(epoch, why);
     }
 
-    /// The lease of the turns of several instances on the store, as `timing` says; of the one
-    /// process of a data directory, held from its start.
-    pub fn lease(&self, timing: Timing) -> Arc<Lease> {
-        Arc::new(Lease::new(
-            self.postgres.clone(),
-            self.shared.clone(),
-            timing,
-        ))
+    /// The lease of the turns of several instances on the store, as `timing` says, this one
+    /// saying itself to the others with the `settings` they are to have alike
+    /// (`crate::instances`); of the one process of a data directory, held from its start.
+    pub fn lease(&self, timing: Timing, settings: BTreeMap<String, String>) -> Arc<Lease> {
+        let seat = self.postgres.as_ref().map(|postgres| Seat {
+            postgres: postgres.clone(),
+            writer: self.writer.clone(),
+            member: Member {
+                build: crate::describe_build(),
+                reads: crate::postgres::SCHEMA,
+                address: postgres.address(),
+                topology: self.flags.topology(),
+                settings,
+            },
+            flags: self.flags.clone(),
+        });
+        Arc::new(Lease::new(seat, self.shared.clone(), timing))
     }
 
     /// Has the reads see what every instance committed by now: a request's first step, failing
@@ -2555,7 +2603,7 @@ pub(crate) mod postgres_server;
 
 #[cfg(test)]
 #[path = "../tests/support/s3_server.rs"]
-mod s3_server;
+pub(crate) mod s3_server;
 
 #[cfg(test)]
 pub(crate) mod tests {
@@ -2570,19 +2618,20 @@ pub(crate) mod tests {
         ca: Option<Vec<u8>>,
         domains: &[&str],
     ) -> Result<Store, String> {
-        try_open_on(dir, url, ca, domains, None).await
+        try_open_on(dir, url, ca, domains, &["a", "b"], None).await
     }
 
-    /// As `try_open`, the blobs in `bucket`.
+    /// As `try_open`, its flags naming the `wickets`, the blobs in `bucket`.
     async fn try_open_on(
         dir: &Path,
         url: Option<&str>,
         ca: Option<Vec<u8>>,
         domains: &[&str],
+        wickets: &[&str],
         bucket: Option<&BlobSettings>,
     ) -> Result<Store, String> {
         let domains: Vec<String> = domains.iter().map(|name| name.to_string()).collect();
-        let wickets = ["a".to_string(), "b".to_string()];
+        let wickets: Vec<String> = wickets.iter().map(|name| name.to_string()).collect();
         let settings = url.map(|url| PostgresSettings {
             url: url.to_string(),
             ca_pem: ca,
@@ -2618,7 +2667,7 @@ pub(crate) mod tests {
 
     /// `store`'s lease kept, as `TIMING` says: the task keeping it.
     pub(crate) fn keep(store: &Store) -> (Arc<Lease>, tokio::task::JoinHandle<()>) {
-        let lease = store.lease(TIMING);
+        let lease = store.lease(TIMING, BTreeMap::new());
         let keeping = tokio::spawn(lease.clone().run());
         (lease, keeping)
     }
@@ -2671,7 +2720,9 @@ pub(crate) mod tests {
                 let url = format!("{url}?sslmode=disable");
                 let bucket = s3_server::bucket().await;
                 let open = async |dir: PathBuf| {
-                    let opened = try_open_on(&dir, Some(&url), None, &["localhost"], Some(&bucket));
+                    let (domains, wickets) = (["localhost"], ["a", "b"]);
+                    let opened =
+                        try_open_on(&dir, Some(&url), None, &domains, &wickets, Some(&bucket));
                     Arc::new(opened.await.unwrap())
                 };
                 (open(dir.join("a")).await, open(dir.join("b")).await)
@@ -2808,7 +2859,8 @@ pub(crate) mod tests {
 
     /// What a change wrote is read at the next start, the lists in their order, with what was
     /// noted aside from a change before it: in the directory, and in PostgreSQL, whose empty
-    /// store takes the directory's state, once; over a connection without TLS.
+    /// store takes the directory's state, once; over a connection without TLS. Other flags are
+    /// the directory's topology at the start, a store's in a turn of the instance.
     #[tokio::test]
     async fn a_change_is_kept_for_the_next_start() {
         let (url, _) = postgres_server::database().await;
@@ -2855,6 +2907,10 @@ pub(crate) mod tests {
             drop(store);
             // the first flag's domain goes before the one there was
             let store = open(&dir, url, &["apps.example.com", "localhost"]).await;
+            let _lease = match url {
+                Some(_) => Some(leading(&store).await),
+                None => None,
+            };
             let domains: Vec<String> =
                 store.read(|state| state.domains.iter().map(|d| d.name.clone()).collect());
             assert_eq!(domains, ["apps.example.com", "localhost"]);
@@ -2878,7 +2934,11 @@ pub(crate) mod tests {
     /// lost, and a connection lost is opened again; over TLS, the server verified, where the
     /// test server takes it. One at a time leads, its own changes and what it saw of the
     /// wickets the other's: one paused past its lease has its turn taken, its changes refused
-    /// and what it saw since forgotten; one letting go of it has it taken at once.
+    /// and what it saw since forgotten; one letting go of it has it taken at once. What a row
+    /// of a newer build holds is kept by a change of this one's; a store of the layout before
+    /// is moved to this build's by the one leading, and one of a newer layout is not opened.
+    /// An instance of other flags leaves the topology the store's, the apps where they are,
+    /// until it is the one on the store: then the apps are placed by its flags.
     #[tokio::test(flavor = "multi_thread")]
     async fn two_instances_change_one_state() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -2962,8 +3022,27 @@ pub(crate) mod tests {
         b.sync().await.unwrap();
         assert_eq!(names(&b), ["z"]);
         assert_eq!(kept(&a), kept(&b));
-        // one starting later reads the same
+        // one starting later reads the same, and its change keeps what a newer build wrote of
+        // the row, at any depth
+        let later = "UPDATE sluice_cf_records SET body = jsonb_set(jsonb_set(body::jsonb, \
+                     '{later}', '{\"of\": 1}'), '{process,later}', 'true')::text \
+                     WHERE kind = 'app' AND body IS NOT NULL";
+        assert_eq!(behind.execute(later, &[]).await.unwrap(), 1);
         let c = open(&dir("c"), Some(&url), &["localhost"]).await;
+        assert_eq!(kept(&c), kept(&a));
+        c.update(|state| {
+            state.apps[0].started = true;
+            state.apps[0].process.instances = 2;
+        })
+        .await;
+        let body = "SELECT body FROM sluice_cf_records WHERE kind = 'app' AND body IS NOT NULL";
+        let body: String = behind.query_one(body, &[]).await.unwrap().get(0);
+        let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body["later"]["of"], 1, "{body}");
+        assert_eq!(body["process"]["later"], true, "{body}");
+        assert_eq!(body["process"]["instances"], 2, "{body}");
+        a.sync().await.unwrap();
+        b.sync().await.unwrap();
         assert_eq!(kept(&c), kept(&a));
 
         // a leads: b makes none of the leader's changes, and sees what a saw of the wickets
@@ -3003,7 +3082,7 @@ pub(crate) mod tests {
         b.sync().await.unwrap();
         assert_eq!(outcome(&b), Some(Outcome::Running));
         // b lets go of it: a's at once
-        let (_, _keeping_a) = keep(&a);
+        let (lease_a, _keeping_a) = keep(&a);
         keeping_b.abort();
         let was = epoch(&b);
         lease_b.release().await;
@@ -3015,6 +3094,74 @@ pub(crate) mod tests {
             released.elapsed()
         );
         assert!(epoch(&a) > was);
+
+        // a store of the layout before, holding what no build reads any more: moved to this
+        // build's by a, every instance on it reading that one
+        let before = "UPDATE sluice_cf_meta SET layout = 1; \
+                      INSERT INTO sluice_cf_records (kind, id, ord, rev, body) \
+                      VALUES ('single', 'flume', 0, 1, '{}')";
+        behind.batch_execute(before).await.unwrap();
+        let layout = "SELECT layout, (SELECT count(*) FROM sluice_cf_records WHERE id = 'flume') \
+                      FROM sluice_cf_meta";
+        let moved = Instant::now();
+        loop {
+            let row = behind.query_one(layout, &[]).await.unwrap();
+            if (row.get::<_, i32>(0), row.get::<_, i64>(1)) == (crate::postgres::SCHEMA, 0) {
+                break;
+            }
+            assert!(moved.elapsed() < Duration::from_secs(10), "not moved");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // an instance whose flags name other wickets, beside a: the store's topology and the
+        // app's indices stay, and it takes no turn
+        let topology = |store: &Store| {
+            store.read(|state| {
+                (
+                    state.wickets.configured.clone(),
+                    state.apps[0].placement.clone(),
+                )
+            })
+        };
+        let (wickets, placement) = topology(&a);
+        let first = ["a", "b"].map(String::from).to_vec();
+        assert_eq!((&wickets, &placement), (&first, &first));
+        let (flags, ca) = (["b", "c"], postgres_server::ca());
+        let d = try_open_on(&dir("d"), Some(&url), ca, &["localhost"], &flags, None)
+            .await
+            .unwrap();
+        let (_, _keeping_d) = keep(&d);
+        tokio::time::sleep(TIMING.take_every * 3).await;
+        assert!(!d.leads());
+        a.sync().await.unwrap();
+        assert_eq!(topology(&a), (wickets.clone(), placement.clone()));
+        assert_eq!(topology(&d), (wickets, placement));
+        // a stopped, its flags are every instance's: its turn, the app placed by them
+        lease_a.release().await;
+        led(&d).await;
+        a.sync().await.unwrap();
+        for store in [&a, &d] {
+            let (wickets, placement) = topology(store);
+            assert_eq!(wickets, flags);
+            assert_eq!(placement.len(), 2);
+            assert!(
+                placement.iter().all(|on| flags.contains(&on.as_str())),
+                "{placement:?}"
+            );
+        }
+
+        // a store of a newer build's layout is not opened
+        let newer = "UPDATE sluice_cf_meta SET layout = layout + 1";
+        behind.batch_execute(newer).await.unwrap();
+        let refused = try_open(
+            &dir("newer"),
+            Some(&url),
+            postgres_server::ca(),
+            &["localhost"],
+        )
+        .await;
+        let error = refused.err().expect("refused");
+        assert!(error.contains("of a newer sluice-wicket-cf-api"), "{error}");
     }
 
     #[test]

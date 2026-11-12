@@ -89,3 +89,16 @@ it (281).
   Kubernetes `preStop` sleep); no lame duck period was added
 - the last write of a stop is bounded (the grace, 1s past it at least): a store not answering
   no longer holds the process
+
+## From 283
+
+- an update's rules are in `ha.md` "An update": the oldest build (`postgres::SCHEMA`) leads, the
+  topology is the store's until every instance has the new flags, `--blobs` and `--flume` are
+  required beside another instance (the two cf-apis of the CLI test need both)
+- left for the CLI test: a previous release's binary beside the current one, once there is a
+  release to take; an update adding a `--wicket` (no index moves until the last instance of the
+  flags before stopped). `instances::tests` covers the rules, `store::tests::
+  two_instances_change_one_state` the topology and the layout's move against PostgreSQL
+- the update's steps to document: the flume first; each instance stopped and started with the new
+  build and flags; `sluice_cf_instances` is the progress; the layout's move is the point of no
+  return (a backup of the store before the last instance is updated)

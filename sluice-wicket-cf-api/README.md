@@ -862,7 +862,7 @@ its wicket's `--listen` (one entry point for both takes a sluice server).
   and every server it streams to took its routes (no request finds the host advertised by
   neither); not within the health check's timeout, it stays. A state of one wicket has its indices on the
   first wicket named, and the indices of a wicket no name gives any more are placed again at the
-  start (logged): a wicket keeps its apps while it keeps its name, and the one wicket of
+  start (logged; of several instances once all have the new names, [ha.md](ha.md#an-update)): a wicket keeps its apps while it keeps its name, and the one wicket of
   `--wicket <url>` is `wicket` (`--wicket wicket=<url>`)
 - **Stacks.** A wicket runs one stack, the one its listing names (`wasip3`, a wasi wicket's;
   `firecracker`), kept in `state.json`: a wicket down is still of its stack. `cf stacks` lists
@@ -1077,7 +1077,9 @@ under way there answered meanwhile ([a stop](ha.md#a-stop)). An edit the
 wickets take at once is made by that one, whichever instance the request reaches: the others send
 it there (`--instance-url`) and relay its answer, so any instance takes any request. A build, a
 broker's operation and an app's delete waiting for its unbinds are that one's work too, the next
-going on with them.
+going on with them. Updated one at a time, the oldest build reconciles the wickets until the last
+of it stopped, and `--wicket` / `--domain` are the store's until every instance has the new ones
+([an update](ha.md#an-update)).
 
 ## Options
 

@@ -7,7 +7,8 @@ the droplets in an S3 bucket (`--blobs`); and who reconciles the wickets, one in
 wickets take at once for every instance ([An edit on any instance](#an-edit-on-any-instance)) and
 does the work that outlives a request
 ([The work outliving a request](#the-work-outliving-a-request)); and the apps' logs, one on every
-instance through the flume ([The logs](#the-logs)).
+instance through the flume ([The logs](#the-logs)); and what holds while their builds and flags
+differ ([An update](#an-update)).
 The options are in the README's [Options](README.md#options).
 
 ## The state in PostgreSQL
@@ -221,3 +222,51 @@ staging log of `cf push` read from any, and go on from another.
 
 What was decided is in
 [.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#the-logs-of-several-instances).
+
+## An update
+
+An update one instance at a time runs two builds, and two sets of flags, on one store. Each
+instance is a row of it (`sluice_cf_instances`), said every 2s for 10s and removed at its stop:
+
+```sql
+SELECT id, build, reads, address, started FROM sluice_cf_instances WHERE expires > now();
+```
+
+is the update's progress (`reads`: the newest rows' layout the build reads); `GET /v3/info` names
+the build of the instance answering.
+
+- the instance reconciling the wickets is of the oldest build on the store: what it puts to the
+  wickets and writes to the store, every instance reads. A newer one waits (`LEASE: not taken by
+  this instance: ...`), and one leading lets go of the lease for an older one come beside it.
+  The last older one stopped, a new one takes over as after any stop
+- what a row holds that a build does not read (a field of a newer one) is kept when that build
+  writes the row; a row of a kind it does not know is left alone
+- the rows' layout is the store's (`sluice_cf_meta.layout`): the instance reconciling the
+  wickets moves it to its build's once every instance reads that one (`STATE: the store's layout
+  is 2 now`). A build reads the layouts before its own; it does not open a store of a newer one
+  (`--state: of a newer sluice-wicket-cf-api`): from the move on, the way back to the build before
+  is the store's backup
+- the wickets' names and the domains (`--wicket`, `--domain`) are the store's, not each
+  instance's: a new store takes the flags of its first instance. Other flags become the store's
+  when an instance having them takes the lease, which it does once every instance on the store
+  has them: until then the instances of the flags before reconcile the wickets and the apps stay
+  where they are; then the apps are placed by the new flags, once (logged, as at one instance's
+  start). While the flags of no instance are the store's and they are not all alike, none takes
+  the lease: the edits are answered 503
+- several share the bucket and the flume: an instance without `--blobs` or `--flume`, or of
+  another bucket or prefix, beside another on the store does not start (after 10s, in which an
+  instance killed is off the store)
+- the rest is to be alike, and said by each instance where another's differs (`INSTANCES: the
+  instance ... on the store has otherwise: its build (...), --admin`): `--admin` (with
+  `--group-role` and `--oidc-groups-claim`), `--client-credentials`, `--cnb-builder` and the
+  build's size, the flume's URL, `--instance-url` (given or not), `--oidc-issuer` (its client
+  and claims), `--security-group-editor`, `--service-broker-editor`, the wickets' URLs,
+  `--wicket-away-grace`, `--wicket-token`. Compared as each build shows them: between two
+  builds one may be said to differ that does not
+- update the flume before the cf-api: an older one stamps no line and begins a watch at its
+  newest lines, each instance then stamping with its own clock
+- a build before the instances said themselves (layout 1) is never one beside a later one: the
+  store refuses it once its layout moved
+
+What was decided is in
+[.kb/wicket-cf-api-findings.md](../.kb/wicket-cf-api-findings.md#an-update-of-several-instances).

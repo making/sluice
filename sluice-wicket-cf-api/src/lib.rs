@@ -30,6 +30,7 @@ pub mod controller;
 pub mod deployments;
 mod env;
 pub mod flume;
+pub mod instances;
 pub mod lease;
 pub mod logs;
 pub mod manifest;
@@ -221,6 +222,61 @@ fn wickets(settings: &Settings) -> Vec<Arc<wicket::Wicket>> {
         .collect()
 }
 
+/// What several instances on a store are to have alike (`crate::instances`), by option: a
+/// secret or a long one as a digest of how this build shows it, which another build may show
+/// otherwise.
+fn alike(settings: &Settings) -> std::collections::BTreeMap<String, String> {
+    use instances::{BLOBS, FLUME, NONE};
+    fn digest(of: &impl std::fmt::Debug) -> String {
+        staging::sha256(format!("{of:?}").as_bytes())[..12].to_string()
+    }
+    fn given<T: std::fmt::Debug>(of: &Option<T>) -> String {
+        of.as_ref().map_or(NONE.to_string(), digest)
+    }
+    let wickets: Vec<String> = (settings.wickets.iter())
+        .map(|wicket| format!("{}={}", wicket.name, wicket.url))
+        .collect();
+    let blobs =
+        (settings.blobs.as_ref()).map(|blobs| format!("s3://{}/{}", blobs.bucket, blobs.prefix));
+    let oidc = (settings.oidc.as_ref()).map(|oidc| (&oidc.issuer, &oidc.client_id, &oidc.claims));
+    let instance_url = settings
+        .state
+        .as_ref()
+        .and_then(|state| state.instance_url.as_ref());
+    let alike = [
+        ("admin", digest(&settings.policy)),
+        (BLOBS, blobs.unwrap_or(NONE.to_string())),
+        ("client-credentials", digest(&settings.clients)),
+        ("cnb-builder", given(&settings.cnb)),
+        (
+            FLUME,
+            given(&settings.flume.as_ref().map(|flume| &flume.url)),
+        ),
+        (
+            "instance-url",
+            instance_url.map_or(NONE, |_| "given").to_string(),
+        ),
+        ("oidc-issuer", given(&oidc)),
+        (
+            "security-group-editor",
+            digest(&settings.security_group_editors),
+        ),
+        (
+            "service-broker-editor",
+            digest(&settings.service_broker_editors),
+        ),
+        ("wicket", wickets.join(",")),
+        (
+            "wicket-away-grace",
+            format!("{}s", settings.wicket_away_grace.as_secs()),
+        ),
+        ("wicket-token", given(&settings.wicket_token)),
+    ];
+    (alike.into_iter())
+        .map(|(option, value)| (option.to_string(), value))
+        .collect()
+}
+
 /// Refuses two `--wicket`s naming one wicket, of those answering now.
 pub async fn check_wickets(settings: &Settings) -> Result<(), String> {
     // reqwest brings no crypto provider of its own
@@ -304,6 +360,9 @@ pub async fn serve(
         },
         None => uaa::Mode::Open,
     };
+    // beside the instances on the store, if it may be
+    let lease = store.lease(settings.lease, alike(&settings));
+    lease.join().await?;
     let uaa = uaa::Uaa::open(&settings.data_dir, mode, store.shared()).await?;
     let provider = match &settings.oidc {
         Some(oidc) => Some(oidc::Provider::new(oidc.clone())?),
@@ -356,7 +415,6 @@ pub async fn serve(
     // what a stop left under way (the stagings, the brokers' operations, the apps' deletes,
     // the deployments and moves) is taken up in this instance's turn reconciling the wickets
     let stop = controller.stop.clone();
-    let lease = store.lease(settings.lease);
     let keeping = tokio::spawn(lease.clone().run());
     let leading = tokio::spawn(controller.lead());
     let sweep = tokio::spawn(store.clone().keep_swept());
@@ -702,7 +760,7 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
-    /// Two instances on one store: an edit the wickets take at once, made through the one not
+    /// Two instances on one store, sharing a bucket and a flume as several do: an edit the wickets take at once, made through the one not
     /// reconciling them, is tried and committed by the one that is, in its turn: refused by a
     /// wicket it is a 422 and changes nothing; two of one app through both leave the wicket
     /// and the state alike; and the one reconciling the wickets killed with an edit under way,
@@ -718,6 +776,23 @@ mod tests {
         let (url, _) = store::postgres_server::database().await;
         let (fake, wicket) = FakeWicket::start(std::time::Duration::from_millis(500)).await;
         let dir = std::env::temp_dir().join(format!("cf-api-edits-{}", store::guid()));
+        let bucket = store::s3_server::bucket().await;
+        let flume = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let logs = flume::FlumeSettings {
+            url: format!("grpc://{}", flume.local_addr().unwrap()),
+            token: "f1ume".into(),
+            ca_pem: None,
+            insecure: false,
+        };
+        let served = sluice_flume::Settings {
+            token: logs.token.clone(),
+            ring_size: 100,
+            ring_bytes: 1 << 20,
+            backfill: 1,
+            tls: None,
+            otlp: None,
+        };
+        tokio::spawn(sluice_flume::serve(flume, served, std::future::pending()));
         let state = postgres::PostgresSettings {
             url: format!("{url}?sslmode=disable"),
             ca_pem: None,
@@ -776,6 +851,7 @@ mod tests {
         let instance = |name: &str| {
             let (dir, wicket) = (dir.join(name), wicket.clone());
             let (mut state, bound) = (state.clone(), tokio::sync::oneshot::channel());
+            let (bucket, logs) = (bucket.clone(), logs.clone());
             let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
             let runtime = tokio::runtime::Runtime::new().unwrap();
             let served = runtime.spawn(async move {
@@ -785,6 +861,7 @@ mod tests {
                 settings.wickets[0].url = wicket;
                 state.instance_url = Some(url.clone());
                 settings.state = Some(state);
+                (settings.blobs, settings.flume) = (Some(bucket), Some(logs));
                 settings.lease = store::tests::TIMING;
                 bound.0.send(url).unwrap();
                 let stopped = async {
