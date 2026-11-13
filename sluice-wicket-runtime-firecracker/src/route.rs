@@ -2313,7 +2313,8 @@ impl Down {
 ///   first (the routes then take no notice)
 /// - a connection failed (`suspected`), and the port refuses for as long as the guest may take
 ///   to listen at a boot (`boot`): one process's restart in place is no end, nor is a client
-///   gone. What lives, listens and does not answer is not seen
+///   gone. The log stream ending meanwhile is the VM gone, as above. What lives, listens and
+///   does not answer is not seen
 async fn watch<F>(
     mut output: Option<Output>,
     mut suspected: mpsc::Receiver<()>,
@@ -2348,8 +2349,21 @@ where
                 }
             }
             None => {
-                if !accepting(boot()).await {
-                    return Some(Down::Unanswered);
+                // a VM gone refuses too: its end, seen while it is looked at, says more
+                let gone = async {
+                    match &mut output {
+                        Some(output) => output.gone().await,
+                        None => std::future::pending().await,
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    () = gone => return Some(Down::Vm),
+                    accepts = accepting(boot()) => {
+                        if !accepts {
+                            return Some(Down::Unanswered);
+                        }
+                    }
                 }
             }
         }
@@ -3759,6 +3773,20 @@ mod tests {
         let (_suspects, suspected) = mpsc::channel(1);
         let why = watch(Some(followed), suspected, answers(&[]), || BOOT).await;
         assert_eq!(why, Some(Down::Vm));
+        // gone while a failed connection has it looked at: its end, not its silence
+        let (followed, guest) = log();
+        let (suspects, suspected) = mpsc::channel(1);
+        let (looked, mut told) = mpsc::unbounded_channel();
+        let accepting = move |_| {
+            let _ = looked.send(());
+            std::future::pending::<bool>()
+        };
+        let watching = tokio::spawn(watch(Some(followed), suspected, accepting, || BOOT));
+        suspects.send(()).await.unwrap();
+        told.recv().await.unwrap();
+        drop(guest);
+        let why = tokio::time::timeout(Duration::from_secs(5), watching).await;
+        assert_eq!(why.expect("the VM's end seen").unwrap(), Some(Down::Vm));
         assert_eq!(Down::Vm.why(None), "its VM ended");
         let (suspects, suspected) = mpsc::channel(1);
         drop(suspects);

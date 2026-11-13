@@ -213,6 +213,11 @@ impl Output {
         }
     }
 
+    /// Resolves once the VM is gone; never on a stream given up with the VM alive.
+    pub async fn gone(&mut self) {
+        turned_on(&mut self.gone).await;
+    }
+
     /// Waits for every line the guest's processes wrote so far, handed on (to the
     /// printer, and the tap), within `timeout`: whether they were.
     pub async fn sync(&mut self, timeout: Duration) -> bool {
