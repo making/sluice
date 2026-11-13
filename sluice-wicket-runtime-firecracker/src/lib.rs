@@ -22,6 +22,11 @@
 //! within the VMs' budget (`capacity`: their number, memory and CPUs). What each VM
 //! uses of the host is read from its process (`usage`) for the console's listings.
 //!
+//! The wicket forks no VM itself: a forker does (`forker`), started before anything
+//! else, the VMs the wicket's children. Where the wicket's own cgroup is delegated
+//! to it, each VM is forked into a cgroup of its own (`cgroup`), which bounds its
+//! memory and threads and gives it its share of the CPUs.
+//!
 //! `--listen` serves the routes over plain TCP as well, each connection routed
 //! by its first request's host (`listener`).
 //!
@@ -43,15 +48,17 @@
 //!
 //! In jail mode (`--jail-ids`) the process started as root is the keeper
 //! (`keeper`): it runs the wicket as `--jail-user` and spawns the VMs at its
-//! request, each in a jail of its own (`jail`).
+//! request, each in a jail of its own (`jail`) and a cgroup of the keeper's.
 
 pub mod capacity;
+pub mod cgroup;
 pub mod config;
 pub mod console;
 pub mod deployed;
 pub mod disk;
 pub mod egress;
 pub mod exchange;
+pub mod forker;
 pub mod head;
 pub mod health;
 pub mod hpack;
@@ -156,7 +163,7 @@ async fn serving(
         state_dir: _,
         guest,
         flume,
-        jail,
+        jail: _,
         mut console,
         mut routes,
         specs: _,
@@ -208,6 +215,7 @@ async fn serving(
         intake = Some(deployed.images().intake());
         routes.deploy(deployed);
     }
+    let takes_cpu = routes.takes_cpu();
     // probed from now on: not ready while the routes start
     let readiness = Readiness::starting(ready_grace);
     if let Some(address) = health {
@@ -301,7 +309,7 @@ async fn serving(
                     builds,
                     dir: console.dir,
                     intake,
-                    jailed: jail.is_some(),
+                    takes_cpu,
                     server: server.clone(),
                     listen: listening,
                     identity,

@@ -14,10 +14,7 @@
 //!   of the host's: the caches and `MIDR_EL1` Firecracker reads, the files the jailer
 //!   copies). No `/dev/net/tun`, `/dev/urandom` or `/dev/userfaultfd`: a vsock-only
 //!   VM restored from a file needs none
-//! - a cgroup of its own ([`Cgroups`]), entered by `clone3` (`CLONE_INTO_CGROUP`), a
-//!   group of the cpu controller of its own (`cpu.weight` by the CPUs it holds, `cpu.max`
-//!   its route's `cpu`) but for a clone of a connection's own, which shares one; its
-//!   `memory.events` tells a VM the OOM killer took ([`Cgroup::oom_killed`])
+//! - a cgroup of its own (`cgroup`), entered by `clone3` (`CLONE_INTO_CGROUP`)
 //! - a uid and gid of its own, no supplementary group, the capability bounding set
 //!   dropped, no new privileges; the wicket's seccomp filter (`seccomp`), then
 //!   Firecracker's as it installs them
@@ -46,19 +43,19 @@
 //! fork and exit of the host takes: 0.25-1ms per VM among 2,300 threads, the keeper's
 //! next spawn and the VMs' own threads stalled behind it.
 
-use std::ffi::{CStr, CString};
+use std::ffi::CString;
 use std::io;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::{Component, Path, PathBuf};
+use std::path::Path;
 
 use crate::seccomp::Filter;
 
 /// `CLONE_INTO_CGROUP` (Linux 5.7), which libc does not name for every target.
-const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+pub(crate) const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
 
 /// `CLONE_PIDFD` (Linux 5.2).
-const CLONE_PIDFD: u64 = 0x1000;
+pub(crate) const CLONE_PIDFD: u64 = 0x1000;
 
 /// `open_tree`'s `OPEN_TREE_CLONE` (Linux 5.2), which libc does not name for every
 /// target.
@@ -221,7 +218,7 @@ fn cstring(bytes: &[u8]) -> io::Result<CString> {
     CString::new(bytes).map_err(|_| io::Error::other("a path holds a NUL byte"))
 }
 
-fn path(path: &Path) -> io::Result<CString> {
+pub(crate) fn path(path: &Path) -> io::Result<CString> {
     cstring(path.as_os_str().as_bytes())
 }
 
@@ -235,7 +232,7 @@ fn kept(relative: &Path) -> io::Result<CString> {
     path(&Path::new(TEMPLATE_STATE).join(relative))
 }
 
-fn check(ret: libc::c_int) -> io::Result<()> {
+pub(crate) fn check(ret: libc::c_int) -> io::Result<()> {
     match ret {
         -1 => Err(io::Error::last_os_error()),
         _ => Ok(()),
@@ -243,7 +240,7 @@ fn check(ret: libc::c_int) -> io::Result<()> {
 }
 
 /// `what`'s error, naming it.
-fn failed(what: &str) -> impl FnOnce(io::Error) -> io::Error + '_ {
+pub(crate) fn failed(what: &str) -> impl FnOnce(io::Error) -> io::Error + '_ {
     move |e| io::Error::new(e.kind(), format!("{what}: {e}"))
 }
 
@@ -452,18 +449,19 @@ struct Prepared {
 
 /// The arguments of `clone3`.
 #[repr(C)]
-struct CloneArgs {
-    flags: u64,
-    pidfd: u64,
-    child_tid: u64,
-    parent_tid: u64,
-    exit_signal: u64,
-    stack: u64,
-    stack_size: u64,
-    tls: u64,
-    set_tid: u64,
-    set_tid_size: u64,
-    cgroup: u64,
+#[derive(Default)]
+pub(crate) struct CloneArgs {
+    pub(crate) flags: u64,
+    pub(crate) pidfd: u64,
+    pub(crate) child_tid: u64,
+    pub(crate) parent_tid: u64,
+    pub(crate) exit_signal: u64,
+    pub(crate) stack: u64,
+    pub(crate) stack_size: u64,
+    pub(crate) tls: u64,
+    pub(crate) set_tid: u64,
+    pub(crate) set_tid_size: u64,
+    pub(crate) cgroup: u64,
 }
 
 /// Clones a child into a new PID namespace and the jail's cgroup, which jails itself
@@ -820,465 +818,6 @@ impl Ids {
     pub fn contains(&self, id: u32) -> bool {
         (self.first..=self.last).contains(&id)
     }
-}
-
-/// The VMs' cgroups (v2), under a parent of theirs: `route-<n>` for a route's template (its
-/// snapshot, which it writes, is charged there as long as the route lives) and `vm-<n>` for a
-/// VM serving, one per uid of [`Ids`] and reused (no cgroup made and removed per clone). Each
-/// is a group of the cpu controller: its `cpu.weight` the VM's share of the CPUs among them
-/// ([`weight`]: by what it holds of the CPU budget), its `cpu.max` its route's `cpu`. So the
-/// VMs share the CPUs they contend for by what each was given, and the wicket's own cgroup,
-/// where it is their sibling (`keeper/`, [`KEEPER_WEIGHT`]), before them.
-///
-/// But a clone of a connection's own without `cpu` ([`Limits::weight`] none) is in `shared/`,
-/// one group of the cpu controller for all of them, their cgroups in it without: a group per
-/// VM, scheduled on its own, costs 8% of the clone rate, and nothing of a VM that lives on.
-/// Its threads share the group's CPUs as equals; the group's weight is what its VMs alive hold
-/// together, the keeper's to write ([`Cgroups::shared_weight`]).
-pub struct Cgroups {
-    /// The parent, absolute.
-    dir: PathBuf,
-    /// Whether the keeper made it: removed at the end.
-    made: bool,
-    /// Whether the VMs' cgroups are groups of the cpu controller: the hierarchy has it.
-    cpu: bool,
-}
-
-/// The cgroup v2 hierarchy.
-const CGROUP_ROOT: &str = "/sys/fs/cgroup";
-
-/// The controllers the VMs' cgroups use.
-const CONTROLLERS: &str = "+memory +pids";
-
-/// The controller of the VMs' shares and of a route's `cpu`, enabled with [`CONTROLLERS`]
-/// down to the VMs' cgroups where the hierarchy has it: without it the VMs have no share of
-/// their own, and a route asking for `cpu` fails its VMs' spawn.
-const CPU_CONTROLLER: &str = "+cpu";
-
-/// The class of the VMs sharing one group of the cpu controller ([`Cgroups`]).
-const SHARED: &str = "shared";
-
-/// The classes of an earlier keeper's cgroups: removed with what it left.
-const EARLIER: [&str; 2] = ["capped", "uncapped"];
-
-/// The period of a VM's `cpu.max`, microseconds.
-pub const CPU_PERIOD_US: u64 = 100_000;
-
-/// `cpu.weight` per CPU a VM holds of the budget: a tenth of the kernel's default, so the
-/// shared group's weight follows its VMs up to 1000 CPUs ([`MAX_WEIGHT`]).
-const CPU_WEIGHT: u64 = 10;
-
-/// The most a `cpu.weight` is.
-const MAX_WEIGHT: u64 = 10_000;
-
-/// The `cpu.weight` of the keeper's leaf, the wicket's own cgroup, where the VMs' are its
-/// siblings: the most, its threads run before theirs. They relay every connection, and take
-/// the CPUs they need, not more.
-const KEEPER_WEIGHT: u64 = MAX_WEIGHT;
-
-/// The `cpu.weight` of a cgroup whose VMs hold `cpu` hundredths of a CPU of the budget.
-pub fn weight(cpu: u64) -> u64 {
-    (cpu.saturating_mul(CPU_WEIGHT).div_ceil(100)).clamp(1, MAX_WEIGHT)
-}
-
-/// What a VM's cgroup allows it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Limits {
-    /// `memory.max`, bytes.
-    pub memory: u64,
-    /// `pids.max`: its threads.
-    pub pids: u64,
-    /// `cpu.max`'s quota per [`CPU_PERIOD_US`], microseconds; None = no limit.
-    pub cpu: Option<u64>,
-    /// `cpu.weight`: its share of the CPUs; None = none of its own, its cgroup no group of
-    /// the cpu controller (a VM of the shared group; a hierarchy without the controller).
-    pub weight: Option<u64>,
-}
-
-impl Cgroups {
-    /// The VMs' parent cgroup: `path` (under the hierarchy's root), made if missing, the
-    /// controllers enabled down to it; or, None, the keeper's own cgroup (delegated to
-    /// it: a systemd service's with `Delegate=yes`, a container's), which the keeper
-    /// leaves for a leaf (`keeper`, of [`KEEPER_WEIGHT`]): cgroup v2 enables no controller
-    /// for the children of a cgroup holding processes. The shared class made, without the
-    /// cpu controller for the cgroups in it. Removes the VMs' cgroups a previous keeper
-    /// left, and fails when one still holds a process.
-    pub fn setup(path: Option<&str>) -> io::Result<Cgroups> {
-        let root = Path::new(CGROUP_ROOT);
-        if !is_cgroup2(root) {
-            return Err(io::Error::other(format!(
-                "{CGROUP_ROOT} is not a cgroup v2 hierarchy: the jail needs one"
-            )));
-        }
-        let cgroups = match path {
-            Some(path) => {
-                let relative = Path::new(path.trim_start_matches('/'));
-                if relative
-                    .components()
-                    .any(|component| !matches!(component, Component::Normal(_)))
-                {
-                    return Err(io::Error::other(format!(
-                        "jail-cgroup {path}: expected a path under {CGROUP_ROOT} without . or .."
-                    )));
-                }
-                let dir = root.join(relative);
-                let made = !dir.exists();
-                writable(root)?;
-                std::fs::create_dir_all(&dir).map_err(failed(&dir.display().to_string()))?;
-                // the root's subtree_control and every one below it, down to the parent's
-                let busy = "it holds processes: choose a jail-cgroup none of whose \
-                            ancestors (but the root) does";
-                let mut at = root.to_path_buf();
-                enable(&at, busy, true)?;
-                for component in relative.components() {
-                    at.push(component);
-                    enable(&at, busy, true)?;
-                }
-                Cgroups::at(dir, made)
-            }
-            None => {
-                let own = std::fs::read_to_string("/proc/self/cgroup")?;
-                let own = own
-                    .lines()
-                    .find_map(|line| line.strip_prefix("0::"))
-                    .ok_or_else(|| io::Error::other("/proc/self/cgroup names no cgroup v2"))?;
-                let dir = root.join(own.trim_start_matches('/'));
-                writable(root)?;
-                let leaf = dir.join("keeper");
-                match std::fs::create_dir(&leaf) {
-                    Err(e) if e.kind() != io::ErrorKind::AlreadyExists => {
-                        return Err(failed(&leaf.display().to_string())(e));
-                    }
-                    _ => {}
-                }
-                std::fs::write(leaf.join("cgroup.procs"), "0")
-                    .map_err(failed(&leaf.display().to_string()))?;
-                enable(
-                    &dir,
-                    "other processes share the keeper's cgroup, so it cannot hold the VMs' \
-                     cgroups: run the wicket as a service with Delegate=yes, in a container, \
-                     or set jail-cgroup",
-                    true,
-                )?;
-                let cgroups = Cgroups::at(dir, false);
-                if cgroups.cpu {
-                    let weight = leaf.join("cpu.weight");
-                    std::fs::write(&weight, KEEPER_WEIGHT.to_string())
-                        .map_err(failed(&weight.display().to_string()))?;
-                }
-                cgroups
-            }
-        };
-        let class = cgroups.dir.join(SHARED);
-        match std::fs::create_dir(&class) {
-            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => {
-                return Err(failed(&class.display().to_string())(e));
-            }
-            _ => {}
-        }
-        enable(
-            &class,
-            "it holds processes, another wicket's: choose another jail-cgroup",
-            false,
-        )?;
-        for stale in cgroups.children()? {
-            let procs = std::fs::read_to_string(stale.join("cgroup.procs")).unwrap_or_default();
-            if !procs.trim().is_empty() {
-                return Err(io::Error::other(format!(
-                    "{} holds processes: another wicket's VMs; choose another jail-cgroup",
-                    stale.display()
-                )));
-            }
-            std::fs::remove_dir(&stale).map_err(failed(&stale.display().to_string()))?;
-        }
-        for earlier in EARLIER {
-            let _ = std::fs::remove_dir(cgroups.dir.join(earlier));
-        }
-        Ok(cgroups)
-    }
-
-    /// The VMs' cgroups in `dir`, the controllers enabled for them: with the cpu controller
-    /// where it is among them.
-    fn at(dir: PathBuf, made: bool) -> Cgroups {
-        let control = dir.join("cgroup.subtree_control");
-        let enabled = std::fs::read_to_string(control).unwrap_or_default();
-        let cpu = enabled.split_whitespace().any(|name| name == "cpu");
-        Cgroups { dir, made, cpu }
-    }
-
-    /// The parent cgroup.
-    pub fn dir(&self) -> &Path {
-        &self.dir
-    }
-
-    /// Whether the VMs' cgroups are groups of the cpu controller.
-    pub fn cpu(&self) -> bool {
-        self.cpu
-    }
-
-    /// Where the cgroups of the VMs that share one group of the cpu controller are (`shared`),
-    /// or the others'.
-    fn class(&self, shared: bool) -> PathBuf {
-        match shared {
-            true => self.dir.join(SHARED),
-            false => self.dir.clone(),
-        }
-    }
-
-    /// The shared group's `cpu.weight`, open for the keeper to write what its VMs hold
-    /// ([`weight`]); none without the cpu controller.
-    pub fn shared_weight(&self) -> Option<std::fs::File> {
-        let weight = self.class(true).join("cpu.weight");
-        let open = || std::fs::OpenOptions::new().write(true).open(weight).ok();
-        self.cpu.then(open).flatten()
-    }
-
-    /// The cgroup `name`, of the VMs that share one group of the cpu controller (`shared`) or
-    /// a group of its own, made if missing.
-    pub fn child(&self, name: &str, shared: bool) -> io::Result<Cgroup> {
-        let dir = self.class(shared).join(name);
-        match std::fs::create_dir(&dir) {
-            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => {
-                return Err(failed(&dir.display().to_string())(e));
-            }
-            _ => {}
-        }
-        let path = path(&dir)?;
-        // SAFETY: open of a NUL-terminated path
-        let fd = unsafe {
-            libc::open(
-                path.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-            )
-        };
-        check(fd).map_err(failed(&dir.display().to_string()))?;
-        Ok(Cgroup {
-            // SAFETY: a new fd of ours
-            dir: unsafe { OwnedFd::from_raw_fd(fd) },
-            limits: None,
-            events: None,
-            oom_kills: 0,
-        })
-    }
-
-    /// Removes the cgroup `name`, shared or not (its processes ended; the pages charged
-    /// to it stay charged to it, a dying cgroup, until they are freed).
-    pub fn remove(&self, name: &str) {
-        for shared in [true, false] {
-            let _ = std::fs::remove_dir(self.class(shared).join(name));
-        }
-    }
-
-    /// The VMs' cgroups, `route-*` and `vm-*`: the parent's, the shared class's, and those
-    /// of an earlier keeper's classes.
-    fn children(&self) -> io::Result<Vec<PathBuf>> {
-        let mut children = Vec::new();
-        let earlier = EARLIER.map(|class| self.dir.join(class));
-        for dir in [self.dir.clone(), self.class(true)]
-            .into_iter()
-            .chain(earlier)
-        {
-            let entries = match std::fs::read_dir(&dir) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-                entries => entries?,
-            };
-            for entry in entries {
-                let entry = entry?;
-                let name = entry.file_name();
-                let name = name.to_string_lossy();
-                if entry.file_type()?.is_dir()
-                    && (name.starts_with("route-") || name.starts_with("vm-"))
-                {
-                    children.push(entry.path());
-                }
-            }
-        }
-        Ok(children)
-    }
-
-    /// Removes the VMs' cgroups (their processes ended), the shared class, and the parent if
-    /// the keeper made it.
-    pub fn close(&self) {
-        for child in self.children().unwrap_or_default() {
-            let _ = std::fs::remove_dir(child);
-        }
-        let _ = std::fs::remove_dir(self.class(true));
-        if self.made {
-            let _ = std::fs::remove_dir(&self.dir);
-        }
-    }
-}
-
-/// A VM's cgroup: its directory, open for `clone3`, its limits as last written, and the OOM
-/// killer's kills in it as last read.
-pub struct Cgroup {
-    dir: OwnedFd,
-    limits: Option<Limits>,
-    /// Its `memory.events`, open from its first read on.
-    events: Option<std::fs::File>,
-    oom_kills: u64,
-}
-
-impl Cgroup {
-    pub fn fd(&self) -> BorrowedFd<'_> {
-        self.dir.as_fd()
-    }
-
-    /// Whether the kernel's OOM killer took a process of it since the last call: its
-    /// `memory.events`' `oom_kill` rose. Asked as each VM it held is reaped, one at a time,
-    /// it tells whether the OOM killer took that VM (whose limit is the cgroup's, or the
-    /// host's memory ran out). An error reads as none.
-    pub fn oom_killed(&mut self) -> bool {
-        use std::os::unix::fs::FileExt as _;
-        if self.events.is_none() {
-            // SAFETY: openat of a NUL-terminated name in our directory
-            let fd = unsafe {
-                libc::openat(
-                    self.dir.as_raw_fd(),
-                    c"memory.events".as_ptr(),
-                    libc::O_RDONLY | libc::O_CLOEXEC,
-                )
-            };
-            // SAFETY: a new fd of ours
-            self.events =
-                (fd >= 0).then(|| std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }));
-        }
-        let Some(events) = &self.events else {
-            return false;
-        };
-        // read from its start each time: the kernel writes it anew
-        let mut text = [0u8; 512];
-        let Ok(read) = events.read_at(&mut text, 0) else {
-            return false;
-        };
-        let text = String::from_utf8_lossy(&text[..read]);
-        let Some(count) = crate::usage::oom_kills(&text) else {
-            return false;
-        };
-        let rose = count > self.oom_kills;
-        self.oom_kills = count;
-        rose
-    }
-
-    /// Sets `limits`, unless they are the ones set last (a reused cgroup's).
-    pub fn limit(&mut self, limits: Limits) -> io::Result<()> {
-        if self.limits == Some(limits) {
-            return Ok(());
-        }
-        for (file, value) in [
-            (c"memory.max", limits.memory),
-            // the VM's threads alone: on OOM it is killed whole
-            (c"memory.oom.group", 1),
-            (c"pids.max", limits.pids),
-        ] {
-            self.write(file, &value.to_string())?;
-        }
-        match (limits.weight, limits.cpu) {
-            // a group of the cpu controller: its share, and its route's `cpu`, or none again
-            // where the VM before it of the id had one
-            (Some(weight), quota) => {
-                self.write(c"cpu.weight", &weight.to_string())?;
-                let capped = self.limits.is_some_and(|before| before.cpu.is_some());
-                if quota.is_some() || capped {
-                    let quota = quota.map_or("max".to_string(), |quota| quota.to_string());
-                    self.write(c"cpu.max", &format!("{quota} {CPU_PERIOD_US}"))?;
-                }
-            }
-            (None, Some(_)) => {
-                return Err(io::Error::other(
-                    "cpu.max: the cpu controller is not enabled for the VMs' cgroups (cpu \
-                     needs it)",
-                ));
-            }
-            (None, None) => {}
-        }
-        self.limits = Some(limits);
-        Ok(())
-    }
-
-    /// Writes `value` into the cgroup's `file`.
-    fn write(&self, file: &CStr, value: &str) -> io::Result<()> {
-        // SAFETY: openat of a NUL-terminated name in our directory, a write of a buffer
-        // of its length, the close of our fd
-        unsafe {
-            let fd = libc::openat(
-                self.dir.as_raw_fd(),
-                file.as_ptr(),
-                libc::O_WRONLY | libc::O_CLOEXEC,
-            );
-            check(fd).map_err(failed(&format!("{file:?}")))?;
-            let written = libc::write(fd, value.as_ptr().cast(), value.len());
-            let error = io::Error::last_os_error();
-            libc::close(fd);
-            if written != value.len() as isize {
-                return Err(failed(&format!("{file:?} {value}"))(error));
-            }
-        }
-        Ok(())
-    }
-}
-
-/// Whether `dir` is the root of a cgroup v2 mount.
-fn is_cgroup2(dir: &Path) -> bool {
-    let Ok(path) = path(dir) else {
-        return false;
-    };
-    let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: a NUL-terminated path and a statfs buffer to fill
-    if unsafe { libc::statfs(path.as_ptr(), fs.as_mut_ptr()) } != 0 {
-        return false;
-    }
-    // SAFETY: filled by the successful call
-    unsafe { fs.assume_init() }.f_type == libc::CGROUP2_SUPER_MAGIC
-}
-
-/// Makes the cgroup mount at `root` writable where it is mounted read-only (a
-/// container's, by default): the keeper holds `CAP_SYS_ADMIN` there.
-fn writable(root: &Path) -> io::Result<()> {
-    let path = path(root)?;
-    let mut fs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: a NUL-terminated path and a buffer to fill
-    check(unsafe { libc::statvfs(path.as_ptr(), fs.as_mut_ptr()) })?;
-    // SAFETY: filled by the successful call
-    if unsafe { fs.assume_init() }.f_flag & libc::ST_RDONLY == 0 {
-        return Ok(());
-    }
-    // SAFETY: a remount of the mount's own flags, clearing read-only
-    check(unsafe {
-        libc::mount(
-            std::ptr::null(),
-            path.as_ptr(),
-            std::ptr::null(),
-            libc::MS_REMOUNT | libc::MS_BIND | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-            std::ptr::null(),
-        )
-    })
-    .map_err(failed(&format!(
-        "{CGROUP_ROOT} is read-only; remounting it"
-    )))
-}
-
-/// Enables [`CONTROLLERS`] for the children of the cgroup `dir`, and, `cpu`,
-/// [`CPU_CONTROLLER`] where `dir` has it (unchecked); `busy` says why it cannot when
-/// `dir` holds processes (cgroup v2 enables no controller for the children of a cgroup
-/// holding processes).
-fn enable(dir: &Path, busy: &str, cpu: bool) -> io::Result<()> {
-    let control = dir.join("cgroup.subtree_control");
-    std::fs::write(&control, CONTROLLERS).map_err(|e| {
-        let why = match e.raw_os_error() {
-            Some(libc::EBUSY) => format!(": {busy}"),
-            _ => String::new(),
-        };
-        io::Error::new(
-            e.kind(),
-            format!("{}: {CONTROLLERS}: {e}{why}", control.display()),
-        )
-    })?;
-    let available = std::fs::read_to_string(dir.join("cgroup.controllers")).unwrap_or_default();
-    if cpu && available.split_whitespace().any(|name| name == "cpu") {
-        let _ = std::fs::write(&control, CPU_CONTROLLER);
-    }
-    Ok(())
 }
 
 /// A pidfd of this process (`pidfd_open`, close-on-exec), for [`Jail::keeper`].

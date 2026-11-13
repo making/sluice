@@ -126,8 +126,8 @@ pub struct Console {
     pub images: Option<Arc<Images>>,
     /// With `--guest`: the builds, and the layers they take and make.
     pub builds: Option<Arc<Builds>>,
-    /// Jail mode: a route may take `cpu`.
-    pub jailed: bool,
+    /// A route may take `cpu`: its VMs' cgroups bound it.
+    pub takes_cpu: bool,
     /// What the page shows besides the routes.
     pub server: Option<String>,
     pub listen: Option<SocketAddr>,
@@ -320,7 +320,7 @@ impl Console {
             listen: self.listen.map(|listen| listen.to_string()),
             max_rootfs_bytes: MAX_ROOTFS_BYTES,
             runtime: RUNTIME,
-            jailed: self.jailed,
+            cpu_limit: self.takes_cpu,
             budget: BudgetView {
                 max_instances: self.capacity.max_instances(),
                 max_memory_mib: self.capacity.max_memory_mib(),
@@ -947,8 +947,9 @@ struct Listing {
     listen: Option<String>,
     max_rootfs_bytes: u64,
     runtime: &'static str,
-    /// Jail mode: a route may take `cpu`.
-    jailed: bool,
+    /// A route may take `cpu`: its VMs' cgroups bound it (jail mode, or the wicket's own
+    /// cgroup delegated to it).
+    cpu_limit: bool,
     budget: BudgetView,
     reload_failure: Option<FailureView>,
     /// Told to stop, until when it serves on at most.

@@ -8,6 +8,9 @@
 //!   own filters follow, stacked)
 //! - [`Filter::keeper`]: the keeper (jail mode, root), and what it spawns before their
 //!   own: the same but for the namespace, mount and root calls of the jails (`jail`)
+//! - [`Filter::forker`]: the forker (`forker`, without the jail), started before the wicket
+//!   installs its own: the wicket's but for `clone3`, by which it forks a VM into its cgroup,
+//!   the flags its own; each VM installs the wicket's before its exec
 //!
 //! A denylist, not the profile's allowlist: the calls the profile refuses, the ones
 //! newer than the kernels it knows aside. Denied calls fail with `EPERM`, `clone3` with
@@ -147,16 +150,23 @@ pub struct Filter(Vec<libc::sock_filter>);
 impl Filter {
     /// The filter of the wicket and the VMs.
     pub fn unprivileged() -> Filter {
-        Filter::build(true)
+        Filter::build(false, false)
     }
 
     /// The keeper's: the jails' namespace and mount calls allowed, `clone3` too (it
     /// clones the VMs into their PID namespace and cgroup).
     pub fn keeper() -> Filter {
-        Filter::build(false)
+        Filter::build(true, true)
     }
 
-    fn build(unprivileged: bool) -> Filter {
+    /// The forker's: the wicket's, `clone3` allowed (it forks the VMs into their cgroup).
+    pub fn forker() -> Filter {
+        Filter::build(false, true)
+    }
+
+    /// The filter of a process that jails VMs (`jailer`: the jails' calls allowed, `clone`'s
+    /// namespace flags too) or not, `clone3` allowed or refused.
+    fn build(jailer: bool, clone3: bool) -> Filter {
         let mut program = Program(Vec::new());
         program.load(ARCH);
         program.jump_eq(AUDIT_ARCH, 1, 0);
@@ -167,12 +177,14 @@ impl Filter {
             program.jump(libc::BPF_JGE, X32_SYSCALL_BIT, 0, 1);
             program.ret(fail(libc::EPERM));
         }
-        let jails = if unprivileged { JAILS } else { &[] };
+        let jails = if jailer { &[] } else { JAILS };
         for nr in DENIED.iter().chain(DENIED_ARCH).chain(jails) {
             program.deny(*nr, libc::EPERM);
         }
-        if unprivileged {
+        if !clone3 {
             program.deny(libc::SYS_clone3, libc::ENOSYS);
+        }
+        if !jailer {
             program.on(libc::SYS_clone, |program| {
                 program.jump(libc::BPF_JSET, CLONE_NAMESPACES, 0, 1);
                 program.ret(fail(libc::EPERM));
@@ -298,7 +310,8 @@ mod tests {
     type Check = (&'static str, fn() -> i64, Option<i64>, Option<i64>);
 
     /// Each filter installed in a child of its own: what the calls it refuses and
-    /// allows return there, as an unprivileged process sees them.
+    /// allows return there, as an unprivileged process sees them; the forker's as the
+    /// wicket's, but for `clone3`.
     #[test]
     fn the_filters_refuse_dockers_denials_and_the_keeper_its_jails_calls() {
         let [eperm, einval, ebadf, enosys, enoent] = [
@@ -381,7 +394,11 @@ mod tests {
                 eperm,
             ),
         ];
-        for (unprivileged, filter) in [(true, Filter::unprivileged()), (false, Filter::keeper())] {
+        for (jailer, clone3, filter) in [
+            (false, false, Filter::unprivileged()),
+            (true, true, Filter::keeper()),
+            (false, true, Filter::forker()),
+        ] {
             let mut results = [i64::MIN; 10];
             let mut pipe = [0; 2];
             // SAFETY: a pipe, a fork whose child installs the filter and writes what the
@@ -411,9 +428,14 @@ mod tests {
             }
             assert_ne!(results[0], i64::MIN, "the filter installed");
             for ((name, _, wicket, keeper), got) in checks.iter().zip(results) {
-                match if unprivileged { wicket } else { keeper } {
-                    Some(want) => assert_eq!(got, *want, "{name}, unprivileged: {unprivileged}"),
-                    None => assert_ne!(Some(got), eperm, "{name}, unprivileged: {unprivileged}"),
+                let allowed = match *name {
+                    "clone3" => clone3,
+                    _ => jailer,
+                };
+                let filtered = format!("{name}, jailer: {jailer}, clone3: {clone3}");
+                match if allowed { keeper } else { wicket } {
+                    Some(want) => assert_eq!(got, *want, "{filtered}"),
+                    None => assert_ne!(Some(got), eperm, "{filtered}"),
                 }
             }
         }

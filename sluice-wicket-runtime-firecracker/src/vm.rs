@@ -6,14 +6,11 @@
 //! it followed by `CONNECT <port>\n`, answered `OK <host port>\n`.
 //!
 //! A VM never outlives the wicket: `firecracker` runs with the parent death signal set
-//! (SIGKILL). Setting it between fork and exec would make every spawn a fork of the
-//! wicket, whose page tables the fork copies holding the wicket's memory map lock (1-2ms
-//! of no page fault, no allocation growing the heap, on any of its threads, for every
-//! VM spawned); the wicket instead spawns itself (`posix_spawn`, no copy) as a launcher
-//! ([`launch`]) that sets the signal and execs `firecracker`.
-//!
-//! The launcher also lowers `firecracker`'s soft open file limit to what a VM needs
-//! ([`set_open_files`]): Firecracker grows its file table to that limit at its start
+//! (SIGKILL). The wicket forks none itself (a fork copies its page tables holding its memory
+//! map lock): without the jail the forker does ([`Place::Dir`], `forker`), the VM the
+//! wicket's child, in a cgroup of its own where the wicket has them (`cgroup`). Before the
+//! VM's exec it sets that signal and lowers `firecracker`'s soft open file limit to what a VM
+//! needs ([`set_open_files`]): Firecracker grows its file table to that limit at its start
 //! (`dup2` to the last descriptor), 3ms per VM at 1048576.
 //!
 //! In jail mode the keeper spawns the VMs, each in a jail ([`Place::Jail`], `keeper`,
@@ -31,20 +28,17 @@
 //! the kernel's command line, which any process of the guest reads, says only that they
 //! are coming.
 //!
-//! An app's booted VM may have a disk (`disk`), a second drive: the launcher takes its lock
-//! for `firecracker`, whose guest's flushes reach the host's disk (`Writeback`: its journal
+//! An app's booted VM may have a disk (`disk`), a second drive: its lock is taken before
+//! `firecracker`'s exec, whose guest's flushes reach the host's disk (`Writeback`: its journal
 //! relies on them across a crash of the host). Its VM is stopped by a notice before it is
 //! killed ([`Vm::stop`]), dropped or not: a start given up drops it, and the stop then runs in a
 //! task of its own (`StopOnDrop`), the disk held until the VM is gone.
 
-use std::ffi::OsString;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::DirBuilderExt as _;
-use std::os::unix::process::CommandExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -54,14 +48,15 @@ use serde_json::{Value, json};
 use sluice_wicket_console::env::Env;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
-use tokio::process::{Child, Command};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::watch;
 use tokio_util::task::TaskTracker;
 
 use crate::BoxError;
 use crate::capacity::Slot;
+use crate::cgroup::Cgroups;
 use crate::disk::{self, Disk};
 use crate::egress::{self, Egress, Listening};
+use crate::forker::{Child, Forker, Launch};
 use crate::jail;
 use crate::keeper::{Client, Role, Size, VmEnd, vm_file_size};
 use crate::usage::{self, Meter};
@@ -78,14 +73,8 @@ const API_TIMEOUT: Duration = Duration::from_secs(5);
 /// snapshot's time, and the restore notice carries the host's (`wire::Notice`).
 pub const RESTORE_ADVANCES_CLOCK: bool = cfg!(target_arch = "x86_64");
 
-/// The first argument of the wicket's launcher mode, see [`launch`].
-pub const LAUNCH: &str = "--launch-vm";
-
 /// Set, the VMs have a serial console (`boot_args`).
 pub const SERIAL_CONSOLE: &str = "SLUICE_WICKET_RUNTIME_FIRECRACKER_SERIAL_CONSOLE";
-
-/// The launcher's disk argument for a VM without one.
-const NO_DISK: &str = "-";
 
 /// The descriptors a `firecracker` holds besides its vsock streams: KVM's, its
 /// vCPUs', event fds, its sockets, files and log.
@@ -132,7 +121,7 @@ pub fn set_open_files(connections: usize) -> std::io::Result<(u64, u64)> {
 
 /// Sets the process's soft open file limit to `soft`, at most its hard one; returns
 /// the hard one.
-fn set_soft_open_files(soft: u64) -> std::io::Result<u64> {
+pub(crate) fn set_soft_open_files(soft: u64) -> std::io::Result<u64> {
     let mut limit = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -149,114 +138,6 @@ fn set_soft_open_files(soft: u64) -> std::io::Result<u64> {
     Ok(limit.rlim_max)
 }
 
-/// The threads spawning the launchers, see [`launching`].
-const LAUNCHING_THREADS: usize = 4;
-
-/// A spawn on a launching thread.
-type Launching = Box<dyn FnOnce() + Send>;
-
-/// Runs `spawn` (a launcher's spawn) on one of the wicket's launching threads, in the
-/// caller's runtime: a `posix_spawn` holds its thread until the launcher's exec (1ms), a
-/// worker's relays with it. A child's parent death signal fires as the thread that
-/// spawned it ends, not its process: the threads live as long as the wicket (a runtime's
-/// blocking threads end once idle, and their VMs with them).
-async fn launching<R: Send + 'static>(
-    spawn: impl FnOnce() -> R + Send + 'static,
-) -> Result<R, BoxError> {
-    static THREADS: OnceLock<Mutex<std::sync::mpsc::Sender<Launching>>> = OnceLock::new();
-    let threads = THREADS.get_or_init(|| {
-        let (sender, receiver) = std::sync::mpsc::channel::<Launching>();
-        let receiver = Arc::new(Mutex::new(receiver));
-        for n in 0..LAUNCHING_THREADS {
-            let receiver = receiver.clone();
-            let _ = std::thread::Builder::new()
-                .name(format!("launching-{n}"))
-                .spawn(move || {
-                    loop {
-                        let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        match next {
-                            Ok(spawn) => spawn(),
-                            Err(_) => return,
-                        }
-                    }
-                });
-        }
-        Mutex::new(sender)
-    });
-    let runtime = tokio::runtime::Handle::current();
-    let (done, spawned) = oneshot::channel();
-    let job: Launching = Box::new(move || {
-        let _entered = runtime.enter();
-        let _ = done.send(spawn());
-    });
-    threads
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .send(job)
-        .map_err(|_| "no launching thread")?;
-    Ok(spawned.await.map_err(|_| "no launching thread")?)
-}
-
-/// The launcher mode (`<wicket> --launch-vm <wicket pid> <open files> <file size>
-/// <disk or -> <program> <args>...`), run before anything else: sets the parent death
-/// signal (SIGKILL), checks that the parent is still the wicket of `<wicket pid>` (else it
-/// died before the signal was set, and exits), sets the soft open file limit, the file
-/// size limit (bytes; a guest's output to its VM's log bounded, as a jail's) and no
-/// core (of a VM's memory), takes the disk's lock for the program ([`disk::hold`]), and
-/// execs the program. Returns only when that failed.
-pub fn launch(mut args: impl Iterator<Item = OsString>) -> std::io::Error {
-    let mut number = || {
-        args.next()
-            .and_then(|arg| arg.to_str()?.parse::<u64>().ok())
-    };
-    let (wicket, files, size) = (number(), number(), number());
-    let (Some(wicket), Some(files), Some(size), Some(locked), Some(program)) =
-        (wicket, files, size, args.next(), args.next())
-    else {
-        return std::io::Error::other(format!(
-            "usage: {LAUNCH} <wicket pid> <open files> <file size> <disk or -> <program> <args>..."
-        ));
-    };
-    // SAFETY: a plain prctl; the signal follows the parent thread, a runtime worker
-    // living as long as the wicket
-    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
-        return std::io::Error::last_os_error();
-    }
-    // SAFETY: a plain getppid
-    if u64::try_from(unsafe { libc::getppid() }) != Ok(wicket) {
-        return std::io::Error::other("the wicket ended before the VM started");
-    }
-    if let Err(e) = set_soft_open_files(files) {
-        return e;
-    }
-    // soft and hard, at most the hard one
-    for (resource, limit) in [(libc::RLIMIT_FSIZE, size), (libc::RLIMIT_CORE, 0)] {
-        let mut current = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-        // SAFETY: plain getrlimit / setrlimit on a valid struct
-        if unsafe { libc::getrlimit(resource, &mut current) } != 0 {
-            return std::io::Error::last_os_error();
-        }
-        let limit = limit.min(current.rlim_max);
-        let limit = libc::rlimit {
-            rlim_cur: limit,
-            rlim_max: limit,
-        };
-        // SAFETY: as above
-        if unsafe { libc::setrlimit(resource, &limit) } != 0 {
-            return std::io::Error::last_os_error();
-        }
-    }
-    if locked != NO_DISK
-        && let Err(e) = disk::hold(Path::new(&locked))
-    {
-        return e;
-    }
-    std::process::Command::new(program).args(args).exec()
-}
-
 /// What a route's VMs are booted from.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Spec {
@@ -265,8 +146,8 @@ pub struct Spec {
     pub rootfs: PathBuf,
     pub vcpus: u32,
     pub memory_mib: u32,
-    /// Jail mode: the host CPU time a VM may take, in percent of one CPU (its cgroup's
-    /// `cpu.max`); None = its vCPUs bound it.
+    /// The host CPU time a VM may take, in percent of one CPU (its cgroup's `cpu.max`: jail
+    /// mode, or the wicket's own cgroup delegated to it); None = its vCPUs bound it.
     pub cpu: Option<u32>,
     /// The destinations its guests may connect to, through the wicket (sorted, once
     /// each).
@@ -317,8 +198,8 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// Its clones are each a connection's own: jailed, they share one group of the cpu
-    /// controller (`jail::Cgroups`).
+    /// Its clones are each a connection's own: in their cgroups, they share one group of the
+    /// cpu controller (`cgroup::Cgroups`).
     pub fn of_connections(mut self) -> Snapshot {
         self.size.shared = true;
         self
@@ -327,18 +208,31 @@ impl Snapshot {
 
 /// How the wicket starts VMs, before its runtime does.
 pub enum Launcher {
-    /// As its children (the launcher mode), their files in the state dir.
-    Direct { state: PathBuf },
+    /// Through the forker at `forker` (the wicket's end of it), its children: their files in
+    /// the state dir, their cgroups `cgroups` where the wicket's own is delegated to it.
+    Direct {
+        state: PathBuf,
+        forker: OwnedFd,
+        cgroups: Option<Cgroups>,
+    },
     /// Through the keeper at `fd` (jail mode), whose `firecracker` is the one named at
     /// startup.
     Jailed { fd: OwnedFd, firecracker: PathBuf },
 }
 
 impl Launcher {
-    /// Its places; the keeper's client started (in the runtime).
+    /// Its places; the forker asked, or the keeper's client started (in the runtime), from
+    /// here on.
     pub fn start(self) -> std::io::Result<Places> {
         Ok(match self {
-            Launcher::Direct { state } => Places::Dirs(state),
+            Launcher::Direct {
+                state,
+                forker,
+                cgroups,
+            } => Places::Dirs {
+                state,
+                forker: Arc::new(Forker::new(forker, cgroups)?),
+            },
             Launcher::Jailed { fd, firecracker } => Places::Jails {
                 keeper: Client::start(fd)?,
                 firecracker,
@@ -349,8 +243,8 @@ impl Launcher {
 
 /// Where the routes' VMs are started.
 pub enum Places {
-    /// A directory per route in the state dir.
-    Dirs(PathBuf),
+    /// A directory per route in the state dir, its VMs the forker's to fork.
+    Dirs { state: PathBuf, forker: Arc<Forker> },
     /// Jails of the keeper's.
     Jails {
         keeper: Arc<Client>,
@@ -365,13 +259,16 @@ impl Places {
     /// wicket's user.
     pub async fn place(&self, name: &str, spec: &Spec) -> Result<Place, BoxError> {
         match self {
-            Places::Dirs(state) => {
+            Places::Dirs { state, forker } => {
                 let dir = state.join(name);
                 std::fs::DirBuilder::new()
                     .mode(0o700)
                     .create(&dir)
                     .map_err(|e| format!("{}: {e}", dir.display()))?;
-                Ok(Place::Dir(dir))
+                Ok(Place::Dir {
+                    dir,
+                    forker: forker.clone(),
+                })
             }
             Places::Jails {
                 keeper,
@@ -421,8 +318,9 @@ impl Places {
 
 /// Where a route's VMs are started, and their files are; removed with the route.
 pub enum Place {
-    /// The route's directory: `boot` (its template), `snapshot`, `clones/vm-<n>`, `vms/vm-<n>`.
-    Dir(PathBuf),
+    /// The route's directory: `boot` (its template), `snapshot`, `clones/vm-<n>`, `vms/vm-<n>`;
+    /// named as its template's cgroup is, where the wicket has them.
+    Dir { dir: PathBuf, forker: Arc<Forker> },
     /// The keeper's route, and its snapshot directory.
     Jail {
         keeper: Arc<Client>,
@@ -436,17 +334,19 @@ impl Place {
     /// mode).
     pub async fn seal(&self) -> Result<(), BoxError> {
         match self {
-            Place::Dir(_) => Ok(()),
+            Place::Dir { .. } => Ok(()),
             Place::Jail { keeper, route, .. } => keeper.seal(*route).await,
         }
     }
 }
 
 impl Drop for Place {
-    /// The route ended: its files go (once its VMs did, in jail mode).
+    /// The route ended: its files go (once its VMs did, in jail mode), its template's
+    /// cgroup with them.
     fn drop(&mut self) {
         match self {
-            Place::Dir(dir) => {
+            Place::Dir { dir, forker } => {
+                forker.forget(&place_name(dir));
                 let _ = std::fs::remove_dir_all(dir);
             }
             Place::Jail { keeper, route, .. } => keeper.close(*route),
@@ -454,9 +354,15 @@ impl Drop for Place {
     }
 }
 
+/// The name of the place whose directory is `dir`.
+fn place_name(dir: &Path) -> String {
+    let name = dir.file_name().unwrap_or_default();
+    name.to_string_lossy().into_owned()
+}
+
 /// A VM's `firecracker` process.
 enum Process {
-    /// The wicket's child, its directory removed with it.
+    /// The wicket's child, the forker's fork; its directory removed with it.
     Child { child: Child, dir: PathBuf },
     /// The keeper's, in a jail; its exit once it ended.
     Jailed {
@@ -476,6 +382,23 @@ struct StopOnDrop {
     _place: Arc<Place>,
     /// What the wicket's end waits for.
     stops: TaskTracker,
+}
+
+/// What a VM without the jail is started with ([`Vm::spawn`]).
+struct Start<'a> {
+    forker: &'a Forker,
+    /// Its place's directory.
+    place: &'a Path,
+    firecracker: &'a Path,
+    /// Its own directory, in its place's.
+    dir: PathBuf,
+    /// The files it writes at most, bytes each.
+    file_size: u64,
+    /// Its disk, whose lock it holds.
+    disk: Option<&'a Path>,
+    /// Its part in its route and what it is given: its cgroup's.
+    role: Role,
+    size: Size,
 }
 
 /// A running VM, killed (and its files removed) on drop; on a disk, stopped first.
@@ -499,16 +422,10 @@ pub struct Vm {
 }
 
 impl Vm {
-    /// Starts `firecracker` in `dir` (created; its API socket, vsock socket and log go
-    /// there), the files it writes at most `file_size` bytes each, holding its `disk`'s
-    /// lock, and waits for its API socket.
-    async fn spawn(
-        firecracker: &Path,
-        dir: PathBuf,
-        file_size: u64,
-        disk: Option<&Path>,
-        slot: Slot,
-    ) -> Result<Vm, BoxError> {
+    /// Has the forker start `firecracker` as `start` says, in its directory (created; its API
+    /// socket, vsock socket and log go there), and waits for its API socket.
+    async fn spawn(start: Start<'_>, slot: Slot) -> Result<Vm, BoxError> {
+        let dir = start.dir;
         tokio::fs::create_dir_all(&dir)
             .await
             .map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -523,46 +440,32 @@ impl Vm {
             .into());
         }
         let log = dir.join("firecracker.log");
-        let vm_log = log.clone();
-        let (firecracker, api_path, dir_path) = (firecracker.to_owned(), api.clone(), dir.clone());
-        let disk = disk.map_or_else(|| PathBuf::from(NO_DISK), Path::to_path_buf);
-        let child = launching(move || -> Result<Child, BoxError> {
-            let file =
-                std::fs::File::create(&log).map_err(|e| format!("{}: {e}", log.display()))?;
-            // the wicket itself, as the launcher (see `launch`): a posix_spawn, no fork
-            Ok(Command::new("/proc/self/exe")
-                .arg(LAUNCH)
-                .arg(std::process::id().to_string())
-                .arg(VM_OPEN_FILES.load(Ordering::Relaxed).to_string())
-                .arg(file_size.to_string())
-                .arg(&disk)
-                .arg(&firecracker)
-                .arg("--api-sock")
-                .arg(&api_path)
-                .current_dir(&dir_path)
-                // the wicket's environment (its token among it) is no VM's business;
-                // PATH finds a bare --firecracker
-                .env_clear()
-                .envs(std::env::var_os("PATH").map(|path| ("PATH", path)))
-                .stdin(Stdio::null())
-                .stdout(file.try_clone()?)
-                .stderr(file)
-                .kill_on_drop(true)
-                .spawn()
-                .map_err(|e| format!("{LAUNCH} {}: {e}", firecracker.display()))?)
-        })
-        .await??;
+        let launch = Launch {
+            program: start.firecracker.to_owned(),
+            args: vec!["--api-sock".into(), api.clone().into()],
+            dir: dir.clone(),
+            log: log.clone(),
+            open_files: VM_OPEN_FILES.load(Ordering::Relaxed),
+            file_size: start.file_size,
+            disk: start.disk.map(Path::to_path_buf),
+            place: place_name(start.place),
+            role: start.role,
+            size: start.size,
+        };
+        let child = start
+            .forker
+            .fork(launch)
+            .await
+            .map_err(|e| format!("{}: {e}", start.firecracker.display()))?;
         let vsock = dir.join("v.sock");
-        // the launcher's pid is its `firecracker`'s, which it execs
-        let pid = child.id().map_or(0, |pid| pid as libc::pid_t);
         let mut vm = Vm {
+            meter: child.meter().clone(),
             process: Process::Child { child, dir },
-            meter: Meter::start(pid, usage::pidfd(pid)),
             _slot: Some(slot),
             api,
             vsock_inside: vsock.clone(),
             vsock,
-            log: vm_log,
+            log,
             egress: None,
             stop_on_drop: None,
             stopped: AtomicBool::new(false),
@@ -588,7 +491,7 @@ impl Vm {
                 vm: spawned.vm,
                 exited: spawned.exited,
             },
-            meter: Meter::start(spawned.pid, spawned.pidfd),
+            meter: Meter::start(spawned.pid, spawned.pidfd.map(Arc::new)),
             _slot: Some(slot),
             api: run.join("api.sock"),
             vsock: run.join("v.sock"),
@@ -606,10 +509,9 @@ impl Vm {
     async fn ready(&mut self) -> Result<(), BoxError> {
         let deadline = Instant::now() + API_TIMEOUT;
         while UnixStream::connect(&self.api).await.is_err() {
-            let ended = match &mut self.process {
-                Process::Child { child, .. } => child
-                    .try_wait()?
-                    .map(|status| format!("{status}; {}", log_tail(&self.log))),
+            let ended = match &self.process {
+                Process::Child { child, .. } => (child.exited().borrow().as_ref())
+                    .map(|end| format!("{}; {}", end.status, log_tail(&self.log))),
                 // its directory is gone: the keeper sent its log's tail
                 Process::Jailed { exited, .. } => {
                     (exited.borrow().as_ref()).map(|end| format!("{}; {}", end.status, end.log))
@@ -640,24 +542,29 @@ impl Vm {
         stops: &TaskTracker,
     ) -> Result<Vm, BoxError> {
         let (mut vm, kernel, rootfs, disk) = match &**place {
-            Place::Dir(dir) => (
-                Vm::spawn(
-                    &spec.firecracker,
-                    dir.join(name),
-                    vm_file_size(role, u64::from(spec.memory_mib)).max(
+            Place::Dir { dir, forker } => {
+                let start = Start {
+                    forker,
+                    place: dir,
+                    firecracker: &spec.firecracker,
+                    dir: dir.join(name),
+                    file_size: vm_file_size(role, u64::from(spec.memory_mib)).max(
                         spec.disk
                             .as_ref()
                             .map_or(Ok(0), Disk::file_bytes)
                             .map_err(BoxError::from)?,
                     ),
-                    spec.disk.as_ref().map(|disk| disk.file.as_path()),
-                    slot,
+                    disk: spec.disk.as_ref().map(|disk| disk.file.as_path()),
+                    role,
+                    size: spec.size(),
+                };
+                (
+                    Vm::spawn(start, slot).await?,
+                    spec.kernel.clone(),
+                    spec.rootfs.clone(),
+                    spec.disk.as_ref().map(|disk| disk.file.clone()),
                 )
-                .await?,
-                spec.kernel.clone(),
-                spec.rootfs.clone(),
-                spec.disk.as_ref().map(|disk| disk.file.clone()),
-            ),
+            }
             Place::Jail { keeper, route, .. } => (
                 Vm::jailed(keeper, *route, role, spec.size(), slot).await?,
                 PathBuf::from(jail::KERNEL),
@@ -753,21 +660,16 @@ impl Vm {
 
     /// Why it serves no more, its log stream ended: its `firecracker` ended, how, once that is
     /// known ([`usage::END_TIMEOUT`] at most); the host kernel's OOM killer's kill named so, as
-    /// its cgroup tells it (jailed), else as the host's count of them rose while it lived.
+    /// its cgroup tells it (the keeper's, or the wicket's own: `forker::Child`), else as the
+    /// host's count of them rose while it lived.
     pub async fn end(&self) -> String {
-        let (status, oom) = match &self.process {
-            Process::Child { .. } => match self.meter.exit(usage::END_TIMEOUT).await {
-                Some(exit) => {
-                    let killed = exit == usage::Exit::Signal(libc::SIGKILL);
-                    (
-                        Some(exit.to_string()),
-                        killed && self.meter.host_oom_killed(),
-                    )
-                }
-                None => (None, false),
-            },
-            Process::Jailed { exited, .. } => {
-                let mut exited = exited.clone();
+        let exited = match &self.process {
+            Process::Child { child, .. } => Some(child.exited().clone()),
+            Process::Jailed { exited, .. } => Some(exited.clone()),
+            Process::HandedOver => None,
+        };
+        let (status, oom) = match exited {
+            Some(mut exited) => {
                 let ended =
                     tokio::time::timeout(usage::END_TIMEOUT, exited.wait_for(Option::is_some));
                 match ended.await {
@@ -778,7 +680,7 @@ impl Vm {
                     _ => (None, false),
                 }
             }
-            Process::HandedOver => (None, false),
+            None => (None, false),
         };
         match (status, oom) {
             (Some(status), true) => format!(
@@ -889,10 +791,18 @@ impl Vm {
         egress: Option<&Arc<Egress>>,
     ) -> Result<Vm, BoxError> {
         let mut vm = match place {
-            Place::Dir(dir) => {
-                let dir = dir.join("clones").join(format!("vm-{n}"));
-                let size = vm_file_size(Role::Clone, u64::from(snapshot.size.mem));
-                Vm::spawn(&snapshot.firecracker, dir, size, None, slot).await?
+            Place::Dir { dir, forker } => {
+                let start = Start {
+                    forker,
+                    place: dir,
+                    firecracker: &snapshot.firecracker,
+                    dir: dir.join("clones").join(format!("vm-{n}")),
+                    file_size: vm_file_size(Role::Clone, u64::from(snapshot.size.mem)),
+                    disk: None,
+                    role: Role::Clone,
+                    size: snapshot.size,
+                };
+                Vm::spawn(start, slot).await?
             }
             Place::Jail { keeper, route, .. } => {
                 Vm::jailed(keeper, *route, Role::Clone, snapshot.size, slot).await?
@@ -922,7 +832,7 @@ impl Vm {
     /// touched rather than all of `memory-mib` (see findings, A snapshot's memory).
     pub async fn snapshot(&self, place: &Place, spec: &Spec) -> Result<Snapshot, BoxError> {
         let (inside, on_host) = match place {
-            Place::Dir(dir) => {
+            Place::Dir { dir, .. } => {
                 let dir = dir.join("snapshot");
                 tokio::fs::create_dir_all(&dir).await?;
                 (dir.clone(), dir)
@@ -1067,7 +977,7 @@ impl Drop for Vm {
         }
         match &mut self.process {
             Process::Child { child, dir } => {
-                let _ = child.start_kill();
+                child.kill();
                 let _ = std::fs::remove_dir_all(dir);
             }
             // the keeper reaps it and removes its directory

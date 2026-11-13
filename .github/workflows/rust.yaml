@@ -585,9 +585,13 @@ jobs:
       run: |
         cargo clippy --all-targets --locked -- -D warnings
         (cd guest && cargo clippy --all-targets --locked -- -D warnings)
+    # the VM test's wicket in a scope of the runner's user's manager (started by lingering),
+    # its cgroup delegated to it and its VMs in cgroups of their own; where that manager does
+    # not come up, the test runs the wicket without
     - name: Test
       run: |
-        cargo test --locked
+        sudo loginctl enable-linger "$USER" || true
+        XDG_RUNTIME_DIR=/run/user/$(id -u) cargo test --locked
         (cd guest && cargo test --locked)
     # the OSS cf CLI deploying to the wicket, its image made on the wicket (x86_64 alone: the
     # aarch64 runner has no /dev/kvm): skipped by the cf-api's job, which has no Firecracker.

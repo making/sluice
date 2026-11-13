@@ -5,9 +5,9 @@ Difficulty: High
 `--max-memory-mib` defaults to none (`capacity.rs`: `u64::MAX`) and is never compared with the host's
 memory. It counts `memory-mib` per VM and nothing else:
 
-- not Firecracker's overhead (the jail's `memory.max` adds `32 + mem/128 + 16` MiB, `keeper.rs`; the
-  budget does not)
-- not a snapshot's memory file, shmem on the state dir's tmpfs (the jail charges a template `2 x mem`;
+- not Firecracker's overhead (a VM's cgroup's `memory.max` adds `32 + mem/128 + 16` MiB, `cgroup.rs`:
+  `Limits::of`; the budget does not)
+- not a snapshot's memory file, shmem on the state dir's tmpfs (its cgroup charges a template `2 x mem`;
   the README has the operator add it by hand and size the tmpfs)
 - clones count in full though they share the snapshot's pages (safe, but it is the other half of the
   same arithmetic)
@@ -17,9 +17,10 @@ Host pressure has no answer: no balloon, `memory.high`, `memory.swap.max`, hugep
 
 What a VM holds is measured now (291): its process's resident memory and peak in the listings'
 `usage` (a clone's counting the snapshot pages it maps; the snapshot's file is the route's
-`snapshot.memory_bytes`), and an OOM kill is named as one, jailed or not. A jailed VM's cgroup is
-reused by the next VM of its id, so its `memory.peak` (and what is left charged to it) is not that
-VM's: see the findings' "What a VM uses".
+`snapshot.memory_bytes`), and an OOM kill is named as one, jailed or not. A VM's cgroup (the keeper's,
+or the wicket's own where its cgroup is delegated to it: 293) is reused by the next VM, so its
+`memory.peak` (and what is left charged to it) is not that VM's: see the findings' "What a VM uses".
+Without one (no jail, no delegated cgroup) nothing but the wicket's own cgroup bounds a VM's memory.
 
 To decide: a default budget from the host (MemTotal or the wicket's own cgroup limit, less a reserve),
 overhead and snapshots inside it, the tmpfs checked against the snapshots it must hold at startup and

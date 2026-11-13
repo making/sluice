@@ -21,7 +21,7 @@
 //! served on the tunnel, listed with its VMs, and an app of two hosts on one
 //! rootfs uploaded by digest, its env seen by the guest, and an app with a disk:
 //! what it wrote kept across a restart of its VM, a failed start, a growth and
-//! its app's removal, its VM killed or taken by the OOM killer (jailed) told so, what it
+//! its app's removal, its VM killed or taken by the OOM killer (in a cgroup) told so, what it
 //! uses (of its disk too), one VM at a time on it, an edit taking over from a reload, or from a restart
 //! there, or from a VM whose `/init` does not answer its stop; a VM
 //! never listening holding no other edit, by an app's edit, in the place of a disk's VM and
@@ -48,13 +48,17 @@
 //! the README runs it: `/dev/kvm` and its group alone, Docker's default
 //! seccomp profile, the state dir on a tmpfs.
 //!
+//! Without the jail the wicket runs in a scope of the user's manager, where that gives one
+//! its cgroup with the controllers (`systemd-run --user --scope`; not as the image): the
+//! cgroup delegated to it, its VMs in cgroups of its own, checked as the jail's below.
+//!
 //! `SLUICE_WICKET_RUNTIME_FIRECRACKER_JAIL=1` runs it in jail mode instead,
 //! started as root (`sudo -n`, skipped without it), the wicket as the test's user,
 //! and checks the jails: each VM a `firecracker` of an id of its own, PID 1 of its
 //! namespace, without privileges, under seccomp filters of the keeper's, its own and
-//! Firecracker's, in a cgroup limiting its memory, a group of the cpu controller weighted
-//! by the CPUs it holds (a route's `cpu` capping it), a connection's own clones in one they
-//! share; the VMs and the wicket ending with the keeper (SIGKILL).
+//! Firecracker's, in a cgroup limiting its memory and threads, a group of the cpu controller
+//! weighted by the CPUs it holds (a route's `cpu` capping it), a connection's own clones in
+//! one they share; the VMs and the wicket ending with the keeper (SIGKILL).
 #![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
@@ -65,6 +69,8 @@ use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use sha2::Digest as _;
+use sluice_wicket_runtime_firecracker::forker::{self, Forker, Launch};
+use sluice_wicket_runtime_firecracker::keeper::{Role, Size};
 use sluice_wicket_runtime_firecracker::{disk, jail, usage};
 use sluice_wicket_tunnel::flume::testing::{FeedStream, flume_server};
 use sluice_wicket_tunnel::proto::{AccessFilter, feed_message};
@@ -99,57 +105,87 @@ const KEEP: Duration = Duration::from_millis(1500);
 /// The console's token.
 const CONSOLE_TOKEN: &str = "c0ns0le";
 
-/// The launcher (`--launch-vm`) execs the program with the soft open file
-/// limit given (Firecracker grows its file table to the limit at its start, a
-/// cost that grows with it: 3ms at 1048576), the file size given (a guest's
-/// output to its VM's log bounded) and no core (of a VM's memory); holding the
-/// disk's lock for it, across the exec, or refusing to start while another does.
-#[test]
-fn the_launcher_execs_with_the_limits_given() {
+/// The forker (`--fork-vms`) forks a VM's process, the caller's child, which execs the
+/// program in its directory with the soft open file limit given (Firecracker grows its
+/// file table to the limit at its start, a cost that grows with it: 3ms at 1048576), the
+/// file size given (a guest's output to its VM's log bounded) and no core (of a VM's
+/// memory), under the wicket's seccomp filter on the forker's, without the caller's
+/// environment; holding the disk's lock for it, across the exec, or refusing to start while
+/// another does. How it ended is told, killed as its handle is dropped too.
+#[tokio::test]
+async fn the_forker_execs_with_the_limits_given() {
     use std::os::fd::AsRawFd as _;
-    let launch = |disk: &str, program: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_sluice-wicket-runtime-firecracker"))
-            .args([
-                "--launch-vm",
-                &std::process::id().to_string(),
-                "1100",
-                "1048576",
-                disk,
-            ])
-            .args(program)
-            .output()
-            .unwrap()
+    let wicket = Path::new(env!("CARGO_BIN_EXE_sluice-wicket-runtime-firecracker"));
+    let forker = Forker::new(Forker::start(wicket).unwrap(), None).unwrap();
+    let dir = std::env::temp_dir().join(format!("sfc-fork-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let fork = |disk: Option<&Path>, program: &[&str]| {
+        forker.fork(Launch {
+            program: program[0].into(),
+            args: program[1..].iter().map(Into::into).collect(),
+            dir: dir.clone(),
+            log: dir.join("log"),
+            open_files: 1100,
+            file_size: 1048576,
+            disk: disk.map(Path::to_path_buf),
+            place: "route-0".into(),
+            role: Role::Boot,
+            size: Size {
+                vcpus: 1,
+                mem: 128,
+                cpu: None,
+                shared: false,
+            },
+        })
     };
-    let disk = std::env::temp_dir().join(format!("sfc-launch-{}.ext4", std::process::id()));
+    // how it ended, and what it wrote
+    let ended = |child: forker::Child| {
+        let (mut exited, log) = (child.exited().clone(), dir.join("log"));
+        async move {
+            let ended = tokio::time::timeout(HANG, exited.wait_for(Option::is_some)).await;
+            let status = ended.expect("it ends").unwrap().clone().unwrap().status;
+            drop(child);
+            (status, std::fs::read_to_string(log).unwrap())
+        }
+    };
+    let disk = dir.join("disk.ext4");
     std::fs::write(&disk, b"").unwrap();
-    let file = disk.clone();
-    let disk = disk.to_str().unwrap();
     // the program's own files: the disk among them, while the lock is held by it alone
-    let held = launch(
-        disk,
-        &["/bin/sh", "-c", "ls -l /proc/self/fd; cat /proc/locks"],
+    let script = "ls -l /proc/self/fd; cat /proc/locks; pwd; env";
+    let held = fork(Some(&disk), &["/bin/sh", "-c", script]).await.unwrap();
+    let (status, files) = ended(held).await;
+    assert_eq!(status, "exit 0", "{files}");
+    assert!(
+        files.contains(disk.to_str().unwrap()),
+        "not inherited: {files}"
     );
-    let files = String::from_utf8_lossy(&held.stdout);
-    assert!(held.status.success(), "{held:?}");
-    assert!(files.contains(disk), "not inherited: {files}");
     assert!(files.contains("FLOCK"), "not locked: {files}");
-    let holder = std::fs::File::open(disk).unwrap();
+    let cwd = format!("\n{}\n", dir.display());
+    assert!(files.contains(&cwd), "not in its directory: {files}");
+    assert!(
+        !files.contains("HOME="),
+        "the caller's environment: {files}"
+    );
+    assert!(!files.contains("socket:"), "the forker's socket: {files}");
+    let holder = std::fs::File::open(&disk).unwrap();
     // SAFETY: flock of an open file
     assert_eq!(
         unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX) },
         0,
         "given up as the program ended"
     );
-    let refused = launch(disk, &["/bin/true"]);
-    assert!(!refused.status.success(), "{refused:?}");
-    let error = String::from_utf8_lossy(&refused.stderr);
+    let refused = fork(Some(&disk), &["/bin/true"]).await.unwrap();
+    let (status, error) = ended(refused).await;
+    assert_eq!(status, "exit 127", "{error}");
     assert!(error.contains("in use by another VM"), "{error}");
     drop(holder);
-    std::fs::remove_file(&file).unwrap();
 
-    let output = launch("-", &["/bin/cat", "/proc/self/limits"]);
-    assert!(output.status.success(), "{output:?}");
-    let limits = String::from_utf8_lossy(&output.stdout);
+    let limited = fork(
+        None,
+        &["/bin/cat", "/proc/self/limits", "/proc/self/status"],
+    );
+    let (status, limits) = ended(limited.await.unwrap()).await;
+    assert_eq!(status, "exit 0", "{limits}");
     let limit = |name: &str| -> Vec<String> {
         let line = limits.lines().find(|line| line.starts_with(name)).unwrap();
         line[name.len()..]
@@ -161,6 +197,18 @@ fn the_launcher_execs_with_the_limits_given() {
     assert_eq!(limit("Max open files")[0], "1100", "{limits}");
     assert_eq!(limit("Max file size"), ["1048576", "1048576"], "{limits}");
     assert_eq!(limit("Max core file size"), ["0", "0"], "{limits}");
+    assert_eq!(limit("Seccomp:"), ["2"], "{limits}");
+    let filters: u32 = limit("Seccomp_filters:")[0].parse().unwrap();
+    assert_eq!(filters, self::filters(std::process::id() as i32) + 2);
+
+    let sleeping = fork(None, &["/bin/sleep", "60"]).await.unwrap();
+    let mut exited = sleeping.exited().clone();
+    assert!(exited.borrow().is_none(), "alive");
+    drop(sleeping);
+    let killed = tokio::time::timeout(HANG, exited.wait_for(Option::is_some)).await;
+    let killed = killed.expect("killed with its handle").unwrap().clone();
+    assert_eq!(killed.unwrap().status, "signal 9");
+    std::fs::remove_dir_all(&dir).unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -213,8 +261,14 @@ async fn every_route_serves_http_through_the_tunnel() {
     }
     let booted_egress = booted_egress.join(", ");
     let config = dir.0.join("wicket.yaml");
-    // jailed, the clones' CPU limited by their cgroups, each a group of its own
-    let cpu = match jailed {
+    // without the jail, in a cgroup delegated to it where the user's manager gives one (not in
+    // the image: the container's is not the image's user's to write)
+    let delegated = !jailed && image.is_none() && delegating();
+    if !jailed && image.is_none() && !delegated {
+        eprintln!("no delegated cgroup here (systemd-run --user --scope): the VMs without one");
+    }
+    // in cgroups, the clones' CPU limited by them, each a group of its own
+    let cpu = match jailed || delegated {
         true => format!(", cpu: {CLONE_CPU}"),
         false => String::new(),
     };
@@ -280,7 +334,7 @@ async fn every_route_serves_http_through_the_tunnel() {
         }
         None => {
             let (firecracker, kernel) = tools();
-            Wicket::start(url, &firecracker, &kernel, args)
+            Wicket::start(url, &firecracker, &kernel, args, delegated)
         }
     };
     let wicket = start(&url, &args);
@@ -507,12 +561,27 @@ async fn every_route_serves_http_through_the_tunnel() {
             // SAFETY: getuid
             jails(&wicket, Some(&cgroup), unsafe { libc::getuid() })
         }
-        // the wicket's seccomp filter, on the test's (if any)
-        (false, None) => assert_eq!(
-            filters(wicket.child.id() as i32),
-            filters(std::process::id() as i32) + 1,
-            "the wicket's filter"
-        ),
+        // the wicket's seccomp filter, on the test's (if any); its VMs' cgroups, where its
+        // own is delegated to it: beside its leaf, of the most weight
+        (false, None) => {
+            let pid = wicket.child.id() as i32;
+            assert_eq!(
+                filters(pid),
+                filters(std::process::id() as i32) + 1,
+                "the wicket's filter"
+            );
+            assert_eq!(wicket.cgroups().is_some(), delegated, "{}", wicket.log());
+            if let Some(cgroup) = wicket.cgroups() {
+                assert!(
+                    tokio::time::timeout(HANG, settled(&wicket)).await.is_ok(),
+                    "the VMs did not settle: {}",
+                    wicket.log()
+                );
+                assert_eq!(cgroup_of(pid), format!("{cgroup}/wicket"));
+                assert_eq!(weight_of(&cgroup_of(pid)).as_deref(), Some("10000"));
+                cgroups(&wicket, &wicket.vms(), &cgroup);
+            }
+        }
         (false, Some(_)) => {}
     }
 
@@ -2461,8 +2530,8 @@ async fn on_data(
 /// place holding no other edit, none coming back on the disk meanwhile, and taken over from: so
 /// a VM whose `/init` does not answer its stop, killed at that stop's end, and a VM started again
 /// after its process ended; for the app's VM alone, its id's in a jail; a VM killed (unjailed),
-/// or taken by the OOM killer (jailed: its cgroup's memory squeezed), told so; what it uses, of
-/// its disk too; listed, and not removed under its app. One more file left unsynced, and a start
+/// or taken by the OOM killer (in a cgroup of its own: its memory squeezed), told so; what it
+/// uses, of its disk too; listed, and not removed under its app. One more file left unsynced, and a start
 /// under way: the wicket's end writes them out.
 async fn disk_app(
     tunnel: &mut ServerTunnel,
@@ -2706,23 +2775,25 @@ async fn disk_app(
         .await;
         let read = on_data(tunnel, &address, conn_id, "/disk?read=a", "").await;
         assert_eq!(read, "fsynced");
-    } else {
-        // its cgroup's memory taken below what it holds: the kernel's OOM killer takes it, its
-        // cgroup's count says so, and another one comes on the disk
+    }
+    if jailed || wicket.cgroups().is_some() {
+        // its cgroup's memory taken below what it holds (the keeper's cgroup: as root): the
+        // kernel's OOM killer takes it, its cgroup's count says so, and another one comes on
+        // the disk, the one after the VM killed above
         let held = wicket.vms_on(&file);
         let [vm] = held[..] else {
             panic!("one VM on the disk: {held:?}");
         };
-        let own = std::fs::read_to_string(format!("/proc/{vm}/cgroup")).unwrap();
-        let own = own.trim().strip_prefix("0::/").unwrap().to_string();
-        let max = format!("/sys/fs/cgroup/{own}/memory.max");
-        let squeezed = Command::new("sudo")
-            .args(["-n", "sh", "-c"])
-            .arg(format!(
-                "was=$(cat {max}); echo 1M > {max}; echo $was > {max}"
-            ))
-            .status()
-            .unwrap();
+        let max = format!("/sys/fs/cgroup/{}/memory.max", cgroup_of(vm));
+        let squeeze = format!("was=$(cat {max}); echo 1M > {max}; echo $was > {max}");
+        let mut shell = match jailed {
+            true => Command::new("sudo"),
+            false => Command::new("sh"),
+        };
+        if jailed {
+            shell.args(["-n", "sh"]);
+        }
+        let squeezed = shell.arg("-c").arg(squeeze).status().unwrap();
         assert!(squeezed.success());
         said(
             wicket,
@@ -2730,7 +2801,7 @@ async fn disk_app(
              OOM killer took it; killed",
         )
         .await;
-        restarted(wicket, "data.local", 1).await;
+        restarted(wicket, "data.local", if jailed { 1 } else { 2 }).await;
         let read = on_data(tunnel, &address, conn_id, "/disk?read=a", "").await;
         assert_eq!(read, "fsynced");
     }
@@ -2940,17 +3011,16 @@ fn jailed_children(keeper: i32) -> (Vec<i32>, Vec<i32>) {
 }
 
 /// Until `deploy`'s connection's clone is gone (it ends after the connection, its output
-/// first) and the keeper's VMs are the ones the budget counts (it counts one no longer once
-/// it asked for its end): `jails` reads each VM, and one ending fails it.
+/// first) and the wicket's VMs are the ones the budget counts (it counts one no longer once
+/// it asked for its end): `jails` and `cgroups` read each VM, and one ending fails them.
 async fn settled(wicket: &Wicket) {
-    let keeper = wicket.keeper();
     loop {
         let (_, listing) =
             console(wicket.console(), "GET", "/api/routes", true, Bytes::new()).await;
         let routes = listing["routes"].as_array().unwrap();
         let deployed = routes.iter().find(|route| route["host"] == "console.local");
         let clones = &deployed.expect("console.local listed")["instances"];
-        let vms = jailed_children(keeper).0.len() as u64;
+        let vms = wicket.vms().len() as u64;
         if clones["alive"] == 1 && clones["warm"] == 1 && listing["budget"]["instances"] == vms {
             return;
         }
@@ -2958,37 +3028,99 @@ async fn settled(wicket: &Wicket) {
     }
 }
 
+/// The cgroup of `pid`, under the hierarchy's root.
+fn cgroup_of(pid: i32) -> String {
+    let own = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
+    own.trim()
+        .strip_prefix("0::/")
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The `cpu.weight` of `cgroup`, where it is a group of the cpu controller.
+fn weight_of(cgroup: &str) -> Option<String> {
+    let weight = std::fs::read_to_string(format!("/sys/fs/cgroup/{cgroup}/cpu.weight"));
+    weight.ok().map(|weight| weight.trim().to_string())
+}
+
+/// The cgroups of the VMs alive (`vms`), the keeper's or the wicket's own, in `cgroup`: each
+/// limiting its VM's memory and its threads (its vCPUs and 16), a group of the cpu controller
+/// weighted by the CPUs it holds, 10 a vCPU, clone.local's capped by its `cpu` and weighted
+/// by it; a connection's own clone without `cpu` in the group they share, weighted by what
+/// they hold together.
+fn cgroups(wicket: &Wicket, vms: &[i32], cgroup: &str) {
+    let (mut cpu_limited, mut sharing) = (0, 0);
+    for vm in vms {
+        let own = cgroup_of(*vm);
+        assert!(
+            own.starts_with(&format!("{cgroup}/")),
+            "{vm}: its cgroup {own}, not in {cgroup}"
+        );
+        let limit = |file: &str| {
+            let limit = std::fs::read_to_string(format!("/sys/fs/cgroup/{own}/{file}"));
+            limit.map(|limit| limit.trim().to_string())
+        };
+        assert_ne!(limit("memory.max").unwrap(), "max", "{vm}: its memory");
+        let threads = (vcpus(*vm) + 16).to_string();
+        assert_eq!(limit("pids.max").unwrap(), threads, "{vm}: its threads");
+        // a group of the cpu controller of its own, its weight the CPUs it holds, 10 a
+        // vCPU, clone.local's its `cpu`'s, which caps it; a connection's own clone without
+        // `cpu` in the shared group, its cgroup none
+        let capped = format!("{} 100000", CLONE_CPU * 1000);
+        let named = own.strip_prefix(&format!("{cgroup}/")).unwrap();
+        let by_vcpus = 10 * vcpus(*vm);
+        match (named.split_once('/'), limit("cpu.max").as_deref()) {
+            (Some(("shared", _)), Err(_)) => sharing += by_vcpus,
+            (None, Ok("max 100000")) => {
+                assert_eq!(weight_of(&own).unwrap(), by_vcpus.to_string(), "{vm}")
+            }
+            (None, Ok(cpu)) if cpu == capped => {
+                assert_eq!(
+                    weight_of(&own).unwrap(),
+                    (CLONE_CPU / 10).to_string(),
+                    "{vm}"
+                );
+                cpu_limited += 1;
+            }
+            other => panic!("{vm}: its cgroup {own}: {other:?}"),
+        }
+    }
+    assert!(
+        cpu_limited > 0,
+        "clone.local's warm clones: their CPU limited"
+    );
+    // console.local's warm clone (none in the image, which has no console): the shared
+    // group's weight what its VMs hold, written within an interval
+    assert!(sharing > 0 || wicket.container.is_some(), "{vms:?}");
+    let shared = format!("{cgroup}/shared");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sharing > 0 && weight_of(&shared).unwrap() != sharing.to_string() {
+        assert!(
+            Instant::now() < deadline,
+            "{shared}: {:?}",
+            weight_of(&shared)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// The jails of the VMs alive (the booted VM and the warm clones): each a
 /// `firecracker` of an id of its own, PID 1 of its namespace, without capability or
-/// new privileges, its seccomp filter on, in a cgroup of the keeper's limiting its
-/// memory (under `cgroup`, else beside the keeper's own: its default, the keeper's of the
-/// most weight there), a group of the cpu controller weighted by the CPUs it holds, 10 a
-/// vCPU, clone.local's capped by its `cpu` and weighted by it; a connection's own clone
-/// without `cpu` in the group they share, weighted by what they hold together; on aarch64
-/// the host CPU's files Firecracker reads in it; the wicket as `user`. The keeper killed
-/// (SIGKILL), they and the wicket end with it (their parent death signal); its files and
-/// cgroups are removed here (a container's go with it).
+/// new privileges, its seccomp filter on, in a cgroup of the keeper's (`cgroups`: under
+/// `cgroup`, else beside the keeper's own: its default, the keeper's of the most weight
+/// there); on aarch64 the host CPU's files Firecracker reads in it; the wicket as `user`.
+/// The keeper killed (SIGKILL), they and the wicket end with it (their parent death
+/// signal); its files and cgroups are removed here (a container's go with it).
 fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
     let keeper = wicket.keeper();
     // the keeper's seccomp filter (the container's under it, if any), the wicket's and
     // each jail's on it, Firecracker's on the jail's
     assert_eq!(status(keeper, "Seccomp:"), "2", "the keeper's filter");
-    let cgroup_of = |pid: i32| {
-        let own = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
-        own.trim()
-            .strip_prefix("0::/")
-            .unwrap_or_default()
-            .to_string()
-    };
-    let weight_of = |cgroup: &str| {
-        let weight = std::fs::read_to_string(format!("/sys/fs/cgroup/{cgroup}/cpu.weight"));
-        weight.map(|weight| weight.trim().to_string())
-    };
     // the keeper leaves its own for a leaf of it (`keeper`), the VMs' cgroups beside: the
     // wicket's threads before the VMs'
     let cgroup = cgroup.map(String::from).unwrap_or_else(|| {
         let own = cgroup_of(keeper);
-        assert_eq!(weight_of(&own).ok().as_deref(), Some("10000"), "{own}");
+        assert_eq!(weight_of(&own).as_deref(), Some("10000"), "{own}");
         own.strip_suffix("/keeper").unwrap_or(&own).to_string()
     });
     let user = user.to_string();
@@ -2999,7 +3131,6 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
         wicket.log()
     );
     let mut ids = Vec::new();
-    let (mut cpu_limited, mut sharing) = (0, 0);
     for vm in &vms {
         let id = status(*vm, "Uid:");
         assert!(
@@ -3025,36 +3156,6 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
             filters(*vm) >= filters(keeper) + 2,
             "{vm}: the jail's filter and Firecracker's"
         );
-        let own = cgroup_of(*vm);
-        assert!(
-            own.starts_with(&format!("{cgroup}/")),
-            "{vm}: its cgroup {own}, not in {cgroup}"
-        );
-        let max = std::fs::read_to_string(format!("/sys/fs/cgroup/{own}/memory.max")).unwrap();
-        assert_ne!(max.trim(), "max", "{vm}: its memory limited");
-        // a group of the cpu controller of its own, its weight the CPUs it holds, 10 a
-        // vCPU, clone.local's its `cpu`'s, which caps it; a connection's own clone without
-        // `cpu` in the shared group, its cgroup none
-        let cpu = std::fs::read_to_string(format!("/sys/fs/cgroup/{own}/cpu.max"));
-        let cpu = cpu.map(|cpu| cpu.trim().to_string());
-        let limit = format!("{} 100000", CLONE_CPU * 1000);
-        let named = own.strip_prefix(&format!("{cgroup}/")).unwrap();
-        let by_vcpus = 10 * vcpus(*vm);
-        match (named.split_once('/'), cpu.as_deref()) {
-            (Some(("shared", _)), Err(_)) => sharing += by_vcpus,
-            (None, Ok("max 100000")) => {
-                assert_eq!(weight_of(&own).unwrap(), by_vcpus.to_string(), "{vm}")
-            }
-            (None, Ok(capped)) if capped == limit => {
-                assert_eq!(
-                    weight_of(&own).unwrap(),
-                    (CLONE_CPU / 10).to_string(),
-                    "{vm}"
-                );
-                cpu_limited += 1;
-            }
-            other => panic!("{vm}: its cgroup {own}: {other:?}"),
-        }
         // aarch64: the host CPU's files Firecracker reads, the host's in the jail
         if cfg!(target_arch = "aarch64") {
             for file in [
@@ -3075,23 +3176,7 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
     ids.sort();
     ids.dedup();
     assert_eq!(ids.len(), vms.len(), "an id per VM: {ids:?}");
-    assert!(
-        cpu_limited > 0,
-        "clone.local's warm clones: their CPU limited"
-    );
-    // console.local's warm clone (none in the image, which has no console): the shared
-    // group's weight what its VMs hold, written within the keeper's interval
-    assert!(sharing > 0 || wicket.container.is_some(), "{vms:?}");
-    let shared = format!("{cgroup}/shared");
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while sharing > 0 && weight_of(&shared).unwrap() != sharing.to_string() {
-        assert!(
-            Instant::now() < deadline,
-            "{shared}: {:?}",
-            weight_of(&shared)
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
+    cgroups(wicket, &vms, &cgroup);
     assert_eq!(others.len(), 1, "the wicket: {others:?}");
     assert_eq!(
         status(others[0], "Uid:").split_whitespace().next(),
@@ -3923,9 +4008,53 @@ const TEST_ONLY: [&str; 3] = [
     "SLUICE_WICKET_RUNTIME_FIRECRACKER_VMS",
 ];
 
+/// What runs a command in a scope of the user's manager, its cgroup delegated to it:
+/// `systemd-run` execs the command, the scope its process's.
+const SCOPE: [&str; 7] = [
+    "systemd-run",
+    "--user",
+    "--scope",
+    "--quiet",
+    "--collect",
+    "--property=Delegate=yes",
+    "--",
+];
+
+/// Whether the user's manager gives a scope ([`SCOPE`]) its cgroup with the controllers the
+/// VMs' cgroups use.
+fn delegating() -> bool {
+    let own = "cat /sys/fs/cgroup$(sed -n 's/^0:://p' /proc/self/cgroup)/cgroup.controllers";
+    let controllers = Command::new(SCOPE[0])
+        .args(&SCOPE[1..])
+        .args(["sh", "-c", own])
+        .stderr(Stdio::null())
+        .output();
+    controllers.is_ok_and(|controllers| {
+        let controllers = String::from_utf8_lossy(&controllers.stdout);
+        ["cpu", "memory", "pids"]
+            .iter()
+            .all(|controller| controllers.split_whitespace().any(|has| has == *controller))
+    })
+}
+
 impl Wicket {
-    fn start(server: &str, firecracker: &Path, kernel: &Path, args: &[String]) -> Wicket {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_sluice-wicket-runtime-firecracker"));
+    /// The wicket without the jail; `delegated`: in a scope of the user's manager, its own
+    /// cgroup its to write.
+    fn start(
+        server: &str,
+        firecracker: &Path,
+        kernel: &Path,
+        args: &[String],
+        delegated: bool,
+    ) -> Wicket {
+        let wicket = env!("CARGO_BIN_EXE_sluice-wicket-runtime-firecracker");
+        let mut command = match delegated {
+            true => Command::new(SCOPE[0]),
+            false => Command::new(wicket),
+        };
+        if delegated {
+            command.args(&SCOPE[1..]).arg(wicket);
+        }
         command
             .args(["--firecracker"])
             .arg(firecracker)
@@ -4054,6 +4183,44 @@ impl Wicket {
         }
     }
 
+    /// Where its VMs' cgroups are, under the hierarchy's root, without the jail: as it says at
+    /// its start, where its own cgroup is delegated to it.
+    fn cgroups(&self) -> Option<String> {
+        // said before its listener, which the test waited for
+        let log = std::fs::read_to_string(&self.log).unwrap_or_default();
+        let said = log
+            .lines()
+            .find_map(|line| line.strip_prefix("the VMs' cgroups in /sys/fs/cgroup/"))?;
+        Some(said.split(',').next().unwrap().to_string())
+    }
+
+    /// Its VMs (not an image's): its `firecracker` children; jailed, the keeper's.
+    fn vms(&self) -> Vec<i32> {
+        if self.jailed {
+            return jailed_children(self.keeper()).0;
+        }
+        let comm = |pid: &i32| std::fs::read_to_string(format!("/proc/{pid}/comm"));
+        let mut vms = self.children();
+        vms.retain(|vm| comm(vm).is_ok_and(|comm| comm.trim() == "firecracker"));
+        vms
+    }
+
+    /// The children of its every thread, without the jail.
+    fn children(&self) -> Vec<i32> {
+        let pid = self.child.id();
+        let threads = std::fs::read_dir(format!("/proc/{pid}/task")).unwrap();
+        threads
+            .filter_map(|thread| thread.ok()?.file_name().to_str()?.parse().ok())
+            .flat_map(|thread: i32| {
+                std::fs::read_to_string(format!("/proc/{pid}/task/{thread}/children"))
+                    .unwrap_or_default()
+                    .split_whitespace()
+                    .filter_map(|child| child.parse().ok())
+                    .collect::<Vec<i32>>()
+            })
+            .collect()
+    }
+
     /// Its VMs (not an image's) with `file` open, a rootfs or a disk: its children; jailed, the
     /// keeper's, whose jail binds that file.
     fn vms_on(&self, file: &Path) -> Vec<i32> {
@@ -4074,25 +4241,15 @@ impl Wicket {
             });
             return vms;
         }
-        let pid = self.child.id();
-        let threads = std::fs::read_dir(format!("/proc/{pid}/task")).unwrap();
-        threads
-            .filter_map(|thread| thread.ok()?.file_name().to_str()?.parse().ok())
-            .flat_map(|thread: i32| {
-                std::fs::read_to_string(format!("/proc/{pid}/task/{thread}/children"))
-                    .unwrap_or_default()
-                    .split_whitespace()
-                    .filter_map(|child| child.parse().ok())
-                    .collect::<Vec<i32>>()
-            })
-            .filter(|vm| {
-                std::fs::read_dir(format!("/proc/{vm}/fd")).is_ok_and(|mut fds| {
-                    fds.any(|fd| {
-                        fd.is_ok_and(|fd| std::fs::read_link(fd.path()).is_ok_and(|to| to == file))
-                    })
+        let mut vms = self.children();
+        vms.retain(|vm| {
+            std::fs::read_dir(format!("/proc/{vm}/fd")).is_ok_and(|mut fds| {
+                fds.any(|fd| {
+                    fd.is_ok_and(|fd| std::fs::read_link(fd.path()).is_ok_and(|to| to == file))
                 })
             })
-            .collect()
+        });
+        vms
     }
 
     /// Sends `signal` to `pid`, as root when it is one of the keeper's.

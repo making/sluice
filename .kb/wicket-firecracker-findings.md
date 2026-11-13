@@ -74,11 +74,12 @@ New connections per mode. The rates are the sample guest's through the server,
   between fork and exec forces a fork, so the wicket `posix_spawn`s itself as a launcher
   (`--launch-vm`, no page table copy) that sets the signal, checks its parent and execs
   `firecracker`: the clone rate at c=16 rose from 549 to 773 req/s, the c=1 latency fell
-  from 3.5 to 2.5ms. A VM still never outlives the wicket (`kill -9` checked).
+  from 3.5 to 2.5ms. A VM still never outlives the wicket (`kill -9` checked). A forker
+  forks them since ([The forker](#the-forker)): no fork of the wicket either.
 - **Firecracker's start grows with the open file limit**: it grows its file table to the
   soft `RLIMIT_NOFILE` at its start (`dup2` to the last descriptor), 2.6ms from spawn to
-  API socket at 1024, 5.4ms at 1048576 (a login shell's limit here). The launcher sets
-  each `firecracker`'s to `--max-connections` + 384 (its vsock streams, 256 of them its
+  API socket at 1024, 5.4ms at 1048576 (a login shell's limit here). Each `firecracker`'s
+  is set to `--max-connections` + 384 (its vsock streams, 256 of them its
   egress's, and its own); at + 128 the
   sample guest's clone rate at c=16 rose from 1,230 to 1,600 req/s (c=1: 545 to 650), the
   JVM's (bound by its guest) stayed. A container's default soft limit (1024) hid the cost.
@@ -158,14 +159,51 @@ New connections per mode. The rates are the sample guest's through the server,
   on 2.2 cores with 64 workers, 33k on one. The wicket's seccomp filter took 8% of a relay
   worker's time (clones through the server, `perf`).
 
-## The threads spawning VMs
+## The forker
 
-- **A VM is spawned from a thread living as long as the wicket**: `posix_spawn` holds its
-  thread until the launcher's exec (about 1ms), on a runtime's thread its relays with it
-  (one worker: 1,130 clones/s against 1,500); and a child's parent death signal fires as
-  the thread that spawned it ends, not its process: spawned from tokio's blocking pool
-  (an idle thread ends after 10s), the VMs died with their threads. Four launching
-  threads spawn them.
+Without the jail a forker process forks the VMs (`forker.rs`), the wicket's children. Before it
+the wicket spawned itself again per VM as a launcher (above), from four threads of its own:
+`posix_spawn` holds its thread until the launcher's exec (about 1ms), on a runtime's thread its
+relays with it (one worker: 1,130 clones/s against 1,500); and a child's parent death signal
+fires as the thread that spawned it ends, not its process: spawned from tokio's blocking pool
+(an idle thread ends after 10s), the VMs died with their threads.
+
+On the 64-core host (6.8 kernel), `--listen`, `oha` for 5s, the sample guest, a VM per
+connection, the builds alternating (the scripts: `.todo/artefacts/293`):
+
+| | the launcher | the forker | the forker, the VMs in cgroups of the wicket's own |
+|---|---|---|---|
+| warm=16, new connections c=16 | 1,416-1,573 req/s | 1,579-1,611 | 1,552-1,579 |
+| the same, c=1 | 449-477 | 430-460 | 550-577 |
+| no warm clone, c=1: a restore per connection, p50 | 15.4-16.2ms | 14.6-15.1ms | 14.6-15.4ms |
+
+- **One exec a VM**: the forker's child does between its fork and its exec what the launcher
+  did after its own (the parent death signal, the limits, the disk's lock) and installs the
+  wicket's seccomp filter, which the launcher inherited: a restore per connection is 0.5-1ms
+  shorter (the wicket's own exec cost 1.2ms). The forker is the wicket's binary in another
+  mode, single-threaded, forking one VM at a time for the one thread of the wicket that asks
+  it; a jailed restore per connection, the keeper's fork, took 14.9-15.1ms in the same runs.
+  The child shares no file of the wicket's meanwhile: a launcher held them all until its exec,
+  another VM's disk and its lock among them
+- **The VM is the wicket's child** (`CLONE_PARENT`), not the forker's: the wicket reaps it by
+  its pidfd and reads how it ended, the forker holds nothing of it, and its parent death
+  signal follows the wicket's first thread, which lives as long as the wicket (`kill -9` of
+  the wicket checked: its VMs and the forker gone)
+- **A VM enters its cgroup as it is cloned** (`clone3`'s `CLONE_INTO_CGROUP`): 0.24-0.55ms
+  for the fork and the exec of a small program with it, as without a cgroup. Moved there once
+  started, by a write to `cgroup.procs`, 17-21ms a move, a second apart (the write waits for
+  an RCU grace period where the hierarchy is not mounted `favordynmods`, as here): more than
+  the restore itself
+- **`clone3` is the forker's alone**: the wicket's seccomp filter refuses it (its flags, the
+  namespaces' among them, are out of a filter's reach), as Docker's default profile does. So
+  the forker is started before that filter, under one of its own allowing the call, and forks
+  by `clone` where the VMs have no cgroup (the image's container, under Docker's profile). It
+  is not dumpable: a process of the wicket's user, the wicket itself taken over, neither traces
+  it nor writes its memory
+- **In cgroups the c=1 rate is higher** (550-577 against 430-477), by the wicket's leaf being
+  weighted apart from the VMs' groups: its `cpu.weight` set by hand to 100 (the 16 warm
+  clones' group at 160), 424-443, as without cgroups; to 10, 553-570 (the scheduler's wakeups
+  between the wicket's threads and a vCPU's, not looked into further)
 
 ## Pools against one VM
 
@@ -392,7 +430,8 @@ What the [liveness check](../sluice-wicket-runtime-firecracker/README.md#livenes
   forks it away. Hence the wicket's jail of its own.
 - **A jailed restore is faster than the launcher's**: a fresh clone restored in 11.9ms
   (p50, c=1, warm=0) against 13.6ms: one fork of the small keeper and one `execveat` instead
-  of the launcher's two execs (the wicket's own exec costs 1.2ms here).
+  of the launcher's two execs (the wicket's own exec costs 1.2ms here). Without the jail
+  [the forker](#the-forker) forks likewise since.
 - **`pivot_root` stalls every fork of the host**: it walks every thread of the host
   (`chroot_fs_refs`, 2,300 threads here) under the kernel's task list lock, which a fork
   or an exit takes, 0.25-1ms per VM. The keeper's `clone3` waited on it for 37% of its
@@ -486,11 +525,12 @@ made of, and why (the 64-core host, its 6.8 kernel):
   private pages) needs ptrace access, and walks the page tables. Every VM every 5s: about 10ms of a
   blocking thread every 5s for 1,000 VMs
 - **The pid is checked against its pidfd**: a read is dropped once the pidfd says the process
-  ended (a pid reaped may be another's). Jailed, the keeper's `clone3` makes the pidfd
-  (`CLONE_PIDFD`) and passes it with its answer; a VM's exit status without the jail is
-  `waitid(P_PIDFD, WNOWAIT)`'s, the reap left to tokio's `Child`
-- **A jailed VM's cgroup is no measure of that VM**: the keeper reuses a cgroup per id
-  (made and removed per VM cost 8% of the clone rate, [Jail mode](#jail-mode)), so its
+  ended (a pid reaped may be another's). The clone that makes the VM makes the pidfd
+  (`CLONE_PIDFD`), the keeper's or the forker's, passed with its answer; without the jail the
+  wicket reaps its VM by it (`waitid(P_PIDFD)`), which tells how it ended
+- **A VM's cgroup is no measure of that VM**: a cgroup is reused, the keeper's per id, the
+  wicket's own per VM alive (made and removed per VM cost 8% of the clone rate,
+  [Jail mode](#jail-mode)), so its
   `memory.peak` is the most of every VM it held, and pages charged to it by a VM before (the
   rootfs's page cache, a snapshot's holes it filled) stay counted for the next. Jailed, the sample
   guest at 128 MiB, a booted VM and a pool of 2 (debug build), its process against its cgroup:
@@ -506,12 +546,13 @@ made of, and why (the 64-core host, its 6.8 kernel):
   A clone's cgroup is charged its private pages alone, the snapshot's being its route's; its
   process maps 18 MiB of them besides. The listings give the process's, alike with the jail or
   without it, and its peak of its own
-- **An OOM kill**: jailed, the cgroup's `memory.events` `oom_kill` read by the keeper as it
-  reaps the VM (its file open, one `pread`), against what it read at the last reap of that
-  cgroup: one VM at a time. Without a cgroup, the host's count (`/proc/vmstat`) rising since the
+- **An OOM kill**: in a cgroup of its own, the cgroup's `memory.events` `oom_kill` read as the
+  VM is reaped (by the keeper, jailed; by the wicket, in its own cgroups: its file open, one
+  `pread`), against what was read at the last reap of that cgroup: one VM at a time. Without a
+  cgroup, the host's count (`/proc/vmstat`) rising since the
   sampler read it, a second before the VM's end at least, and the VM ending by a SIGKILL
   no one of the wicket sent. In the guest, `/init` reads its kernel's count as the process starts
-  and as it is reaped. Lowering a jailed VM's `memory.max` below what it holds (`echo 1M >`) has the
+  and as it is reaped. Lowering a VM's `memory.max` below what it holds (`echo 1M >`) has the
   kernel's OOM killer take it within the write: the VM test's way
 
 ## The CPU budget and the shares
@@ -564,8 +605,16 @@ the sample guest, the runs of each row alternating (the scripts: `.todo/artefact
   on a CPU 27% of the time and waiting for one 68% (1.3ms a time). It takes the CPUs it
   needs, the VMs the rest. With `--jail-cgroup <path>` the wicket is elsewhere, and the VMs'
   parent one group among the host's (weight 100): nothing of the keeper's to weigh
-- **Not covered**: without the jail a VM has no cgroup, so no share (the budget alone keeps
-  the wicket its CPUs there); x86_64's `kvm-pit/<pid>` kernel thread stays in the root cgroup,
+- **Without the jail, in the wicket's own cgroups, the same** (its cgroup delegated to it, a
+  scope of the user's manager; `share.sh` of `.todo/artefacts/293`): a VM of 4 vCPUs and
+  one of 1, 1.58 and 0.43; a VM of 2 vCPUs capped (`cpu=200`) and six of 1, 0.51 and 0.25
+  each; a VM of 2 vCPUs and four clones per connection, 0.68 and 0.34 each; a VM spinning 2
+  vCPUs under `cpu=50`, 0.50. The wicket's own connections at c=64 on 2 CPUs: 37.0k req/s with
+  8 vCPUs spinning, as with none (36.9k); where its cgroup is not delegated, 8.5k, its threads
+  on 0.42 CPUs and each VM on 0.20
+- **Not covered**: a VM without a cgroup of its own (no jail, the wicket's cgroup not
+  delegated to it) has no share: the budget alone keeps the wicket its CPUs there, as the
+  line above shows. x86_64's `kvm-pit/<pid>` kernel thread stays in the root cgroup,
   named after its VM's pid in the VM's own PID namespace (`kvm-pit/1` for every jailed VM), so
   nothing tells which VM's it is
 
@@ -573,6 +622,11 @@ the sample guest, the runs of each row alternating (the scripts: `.todo/artefact
 
 - `/dev/kvm` ACLs set by hand do not last: udev rewrote one within minutes. Use the
   `kvm` group.
+- A systemd unit's stop sends SIGTERM to every process of its cgroup by default
+  (`KillMode=control-group`), and a `firecracker` ends on one (`its VM ended (signal 15)`):
+  the VMs are gone before the wicket drains. `KillMode=mixed` sends it to the wicket alone
+  (systemd 255, a transient unit: a child alive while its main process handled the stop,
+  gone at once without).
 - An h2c-unaware process answers prior-knowledge h2 with 502, as behind the Java client;
   the Go sample enables h2c (`http.Protocols`).
 
@@ -626,7 +680,7 @@ the sample guest, the runs of each row alternating (the scripts: `.todo/artefact
     before the rename, none gone either way: why `/init` mounts so, and why the cf-api's writes
     `fsync` (its push right before a kill was lost without)
   - one drive under two VMs: nothing refuses, both mount, `e2fsck` finds damage in seconds.
-    A `flock` taken by the launcher, on a file open across its exec, holds as long as
+    A `flock` taken before `firecracker`'s exec, on a file open across it, holds as long as
     `firecracker` lives and is gone 43ms after its SIGKILL (a 128 MiB VM's teardown): a start
     right after a kill must wait for it
   - `RLIMIT_FSIZE` of 16 MiB under a 256 MiB drive: Firecracker ends at the first write past
@@ -685,7 +739,8 @@ connection 647-737 (outside 623-672).
 
 Linux 6.1's boot time mitigations (`favordynmods`, `kvm.nx_huge_pages=never`) are not needed at the
 wicket's rates: `KVM_CREATE_VM` takes 0.26ms on the 6.8 kernel of these findings (0.34-0.51ms, 16
-at once), of a clone's 12ms restore.
+at once), of a clone's 12ms restore; and `favordynmods` speeds a process's move into a cgroup,
+which no VM makes (each is cloned into its own: [The forker](#the-forker)).
 
 ## A build without an analyzer and an exporter
 

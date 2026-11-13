@@ -53,8 +53,9 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
                                   port=N (the guest's vsock port, 8080),
                                   boot-ms=N a cold-booted guest may take to listen (10000),
                                   per-client=N a client address's connections at once,
-                                  idle-ms=N a connection may relay no byte, cpu=N (jail
-                                  mode) a VM's host CPU in percent of one,
+                                  idle-ms=N a connection may relay no byte, cpu=N a VM's
+                                  host CPU in percent of one (its cgroup's: jail mode, or
+                                  the wicket's own cgroup delegated to it),
                                   readiness=process|port|http (boot, pool: a VM takes
                                   connections once its probe passes; process: once up),
                                   readiness-endpoint=<path> (http: answered 200, /),
@@ -446,7 +447,7 @@ pub fn parse(
         flags: vms,
         kernel: flag("kernel").map(PathBuf::from),
         firecracker: flag("firecracker").map(PathBuf::from),
-        jailed: jail.is_some(),
+        no_cpu: None,
         console: None,
     };
     let key = |key: &str| match &config {
@@ -663,7 +664,7 @@ impl Binaries {
             flags: Vec::new(),
             kernel: self.kernel.clone(),
             firecracker: self.firecracker.clone(),
-            jailed: false,
+            no_cpu: None,
             console: None,
         };
         source.paths(source.file()?.as_ref())
@@ -677,8 +678,9 @@ pub struct RouteSource {
     /// `--kernel` / `--firecracker` (flag or environment), over the file's.
     kernel: Option<PathBuf>,
     firecracker: Option<PathBuf>,
-    /// Jail mode: a route's `cpu` is its VMs' cgroups'.
-    jailed: bool,
+    /// What a route's `cpu` needs and its VMs have not, where they have not: without the jail,
+    /// a cgroup of their own with the cpu controller.
+    no_cpu: Option<String>,
     /// The console's routes, with `--console`.
     console: Option<Deployed>,
 }
@@ -699,9 +701,14 @@ impl RouteSource {
         self.console.replace(deployed)
     }
 
-    /// Whether a route's `cpu` is its VMs' cgroups' (jail mode).
-    pub fn jailed(&self) -> bool {
-        self.jailed
+    /// Refuses a route's `cpu` from here on: it needs `what`, which its VMs have not.
+    pub fn refuse_cpu(&mut self, what: String) {
+        self.no_cpu = Some(what);
+    }
+
+    /// Whether a route may take `cpu`: its VMs' cgroups bound it.
+    pub fn takes_cpu(&self) -> bool {
+        self.no_cpu.is_none()
     }
 
     /// The firecracker binary as the routes name it now (a bare name is looked up on
@@ -827,11 +834,8 @@ impl RouteSource {
                     false => format!("{}: routed twice: by {other} and by {origin}", spec.host),
                 });
             }
-            if spec.vm.cpu.is_some() && !self.jailed {
-                return Err(format!(
-                    "{}: cpu needs jail mode (--jail-ids): its VMs' cgroups bound it",
-                    spec.host
-                ));
+            if let (Some(_), Some(what)) = (spec.vm.cpu, &self.no_cpu) {
+                return Err(format!("{}: cpu needs {what}", spec.host));
             }
             if spec.vm.disk.is_some() && !matches!(origin, Origin::Api { .. }) {
                 return Err(format!(
@@ -1112,8 +1116,9 @@ mod tests {
 
     /// A flag wins over the environment, the environment over the file, the
     /// file over the defaults; the file's paths are relative to it, its routes
-    /// come before the flags', a host is routed once, a route's `cpu` needs jail
-    /// mode; the CPU budget is a number of CPUs or of times those it runs on.
+    /// come before the flags', a host is routed once, a route's `cpu` is refused
+    /// once its VMs are found without a cgroup for it; the CPU budget is a number
+    /// of CPUs or of times those it runs on.
     #[test]
     fn flags_win_over_the_environment_over_the_file_over_the_defaults() {
         let dir = std::env::temp_dir().join(format!("sfc-config-{}", std::process::id()));
@@ -1301,9 +1306,17 @@ mod tests {
         .unwrap();
         assert_eq!(settings.token, "from-token-file");
 
+        let cpu = format!("c.local={}?cpu=50", rootfs.display());
+        let mut capped = run(&["--server", "s", "--kernel", "k", "--vm", &cpu], &[]).unwrap();
+        assert!(capped.routes.takes_cpu());
+        capped.routes.refuse_cpu("a cgroup of its VMs' own".into());
+        assert_eq!(
+            capped.routes.read().unwrap_err(),
+            "c.local: cpu needs a cgroup of its VMs' own"
+        );
+
         let twice = format!("a.local={}", rootfs.display());
         let disk = format!("d.local={}?disk=/data", rootfs.display());
-        let cpu = format!("c.local={}?cpu=50", rootfs.display());
         let no_share = format!("c.local={}?per-client=0", rootfs.display());
         let no_port = format!("c.local={}?egress=db.internal", rootfs.display());
         let egress: Vec<String> = (0..64).map(|n| format!("db-{n}.internal:5432")).collect();
@@ -1323,10 +1336,6 @@ mod tests {
             (
                 vec!["--server", "s", "--kernel", "k", "--vm", &unsized_pool],
                 "mode=pool needs instances",
-            ),
-            (
-                vec!["--server", "s", "--kernel", "k", "--vm", &cpu],
-                "c.local: cpu needs jail mode",
             ),
             (
                 vec!["--server", "s", "--kernel", "k", "--vm", &disk],

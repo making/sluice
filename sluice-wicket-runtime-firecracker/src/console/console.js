@@ -29,14 +29,15 @@ const MODE_HINTS = {
 /**
  * The numeric options of a route: the `--vm` query's key, the mode(s) taking it, the default
  * (null: none, unbounded), the least value, and where the form puts it; `checked`, a readiness
- * check's (port, http) alone, or a liveness check's (http) alone.
+ * check's (port, http) alone, or a liveness check's (http) alone; `listed`, only where the listing
+ * says so (a route's `cpu`: where its VMs' cgroups bound it).
  */
 const NUMBERS = [
   { key: "vcpus", group: "vm", label: "vCPUs", unit: "", fallback: 1, min: 1, modes: MODES },
   { key: "memory-mib", group: "vm", label: "Memory", unit: "MiB", fallback: 128, min: 1, modes: MODES },
   { key: "port", group: "vm", label: "Port", unit: "vsock", fallback: 8080, min: 0, modes: MODES },
   { key: "boot-ms", group: "vm", label: "Boot", unit: "ms to listen", fallback: 10000, min: 1, modes: MODES },
-  { key: "cpu", group: "vm", label: "CPU", unit: "% of one", fallback: null, min: 1, modes: MODES, jailed: true },
+  { key: "cpu", group: "vm", label: "CPU", unit: "% of one", fallback: null, min: 1, modes: MODES, listed: "cpu_limit" },
   { key: "warm", group: "clones", label: "Warm", unit: "ahead", fallback: 0, min: 0, modes: CLONED },
   { key: "prime", group: "clones", label: "Prime", unit: "GET /", fallback: 0, min: 0, modes: CLONED },
   { key: "instances", group: "vm", label: "VMs", unit: "at most, boot: kept", fallback: null, min: 1, modes: MODES },
@@ -168,11 +169,11 @@ function optionFields(initial, onChange) {
     modes.append(choiceView(radio, mode, MODE_HINTS[mode]));
   }
 
-  const jailed = Boolean(currentListing()?.jailed);
+  const listing = currentListing();
   const inputs = new Map();
   const limits = new Map();
   for (const number of NUMBERS) {
-    if (number.jailed && !jailed) {
+    if (number.listed && !listing?.[number.listed]) {
       continue;
     }
     const input = h("input", {
