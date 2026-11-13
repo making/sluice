@@ -4,6 +4,13 @@ Difficulty: Medium
 
 Found during the 041 investigation (by reading, not tested).
 
+## Since written (2026-11-13, by reading)
+
+A pooled unit's store now has a callback (`stop_at_the_deadline`): it continues until the earliest
+request's deadline and yields only past it; a per-request store still has `set_epoch_deadline` alone.
+So a spinning guest still holds its worker for the budget on both paths, and the fix below changes that
+callback instead of installing the first one. 302 is the CPU accounting and the share after it.
+
 ## Problem
 
 `wasm_host.rs` enables `epoch_interruption(true)` and arms each store with
