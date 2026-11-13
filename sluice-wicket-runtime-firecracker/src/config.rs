@@ -14,6 +14,7 @@ use sluice_wicket_tunnel::flume::FlumeSettings;
 use sluice_wicket_tunnel::{DEFAULT_DRAIN_GRACE, DEFAULT_MAX_CONNECTIONS, DEFAULT_STALL_TIMEOUT};
 
 use crate::deployed::Deployed;
+use crate::host::{Budget, Memory};
 use crate::jail::Ids;
 use crate::route::RouteSpec;
 
@@ -90,8 +91,14 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
                                   and --listen's apart
   --max-instances <n>             VMs alive at once over every route: booted, warm, in use,
                                   templates (default 64)
-  --max-memory-mib <MiB>          their guest memory (memory-mib) at most (default none:
-                                  --max-instances x the largest memory-mib bounds it)
+  --max-memory-mib <MiB>|<ratio>x what they take of the host's memory at most: a VM its
+                                  memory-mib and 48 MiB + memory-mib/128 (its firecracker's
+                                  own, its log), a cloned route its memory-mib once more
+                                  (its snapshot, where the state dir is on a tmpfs). So
+                                  many MiB, which the host must have for them, or with x so
+                                  many times what it has, 1.5x: overcommitted (default all
+                                  it has for them: its memory, or what the wicket's cgroup
+                                  allows where less, but a twentieth, 64 MiB at least)
   --max-cpus <n>|<ratio>x         their CPUs at most, a VM's its vcpus (its cpu where less):
                                   so many, or with x so many times the CPUs the wicket runs
                                   on, 4x: four vCPUs to each (default none: --max-instances
@@ -190,8 +197,8 @@ pub struct Settings {
     /// How long from the routes' start the readiness probe waits for each to have a VM ready.
     pub ready_grace: Duration,
     pub max_instances: usize,
-    /// MiB; None = no memory budget.
-    pub max_memory_mib: Option<u64>,
+    /// What the VMs take of the host's memory at most.
+    pub max_memory: Budget,
     /// Hundredths of a CPU; None = no CPU budget.
     pub max_cpus: Option<u64>,
     /// The relay workers (`sluice_wicket_tunnel::workers`).
@@ -411,9 +418,8 @@ pub fn parse(
     .map_or(DEFAULT_MAX_CONNECTIONS, |max| max as usize);
     let max_instances = positive("max-instances", file.and_then(|file| file.max_instances))?
         .map_or(DEFAULT_MAX_INSTANCES, |max| max as usize);
-    let max_memory_mib = positive("max-memory-mib", file.and_then(|file| file.max_memory_mib))?;
     let max_cpus = flag("max-cpus")
-        .or_else(|| file.and_then(|file| file.max_cpus.as_ref().map(Cpus::text)))
+        .or_else(|| file.and_then(|file| file.max_cpus.as_ref().map(Amount::text)))
         .map(|cpus| max_cpus(&cpus, host_cpus()))
         .transpose()?;
     let workers = positive("workers", file.and_then(|file| file.workers))?.map_or_else(
@@ -442,6 +448,11 @@ pub fn parse(
         (None, None) => None,
         _ => return Err("--jail-ids and --jail-user go together (jail mode)".into()),
     };
+    // against what the cgroup the VMs are in has: the jail's, or the wicket's own
+    let max_memory = flag("max-memory-mib")
+        .or_else(|| file.and_then(|file| file.max_memory_mib.as_ref().map(Amount::text)));
+    let charged = jail.as_ref().and_then(|jail| jail.cgroup.as_deref());
+    let max_memory = Budget::resolve(max_memory.as_deref(), Memory::read(charged).as_ref())?;
     let routes = RouteSource {
         config: config.as_ref().map(|(_, path)| path.clone()),
         flags: vms,
@@ -559,7 +570,7 @@ pub fn parse(
             DEFAULT_READY_GRACE,
         )?,
         max_instances,
-        max_memory_mib,
+        max_memory,
         max_cpus,
         workers,
         watch_interval: seconds(
@@ -867,8 +878,8 @@ pub struct File {
     guest: Option<PathBuf>,
     max_connections: Option<u64>,
     max_instances: Option<u64>,
-    max_memory_mib: Option<u64>,
-    max_cpus: Option<Cpus>,
+    max_memory_mib: Option<Amount>,
+    max_cpus: Option<Amount>,
     workers: Option<u64>,
     tunnel_stall_timeout: Option<Scalar>,
     drain_grace: Option<Scalar>,
@@ -1043,20 +1054,20 @@ impl FileRoute {
     }
 }
 
-/// A YAML scalar taken as `--max-cpus`: a number of CPUs, or a ratio (`4x`).
+/// A YAML scalar taken as `--max-cpus` or `--max-memory-mib`: a number, or a ratio (`4x`).
 #[derive(Deserialize)]
 #[serde(untagged)]
-enum Cpus {
+enum Amount {
     Number(f64),
     Text(String),
 }
 
-impl Cpus {
+impl Amount {
     /// As the flag has it.
     fn text(&self) -> String {
         match self {
-            Cpus::Number(cpus) => cpus.to_string(),
-            Cpus::Text(text) => text.trim().to_string(),
+            Amount::Number(amount) => amount.to_string(),
+            Amount::Text(text) => text.trim().to_string(),
         }
     }
 }
@@ -1118,7 +1129,8 @@ mod tests {
     /// file over the defaults; the file's paths are relative to it, its routes
     /// come before the flags', a host is routed once, a route's `cpu` is refused
     /// once its VMs are found without a cgroup for it; the CPU budget is a number
-    /// of CPUs or of times those it runs on.
+    /// of CPUs or of times those it runs on, the memory budget what the host has
+    /// for the VMs, so many times it, or so many MiB of it.
     #[test]
     fn flags_win_over_the_environment_over_the_file_over_the_defaults() {
         let dir = std::env::temp_dir().join(format!("sfc-config-{}", std::process::id()));
@@ -1129,7 +1141,7 @@ mod tests {
         std::fs::write(
             &config,
             "server: grpc://file:8001\ntoken: from-file\nkernel: vmlinux\nmax-instances: 8\nworkers: 2\n\
-             max-cpus: 2x\nhealth: 127.0.0.1:8081\n\
+             max-cpus: 2x\nmax-memory-mib: 0.5x\nhealth: 127.0.0.1:8081\n\
              drain-grace: 5s\nevacuation-grace: 1m\nready-grace: 2m\nflume: grpc://file:8002\nflume-token: from-file\n\
              flume-ca-cert: flume-ca.pem\njail-ids: 900000-900063\njail-user: from-file\n\
              console: 127.0.0.1:9090\nconsole-dir: kept\noidc-claim: [email=*]\n\
@@ -1195,6 +1207,9 @@ mod tests {
             Some(2 * 100 * host_cpus() as u64),
             "twice the CPUs it runs on, in hundredths"
         );
+        let host = Memory::read(None);
+        let memory = |asked| Budget::resolve(asked, host.as_ref()).unwrap();
+        assert_eq!(settings.max_memory, memory(Some("0.5x")), "half of it");
         assert_eq!(settings.workers, 2);
         assert_eq!(settings.drain_grace, Duration::from_secs(5));
         assert_eq!(settings.evacuation_grace, Duration::from_secs(60));
@@ -1232,6 +1247,7 @@ mod tests {
                 "flag",
                 "--max-instances=4",
                 "--max-cpus=6.5",
+                "--max-memory-mib=64",
                 "--workers=3",
                 "--health=0.0.0.0:10",
                 "--flume=grpcs://flag:8002",
@@ -1268,6 +1284,7 @@ mod tests {
         assert_eq!(settings.health.as_deref(), Some("0.0.0.0:10"));
         assert_eq!(settings.max_instances, 4);
         assert_eq!(settings.max_cpus, Some(650));
+        assert_eq!(settings.max_memory.mib, Some(64));
         assert_eq!(settings.workers, 3);
         assert_eq!(
             settings.jail,
@@ -1298,6 +1315,7 @@ mod tests {
         let settings = run(&["--config", &by_file], &[]).unwrap();
         assert_eq!(settings.token, "from-token-file");
         assert_eq!(settings.max_cpus, None, "no CPU budget unless stated");
+        assert_eq!(settings.max_memory, memory(None), "what the host has");
         let token_file = dir.join("token").display().to_string();
         let settings = run(
             &["--config", &config_flag, "--token-file", &token_file],
@@ -1388,6 +1406,10 @@ mod tests {
             (
                 vec!["--config", &config_flag, "--max-cpus", "0x"],
                 "--max-cpus 0x: expected a number of CPUs",
+            ),
+            (
+                vec!["--config", &config_flag, "--max-memory-mib", "1x2"],
+                "--max-memory-mib 1x2: expected a number of MiB",
             ),
             (
                 vec![

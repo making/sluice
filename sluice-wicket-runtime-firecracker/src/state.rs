@@ -3,6 +3,8 @@
 use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 
+use crate::capacity::Snapshots;
+
 /// The directory of the VMs' files: the process's own (0700) under
 /// `$XDG_RUNTIME_DIR`, else the system's temp dir, removed at the end; or
 /// `--state-dir`, where the routes' directories (`route-*`, 0700) are created
@@ -64,18 +66,30 @@ impl StateDir {
 
 /// Whether `dir` is on a tmpfs (or a ramfs): its files never reach a disk.
 pub fn on_tmpfs(dir: &Path) -> bool {
+    snapshots(dir) != Snapshots::Disk
+}
+
+/// Where a snapshot written into `dir` is, and so what it takes (`capacity`): on a tmpfs (or
+/// a ramfs), the host's memory, and of the room the tmpfs has now where it has a size; else
+/// on a disk.
+pub fn snapshots(dir: &Path) -> Snapshots {
     let Ok(path) = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()) else {
-        return false;
+        return Snapshots::Disk;
     };
     let mut fs = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: a NUL-terminated path and a statfs buffer to fill
     if unsafe { libc::statfs(path.as_ptr(), fs.as_mut_ptr()) } != 0 {
-        return false;
+        return Snapshots::Disk;
     }
     // SAFETY: filled by the successful call
-    let kind = unsafe { fs.assume_init() }.f_type;
+    let fs = unsafe { fs.assume_init() };
     // ramfs: 0x858458f6, which libc does not name
-    kind == libc::TMPFS_MAGIC || kind == 0x858458f6
+    if fs.f_type != libc::TMPFS_MAGIC && fs.f_type != 0x858458f6 {
+        return Snapshots::Disk;
+    }
+    // no blocks: without a size (a ramfs; a tmpfs of size=0), the memory alone bounds it
+    let room = (fs.f_blocks > 0).then(|| fs.f_bavail.saturating_mul(fs.f_bsize as u64) >> 20);
+    Snapshots::Memory(room)
 }
 
 /// The routes' directories in `dir`.

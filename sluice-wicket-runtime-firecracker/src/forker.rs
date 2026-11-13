@@ -21,7 +21,8 @@
 //! The VM is the wicket's child, not the forker's (`CLONE_PARENT`): the wicket reaps it and
 //! reads how it ended ([`Child`]), it never outlives the wicket (its parent death signal,
 //! SIGKILL, set before its exec: the parent the wicket's first thread, which lives as long),
-//! and the forker holds nothing of it. What the forker forks runs as the wicket's user under
+//! the kernel's OOM killer takes it before the wicket (`jail::OomScore`), and the forker holds
+//! nothing of it. What the forker forks runs as the wicket's user under
 //! the wicket's filter, whatever is asked of it; no process of that user traces it or writes
 //! its memory (not dumpable), a wicket taken over neither.
 
@@ -45,7 +46,7 @@ use tokio::sync::{oneshot, watch};
 use crate::BoxError;
 use crate::cgroup::{Cgroups, Held, Own};
 use crate::disk;
-use crate::jail::{CLONE_INTO_CGROUP, CLONE_PIDFD, CloneArgs, check, failed};
+use crate::jail::{CLONE_INTO_CGROUP, CLONE_PIDFD, CloneArgs, OomScore, check, failed};
 use crate::keeper::{MESSAGE, Role, Size, VmEnd, receive, send};
 use crate::seccomp::Filter;
 use crate::usage::Meter;
@@ -89,6 +90,15 @@ pub fn serve(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
             "usage: {FORK} <wicket pid> <socket fd>"
         )));
     };
+    // opened while it may be: not dumpable, a process's files in /proc are root's
+    let oom = OomScore::open()
+        .inspect_err(|e| {
+            eprintln!(
+                "the VMs' oom_score_adj: {e}; the kernel's OOM killer may take the wicket \
+                 before a VM"
+            )
+        })
+        .ok();
     // SAFETY: plain calls on the fd the wicket gave us and on our own process
     let socket = unsafe {
         check(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC))?;
@@ -119,7 +129,8 @@ pub fn serve(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
         let forked = serde_json::from_slice::<Request>(&buffer[..n])
             .map_err(|e| format!("a request it cannot read: {e}"))
             .and_then(|request| {
-                fork(&request, fds, null.as_fd(), wicket, &filter).map_err(|e| e.to_string())
+                let forked = fork(&request, fds, null.as_fd(), wicket, &filter, oom.as_ref());
+                forked.map_err(|e| e.to_string())
             });
         let (answer, pidfd): (Answer, _) = match forked {
             Ok((pid, pidfd)) => (Ok(pid), Some(pidfd)),
@@ -134,13 +145,15 @@ pub fn serve(mut args: impl Iterator<Item = OsString>) -> io::Result<()> {
 /// Forks the VM of `request`, the wicket's child (`CLONE_PARENT`), with `fds`: its log and,
 /// asked for, its cgroup's directory, which it starts in (`clone3`; without one, `clone`,
 /// which every seccomp profile takes: Docker's refuses `clone3`). Its pid and a pidfd of it.
-/// The child becomes the VM ([`launch`]), or says why not in its log and exits 127.
+/// The child becomes the VM ([`launch`]), or says why not in its log and exits 127; its
+/// `oom_score_adj` a VM's, the forker's own raised to it for the fork (`oom`).
 fn fork(
     request: &Request,
     fds: Vec<OwnedFd>,
     null: BorrowedFd<'_>,
     wicket: libc::pid_t,
     filter: &Filter,
+    oom: Option<&OomScore>,
 ) -> io::Result<(libc::pid_t, OwnedFd)> {
     let mut fds = fds.into_iter();
     let log = fds
@@ -154,6 +167,7 @@ fn fork(
         false => None,
     };
     let mut pidfd: libc::c_int = -1;
+    let raised = oom.is_some_and(|oom| oom.raise().is_ok());
     // SAFETY: a clone without a stack: fork's semantics. The child only runs `launch` (no
     // lock another thread holds: the forker is single-threaded) and exits.
     let pid = unsafe {
@@ -182,13 +196,18 @@ fn fork(
             ),
         }
     };
+    // the forker's own again: in the forker alone, the file is its
+    let failure = io::Error::last_os_error();
+    if let (true, Some(oom), 1.. | -1) = (raised, oom, pid) {
+        let _ = oom.lower();
+    }
     match pid {
         -1 => {
             let call = match cgroup {
                 Some(_) => "clone3 into the VM's cgroup",
                 None => "clone",
             };
-            Err(failed(call)(io::Error::last_os_error()))
+            Err(failed(call)(failure))
         }
         0 => {
             let error = launch(request, log.as_fd(), null, wicket, filter);

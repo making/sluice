@@ -13,7 +13,8 @@
 //! (http/1.1 and h2c, an unknown one answered 404), clients left quiet there and their slots given
 //! way, a `--vm` route alone
 //! whatever the host and handing through a guest speaking first, not with `--console` nor
-//! from the config file, its process taken by the guest kernel's OOM killer told so; a reload of the `--config`
+//! from the config file; a process taken by the guest kernel's OOM killer told so, a booted VM's
+//! and a clone's, its guest taking all its memory; a reload of the `--config`
 //! file, polled, removing a route and replacing a rootfs; its numbers and an app's changed, the
 //! VMs running kept; a pool's VM going down replaced; what keeps a route below its `warm` told; the
 //! console deploying
@@ -71,7 +72,7 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use sha2::Digest as _;
 use sluice_wicket_runtime_firecracker::forker::{self, Forker, Launch};
 use sluice_wicket_runtime_firecracker::keeper::{Role, Size};
-use sluice_wicket_runtime_firecracker::{disk, jail, usage};
+use sluice_wicket_runtime_firecracker::{disk, jail, state, usage};
 use sluice_wicket_tunnel::flume::testing::{FeedStream, flume_server};
 use sluice_wicket_tunnel::proto::{AccessFilter, feed_message};
 use sluice_wicket_tunnel::session::testing::{ServerTunnel, dial_address, tunnel_server};
@@ -110,8 +111,9 @@ const CONSOLE_TOKEN: &str = "c0ns0le";
 /// file table to the limit at its start, a cost that grows with it: 3ms at 1048576), the
 /// file size given (a guest's output to its VM's log bounded) and no core (of a VM's
 /// memory), under the wicket's seccomp filter on the forker's, without the caller's
-/// environment; holding the disk's lock for it, across the exec, or refusing to start while
-/// another does. How it ended is told, killed as its handle is dropped too.
+/// environment, the kernel's OOM killer taking it before the caller; holding the disk's lock
+/// for it, across the exec, or refusing to start while another does. How it ended is told,
+/// killed as its handle is dropped too.
 #[tokio::test]
 async fn the_forker_execs_with_the_limits_given() {
     use std::os::fd::AsRawFd as _;
@@ -180,12 +182,13 @@ async fn the_forker_execs_with_the_limits_given() {
     assert!(error.contains("in use by another VM"), "{error}");
     drop(holder);
 
-    let limited = fork(
-        None,
-        &["/bin/cat", "/proc/self/limits", "/proc/self/status"],
-    );
+    let files = ["/proc/self/limits", "/proc/self/status"];
+    let score = "/proc/self/oom_score_adj";
+    let limited = fork(None, &["/bin/cat", files[0], files[1], score]);
     let (status, limits) = ended(limited.await.unwrap()).await;
     assert_eq!(status, "exit 0", "{limits}");
+    let expendable = jail::VM_OOM_SCORE_ADJ.to_string();
+    assert_eq!(limits.lines().last(), Some(expendable.as_str()), "{limits}");
     let limit = |name: &str| -> Vec<String> {
         let line = limits.lines().find(|line| line.starts_with(name)).unwrap();
         line[name.len()..]
@@ -570,6 +573,7 @@ async fn every_route_serves_http_through_the_tunnel() {
                 filters(std::process::id() as i32) + 1,
                 "the wicket's filter"
             );
+            expendable(&wicket.vms(), pid, std::process::id() as i32);
             assert_eq!(wicket.cgroups().is_some(), delegated, "{}", wicket.log());
             if let Some(cgroup) = wicket.cgroups() {
                 assert!(
@@ -683,8 +687,9 @@ async fn every_route_serves_http_through_the_tunnel() {
         let bodies =
             served_again.unwrap_or_else(|_| panic!("console.local: hung; {}", wicket.log()));
         assert_eq!(served(&bodies), [1, 2, 3]);
+        drop(wicket);
+        out_of_memory(&dir.0, &rootfs, |args| start(&url, args)).await;
         if !jailed {
-            drop(wicket);
             sole_routes(&dir.0, &rootfs, |args| start(&url, args)).await;
             giving_way(&dir.0, &rootfs, |args| start(&url, args)).await;
             below_warm(&dir.0, &rootfs, |args| start(&url, args)).await;
@@ -739,14 +744,31 @@ async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> 
         move |route: &serde_json::Value| pooled(n)(route) && route["instances"]["down"].is_null()
     };
     listed_as(wicket, POOL, up(1)).await;
-    // the budget as the apps' listing has it: what the routes keep for good, the pool's VM
+    // the budget as the apps' listing has it: what the routes keep for good, the pool's VM;
+    // of the memory what it may be charged (128 + 48 + 1 MiB) and, on a tmpfs, the two routes'
+    // snapshots (128 MiB each), within what the host has for the VMs
     let (_, apps) = console(wicket.console(), "GET", "/api/apps", true, Bytes::new()).await;
     let budget = &apps["budget"];
+    let kept = match state::on_tmpfs(&state) {
+        true => 177 + 2 * 128,
+        false => 177,
+    };
     assert_eq!(
-        (&budget["max_cpus"], &budget["cpus"]),
-        (&3.0.into(), &1.0.into()),
+        (&budget["max_cpus"], &budget["cpus"], &budget["memory_mib"]),
+        (&3.0.into(), &1.0.into(), &kept.into()),
         "{apps}"
     );
+    let host = std::fs::read_to_string("/proc/meminfo").unwrap();
+    let host = host.lines().find_map(|line| line.strip_prefix("MemTotal:"));
+    let host: u64 = host
+        .unwrap()
+        .trim()
+        .trim_end_matches("kB")
+        .trim()
+        .parse()
+        .unwrap();
+    let max = budget["max_memory_mib"].as_u64().unwrap();
+    assert!(max > 177 && max < host >> 10, "{max} of {host} kB");
     let serving = async |host: &str| {
         let mut client = tokio::net::TcpStream::connect(wicket.listening())
             .await
@@ -1109,10 +1131,10 @@ async fn app_alive(wicket: &Wicket, name: &str) -> (Vec<(u64, u64)>, serde_json:
 /// A route given by `--vm` alone takes any host, nothing read first: a guest speaking first
 /// speaks to a connection that sent nothing. With `--console`, or as the config file's one route,
 /// a connection is routed by its first request: nothing reaches the guest before it, and another
-/// host is answered 404. Its process taken by the guest kernel's OOM killer is said to be.
+/// host is answered 404.
 async fn sole_routes(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> Wicket) {
     const SPOKEN: &str = "220 speaking first";
-    let speaking = speaking_rootfs(scratch, rootfs, SPOKEN);
+    let speaking = process_rootfs(scratch, rootfs, &[format!("SAMPLE_SPEAK_FIRST={SPOKEN}")]);
     let config = scratch.join("sole.yaml");
     let route = format!("- {{host: sole.local, rootfs: {}}}\n", speaking.display());
     std::fs::write(&config, format!("routes:\n{route}")).unwrap();
@@ -1153,15 +1175,34 @@ async fn sole_routes(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) ->
         });
         assert!(checked.await.is_ok(), "{args:?}: hung; {}", routed.log());
     }
+}
 
-    // its process taking memory until the guest kernel's OOM killer takes it: told so
-    let routed = wicket(&[&by_file]);
-    let oom = "GET /oom HTTP/1.1\r\nhost: sole.local\r\n\r\n";
-    let connected = tokio::net::TcpStream::connect(routed.listening()).await;
-    exchange(connected.unwrap(), oom).await;
-    let killed = "route sole.local: VM 0: its process ended (signal: 9 (SIGKILL)): out of memory, \
-                  the guest kernel's OOM killer took a process; killed";
-    said(&routed, killed).await;
+/// A process taking memory until its guest kernel's OOM killer takes it is told so: its guest
+/// may take all of its `memory-mib`. A booted VM's, and a clone's, whose cgroup (where it has
+/// one) is charged what it is first to touch of its route's snapshot too, and keeps that: the
+/// clone in its place alike.
+async fn out_of_memory(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> Wicket) {
+    let image = process_rootfs(scratch, rootfs, &[]);
+    let config = scratch.join("oom.yaml");
+    let routes = format!(
+        "routes:\n- {{host: booted.local, rootfs: {image}}}\n\
+         - {{host: pool.local, rootfs: {image}, mode: pool, instances: 1, memory-mib: 256}}\n",
+        image = image.display()
+    );
+    std::fs::write(&config, routes).unwrap();
+    let args = ["--listen", "127.0.0.1:0", "--config"].map(String::from);
+    let wicket = start(&[&args[..], &[config.display().to_string()]].concat());
+    for host in ["booted.local", "pool.local", "pool.local"] {
+        let mark = wicket.log().len();
+        let oom = format!("GET /oom HTTP/1.1\r\nhost: {host}\r\n\r\n");
+        let connected = tokio::net::TcpStream::connect(wicket.listening()).await;
+        exchange(connected.unwrap(), &oom).await;
+        let killed = format!(
+            "route {host}: VM 0: its process ended (signal: 9 (SIGKILL)): out of memory, the \
+             guest kernel's OOM killer took a process; killed"
+        );
+        said_after(&wicket, mark, &killed).await;
+    }
 }
 
 /// `--listen`'s one slot taken, the next connection is served at once: a head not ended gives way,
@@ -1291,14 +1332,14 @@ async fn exchange(mut client: tokio::net::TcpStream, what: &str) -> String {
     String::from_utf8_lossy(&got).into_owned()
 }
 
-/// The sample rootfs running the sample process as an image's, speaking `line` first.
-fn speaking_rootfs(scratch: &Path, rootfs: &Path, line: &str) -> PathBuf {
-    let speaking = scratch.join("speaking.ext4");
+/// The sample rootfs running the sample process as an image's, with `env`.
+fn process_rootfs(scratch: &Path, rootfs: &Path, env: &[String]) -> PathBuf {
+    let speaking = scratch.join(format!("process-{}.ext4", env.len()));
     std::fs::copy(rootfs, &speaking).unwrap();
     let launch = scratch.join("init.json");
     let config = serde_json::json!({
         "argv": ["/serve"],
-        "env": [format!("SAMPLE_SPEAK_FIRST={line}")],
+        "env": env,
         "uid": 0,
         "gid": 0,
         "workdir": "/",
@@ -3028,6 +3069,20 @@ async fn settled(wicket: &Wicket) {
     }
 }
 
+/// The kernel's OOM killer takes one of `vms` before the wicket: their `oom_score_adj` a
+/// VM's, the wicket's as it was started with (its `parent`'s).
+fn expendable(vms: &[i32], wicket: i32, parent: i32) {
+    let score = |pid: i32| {
+        let score = std::fs::read_to_string(format!("/proc/{pid}/oom_score_adj"));
+        score.unwrap_or_default().trim().to_string()
+    };
+    assert!(!vms.is_empty(), "no VM alive");
+    for vm in vms {
+        assert_eq!(score(*vm), jail::VM_OOM_SCORE_ADJ.to_string(), "{vm}");
+    }
+    assert_eq!(score(wicket), score(parent), "the wicket's own");
+}
+
 /// The cgroup of `pid`, under the hierarchy's root.
 fn cgroup_of(pid: i32) -> String {
     let own = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap_or_default();
@@ -3035,6 +3090,12 @@ fn cgroup_of(pid: i32) -> String {
         .strip_prefix("0::/")
         .unwrap_or_default()
         .to_string()
+}
+
+/// Whether the kernel accounts a cgroup's swap: the hierarchy's cgroups have the file.
+fn swapping() -> bool {
+    let own = cgroup_of(std::process::id() as i32);
+    Path::new(&format!("/sys/fs/cgroup/{own}/memory.swap.max")).exists()
 }
 
 /// The `cpu.weight` of `cgroup`, where it is a group of the cpu controller.
@@ -3061,6 +3122,9 @@ fn cgroups(wicket: &Wicket, vms: &[i32], cgroup: &str) {
             limit.map(|limit| limit.trim().to_string())
         };
         assert_ne!(limit("memory.max").unwrap(), "max", "{vm}: its memory");
+        // none of it swapped, where the kernel accounts swap
+        let swap = limit("memory.swap.max");
+        assert!(swap.is_ok_and(|max| max == "0") || !swapping(), "{vm}");
         let threads = (vcpus(*vm) + 16).to_string();
         assert_eq!(limit("pids.max").unwrap(), threads, "{vm}: its threads");
         // a group of the cpu controller of its own, its weight the CPUs it holds, 10 a
@@ -3178,6 +3242,7 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
     assert_eq!(ids.len(), vms.len(), "an id per VM: {ids:?}");
     cgroups(wicket, &vms, &cgroup);
     assert_eq!(others.len(), 1, "the wicket: {others:?}");
+    expendable(&vms, others[0], keeper);
     assert_eq!(
         status(others[0], "Uid:").split_whitespace().next(),
         Some(user.as_str()),

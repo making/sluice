@@ -281,7 +281,8 @@ as a VM's PSS, plus the snapshot on the tmpfs (`du`).
   at 1 GiB, and restores past the 3 GiB of the MMIO gap
 - **Its holes fill as clones touch them**: shmem gives a fault on a hole a page of the file, then a
   private copy for a write: 81 to 86 MiB (Go), 176 to 195 (the JVM) over these loads. `memory-mib` at most,
-  what `Full` takes from the start
+  what `Full` takes from the start; the page is charged to the clone, not the route
+  ([The memory budget](#the-memory-budget))
 - **What a clone writes is there twice**, in the file and privately: the difference of a pool of one
   from a booted VM, +18 MiB (sample), +31 (Go), +124 (the JVM)
 - **aarch64 is alike**: 53 MiB at 1 GiB, 180 at 4 ([aarch64](#aarch64))
@@ -528,9 +529,9 @@ made of, and why (the 64-core host, its 6.8 kernel):
   ended (a pid reaped may be another's). The clone that makes the VM makes the pidfd
   (`CLONE_PIDFD`), the keeper's or the forker's, passed with its answer; without the jail the
   wicket reaps its VM by it (`waitid(P_PIDFD)`), which tells how it ended
-- **A VM's cgroup is no measure of that VM**: a cgroup is reused, the keeper's per id, the
-  wicket's own per VM alive (made and removed per VM cost 8% of the clone rate,
-  [Jail mode](#jail-mode)), so its
+- **A VM's cgroup is no measure of that VM**: a cgroup is reused, a booted VM's by the next
+  booted VM, a clone's by its route's next clone (made and removed per VM cost 8% of the clone
+  rate, [Jail mode](#jail-mode)), so its
   `memory.peak` is the most of every VM it held, and pages charged to it by a VM before (the
   rootfs's page cache, a snapshot's holes it filled) stay counted for the next. Jailed, the sample
   guest at 128 MiB, a booted VM and a pool of 2 (debug build), its process against its cgroup:
@@ -617,6 +618,87 @@ the sample guest, the runs of each row alternating (the scripts: `.todo/artefact
   line above shows. x86_64's `kvm-pit/<pid>` kernel thread stays in the root cgroup,
   named after its VM's pid in the VM's own PID namespace (`kvm-pit/1` for every jailed VM), so
   nothing tells which VM's it is
+
+## The memory budget
+
+What [the memory budget](../sluice-wicket-runtime-firecracker/README.md#limits) counts, and why.
+Measured on the 64-core host (6.8 kernel, 252 GiB, no swap), the release build on `--listen`, the
+wicket in a scope of the user's manager (its VMs in cgroups of its own), the state dir on a
+tmpfs, the sample guest (the scripts: `.todo/artefacts/294`).
+
+- **The unit is what the host may be charged**: a VM its `memory-mib` + 32 MiB + `memory-mib`/128
+  + 16 MiB, what its cgroup allows it of its own; a cloned route its `memory-mib` once more, its
+  snapshot. Before, a VM counted its `memory-mib` and a snapshot nothing, with no budget unless
+  stated. A process taking all its guest's memory (`/oom`):
+
+  | `memory-mib` | a booted VM's cgroup, at most | a snapshot as taken | a clone's cgroup, at most | of it the snapshot's, left there | the snapshot then | the clone in its place, at most |
+  |---|---|---|---|---|---|---|
+  | 128 | 128 MiB (of 177) | 51 MiB | 165 MiB (of 305) | 74 MiB | 127 MiB | 90 MiB |
+  | 512 | 513 (of 564) | 59 | 923 (of 1,076) | 449 | 509 | 472 |
+  | 1024 | 986 (of 1,080) | 69 | 1,855 (of 2,104) | 911 | 982 | 941 |
+
+- **A snapshot grows to `memory-mib`, and the clone that touches it pays**: of its memory file a
+  page the template did not write is a hole; a clone's first touch of one has shmem allocate the
+  page in the file, charged to the clone's cgroup, and it stays charged there as long as the
+  file, whatever becomes of the clone (a write takes a private page besides: the table's
+  second half). So a clone's cgroup limited to the clone's own share, as it was, had the host's
+  OOM killer take a clone of 512 MiB once its guest held about 280 (`its VM ended (signal 9):
+  out of memory, the host kernel's OOM killer took it`, its cgroup at its 564 MiB), 275 MiB of
+  the snapshot left in a cgroup the next VM took, of whatever route. Now a clone's cgroup allows it
+  `memory-mib` once more, as a template's, and is its route's own (`route-<n>-vm-<m>`): what
+  the route's clones leave there is the route's snapshot, `memory-mib` at most over all of
+  them, which the limit has room for; it goes with the route. The budget counts the snapshot
+  once, for the route
+- **A tmpfs full stops a clone without a word**: the state dir's tmpfs at its size (100 MiB,
+  a route of 128), a clone touching a hole stopped answering (Firecracker's vCPU thread
+  ended, its process alive) and was killed 10s later for it (`vsock handshake: no answer
+  within 10s`), the one in its place alike. Hence the snapshots counted against the tmpfs's
+  room, `memory-mib` each, at the start and at every reload
+- **By default what the host has, less a twentieth, 64 MiB at least**: `MemTotal`, or the least
+  `memory.max` / `memory.high` of the cgroup the VMs are charged to and those above it (past
+  `memory.high` a cgroup's processes stall while the kernel reclaims, and a guest's memory is
+  not reclaimed). The reserve is the wicket's own and the host's: its process holds 10 MiB at
+  its start, 17 after 48k req/s over 256 keep-alive connections, 25 after 19,000 clones; its
+  cgroup's leaf (the forker's too) 14 MiB at most under the former. So many MiB asked for must
+  fit it (a number written for a larger host is refused, not found out by the OOM killer);
+  more is asked for as a ratio (`1.5x`)
+- **A VM goes before the wicket**: `oom_score_adj` 500 adds half the memory to what a process
+  holds in the OOM killer's eyes, so a VM is taken before any process holding less than half
+  of it, the wicket among them, and a wicket holding more is what to take. A child inherits
+  its parent's: the forker (the keeper, jailed) raises its own for each fork and lowers it
+  again, its file open from its start. The child cannot write its own: not dumpable, its
+  `/proc` files are root's
+- **`memory.swap.max` 0** in a VM's cgroup: `memory.max` bounds memory alone, so with swap a VM
+  held its limit and as much swap as the host had, its guest's memory on the disk. **No
+  `memory.high`**: it throttles a cgroup while the kernel reclaims, and without swap nothing
+  of a guest's memory is reclaimed. **No hugetlbfs** (`huge_pages: 2M`): a pool reserved at
+  boot beside the budget, not shared by clones (a restore of it takes the UFFD backend)
+- **A balloon gives back what a guest freed, by free page reporting alone**: a balloon device
+  (`balloon.patch`), a guest of 512 MiB taking 300 MiB and freeing them (a file in its `/tmp`):
+
+  | | the VM's process, booted | after its guest freed 300 MiB | a moment later |
+  |---|---|---|---|
+  | no balloon | 62 MiB | 304 MiB | 304 MiB |
+  | the balloon inflated by 300 MiB, then deflated | 63 | 305 | 63 (within 3s of the inflation) |
+  | `free_page_reporting` | 62 | 304 | 66 (within 2s, by itself) |
+  | a pool's clone, no balloon: of its own / the snapshot | 2 / 61 | 249 / 303 | 249 / 303 |
+  | a pool's clone, `free_page_reporting` | 2 / 62 | 250 / 234 | 14 / 234 |
+
+  Inflating takes someone to say by how much; reporting needs nobody (the guest's kernel
+  reports its free pages of 2 MiB every 2s, Firecracker gives them back), and costs nothing
+  measurable: a booted VM of 2 vCPUs 15.2-16.3k keep-alive req/s with it against 15.1-20.1k
+  without, a VM per connection 1,540-1,600 against 1,563-1,643 (warm=16, c=16), a restore
+  15.3-15.8ms against 15.2-15.5. It changes what a VM holds, not what it may: the budget
+  stays, and what a clone left in its snapshot stays too. Worth having for what the host
+  then has free; not done here
+- **Not covered**: a `firecracker` taken over in a clone's cgroup may hold its route's
+  `memory-mib` more than its share (a route's cgroups are not bound together). A VM killed
+  is out of the budget before it is gone: under a storm of clones (1,880/s, warm=64, c=64)
+  2,100 of them are dying after 10s, 200 more each second, each waiting in KVM's teardown
+  (`rcu_barrier` in `kvm_mmu_uninit_tdp_mmu`), their kernel memory charged to the wicket's
+  leaf (111 MiB by then: the forker's forks), gone within 2s of the storm's end. The cf-api
+  places by `memory-mib` against this budget: short of it by a VM's 48 MiB and a snapshot, a
+  share is refused for room and passed on
 
 ## Caveats
 

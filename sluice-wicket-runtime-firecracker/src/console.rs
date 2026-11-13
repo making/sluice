@@ -43,8 +43,8 @@
 //! values; an app's `tag`, opaque to the console, tells its owner what it put),
 //! and its `disk` (`disk`). The apps' listing names the wicket too -- its id, kept in the
 //! console's directory, its flume node, its build -- and its budget: `--max-instances`,
-//! `--max-memory-mib`, `--max-cpus` and what the routes keep of them for good; an edit needing
-//! more is refused `no_room`. Both listings say when the wicket is leaving: told to stop, it waits for
+//! `--max-memory-mib` (what the VMs may take of the host's memory: `capacity`), `--max-cpus`
+//! and what the routes keep of them for good; an edit needing more is refused `no_room`. Both listings say when the wicket is leaving: told to stop, it waits for
 //! the apps of the API but those with a disk to be moved elsewhere (`--evacuation-grace`). An app
 //! put with `held-ms` is held at each start of the wicket, listed so, until its owner confirms it,
 //! puts it again or removes it, or `held-ms` passed: its owner may have moved, changed or removed
@@ -392,7 +392,8 @@ impl Console {
                 max_memory_mib: self.capacity.max_memory_mib(),
                 max_cpus: self.capacity.max_cpu().map(in_cpus),
                 instances: kept.vms,
-                memory_mib: self.capacity.max_memory_mib().map(|_| kept.memory),
+                memory_mib: (self.capacity.max_memory_mib())
+                    .map(|_| kept.memory + self.capacity.snapshot_mib(kept.snapshots)),
                 cpus: self.capacity.max_cpu().map(|_| in_cpus(kept.cpu)),
             },
             runtime: RUNTIME,
@@ -962,12 +963,13 @@ struct Listing {
 #[derive(Serialize)]
 struct BudgetView {
     max_instances: usize,
-    /// None: no memory budget.
+    /// Of the host's memory; None: no memory budget.
     max_memory_mib: Option<u64>,
     /// In CPUs; None: no CPU budget.
     max_cpus: Option<f64>,
     /// The VMs alive over every route.
     instances: usize,
+    /// What they, and the snapshots that count, may take of the host's memory.
     memory_mib: u64,
     /// What they hold, in CPUs: each its vCPUs, or its `cpu` where that is less.
     cpus: f64,

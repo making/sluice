@@ -855,7 +855,9 @@ its wicket's `--listen` (one entry point for both takes a sluice server).
   one holding the fewest, of them the one with the most room, the first named of those. A
   wicket's room is its budget (`--max-instances`, a Firecracker wicket's `--max-memory-mib`) less
   what its routes not of the cf-api's apps keep and the indices of the started apps placed on it,
-  each an instance (a VM's memory too). A scale down drops the highest indices, as on CF, and
+  each an instance (a VM's memory too: its app's, less than a Firecracker wicket
+  [counts for it](../sluice-wicket-runtime-firecracker/README.md#limits), which refuses a share
+  it has no room for). A scale down drops the highest indices, as on CF, and
   removes the app from a wicket left with none. A wicket runs an app of its indices: their count
   is its `instances`, those below the app's `warm` (the lowest are the warm ones) its `warm`. A
   wicket refusing a share for room has none until its apps change: an edit (`cf scale -i`) is

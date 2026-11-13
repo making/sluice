@@ -63,7 +63,7 @@ use tokio::sync::{mpsc, watch};
 use tokio::task::AbortHandle;
 use tokio_util::task::TaskTracker;
 
-use crate::capacity::{Capacity, Need};
+use crate::capacity::Capacity;
 use crate::config::Binaries;
 use crate::disk::Disk;
 use crate::egress::Egress;
@@ -676,11 +676,7 @@ impl Builds {
             disk: Some(disk),
             stage: true,
         };
-        let need = Need {
-            memory: u64::from(spec.memory_mib),
-            cpu: spec.cpus(),
-            route: crate::route::next_route(),
-        };
+        let need = spec.need(crate::route::next_route());
         let slot = self
             .capacity
             .take(need, ROOM_WAIT)

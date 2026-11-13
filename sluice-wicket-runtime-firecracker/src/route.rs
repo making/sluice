@@ -34,7 +34,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::BoxError;
-use crate::capacity::{Capacity, Full, Need, Pool, Slot};
+use crate::capacity::{Capacity, Full, Need, Pool, Reserved, Slot};
 use crate::disk::{self, Disk};
 use crate::egress::Egress;
 use crate::health::{self, Check, Liveness, Readiness};
@@ -108,7 +108,7 @@ const RESTART_STABLE: Duration = Duration::from_secs(60);
 /// Names the routes for the budget, over every route the wicket ever started.
 static NEXT_ROUTE: AtomicU64 = AtomicU64::new(0);
 
-/// The budget's name of what is no route but takes VMs of it: a build (`stage`).
+/// The budget's name of a route, or of what is none but takes VMs of it: a build (`stage`).
 pub fn next_route() -> u64 {
     NEXT_ROUTE.fetch_add(1, Ordering::Relaxed)
 }
@@ -2177,6 +2177,8 @@ struct Cloner {
     snapshot: Snapshot,
     /// Where the clones are started.
     place: Arc<Place>,
+    /// The snapshot's share of the budget, as long as a clone may be restored from it.
+    _reserved: Reserved,
     /// Numbers the clones.
     next: AtomicU64,
     /// The instance indices its clones alive hold.
@@ -2572,11 +2574,7 @@ impl Route {
         let hosts = Hosts::new(hosts);
         let label = hosts.current().label.clone();
         let bounds = Current(Arc::new(Mutex::new(spec.bounds.clone())));
-        let need = Need {
-            memory: u64::from(spec.vm.memory_mib),
-            cpu: spec.vm.cpus(),
-            route: NEXT_ROUTE.fetch_add(1, Ordering::Relaxed),
-        };
+        let need = spec.vm.need(next_route());
         capacity.cap(need.route, spec.bounds.instances);
         // the place opens the disk's file: made by then
         if let Some(disk) = &spec.vm.disk {
@@ -2671,16 +2669,19 @@ impl Route {
         let hosts = Hosts::new(hosts);
         let label = hosts.current().label.clone();
         let bounds = Current(Arc::new(Mutex::new(spec.bounds.clone())));
-        let need = Need {
-            memory: u64::from(spec.vm.memory_mib),
-            cpu: spec.vm.cpus(),
-            route: NEXT_ROUTE.fetch_add(1, Ordering::Relaxed),
-        };
+        let need = spec.vm.need(next_route());
         capacity.cap(need.route, spec.bounds.instances);
-        let slot = capacity
-            .take(need, START_WAIT)
+        // the template, and the snapshot it writes, which stays as the route lives: its
+        // guest memory at most, what the template wrote and the rest as the clones touch it
+        let template = Need {
+            snapshot: u64::from(spec.vm.memory_mib),
+            ..need
+        };
+        let mut slot = capacity
+            .take(template, START_WAIT)
             .await
             .map_err(|e| e.of(&label))?;
+        let reserved = slot.reserved();
         let place = Arc::new(
             places
                 .place(&format!("route-{n}"), &spec.vm)
@@ -2764,6 +2765,7 @@ impl Route {
         let cloner = Arc::new(Cloner {
             snapshot,
             place: place.clone(),
+            _reserved: reserved,
             next: AtomicU64::new(0),
             indices: indices.clone(),
             meters: Mutex::default(),
@@ -3491,6 +3493,7 @@ mod tests {
     use tokio::io::DuplexStream;
 
     use super::*;
+    use crate::capacity::Budget;
 
     /// A pool's start failing for room reads so up to the route's start, and only that: what a
     /// controller tries again as the routes change, unlike VMs that do not start.
@@ -3498,10 +3501,11 @@ mod tests {
     async fn a_pool_failing_for_room_says_so() {
         let need = Need {
             memory: 1,
+            snapshot: 0,
             cpu: 100,
             route: 1,
         };
-        let capacity = Capacity::new(0, None, None);
+        let capacity = Capacity::new(Budget::of(0));
         let Err(full) = capacity.take(need, Duration::ZERO).await else {
             panic!("no room at all");
         };
@@ -3660,7 +3664,7 @@ mod tests {
             clones: Mutex::default(),
             failed: Mutex::default(),
             bounds: Current(Arc::new(Mutex::new(spec.bounds))),
-            capacity: Capacity::new(1, None, None),
+            capacity: Capacity::new(Budget::of(1)),
             route: 1,
             changed: changed.clone(),
             ready_changed: Arc::new(|| {}),

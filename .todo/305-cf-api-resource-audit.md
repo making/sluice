@@ -10,7 +10,12 @@ report, then file what is missing:
 - `placement.rs`: what room is (memory only? the wicket's reported budget or the cf-api's own count?),
   CPU and disk in it, build VMs, what a push sees where no wicket has room. A Firecracker wicket with
   `--max-cpus` lists `budget.max_cpus` and `cpus`, what its routes keep for good, in CPUs (a VM's its
-  `vcpus`, or its `cpu` / 100 where less); `ListedBudget` does not read them yet
+  `vcpus`, or its `cpu` / 100 where less); `ListedBudget` does not read them yet. Its
+  `max_memory_mib` / `memory_mib` count what the host may be charged since 294 (a VM its
+  `memory-mib` + 48 MiB + `memory-mib`/128; a cloned route its `memory-mib` once more, its snapshot,
+  where the state dir is on a tmpfs), by default what the host has; `rooms` still takes an index for
+  its app's `memory-mib`, so it finds room where the wicket refuses a share (passed on then), and a
+  1 GiB app as a pool of one takes 2,104 MiB of it
 - org / space quotas (`orgs.rs`): enforced or shown only
 - process stats (`views.rs`): `cpu`, `mem` and `disk` are the wickets' measurements now (291: an
   instance's `usage` in their listings, those of one index summed); `cpu_entitlement` and `log_rate`

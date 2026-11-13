@@ -80,7 +80,8 @@ Two Cargo workspaces:
 
 - `.` -- the wicket: `src/lib.rs` wires the modules, `src/main.rs` reads the command line
   (`config.rs`); `routes.rs` the route table, its reload and the relay of a connection,
-  `route.rs` a route's VMs, `capacity.rs` their budget, `vm.rs` one Firecracker VM,
+  `route.rs` a route's VMs, `capacity.rs` their budget, `host.rs` what the host has for it,
+  `vm.rs` one Firecracker VM,
   `forker.rs` the process forking them (without the jail), `cgroup.rs` their cgroups,
   `output.rs` the VMs' output, `egress.rs` their egress, `wire.rs` the vsock framing, the
   restore notice and the egress rules,
@@ -228,9 +229,10 @@ process's own, 0700, under `$XDG_RUNTIME_DIR` (a tmpfs where systemd sets it), e
 system's temp dir, removed at the end; a `--state-dir` given gets a `route-<n>` directory
 (0700) per route started, removed with it). A cloned route's snapshot there is what its
 template wrote of its memory, unencrypted: keep the state dir on a tmpfs (the wicket warns
-otherwise), or it is on disk until the route ends, and after a crash. The tmpfs must hold
-every cloned route's snapshot, its `memory-mib` at most (systemd sizes `$XDG_RUNTIME_DIR` to 10% of
-the host's memory: `RuntimeDirectorySize` in `logind.conf`).
+otherwise), or it is on disk until the route ends, and after a crash. On a tmpfs a snapshot is
+memory, up to its route's `memory-mib`: routes whose snapshots the tmpfs has no room for are
+[refused](#limits) (systemd sizes `$XDG_RUNTIME_DIR` to 10% of the host's memory,
+`RuntimeDirectorySize` in `logind.conf`: give `--state-dir` a tmpfs of the size they take).
 
 The VMs are the wicket's children, forked for it by a process of its own (`sluice-forker`,
 the wicket again, started first: a fork of the wicket itself would stall its threads; see
@@ -273,7 +275,7 @@ token: ${SLUICE_TOKEN}           # or token-file: <path>
 kernel: /opt/firecracker/vmlinux
 firecracker: firecracker        # on the PATH
 max-instances: 64
-max-memory-mib: 16384           # of guest memory
+# max-memory-mib: 16384         # of the host's memory, or 1.5x what it has for the VMs (default: that)
 max-cpus: 4x                    # the VMs' CPUs: 4 times the wicket's; or so many, 256
 workers: 4                      # threads relaying the connections
 watch-interval: 1s              # 0 = SIGHUP only
@@ -816,14 +818,43 @@ is where `/init` mounts it before the process starts, `disk-mib` its size (defau
 ### Limits
 
 `--max-instances N` (default 64) caps the VMs alive at once over every route -- booted ones,
-templates, clones warm, in use, kept and pooled --, `--max-memory-mib N` (default none:
-`--max-instances` x the largest `memory-mib` bounds it) their guest memory (`memory-mib`) and
-`--max-cpus` (default none: `--max-instances` x the largest `vcpus`) their CPUs. A route's
-`instances=N` caps its own (at least `warm`). A VM takes its share before its `firecracker` starts
-and gives it back once killed, and one going down holds it for the VM in its place; a startup whose
-booted VMs (`instances` x `memory-mib`, x their CPUs) and pools' `warm` VMs do not fit, with
-a template at a time beside the other routes', fails, and so does a reload (a console's edit
-included).
+templates, clones warm, in use, kept and pooled --, `--max-memory-mib` what they take of the
+host's memory and `--max-cpus` (default none: `--max-instances` x the largest `vcpus`) their
+CPUs. A route's `instances=N` caps its own (at least `warm`). A VM takes its share before its
+`firecracker` starts and gives it back once killed, and one going down holds it for the VM in
+its place; a startup whose booted VMs (`instances` of them) and pools' `warm` VMs do not fit,
+with a template at a time beside the other routes' and the cloned routes' snapshots, fails,
+and so does a reload (a console's edit included), saying what they need and of what:
+
+```text
+the routes need 2 VM(s), 2281 MiB of memory (1257 MiB for the VMs, each memory-mib + 48 MiB +
+memory-mib/128, and 1024 MiB for their snapshots, a cloned route's memory-mib) and 2 CPU(s) to
+start (their booted VMs, their pools' warm VMs, and a template at a time beside the other
+routes'): over the memory budget of 1946 MiB (the 2048 MiB /sys/fs/cgroup allows less 102 MiB
+kept for the wicket and the host)
+```
+
+Of the memory a VM counts what the host may be charged for it, whatever its guest touched: its
+`memory-mib`, 32 MiB of its `firecracker`'s own, `memory-mib`/128 of page tables and 16 MiB of
+log (177 MiB at the default 128). A cloned route counts its `memory-mib` once more, for its
+snapshot, from before its template starts until the route is gone: what the template wrote,
+and the rest as its clones touch it. That is with the state dir on a tmpfs, whose room the
+snapshots take too (what it had free as the wicket started); on a disk they count for neither.
+
+`--max-memory-mib` is so many MiB, which the host must have for the VMs, or with `x` so many
+times what it has (`1.5x`): overcommitted, which the wicket warns of. By default all it has
+for them: the host's memory, or what the cgroup the VMs are charged to allows where that is
+less (a container's `--memory`, a unit's `MemoryMax=` or `MemoryHigh=`; in jail mode
+`--jail-cgroup`'s), but a twentieth of it, 64 MiB at least, kept for the wicket itself and the
+rest of the host. The wicket says which at its start (`memory limit 1946 MiB (the 2048 MiB
+/sys/fs/cgroup allows less 102 MiB kept for the wicket and the host)`, in a container of
+`--memory 2g`).
+
+Memory short all the same -- overcommitted, or taken by something else --, the kernel's OOM
+killer takes a VM before the wicket: a `firecracker` runs at `oom_score_adj` 500, so only a
+process holding more than half the memory goes before one. Its route is told
+([A VM going down](#a-vm-going-down)), and starts another
+([measured](../.kb/wicket-firecracker-findings.md#the-memory-budget)).
 
 A VM's CPUs are its `vcpus`, or its route's `cpu` where that is less (`vcpus=2`: 2; `cpu=50`: 0.5),
 whatever it runs. `--max-cpus` is so many (`96`, `6.5`) or, with `x`, so many times the CPUs the
@@ -873,8 +904,10 @@ A VM in a cgroup (v2) of its own is held to what it was given, whatever its gues
 
 - **`memory.max`**: its `memory-mib` plus 32 MiB plus `memory-mib`/128 (its page tables) plus
   16 MiB (its log, bound by `RLIMIT_FSIZE`, a disk's size with a disk: the limit holds for an
-  offset in any file), its `memory-mib` twice for a template (it writes its snapshot). Past
-  it the kernel's OOM killer ends the VM, nothing else
+  offset in any file): its share of the memory [budget](#limits). Its `memory-mib` twice for a
+  template (it writes its snapshot) and for a clone: a page of the snapshot its template did
+  not write is charged to the clone first to touch it. Past it the kernel's OOM killer ends
+  the VM, nothing else; none of it is swapped (`memory.swap.max` 0)
 - **`pids.max`**: its vCPUs plus 16
 - **`cpu.weight`**: 10 per CPU the VM holds of the budget (see [Limits](#limits)), so VMs short
   of CPUs share them by what each was given, and **`cpu.max`** its route's `cpu`. A clone of
@@ -883,8 +916,10 @@ A VM in a cgroup (v2) of its own is held to what it was given, whatever its gues
   group per VM costs 8% of their rate (see
   [findings](../.kb/wicket-firecracker-findings.md#the-cpu-budget-and-the-shares))
 
-A cloned route's snapshot stays charged to the route's cgroup (`route-<n>`) as long as the
-route lives; a serving VM's (`vm-<n>`, one per VM alive) is reused by the next.
+What its template wrote of a cloned route's snapshot stays charged to the route's cgroup
+(`route-<n>`) as long as the route lives, and what its clones touched of the rest to theirs
+(`route-<n>-vm-<m>`: the route's own, reused by its next clone, gone with it); a booted VM's
+(`vm-<n>`, one per VM alive) is reused by the next.
 
 Who makes them:
 
@@ -1117,7 +1152,8 @@ What it needs:
 - `--jail-cgroup <path>`: the VMs' parent cgroup under `/sys/fs/cgroup`, made, the memory and
   pids controllers enabled down to it, and cpu where the hierarchy has it (without it the
   keeper warns: no VM has a share of its own, and a route's `cpu` fails its VMs' spawn). It
-  is one group beside the host's others, its own `cpu.weight` (100) the operator's to set.
+  is one group beside the host's others, its own `cpu.weight` (100) the operator's to set,
+  and its `memory.max`, which the memory [budget](#limits) follows.
   By default the wicket's own cgroup, which the keeper leaves for `keeper/` (cgroup v2
   enables no controller for the children of a cgroup holding processes): a systemd
   service's with `Delegate=yes`, a container's; run by hand, give a path
@@ -1160,8 +1196,9 @@ What applies, in both modes unless said:
   be siblings. A host of one tenant may keep it
 - **KSM off** (`/sys/kernel/mm/ksm/run` 0, the default)
 - **swap off, or encrypted**: it writes the guests' memory, the snapshots (shmem on the
-  state dir's tmpfs) and the VMs' logs to disk (`swapon --show` prints nothing). The
-  memory bound of the [Docker image](#docker-image) assumes none
+  state dir's tmpfs) and the VMs' logs to disk (`swapon --show` prints nothing). In
+  [cgroups](#cgroups) of their own the VMs' are kept out of it; the memory [budget](#limits)
+  counts none
 - **the host's mitigations and microcode**: the kernel's defaults (`mitigations=auto`),
   checked in `/sys/devices/system/cpu/vulnerabilities/` or with Firecracker's
   `spectre-meltdown-checker`; memory with ECC and TRR (Rowhammer). aarch64: a host kernel
@@ -1192,7 +1229,8 @@ What applies, in both modes unless said:
 - **a VM's memory, threads and CPUs**: a [cgroup](#cgroups) of its own, in jail mode or
   where the wicket's cgroup is delegated to it (a service: `Delegate=yes`). Without one the
   wicket's cgroup (a container's or a unit's `MemoryMax=`) holds the VMs all together, and
-  they have no share of the CPUs
+  they have no share of the CPUs. All of them together stay within what the host has: the
+  memory [budget](#limits)
 - **`/dev/kvm`**: unjailed, the wicket's user in the `kvm` group (see [Setup](#setup)), and
   nobody else: a member boots VMs past the budget, in no cgroup of the wicket's. Jailed, nobody: the
   keeper (root) makes each jail a node of its own, its VM's id's alone, so the host's may
@@ -1273,11 +1311,10 @@ The VMs' memory counts against the container's memory cgroup: a VM's guest memor
 guest touches it, the `firecracker` process's few MiB, and a cloned route's snapshot
 on the tmpfs, what its template and its clones touched (shmem: never reclaimed without swap). An idle clone costs its dirty
 pages, a busy one up to its `memory-mib` ([measured](../.kb/wicket-firecracker-findings.md#docker-image-memory)).
-The bound
-to set (`--memory`, a Pod's limit): `--max-memory-mib` (every VM at its `memory-mib`; without it,
-`--max-instances` x the largest `memory-mib`) plus each cloned route's `memory-mib` (its snapshot; twice
-while a reload restarts it and the old clones live) plus 64 MiB for the wicket. Past it,
-the kernel's OOM killer ends a `firecracker` or the wicket.
+The wicket budgets them by the container's bound (`--memory`, a Pod's limit) less a twentieth,
+64 MiB at least, and refuses the routes that need more ([Limits](#limits)): `--memory 1g`
+leaves the VMs 960 MiB. A `--tmpfs` without a size is as large as half the host's memory; the
+snapshots count against its room too (`--tmpfs /run/sluice:size=4g`).
 
 Through the image (`--network host` or a bridge) the rates are those outside it, within the spread
 of runs ([findings](../.kb/wicket-firecracker-findings.md#through-the-docker-image)).
@@ -1285,7 +1322,8 @@ of runs ([findings](../.kb/wicket-firecracker-findings.md#through-the-docker-ima
 Kubernetes: `/dev/kvm` reaches a Pod through a device plugin (KubeVirt's
 `devices.kubevirt.io/kvm`, or a generic one), or a privileged container;
 `securityContext.supplementalGroups` holds the node's `kvm` gid, `/run/sluice` is an
-`emptyDir` of `medium: Memory` (counted against the Pod's memory limit),
+`emptyDir` of `medium: Memory` (counted against the Pod's memory limit, as the wicket's budget
+is),
 `terminationGracePeriodSeconds` exceeds `--evacuation-grace` and `--drain-grace` together, and a
 `readinessProbe`'s `httpGet` asks
 `/ready` of `--health` (on `0.0.0.0`). Jail mode: `runAsUser: 0`,
@@ -1354,7 +1392,7 @@ VM serving two hosts, a VM per connection, reused clones, a pool
 and a route of two VMs at most, one per client address, it checks http/1.1 with keep-alive,
 h2c, a 5MB POST under the tunnel's flow control and a client half-closing after its request,
 the clones' clock and random values, a client past its share, the connection finding no room,
-a pool's VM past the CPU budget not started,
+a pool's VM past the CPU budget not started, the memory budget as the listing has it,
 idle connections failed, clients left quiet on `--listen` closed and giving way, a reused clone serving the next connection until its `uses` or
 `keep-ms` ran out, a pool growing with the connections held, shrinking idle and replacing its
 VMs killed (unjailed) or their processes ended, a route's and an app's VMs kept as their numbers
@@ -1362,8 +1400,9 @@ change, the VMs' output (a booted VM's, a template's, a clone's) on the wicket's
 stdout / stderr and on a flume (`sluice-wicket-tunnel`'s double), the guests' egress (a booted
 VM's and a clone's, to a destination on the host by name, address, range and IPv6, and its
 records), reloads of the config file, an edit taking over from a reload on a disk, a route
-given by `--vm` alone handing through a guest speaking first, its process taken by the guest
-kernel's OOM killer told so, a booted route checking its VMs'
+given by `--vm` alone handing through a guest speaking first, a process taking all its guest's
+memory taken by the guest kernel's OOM killer and told so (a booted VM's and a clone's, in a
+cgroup too: not the host's to kill), a booted route checking its VMs'
 readiness: one failing its check taking no connection, none ready leaving the advertisement until
 one answers again, a process ending likewise, and their liveness: one whose endpoint fails
 restarted, the other serving meanwhile, a start whose endpoint never answers 200 failing at
@@ -1384,7 +1423,8 @@ sg kvm -c "SLUICE_WICKET_RUNTIME_FIRECRACKER_VMS='java.local=$T/upstream.ext4?me
 started as root (`sudo -n`; skipped without it) or, with `..._IMAGE`, as the image runs it
 jailed, and checks the jails of the VMs alive: an id of its own each, PID 1 of its
 namespace, no capability, no new privileges, the jail's seccomp filter and Firecracker's
-on the keeper's, a cgroup limiting its memory (a disk's VM taken by the OOM killer as its
+on the keeper's, the kernel's OOM killer taking it before the wicket (`oom_score_adj`), a
+cgroup limiting its memory, none of it swapped (a disk's VM taken by the OOM killer as its
 cgroup's memory is squeezed, told so) and weighted by its CPUs (a route's `cpu` capping it, a
 connection's own clones in the group they share, the keeper's of the most weight), on aarch64
 the host CPU's files, the wicket as `--jail-user` under its
@@ -1412,6 +1452,7 @@ A liveness check of a VM per connection past its template (a clone goes on a fai
 a route of the config file, a flag or the page, a backup of a running disk, a pool
 spreading by load rather than by connections, an image of the
 page rather than the API (`PUT /api/images`), a docker-archive upload, a build's cache between
-builds and its buildpacks chosen by the request, the requests on the
+builds and its buildpacks chosen by the request, the memory a guest freed given back to the host,
+the requests on the
 flume (the VMs' output alone: `cf logs` shows no `RTR` line here), and egress over UDP or to
 names a route does not list (`*.example.com`).

@@ -450,8 +450,8 @@ function budgetStatus(listing) {
     ? `${budget.memory_mib} MiB`
     : `${budget.memory_mib} / ${budget.max_memory_mib} MiB`;
   memory.title = budget.max_memory_mib === null || budget.max_memory_mib === undefined
-    ? "their guest memory; no memory budget (--max-memory-mib)"
-    : "their guest memory / --max-memory-mib";
+    ? "what they may take of the host's memory: each its memory-mib, its firecracker's own and its log, a cloned route its snapshot on a tmpfs; no memory budget (--max-memory-mib)"
+    : "what they may take of the host's memory: each its memory-mib, its firecracker's own and its log, a cloned route its snapshot on a tmpfs / --max-memory-mib, by default what the host has for them";
   const cpus = field("budget-cpus");
   cpus.textContent = budget.max_cpus === null || budget.max_cpus === undefined
     ? `${budget.cpus}`

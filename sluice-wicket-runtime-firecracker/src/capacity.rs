@@ -1,15 +1,24 @@
-//! The VMs' budget: the VMs alive at once (`--max-instances`), their guest memory
-//! (`--max-memory-mib`) and their CPUs (`--max-cpus`) over every route, and a route's own cap
-//! (`instances=N`), which a running route may change ([`Capacity::cap`]). A VM holds its
-//! share, a [`Slot`], from before its `firecracker` starts until it is killed.
+//! The VMs' budget: the VMs alive at once (`--max-instances`), what they take of the host's
+//! memory (`--max-memory-mib`) and their CPUs (`--max-cpus`) over every route, and a route's
+//! own cap (`instances=N`), which a running route may change ([`Capacity::cap`]). A VM holds
+//! its share, a [`Slot`], from before its `firecracker` starts until it is killed.
+//!
+//! Memory is counted as the host is charged it at most: a VM's guest memory, what its
+//! `firecracker` takes besides and its log (`cgroup::vm_charge_mib`), and a cloned route's
+//! snapshot, its `memory-mib` ([`Need::snapshot`]: what its template wrote, and the rest as
+//! its clones touch it), from before its template starts until the route is gone
+//! ([`Reserved`]). A snapshot is the host's memory on a tmpfs, whose room it takes as well;
+//! on a disk it is neither ([`Snapshots`]). In cgroups of their own (`cgroup`) the VMs are
+//! held to it: each to its own, and to what it is charged of its route's snapshot.
 //!
 //! CPUs are counted in hundredths (a route's `cpu` is percent of one): a VM takes its vCPUs,
 //! or its route's `cpu` where that is less, whatever it runs; the budget may be more than the
 //! CPUs the host has, by as much as its operator states.
 //!
 //! Slots go to the VMs asking for one in the order they asked
-//! ([`Capacity::take`]), but for one held back by its route's cap alone, which
-//! keeps no other route waiting. A warm clone is restored only into room nobody
+//! ([`Capacity::take`]), but for one held back by its route's cap alone, or by the room for
+//! the snapshot it writes, which keeps no other route waiting: no VM going frees either. A
+//! warm clone is restored only into room nobody
 //! waits for ([`Capacity::try_take`]), and gives its slot up to a VM that does:
 //! the first in line, finding no room within the global limits, has a spare VM
 //! of another route killed ([`Pool::evict`]) -- a warm clone, a reuse route's
@@ -22,14 +31,53 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::time::Instant;
 
-/// What one VM takes: its guest memory and its CPUs, counted against its route's cap.
+/// What one VM takes: of the host's memory and its CPUs, counted against its route's cap.
 #[derive(Clone, Copy, Debug)]
 pub struct Need {
-    /// MiB.
+    /// MiB the VM may be charged (`cgroup::vm_charge_mib`).
     pub memory: u64,
+    /// MiB of the snapshot it writes, which outlives it ([`Slot::reserved`]): a template's.
+    pub snapshot: u64,
     /// Hundredths of a CPU.
     pub cpu: u64,
     pub route: u64,
+}
+
+/// Where the routes' snapshots are (the state dir), and so what one takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Snapshots {
+    /// On a disk: none of the host's memory.
+    Disk,
+    /// On a tmpfs: the host's memory, and the room the tmpfs has, MiB, where it has a size.
+    Memory(Option<u64>),
+}
+
+/// What bounds the VMs.
+#[derive(Clone, Debug)]
+pub struct Budget {
+    pub max_instances: usize,
+    /// MiB of the host's memory; None = no budget of it (`max_instances` x the largest VM
+    /// bounds it).
+    pub max_memory_mib: Option<u64>,
+    /// Where the memory budget comes from, for a refusal.
+    pub memory_of: String,
+    /// Hundredths of a CPU; None = no budget of them.
+    pub max_cpu: Option<u64>,
+    pub snapshots: Snapshots,
+}
+
+impl Budget {
+    /// `max_instances` VMs and no more: no budget of the memory nor of the CPUs, the
+    /// snapshots on a disk.
+    pub fn of(max_instances: usize) -> Budget {
+        Budget {
+            max_instances,
+            max_memory_mib: None,
+            memory_of: String::new(),
+            max_cpu: None,
+            snapshots: Snapshots::Disk,
+        }
+    }
 }
 
 /// `cpu`, hundredths of a CPU, in CPUs: `2`, `0.5`.
@@ -54,8 +102,10 @@ pub struct Capacity {
     max_instances: usize,
     /// MiB.
     max_memory_mib: u64,
+    memory_of: String,
     /// Hundredths of a CPU.
     max_cpu: u64,
+    snapshots: Snapshots,
     state: Mutex<State>,
     changed: Notify,
 }
@@ -63,8 +113,11 @@ pub struct Capacity {
 #[derive(Default)]
 struct State {
     vms: usize,
+    /// MiB: the VMs', and the snapshots' that count.
     memory: u64,
     cpu: u64,
+    /// MiB of the snapshots that count.
+    snapshots: u64,
     /// Route -> its VMs alive and its cap.
     routes: HashMap<u64, Room>,
     /// The VMs waiting for a slot, their tickets and needs, in the order they
@@ -89,8 +142,9 @@ enum Short {
     /// `--max-instances`, `--max-memory-mib` or `--max-cpus`: another route's spare VM may
     /// give way.
     Global,
-    /// The route's own cap.
-    Route,
+    /// What no other route's VM going frees: the route's own cap, or the room for the
+    /// snapshot it writes.
+    Own,
 }
 
 /// A VM's share of the budget, given back when dropped.
@@ -105,16 +159,46 @@ impl std::fmt::Debug for Slot {
     }
 }
 
+impl Slot {
+    /// The share of the snapshot the VM writes, out of the slot's: it stays as the route
+    /// lives, the VM gone.
+    pub fn reserved(&mut self) -> Reserved {
+        Reserved {
+            capacity: self.capacity.clone(),
+            mib: std::mem::take(&mut self.need.snapshot),
+        }
+    }
+}
+
 impl Drop for Slot {
     fn drop(&mut self) {
         {
             let mut state = self.capacity.state.lock().unwrap();
             state.vms -= 1;
-            state.memory -= self.need.memory;
+            state.memory -= self.need.memory + self.need.snapshot;
+            state.snapshots -= self.need.snapshot;
             state.cpu -= self.need.cpu;
             if let Some(room) = state.routes.get_mut(&self.need.route) {
                 room.alive -= 1;
             }
+        }
+        self.capacity.changed.notify_waiters();
+    }
+}
+
+/// A snapshot's share of the budget, given back when dropped: its route gone.
+pub struct Reserved {
+    capacity: Arc<Capacity>,
+    /// MiB, as it counts ([`Capacity::snapshot_mib`]).
+    mib: u64,
+}
+
+impl Drop for Reserved {
+    fn drop(&mut self) {
+        {
+            let mut state = self.capacity.state.lock().unwrap();
+            state.memory -= self.mib;
+            state.snapshots -= self.mib;
         }
         self.capacity.changed.notify_waiters();
     }
@@ -145,20 +229,33 @@ impl std::fmt::Display for Full {
 impl std::error::Error for Full {}
 
 impl Capacity {
-    /// `max_memory_mib` in MiB, `max_cpu` in hundredths of a CPU; None = no budget of it
-    /// (`max_instances` x the largest VM bounds it).
-    pub fn new(
-        max_instances: usize,
-        max_memory_mib: Option<u64>,
-        max_cpu: Option<u64>,
-    ) -> Arc<Capacity> {
+    pub fn new(budget: Budget) -> Arc<Capacity> {
         Arc::new(Capacity {
-            max_instances,
-            max_memory_mib: max_memory_mib.unwrap_or(u64::MAX),
-            max_cpu: max_cpu.unwrap_or(u64::MAX),
+            max_instances: budget.max_instances,
+            max_memory_mib: budget.max_memory_mib.unwrap_or(u64::MAX),
+            memory_of: budget.memory_of,
+            max_cpu: budget.max_cpu.unwrap_or(u64::MAX),
+            snapshots: budget.snapshots,
             state: Mutex::default(),
             changed: Notify::new(),
         })
+    }
+
+    /// What `mib` MiB of snapshots count: all of it on a tmpfs, none on a disk.
+    pub fn snapshot_mib(&self, mib: u64) -> u64 {
+        match self.snapshots {
+            Snapshots::Disk => 0,
+            Snapshots::Memory(_) => mib,
+        }
+    }
+
+    /// The room the snapshots have besides the memory budget, MiB: the state dir's tmpfs's;
+    /// None = none of its own.
+    pub fn snapshot_room(&self) -> Option<u64> {
+        match self.snapshots {
+            Snapshots::Memory(room) => room,
+            Snapshots::Disk => None,
+        }
     }
 
     /// Lets a waiting VM of another route kill a spare VM of `pool`.
@@ -189,10 +286,14 @@ impl Capacity {
     /// What keeps `need` out of `state`, if anything.
     fn short(&self, state: &State, need: &Need) -> Option<Short> {
         let room = state.routes.get(&need.route);
-        if room.is_some_and(|room| room.cap.is_some_and(|cap| room.alive >= cap)) {
-            Some(Short::Route)
+        let snapshot = self.snapshot_mib(need.snapshot);
+        let memory = need.memory.saturating_add(snapshot);
+        if room.is_some_and(|room| room.cap.is_some_and(|cap| room.alive >= cap))
+            || state.snapshots.saturating_add(snapshot) > self.snapshot_room().unwrap_or(u64::MAX)
+        {
+            Some(Short::Own)
         } else if state.vms >= self.max_instances
-            || state.memory.saturating_add(need.memory) > self.max_memory_mib
+            || state.memory.saturating_add(memory) > self.max_memory_mib
             || state.cpu.saturating_add(need.cpu) > self.max_cpu
         {
             Some(Short::Global)
@@ -202,8 +303,14 @@ impl Capacity {
     }
 
     fn grant(self: &Arc<Self>, state: &mut State, need: Need) -> Slot {
+        // as it counts from here on: the slot gives back what it took
+        let need = Need {
+            snapshot: self.snapshot_mib(need.snapshot),
+            ..need
+        };
         state.vms += 1;
-        state.memory += need.memory;
+        state.memory += need.memory + need.snapshot;
+        state.snapshots += need.snapshot;
         state.cpu += need.cpu;
         state.routes.entry(need.route).or_default().alive += 1;
         Slot {
@@ -213,13 +320,13 @@ impl Capacity {
     }
 
     /// Whether a VM waiting before `ticket` (every one, without) may take the
-    /// room: one held back by its route's cap alone may not.
+    /// room: one held back by its route's cap, or by its snapshot's room, alone may not.
     fn ahead(&self, state: &State, ticket: Option<u64>) -> bool {
         state
             .waiting
             .iter()
             .take_while(|(queued, _)| Some(*queued) != ticket)
-            .any(|(_, need)| self.short(state, need) != Some(Short::Route))
+            .any(|(_, need)| self.short(state, need) != Some(Short::Own))
     }
 
     /// The room of a VM of `need` going down, beside the budget as long as it is not gone, for
@@ -293,9 +400,12 @@ impl Capacity {
                     let state = self.state.lock().unwrap();
                     let room = state.routes.get(&need.route);
                     let none = || "-".to_string();
+                    let snapshots = self.snapshot_room().map_or(String::new(), |room| {
+                        format!("snapshots {}/{room} MiB, ", state.snapshots)
+                    });
                     return Err(Full(format!(
                         "no room for a VM within {}ms (VMs {}/{}, memory {}/{} MiB, CPUs {}/{}, \
-                         the route's {}/{})",
+                         {snapshots}the route's {}/{})",
                         wait.as_millis(),
                         state.vms,
                         self.max_instances,
@@ -337,7 +447,8 @@ impl Capacity {
         }
     }
 
-    /// The VMs alive, their guest memory (MiB) and their CPUs (hundredths), over every route.
+    /// The VMs alive, what they and the snapshots take of the memory budget (MiB) and their
+    /// CPUs (hundredths), over every route.
     pub fn usage(&self) -> (usize, u64, u64) {
         let state = self.state.lock().unwrap();
         (state.vms, state.memory, state.cpu)
@@ -356,6 +467,11 @@ impl Capacity {
     /// MiB; None = no memory budget.
     pub fn max_memory_mib(&self) -> Option<u64> {
         (self.max_memory_mib != u64::MAX).then_some(self.max_memory_mib)
+    }
+
+    /// Where the memory budget comes from.
+    pub fn memory_of(&self) -> &str {
+        &self.memory_of
     }
 
     /// Hundredths of a CPU; None = no CPU budget.
@@ -393,7 +509,28 @@ mod tests {
 
     /// A VM of `memory` MiB and `cpu` hundredths of a CPU.
     fn need(memory: u64, cpu: u64, route: u64) -> Need {
-        Need { memory, cpu, route }
+        Need {
+            memory,
+            snapshot: 0,
+            cpu,
+            route,
+        }
+    }
+
+    /// A budget of `max_instances` VMs, `memory` MiB and `cpu` hundredths of a CPU, the
+    /// snapshots at `snapshots`.
+    fn capacity(
+        max_instances: usize,
+        memory: Option<u64>,
+        cpu: Option<u64>,
+        snapshots: Snapshots,
+    ) -> Arc<Capacity> {
+        Capacity::new(Budget {
+            max_memory_mib: memory,
+            max_cpu: cpu,
+            snapshots,
+            ..Budget::of(max_instances)
+        })
     }
 
     /// Warm clones held as slots, given up one by one.
@@ -412,10 +549,12 @@ mod tests {
     /// The limits count VMs, memory, CPUs and a route's VMs; a wait gets the slot
     /// a VM gives back, in the order of asking, and a warm clone only takes
     /// room nobody waits for. A hold keeps the room of a VM gone from them, and gives it to
-    /// the VM that comes back.
+    /// the VM that comes back. A template's snapshot counts beside it and stays, the template
+    /// gone, until its route is: on a tmpfs, of the memory and of the tmpfs's room; on a disk,
+    /// of neither.
     #[tokio::test(start_paused = true)]
     async fn slots_go_in_turn_within_the_limits() {
-        let capacity = Capacity::new(3, Some(1024), Some(300));
+        let capacity = capacity(3, Some(1024), Some(300), Snapshots::Disk);
         let big = capacity
             .take(need(768, 100, 1), Duration::ZERO)
             .await
@@ -471,6 +610,45 @@ mod tests {
         assert_eq!(capacity.usage(), (1, 1024, 300));
         drop(back);
         assert_eq!(cpus(1205), "12.05");
+
+        let template = Need {
+            snapshot: 256,
+            ..need(128, 100, 8)
+        };
+        let mut slot = capacity.try_take(template).unwrap();
+        let reserved = slot.reserved();
+        assert_eq!(capacity.usage(), (1, 128, 100), "on a disk: no memory");
+        drop((slot, reserved));
+
+        let on_tmpfs = self::capacity(3, Some(1024), None, Snapshots::Memory(Some(256)));
+        let mut slot = on_tmpfs.try_take(template).unwrap();
+        let reserved = slot.reserved();
+        assert_eq!(on_tmpfs.usage(), (1, 384, 100));
+        drop(slot);
+        assert_eq!(on_tmpfs.usage(), (0, 256, 0), "it stays, the template gone");
+        assert!(
+            on_tmpfs.try_take(need(769, 100, 9)).is_none(),
+            "the memory: 256 + 769"
+        );
+        let another = Need {
+            snapshot: 1,
+            ..need(1, 100, 9)
+        };
+        let waiting = tokio::spawn({
+            let on_tmpfs = on_tmpfs.clone();
+            async move { on_tmpfs.take(another, Duration::from_millis(100)).await }
+        });
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            on_tmpfs.try_take(need(1, 100, 9)).is_some(),
+            "the tmpfs's room, which no VM going frees: it keeps none waiting"
+        );
+        let full = waiting.await.unwrap().unwrap_err();
+        let counted = "memory 256/1024 MiB, CPUs 0/-, snapshots 256/256 MiB";
+        assert!(full.to_string().contains(counted), "{full}");
+        drop(reserved);
+        assert_eq!(on_tmpfs.usage(), (0, 0, 0));
+        assert!(on_tmpfs.try_take(another).is_some(), "its route gone");
     }
 
     /// The first in line short of global room has another route's spare VM
@@ -478,7 +656,7 @@ mod tests {
     /// own VMs.
     #[tokio::test(start_paused = true)]
     async fn a_wait_has_another_routes_warm_clone_give_way() {
-        let capacity = Capacity::new(2, None, None);
+        let capacity = capacity(2, None, None, Snapshots::Disk);
         let empty: Arc<dyn Pool> = Arc::new(Warm(Mutex::new(Vec::new()), AtomicUsize::new(0)));
         capacity.register(4, Arc::downgrade(&empty));
         let warm = Arc::new(Warm(
@@ -525,7 +703,7 @@ mod tests {
     /// stay until they go, and nothing more is started.
     #[tokio::test(start_paused = true)]
     async fn a_routes_cap_changes_under_its_vms() {
-        let capacity = Capacity::new(8, None, None);
+        let capacity = capacity(8, None, None, Snapshots::Disk);
         capacity.cap(1, Some(1));
         let first = capacity.try_take(need(128, 100, 1)).unwrap();
         let waiting = tokio::spawn({

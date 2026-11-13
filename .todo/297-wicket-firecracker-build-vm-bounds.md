@@ -3,7 +3,7 @@ Difficulty: Medium
 # sluice-wicket-runtime-firecracker: bound what builds take
 
 A build (`stage.rs`) may ask for up to 32 vCPUs, 1 TiB of memory and 1 TiB of scratch. Its memory is in
-the budget (unbounded where `--max-memory-mib` is unset, 294), and its vCPUs in the CPU budget
+the budget (what the host may be charged for its VM, of what the host has by default: 294), and its vCPUs in the CPU budget
 (`--max-cpus`, none unless stated); its scratch is sparse, not reserved and not counted (`disk.rs`); its
 VM has no `cpu` cap even in a cgroup of its own (jailed, or the wicket's own: `cgroup.rs`), where it
 shares the CPUs by its vCPUs as any VM (`cpu.weight`); and

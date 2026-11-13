@@ -52,8 +52,8 @@ use tokio::sync::watch;
 use tokio_util::task::TaskTracker;
 
 use crate::BoxError;
-use crate::capacity::Slot;
-use crate::cgroup::Cgroups;
+use crate::capacity::{Need, Slot};
+use crate::cgroup::{Cgroups, vm_charge_mib};
 use crate::disk::{self, Disk};
 use crate::egress::{self, Egress, Listening};
 use crate::forker::{Child, Forker, Launch};
@@ -181,6 +181,17 @@ impl Spec {
     /// its `cpu` where that is less.
     pub fn cpus(&self) -> u64 {
         self.size().cpus()
+    }
+
+    /// What a VM of the spec takes of the budget, serving `route`: of the memory, what it may
+    /// be charged.
+    pub fn need(&self, route: u64) -> Need {
+        Need {
+            memory: vm_charge_mib(u64::from(self.memory_mib)),
+            snapshot: 0,
+            cpu: self.cpus(),
+            route,
+        }
     }
 }
 

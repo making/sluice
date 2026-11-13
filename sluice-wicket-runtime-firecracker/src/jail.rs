@@ -447,6 +447,53 @@ struct Prepared {
     argv: Vec<CString>,
 }
 
+/// A VM's `oom_score_adj`: memory short -- the host's, or a cgroup's above the VMs --, the
+/// kernel's OOM killer takes a VM before the wicket, its forker or its keeper, which hold
+/// every other one: half the memory is added to what a VM holds, so only a process holding
+/// more than that goes before it.
+pub const VM_OOM_SCORE_ADJ: i32 = 500;
+
+/// The `oom_score_adj` of the process forking the VMs, its own file open: a child inherits
+/// its parent's, so it is raised to a VM's for each fork ([`OomScore::raise`]) and lowered
+/// again once forked ([`OomScore::lower`]). The child does not write its own: one that is not
+/// dumpable (the forker's) may not open the file.
+pub(crate) struct OomScore {
+    file: std::fs::File,
+    /// The process's own.
+    own: i32,
+}
+
+impl OomScore {
+    /// The caller's own, as it is now.
+    pub(crate) fn open() -> io::Result<OomScore> {
+        use std::io::Read as _;
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/proc/self/oom_score_adj")?;
+        let mut own = String::new();
+        file.read_to_string(&mut own)?;
+        let own = own.trim().parse().map_err(io::Error::other)?;
+        Ok(OomScore { file, own })
+    }
+
+    /// A VM's, for what is forked from here on; no lower than the caller's own.
+    pub(crate) fn raise(&self) -> io::Result<()> {
+        self.write(self.own.max(VM_OOM_SCORE_ADJ))
+    }
+
+    /// The caller's own again.
+    pub(crate) fn lower(&self) -> io::Result<()> {
+        self.write(self.own)
+    }
+
+    fn write(&self, score: i32) -> io::Result<()> {
+        use std::os::unix::fs::FileExt as _;
+        // the kernel reads the number whatever the offset
+        self.file.write_all_at(score.to_string().as_bytes(), 0)
+    }
+}
+
 /// The arguments of `clone3`.
 #[repr(C)]
 #[derive(Default)]

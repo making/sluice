@@ -11,5 +11,6 @@ Difficulty: Low
 - Neither has a ceiling per owner: one owner of the console may ask for the whole budget.
 
 Give each option a range checked where it is parsed (config and console alike), with operator-set ceilings
-(`--max-app-memory-mib` or the like, to decide with 294 / 300, beside `--max-cpus`) reported in the listing's identity.
+(`--max-app-memory-mib` or the like, to decide with 300, beside `--max-cpus`; the Firecracker
+wicket's memory budget is by default what the host has, 294) reported in the listing's identity.
 Extend the existing option parsing tests; READMEs' option tables updated.

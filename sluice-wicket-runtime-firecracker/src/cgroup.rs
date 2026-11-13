@@ -24,14 +24,21 @@ use std::time::{Duration, Instant};
 use crate::jail::{check, failed, path};
 use crate::keeper::{Role, Size};
 
-/// The VMs' cgroups (v2), under a parent of theirs: `route-<n>` for a route's template (its
-/// snapshot, which it writes, is charged there as long as the route lives) and `vm-<n>` for a
-/// VM serving, one per VM alive (an id of the jail's, a number of [`Own`]) and reused (no
-/// cgroup made and removed per clone). Each is a group of the cpu controller: its `cpu.weight`
-/// the VM's share of the CPUs among them ([`weight`]: by what it holds of the CPU budget), its
-/// `cpu.max` its route's `cpu`. So the VMs share the CPUs they contend for by what each was
-/// given, and the wicket's own cgroup, where it is their sibling (`keeper/`, or `wicket/`
-/// without a keeper: [`OWN_WEIGHT`]), before them.
+/// The VMs' cgroups (v2), under a parent of theirs: `route-<n>` for a route's template (what
+/// it writes of its snapshot is charged there as long as the route lives), `vm-<n>` for a
+/// booted VM and `route-<n>-vm-<m>` for a clone ([`serving`]), one per VM alive (an id of the
+/// jail's, a number of [`Own`]) and reused (no cgroup made and removed per clone). Each is a
+/// group of the cpu controller: its `cpu.weight` the VM's share of the CPUs among them
+/// ([`weight`]: by what it holds of the CPU budget), its `cpu.max` its route's `cpu`. So the
+/// VMs share the CPUs they contend for by what each was given, and the wicket's own cgroup,
+/// where it is their sibling (`keeper/`, or `wicket/` without a keeper: [`OWN_WEIGHT`]),
+/// before them.
+///
+/// A clone's cgroup is its route's own, reused by the route's clones alone and gone with the
+/// route: of the snapshot's memory file, sparse, a page its template did not write is
+/// charged to the clone first to touch it, and stays charged to that clone's cgroup as long
+/// as the snapshot ([`Limits::of`] allows for it). In a cgroup any VM took, it would be
+/// counted against a VM that has nothing of it.
 ///
 /// But a clone of a connection's own without `cpu` ([`Limits::weight`] none) is in `shared/`,
 /// one group of the cpu controller for all of them, their cgroups in it without: a group per
@@ -49,7 +56,7 @@ pub struct Cgroups {
 }
 
 /// The cgroup v2 hierarchy.
-const CGROUP_ROOT: &str = "/sys/fs/cgroup";
+pub(crate) const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
 /// The controllers the VMs' cgroups use.
 const CONTROLLERS: &str = "+memory +pids";
@@ -89,12 +96,33 @@ const OWN_WEIGHT: u64 = MAX_WEIGHT;
 /// at every spawn and reap it cost 3% of the clone rate.
 const SHARED_WEIGHT_INTERVAL: Duration = Duration::from_millis(100);
 
+/// What a VM's `firecracker` may be charged of its own, in MiB: its heap and KVM's structures
+/// (about 3 MiB measured), a vsock stream's buffers (64KiB each at most).
+const VMM_MIB: u64 = 32;
+
+/// The MiB of guest memory whose page tables may take one (about 0.25% of what a guest
+/// touched).
+const PAGE_TABLES: u64 = 128;
+
 /// What a VM is charged besides its guest memory, its log and a template's snapshot, in
-/// MiB, for `memory-mib` MiB of guest memory: `firecracker`'s heap and KVM's structures (about
-/// 3 MiB measured), a vsock stream's buffers (64KiB each at most), and the page tables
-/// of the guest memory (about 0.25% of what it touched).
+/// MiB, for `memory-mib` MiB of guest memory: its `firecracker`'s own ([`VMM_MIB`]) and the
+/// page tables of the guest memory ([`PAGE_TABLES`]).
 pub fn vm_overhead_mib(mem: u64) -> u64 {
-    32 + mem / 128
+    VMM_MIB + mem / PAGE_TABLES
+}
+
+/// What a VM of `memory-mib` MiB of guest memory may be charged of its own, in MiB: its guest
+/// memory, what it is charged besides ([`vm_overhead_mib`]) and its log (`keeper::LOG_MIB`).
+/// Its share of the memory budget (`capacity`), and what its cgroup allows it ([`Limits::of`])
+/// but for a snapshot, which the budget counts once, for its route.
+pub fn vm_charge_mib(mem: u64) -> u64 {
+    mem + vm_overhead_mib(mem) + crate::keeper::LOG_MIB
+}
+
+/// [`vm_charge_mib`] in words, for a refusal.
+pub fn vm_charge_said() -> String {
+    let fixed = VMM_MIB + crate::keeper::LOG_MIB;
+    format!("memory-mib + {fixed} MiB + memory-mib/{PAGE_TABLES}")
 }
 
 /// Threads of a VM besides its vCPUs (its VMM and API threads, a few more).
@@ -120,21 +148,21 @@ pub struct Limits {
 }
 
 impl Limits {
-    /// What the cgroup of a VM of `size` in `role` allows it: its guest memory, what it is
-    /// charged besides ([`vm_overhead_mib`]) and its log (`keeper::LOG_MIB`), and its guest
-    /// memory again for a template (its snapshot, which it writes, is charged to it); its
-    /// vCPUs' threads and [`THREADS`]; its route's `cpu`; and, where the cgroups are groups of
-    /// the cpu controller (`cpu`), its share by what it holds of the CPU budget, unless it is
-    /// one of the shared group.
+    /// What the cgroup of a VM of `size` in `role` allows it: what a VM may be charged
+    /// ([`vm_charge_mib`]), and its guest memory again for what it is charged of its route's
+    /// snapshot -- a template what it writes of it, a clone what it is first to touch of the
+    /// rest, the clones before it in its cgroup too: the snapshot's size at most, all of the
+    /// route's cgroups together --; its vCPUs' threads and [`THREADS`]; its route's `cpu`;
+    /// and, where the cgroups are groups of the cpu controller (`cpu`), its share by what it
+    /// holds of the CPU budget, unless it is one of the shared group.
     pub fn of(role: Role, size: &Size, cpu: bool) -> Limits {
         let mem = u64::from(size.mem);
-        let overhead = (vm_overhead_mib(mem) + crate::keeper::LOG_MIB) << 20;
-        let memory = match role {
-            Role::Boot | Role::Clone => (mem << 20) + overhead,
-            Role::Template => ((2 * mem) << 20) + overhead,
+        let snapshot = match role {
+            Role::Boot => 0,
+            Role::Template | Role::Clone => mem,
         };
         Limits {
-            memory,
+            memory: (vm_charge_mib(mem) + snapshot) << 20,
             pids: u64::from(size.vcpus) + THREADS,
             cpu: size
                 .cpu
@@ -488,6 +516,9 @@ impl Cgroup {
         ] {
             self.write(file, &value.to_string())?;
         }
+        // none of it swapped: its limit bounds all it takes, and a guest's memory stays off
+        // the host's disk (a kernel not accounting swap has no such file)
+        let _ = self.write(c"memory.swap.max", "0");
         match (limits.weight, limits.cpu) {
             // a group of the cpu controller: its share, and its route's `cpu`, or none again
             // where the VM before it of the id had one
@@ -534,7 +565,7 @@ impl Cgroup {
 }
 
 /// The caller's own cgroup, under the hierarchy at `root`.
-fn own(root: &Path) -> io::Result<PathBuf> {
+pub(crate) fn own(root: &Path) -> io::Result<PathBuf> {
     let own = std::fs::read_to_string("/proc/self/cgroup")?;
     let own = own
         .lines()
@@ -652,29 +683,53 @@ impl Shared {
     }
 }
 
+/// The name of the cgroup of a VM serving, the `number`th: a clone's is its route's own
+/// (`route`, as its template's is named), a booted VM's any booted VM's.
+pub fn serving(route: Option<&str>, number: u32) -> String {
+    match route {
+        Some(route) => format!("{route}-vm-{number}"),
+        None => format!("vm-{number}"),
+    }
+}
+
 /// The cgroups of the wicket's own VMs, without a keeper to hold them: a VM serving takes
-/// the lowest number no VM alive holds, from its fork until it is reaped (the keeper's are
-/// the jail's ids), its cgroup that number's (`vm-<n>`), made for the first and reused; a
-/// template's is its place's (`route-<n>`), kept as long as the place.
+/// the lowest number no VM alive holds -- of the booted VMs, or of its place's clones --,
+/// from its fork until it is reaped (the keeper's are the jail's ids), its cgroup that
+/// number's ([`serving`]), made for the first and reused; a template's is its place's
+/// (`route-<n>`). A place's cgroups are kept as long as the place.
 pub struct Own {
     cgroups: Cgroups,
-    /// The numbers taken once and free again.
-    free: BTreeSet<u32>,
-    /// The next number never taken.
-    next: u32,
-    /// The serving VMs' cgroups, by number and whether they are of the shared group.
-    serving: HashMap<(u32, bool), Cgroup>,
+    /// The booted VMs' cgroups.
+    booted: Numbered,
+    /// The clones' cgroups, by place.
+    clones: HashMap<String, Numbered>,
     /// The templates' cgroups, by place.
     templates: HashMap<String, Cgroup>,
     shared: Shared,
 }
 
+/// Cgroups by number, the lowest free taken first.
+#[derive(Default)]
+struct Numbered {
+    /// The numbers taken once and free again.
+    free: BTreeSet<u32>,
+    /// The next number never taken.
+    next: u32,
+    /// By number and whether they are of the shared group.
+    cgroups: HashMap<(u32, bool), Cgroup>,
+}
+
 /// What a VM holds of [`Own`]: its cgroup.
 #[derive(Debug)]
 pub enum Held {
-    /// A VM serving: its number, whether it is one of the shared group, and what it holds of
-    /// the CPU budget, hundredths of a CPU.
-    Serving { number: u32, shared: bool, cpu: u64 },
+    /// A VM serving: the place whose clone it is (none: booted), its number, whether it is
+    /// one of the shared group, and what it holds of the CPU budget, hundredths of a CPU.
+    Serving {
+        place: Option<String>,
+        number: u32,
+        shared: bool,
+        cpu: u64,
+    },
     /// A template, of the place named.
     Template { place: String },
 }
@@ -684,9 +739,8 @@ impl Own {
         Own {
             shared: Shared::of(&cgroups),
             cgroups,
-            free: BTreeSet::new(),
-            next: 0,
-            serving: HashMap::new(),
+            booted: Numbered::default(),
+            clones: HashMap::new(),
             templates: HashMap::new(),
         }
     }
@@ -711,21 +765,28 @@ impl Own {
             return Ok((held, entered(cgroup)?));
         }
         let (shared, cpu) = (size.shares(role), size.cpus());
-        let number = self.free.pop_first().unwrap_or(self.next);
-        let made = match self.serving.entry((number, shared)) {
+        let place = (role == Role::Clone).then(|| place.to_string());
+        let numbered = match &place {
+            Some(place) => self.clones.entry(place.clone()).or_default(),
+            None => &mut self.booted,
+        };
+        let number = numbered.free.pop_first().unwrap_or(numbered.next);
+        let made = match numbered.cgroups.entry((number, shared)) {
             Entry::Occupied(cgroup) => Ok(cgroup.into_mut()),
             Entry::Vacant(vacant) => {
-                let made = self.cgroups.child(&format!("vm-{number}"), shared);
+                let name = serving(place.as_deref(), number);
+                let made = self.cgroups.child(&name, shared);
                 made.map(|cgroup| vacant.insert(cgroup))
             }
         };
         match made.and_then(entered) {
             Ok(dir) => {
-                self.next = self.next.max(number + 1);
+                numbered.next = numbered.next.max(number + 1);
                 if shared {
                     self.shared.cpu += cpu;
                 }
                 let held = Held::Serving {
+                    place,
                     number,
                     shared,
                     cpu,
@@ -734,8 +795,8 @@ impl Own {
             }
             Err(e) => {
                 // a number never taken stays the next
-                if number < self.next {
-                    self.free.insert(number);
+                if number < numbered.next {
+                    numbered.free.insert(number);
                 }
                 Err(e)
             }
@@ -747,16 +808,26 @@ impl Own {
     pub fn leave(&mut self, held: Held) -> bool {
         match held {
             Held::Serving {
+                place,
                 number,
                 shared,
                 cpu,
             } => {
-                let cgroup = self.serving.get_mut(&(number, shared));
-                let oom = cgroup.is_some_and(Cgroup::oom_killed);
                 if shared {
                     self.shared.cpu -= cpu;
                 }
-                self.free.insert(number);
+                let numbered = match &place {
+                    Some(place) => self.clones.get_mut(place),
+                    None => Some(&mut self.booted),
+                };
+                let Some(numbered) = numbered else {
+                    // its place went before it did: its cgroup goes now
+                    self.cgroups.remove(&serving(place.as_deref(), number));
+                    return false;
+                };
+                let cgroup = numbered.cgroups.get_mut(&(number, shared));
+                let oom = cgroup.is_some_and(Cgroup::oom_killed);
+                numbered.free.insert(number);
                 oom
             }
             Held::Template { place } => match self.templates.get_mut(&place) {
@@ -770,11 +841,15 @@ impl Own {
         }
     }
 
-    /// The place `place` is gone: its template's cgroup with it, or once the template is
-    /// reaped ([`Own::leave`]).
+    /// The place `place` is gone: its template's cgroup and its clones' with it, one whose
+    /// VM is not reaped yet once it is ([`Own::leave`]).
     pub fn forget(&mut self, place: &str) {
         if self.templates.remove(place).is_some() {
             self.cgroups.remove(place);
+        }
+        let clones = self.clones.remove(place).unwrap_or_default();
+        for (number, _) in clones.cgroups.keys() {
+            self.cgroups.remove(&serving(Some(place), *number));
         }
     }
 
@@ -789,8 +864,9 @@ mod tests {
     use super::*;
 
     /// What a cgroup allows its VM follows what the VM is given: its guest memory and what
-    /// it is charged besides, twice the memory for a template, its vCPUs' threads, its route's
-    /// `cpu`, a share by the CPUs it holds unless it is one of the shared group. The shared
+    /// it is charged besides, twice the memory for a template and for a clone (what each is
+    /// charged of the snapshot), its vCPUs' threads, its route's `cpu`, a share by the CPUs it
+    /// holds unless it is one of the shared group. The shared
     /// group's weight is what its VMs hold, 10 a CPU and 1 at least: written at once, then an
     /// interval apart at least, and not for a group left without a VM.
     #[test]
@@ -823,6 +899,16 @@ mod tests {
         );
         let shared = Limits::of(Role::Clone, &size(None, true), true);
         assert_eq!((shared.cpu, shared.weight), (None, None));
+        assert_eq!(shared.memory, mib(2 * 256 + 32 + 2 + 16), "a clone");
+        assert_eq!(
+            vm_charge_mib(256),
+            256 + 32 + 2 + 16,
+            "its share of the budget"
+        );
+        assert_eq!(
+            (serving(None, 3), serving(Some("route-1"), 0)),
+            ("vm-3".into(), "route-1-vm-0".into())
+        );
         let unweighted = Limits::of(Role::Boot, &size(Some(300), false), false);
         assert_eq!((unweighted.cpu, unweighted.weight), (Some(300_000), None));
 

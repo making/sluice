@@ -74,6 +74,7 @@ use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use crate::BoxError;
 use crate::capacity::{Capacity, Full, cpus};
+use crate::cgroup::{vm_charge_mib, vm_charge_said};
 use crate::config::{File, Origin, RouteSource};
 use crate::deployed::{self, AppSpec, Deployed, Options};
 use crate::listener;
@@ -99,9 +100,9 @@ pub struct Table {
 }
 
 impl Table {
-    /// The VMs the advertised routes keep for good (their booted VMs, their pools' warm), their
-    /// guest memory (MiB) and their CPUs (hundredths): what an edit's routes may not need more
-    /// of than the budget.
+    /// The VMs the advertised routes keep for good (their booted VMs, their pools' warm), what
+    /// they take of the host's memory (MiB), their CPUs (hundredths) and their snapshots: what
+    /// an edit's routes may not need more of than the budget.
     pub fn resident(&self) -> Resident {
         let targets: HashSet<&String> = self.advertised.iter().map(|up| &up.target_url).collect();
         let specs: Vec<RouteSpec> = targets
@@ -498,7 +499,8 @@ pub enum Refused {
     Rejected(String),
     /// Its VMs did not start, of what they are: another try, nothing else changed, fails alike.
     DidNotStart(String),
-    /// The routes need more than the VMs' budget (`--max-instances`, `--max-memory-mib`).
+    /// The routes need more than the VMs' budget (`--max-instances`, `--max-memory-mib`,
+    /// `--max-cpus`, the snapshots' room).
     NoRoom(String),
     /// The console's directory failed.
     Failed(String),
@@ -1709,7 +1711,8 @@ fn taken(edit: &Edit, origins: &HashMap<String, Origin>) -> Result<(), Refused> 
 }
 
 /// Whether the routes can start within `capacity`: their booted VMs and their pools' warm VMs for
-/// good, and a template at a time beside the other routes' (its own come as it is gone).
+/// good, a template at a time beside the other routes' (its own come as it is gone), and the
+/// snapshots of the cloned ones. Refused, with what they need of each and what that is over.
 fn fits(specs: &[(RouteSpec, Origin)], capacity: &Capacity) -> Result<(), BoxError> {
     let mut targets: Vec<(String, &RouteSpec)> = Vec::new();
     for (spec, _) in specs {
@@ -1727,38 +1730,55 @@ fn fits(specs: &[(RouteSpec, Origin)], capacity: &Capacity) -> Result<(), BoxErr
             kept.without(own).with(Resident::of(spec, 1))
         })
         .fold(kept, Resident::most);
-    let within = |max: Option<u64>, needed: u64| max.is_none_or(|max| needed <= max);
-    if needed.vms > capacity.max_instances()
-        || !within(capacity.max_memory_mib(), needed.memory)
-        || !within(capacity.max_cpu(), needed.cpu)
-    {
-        let none = || "-".to_string();
-        return Err(Full::over(format!(
-            "the routes need {} VM(s), {} MiB of guest memory and {} CPU(s) to start (their \
-             booted VMs, their pools' warm VMs, and a template at a time beside the other \
-             routes'): over --max-instances {} / --max-memory-mib {} / --max-cpus {}",
-            needed.vms,
-            needed.memory,
-            cpus(needed.cpu),
-            capacity.max_instances(),
-            capacity
-                .max_memory_mib()
-                .map_or_else(none, |mib| mib.to_string()),
-            capacity.max_cpu().map_or_else(none, cpus),
-        ))
-        .into());
+    let snapshots = capacity.snapshot_mib(needed.snapshots);
+    let memory = needed.memory + snapshots;
+    let mut over = Vec::new();
+    if needed.vms > capacity.max_instances() {
+        over.push(format!("--max-instances {}", capacity.max_instances()));
     }
-    Ok(())
+    if let Some(max) = capacity.max_memory_mib().filter(|max| memory > *max) {
+        let of = capacity.memory_of();
+        over.push(format!("the memory budget of {max} MiB ({of})"));
+    }
+    if let Some(max) = capacity.max_cpu().filter(|max| needed.cpu > *max) {
+        over.push(format!("--max-cpus {}", cpus(max)));
+    }
+    if let Some(room) = capacity.snapshot_room().filter(|room| snapshots > *room) {
+        over.push(format!(
+            "the {room} MiB the state dir's tmpfs has for the snapshots"
+        ));
+    }
+    if over.is_empty() {
+        return Ok(());
+    }
+    let of_snapshots = match snapshots {
+        0 => String::new(),
+        mib => format!(", and {mib} MiB for their snapshots, a cloned route's memory-mib"),
+    };
+    Err(Full::over(format!(
+        "the routes need {} VM(s), {memory} MiB of memory ({} MiB for the VMs, each \
+         {}{of_snapshots}) and {} CPU(s) to start (their booted VMs, their pools' warm VMs, and \
+         a template at a time beside the other routes'): over {}",
+        needed.vms,
+        needed.memory,
+        vm_charge_said(),
+        cpus(needed.cpu),
+        over.join(", "),
+    ))
+    .into())
 }
 
 /// What routes keep of the budget for good.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Resident {
     pub vms: usize,
-    /// Their guest memory, MiB.
+    /// What the VMs may be charged of the host's memory, MiB.
     pub memory: u64,
     /// Their CPUs, hundredths.
     pub cpu: u64,
+    /// The snapshots of the cloned routes, MiB: the `memory-mib` of each
+    /// (`Capacity::snapshot_mib`: what of it counts).
+    pub snapshots: u64,
 }
 
 impl Resident {
@@ -1766,8 +1786,20 @@ impl Resident {
     fn of(spec: &RouteSpec, vms: usize) -> Resident {
         Resident {
             vms,
-            memory: vms as u64 * u64::from(spec.vm.memory_mib),
+            memory: vms as u64 * vm_charge_mib(u64::from(spec.vm.memory_mib)),
             cpu: vms as u64 * spec.vm.cpus(),
+            snapshots: 0,
+        }
+    }
+
+    /// The snapshot of `spec`, if its VMs are cloned from one.
+    fn snapshot(spec: &RouteSpec) -> Resident {
+        Resident {
+            snapshots: match spec.mode.cloned() {
+                true => u64::from(spec.vm.memory_mib),
+                false => 0,
+            },
+            ..Resident::default()
         }
     }
 
@@ -1776,6 +1808,7 @@ impl Resident {
             vms: self.vms + more.vms,
             memory: self.memory + more.memory,
             cpu: self.cpu + more.cpu,
+            snapshots: self.snapshots + more.snapshots,
         }
     }
 
@@ -1784,6 +1817,7 @@ impl Resident {
             vms: self.vms - less.vms,
             memory: self.memory - less.memory,
             cpu: self.cpu - less.cpu,
+            snapshots: self.snapshots - less.snapshots,
         }
     }
 
@@ -1793,23 +1827,28 @@ impl Resident {
             vms: self.vms.max(other.vms),
             memory: self.memory.max(other.memory),
             cpu: self.cpu.max(other.cpu),
+            snapshots: self.snapshots.max(other.snapshots),
         }
     }
 }
 
-/// What the routes of `specs`, one of each target, keep for good.
+/// What the routes of `specs`, one of each target, keep for good: their VMs, and their snapshots.
 fn resident<'a>(specs: impl Iterator<Item = &'a RouteSpec>) -> Resident {
     specs.fold(Resident::default(), |kept, spec| {
         kept.with(Resident::of(spec, spec.resident()))
+            .with(Resident::snapshot(spec))
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::capacity::{Budget, Snapshots};
 
     /// The routes' VMs fit for good, and a template beside the other routes': a pool's own come
-    /// as it is gone, so a pool of one needs its one VM, what serves no connection none.
+    /// as it is gone, so a pool of one needs its one VM, what serves no connection none. Of the
+    /// memory a VM counts what it may be charged, and on a tmpfs a cloned route its snapshot too,
+    /// within the tmpfs's room; what does not fit is refused with what it needs and what of.
     #[test]
     fn the_routes_fit_with_a_template_beside_the_others() {
         let specs = |routes: &[(&str, &[(&str, &str)])]| {
@@ -1841,33 +1880,125 @@ mod tests {
         let capped: &[(&str, &str)] = &[("memory-mib", "64"), ("vcpus", "2"), ("cpu", "50")];
         // hundredths of a CPU, a vCPU 100
         const CPUS: u64 = 6400;
-        for (routes, max_instances, max_memory_mib, max_cpu, fit) in [
-            (&[("a", pool), ("b", pool)][..], 2, 128, CPUS, true),
-            (&[("a", pool), ("b", pool)], 1, 128, CPUS, false),
-            (&[("a", pool), ("b", pool)], 2, 127, CPUS, false),
-            (&[("a", pool), ("b", pool)], 2, 128, 199, false),
-            (&[("a", booted), ("b", pool)], 2, 128, 200, true),
-            // N x memory-mib and N x its CPUs, all of them for good
-            (&[("a", scaled), ("b", pool)], 4, 256, 400, true),
-            (&[("a", scaled), ("b", pool)], 3, 256, 400, false),
-            (&[("a", scaled), ("b", pool)], 4, 255, 400, false),
-            (&[("a", scaled), ("b", pool)], 4, 256, 399, false),
-            // no VM of its own to take a template's place
-            (&[("a", pool), ("b", large)], 1, 320, 200, false),
-            (&[("a", pool), ("b", large)], 2, 319, 200, false),
-            (&[("a", pool), ("b", large)], 2, 320, 199, false),
-            (&[("a", pool), ("b", large)], 2, 320, 200, true),
-            // its `cpu` where that is less than its vCPUs
-            (&[("a", capped), ("b", booted)], 2, 128, 150, true),
-            (&[("a", capped), ("b", booted)], 2, 128, 149, false),
-        ] {
-            let capacity = Capacity::new(max_instances, Some(max_memory_mib), Some(max_cpu));
-            let hosts: Vec<_> = routes.iter().map(|(host, _)| host).collect();
-            assert_eq!(
-                fits(&specs(routes), &capacity).is_ok(),
+        const DISK: Snapshots = Snapshots::Disk;
+        const TMPFS: Snapshots = Snapshots::Memory(None);
+        // a VM of 64 MiB may be charged 64 + 48 = 112 MiB, one of 256 MiB 256 + 48 + 2 = 306
+        let fit = "";
+        let memory = "2 VM(s), 352 MiB of memory (224 MiB for the VMs, each memory-mib + 48 MiB + \
+                      memory-mib/128, and 128 MiB for their snapshots, a cloned route's \
+                      memory-mib) and 2 CPU(s) to start";
+        for (routes, max_instances, max_memory_mib, max_cpu, snapshots, over) in [
+            (&[("a", pool), ("b", pool)][..], 2, 224, CPUS, DISK, fit),
+            (
+                &[("a", pool), ("b", pool)],
+                1,
+                224,
+                CPUS,
+                DISK,
+                "--max-instances 1",
+            ),
+            (&[("a", pool), ("b", pool)], 2, 223, CPUS, DISK, "223 MiB"),
+            (
+                &[("a", pool), ("b", pool)],
+                2,
+                224,
+                199,
+                DISK,
+                "--max-cpus 1.99",
+            ),
+            // on a tmpfs their snapshots count too, 64 MiB each, and take its room
+            (&[("a", pool), ("b", pool)], 2, 352, CPUS, TMPFS, fit),
+            (&[("a", pool), ("b", pool)], 2, 351, CPUS, TMPFS, memory),
+            (
+                &[("a", pool), ("b", pool)],
+                2,
+                351,
+                CPUS,
+                TMPFS,
+                "351 MiB (the host's)",
+            ),
+            (
+                &[("a", pool), ("b", pool)],
+                2,
+                352,
+                CPUS,
+                Snapshots::Memory(Some(128)),
                 fit,
-                "{hosts:?} {max_instances} {max_memory_mib} {max_cpu}"
+            ),
+            (
+                &[("a", pool), ("b", pool)],
+                2,
+                352,
+                CPUS,
+                Snapshots::Memory(Some(127)),
+                "over the 127 MiB the state dir's tmpfs has for the snapshots",
+            ),
+            (&[("a", booted), ("b", pool)], 2, 224, 200, DISK, fit),
+            // N x a VM's memory and N x its CPUs, all of them for good
+            (&[("a", scaled), ("b", pool)], 4, 448, 400, DISK, fit),
+            (
+                &[("a", scaled), ("b", pool)],
+                3,
+                448,
+                400,
+                DISK,
+                "--max-instances 3",
+            ),
+            (&[("a", scaled), ("b", pool)], 4, 447, 400, DISK, "447 MiB"),
+            (
+                &[("a", scaled), ("b", pool)],
+                4,
+                448,
+                399,
+                DISK,
+                "--max-cpus 3.99",
+            ),
+            // no VM of its own to take a template's place
+            (
+                &[("a", pool), ("b", large)],
+                1,
+                418,
+                200,
+                DISK,
+                "--max-instances 1",
+            ),
+            (&[("a", pool), ("b", large)], 2, 417, 200, DISK, "417 MiB"),
+            (
+                &[("a", pool), ("b", large)],
+                2,
+                418,
+                199,
+                DISK,
+                "--max-cpus 1.99",
+            ),
+            (&[("a", pool), ("b", large)], 2, 418, 200, DISK, fit),
+            // its `cpu` where that is less than its vCPUs
+            (&[("a", capped), ("b", booted)], 2, 224, 150, DISK, fit),
+            (
+                &[("a", capped), ("b", booted)],
+                2,
+                224,
+                149,
+                DISK,
+                "--max-cpus 1.49",
+            ),
+        ] {
+            let capacity = Capacity::new(Budget {
+                max_memory_mib: Some(max_memory_mib),
+                memory_of: "the host's".into(),
+                max_cpu: Some(max_cpu),
+                snapshots,
+                ..Budget::of(max_instances)
+            });
+            let hosts: Vec<_> = routes.iter().map(|(host, _)| host).collect();
+            let refused =
+                fits(&specs(routes), &capacity).map_or_else(|e| e.to_string(), |()| fit.into());
+            assert_eq!(
+                refused.is_empty(),
+                over.is_empty(),
+                "{hosts:?} {max_instances} {max_memory_mib} {max_cpu}: {refused}"
             );
+            assert!(refused.contains(over), "{refused}: no '{over}'");
         }
     }
 

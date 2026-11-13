@@ -36,10 +36,13 @@ use tokio::io::unix::AsyncFd;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::BoxError;
-use crate::cgroup::{Cgroup, Cgroups, Limits, Shared};
+use crate::cgroup::{Cgroup, Cgroups, Limits, Shared, serving};
 use crate::config::JailSettings;
-use crate::jail::{self, Access, Ids, Jail, Template};
+use crate::jail::{self, Access, Ids, Jail, OomScore, Template};
 use crate::seccomp::Filter;
+
+/// Where the keeper's directory is by default (a tmpfs).
+pub const STATE: &str = "/run";
 
 /// The environment variable naming the wicket's end of the socket pair.
 pub const KEEPER_FD: &str = "SLUICE_WICKET_RUNTIME_FIRECRACKER_KEEPER_FD";
@@ -370,6 +373,9 @@ struct Route {
     dir: PathBuf,
     /// Its template's cgroup, made with it.
     cgroup: Option<Cgroup>,
+    /// Its clones' cgroups, by id and whether they are of the shared group: its own, made with
+    /// the first and reused, gone with it.
+    clones: HashMap<(u32, bool), Cgroup>,
     /// An app's disk: attached in the template, its VM's to write once given its id, and
     /// locked per VM on an open file of its own.
     disk: Option<OwnedFd>,
@@ -418,9 +424,8 @@ struct Keeper {
     /// The ids whose directory (`vm-<n>`) is made, kept for the next VM of the id.
     made: HashSet<u32>,
     cgroups: Cgroups,
-    /// The serving VMs' cgroups by id and whether they are of the shared group, made with
-    /// the first and reused.
-    clones: HashMap<(u32, bool), Cgroup>,
+    /// The booted VMs' cgroups by id, made with the first and reused.
+    booted: HashMap<u32, Cgroup>,
     /// The shared group's weight.
     shared: Shared,
     /// The keeper's directory: `jail` (the template namespace's root), `route-<n>`,
@@ -442,6 +447,8 @@ struct Keeper {
     seals: Vec<(u64, u64)>,
     /// The VMs' seccomp filter, installed in each jail.
     filter: Filter,
+    /// The keeper's own `oom_score_adj`, raised to a VM's for each spawn.
+    oom: Option<OomScore>,
 }
 
 impl Keeper {
@@ -474,7 +481,7 @@ impl Keeper {
         }
         let firecracker = executable(&firecracker)?;
         // the keeper's directory, the wicket's group's (it reaches its VMs' sockets)
-        let base = state.unwrap_or_else(|| PathBuf::from("/run"));
+        let base = state.unwrap_or_else(|| PathBuf::from(STATE));
         let base = std::path::absolute(base)?;
         std::fs::create_dir_all(&base)?;
         let dir = base.join(format!(
@@ -619,7 +626,7 @@ impl Keeper {
             made: HashSet::new(),
             shared: Shared::of(&cgroups),
             cgroups,
-            clones: HashMap::new(),
+            booted: HashMap::new(),
             dir,
             template,
             null,
@@ -633,6 +640,14 @@ impl Keeper {
             waiting: VecDeque::new(),
             seals: Vec::new(),
             filter: Filter::unprivileged(),
+            oom: OomScore::open()
+                .inspect_err(|e| {
+                    eprintln!(
+                        "keeper: warning: the VMs' oom_score_adj: {e}; the kernel's OOM killer \
+                         may take the wicket before a VM"
+                    )
+                })
+                .ok(),
         })
     }
 
@@ -737,11 +752,11 @@ impl Keeper {
         let Some(ended) = self.vms.remove(&vm) else {
             return;
         };
+        let route = self.routes.get_mut(&ended.route);
         let cgroup = match ended.role {
-            Role::Template => {
-                (self.routes.get_mut(&ended.route)).and_then(|route| route.cgroup.as_mut())
-            }
-            Role::Boot | Role::Clone => self.clones.get_mut(&(ended.id, ended.shared)),
+            Role::Template => route.and_then(|route| route.cgroup.as_mut()),
+            Role::Clone => route.and_then(|route| route.clones.get_mut(&(ended.id, ended.shared))),
+            Role::Boot => self.booted.get_mut(&ended.id),
         };
         let oom = cgroup.is_some_and(Cgroup::oom_killed);
         if ended.shared {
@@ -975,6 +990,7 @@ impl Keeper {
                 firecracker,
                 dir,
                 cgroup: None,
+                clones: HashMap::new(),
                 disk,
                 sealed: false,
                 closing: false,
@@ -1112,10 +1128,17 @@ impl Keeper {
                 }
                 route.cgroup.as_mut().expect("made")
             }
-            Role::Boot | Role::Clone => match self.clones.entry((id, shared)) {
+            Role::Clone => match route.clones.entry((id, shared)) {
                 std::collections::hash_map::Entry::Occupied(cgroup) => cgroup.into_mut(),
                 std::collections::hash_map::Entry::Vacant(vacant) => {
-                    vacant.insert(self.cgroups.child(&format!("vm-{n}"), shared)?)
+                    let name = serving(Some(&format!("route-{}", request.route)), n);
+                    vacant.insert(self.cgroups.child(&name, shared)?)
+                }
+            },
+            Role::Boot => match self.booted.entry(id) {
+                std::collections::hash_map::Entry::Occupied(cgroup) => cgroup.into_mut(),
+                std::collections::hash_map::Entry::Vacant(vacant) => {
+                    vacant.insert(self.cgroups.child(&serving(None, n), false)?)
                 }
             },
         };
@@ -1132,7 +1155,9 @@ impl Keeper {
             }
             Role::Clone => Some((snapshot_in_dir.as_path(), Access::ReadOnly)),
         };
-        jail::spawn(&Jail {
+        // a VM's oom_score_adj: the keeper's own raised to it for the clone
+        let raised = self.oom.as_ref().is_some_and(|oom| oom.raise().is_ok());
+        let spawned = jail::spawn(&Jail {
             template: &self.template,
             id,
             firecracker: route.firecracker.as_fd(),
@@ -1149,7 +1174,11 @@ impl Keeper {
             open_files: request.open_files.min(MAX_OPEN_FILES),
             file_size,
             filter: &self.filter,
-        })
+        });
+        if let (true, Some(oom)) = (raised, &self.oom) {
+            let _ = oom.lower();
+        }
+        spawned
     }
 
     /// Makes the route's snapshot read-only (its template reaped): its files, regular
@@ -1187,9 +1216,14 @@ impl Keeper {
         if !closing || self.vms.values().any(|vm| vm.route == route) {
             return;
         }
-        if self.routes.remove(&route).is_some() {
-            self.forget(Path::new(&format!("route-{route}")));
-            self.cgroups.remove(&format!("route-{route}"));
+        if let Some(closed) = self.routes.remove(&route) {
+            let name = format!("route-{route}");
+            self.forget(Path::new(&name));
+            self.cgroups.remove(&name);
+            for (id, _) in closed.clones.keys() {
+                self.cgroups
+                    .remove(&serving(Some(&name), id - self.ids.first));
+            }
         }
     }
 

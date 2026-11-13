@@ -19,8 +19,9 @@
 //! `/init` relays it on to the process's TCP port (`routes`). A route's VMs
 //! are either VMs booted, or clones of a snapshot -- one per connection,
 //! reused by the next connections, or a pool serving many each -- (`route`, `vm`),
-//! within the VMs' budget (`capacity`: their number, memory and CPUs). What each VM
-//! uses of the host is read from its process (`usage`) for the console's listings.
+//! within the VMs' budget (`capacity`: their number, what they take of the host's memory, by
+//! default what it has for them (`host`), and their CPUs). What each VM uses of the host is
+//! read from its process (`usage`) for the console's listings.
 //!
 //! The wicket forks no VM itself: a forker does (`forker`), started before anything
 //! else, the VMs the wicket's children. Where the wicket's own cgroup is delegated
@@ -61,6 +62,7 @@ pub mod exchange;
 pub mod forker;
 pub mod head;
 pub mod health;
+pub mod host;
 pub mod hpack;
 pub mod image;
 pub mod jail;
@@ -92,7 +94,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use capacity::Capacity;
+use capacity::{Budget, Capacity, Snapshots};
 use console::Console;
 use deployed::Deployed;
 use output::{Printer, Sink};
@@ -156,11 +158,11 @@ async fn serving(
         evacuation_grace,
         ready_grace,
         max_instances,
-        max_memory_mib,
+        max_memory,
         max_cpus,
         workers: _,
         watch_interval,
-        state_dir: _,
+        state_dir,
         guest,
         flume,
         jail: _,
@@ -182,18 +184,46 @@ async fn serving(
     let serving = usize::from(server.is_some()) + usize::from(listen.is_some());
     let (open_files, vm_open_files) = vm::set_open_files(max_connections * serving)?;
     println!("open file limit {open_files}, each VM's {vm_open_files}");
-    let capacity = Capacity::new(max_instances, max_memory_mib, max_cpus);
+    // where the snapshots are written: the state dir, the keeper's in jail mode
+    let snapshots = state::snapshots(&match &launcher {
+        Launcher::Direct { state, .. } => state.clone(),
+        Launcher::Jailed { .. } => state_dir.unwrap_or_else(|| keeper::STATE.into()),
+    });
     // against the CPUs it runs on: what its operator overcommits them by
     let host = config::host_cpus();
     println!(
-        "VM limit {max_instances}, guest memory limit {}, CPU limit {} (on {host} CPU(s){})",
-        max_memory_mib.map_or("none".to_string(), |mib| format!("{mib} MiB")),
+        "VM limit {max_instances}, memory limit {} ({}), CPU limit {} (on {host} CPU(s){})",
+        (max_memory.mib).map_or("none".to_string(), |mib| format!("{mib} MiB")),
+        max_memory.of,
         max_cpus.map_or("none".to_string(), capacity::cpus),
         max_cpus.map_or(String::new(), |cpu| format!(
             ": {:.2}x",
             cpu as f64 / (host * 100) as f64
         )),
     );
+    println!(
+        "a cloned route's snapshot {}",
+        match snapshots {
+            Snapshots::Disk => "is on a disk: none of the memory limit".to_string(),
+            Snapshots::Memory(None) => "counts in the memory limit".to_string(),
+            Snapshots::Memory(Some(room)) => format!(
+                "counts in the memory limit, and in the {room} MiB the state dir's tmpfs has"
+            ),
+        }
+    );
+    if max_memory.overcommitted {
+        eprintln!(
+            "warning: the VMs' memory is overcommitted: the host's short, the kernel's OOM \
+             killer takes VMs"
+        );
+    }
+    let capacity = Capacity::new(Budget {
+        max_instances,
+        max_memory_mib: max_memory.mib,
+        memory_of: max_memory.of,
+        max_cpu: max_cpus,
+        snapshots,
+    });
     let tap = match flume {
         Some(_) => Tap::new(),
         None => Tap::off(),

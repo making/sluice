@@ -1,0 +1,25 @@
+--- a/sluice-wicket-runtime-firecracker/src/vm.rs
++++ b/sluice-wicket-runtime-firecracker/src/vm.rs
+@@ -641,6 +641,22 @@
+             json!({ "guest_cid": GUEST_CID, "uds_path": vm.vsock_inside }),
+         )
+         .await?;
++        // measurement only: a balloon device, driven through the VM's API socket;
++        // SFC_BALLOON=reporting: its guest reports the pages it freed
++        if let Ok(mode) = std::env::var("SFC_BALLOON") {
++            vm.api(
++                "PUT",
++                "/balloon",
++                json!({
++                    "amount_mib": 0,
++                    "deflate_on_oom": true,
++                    "stats_polling_interval_s": 1,
++                    "free_page_reporting": mode.contains("reporting"),
++                    "free_page_hinting": mode.contains("hinting"),
++                }),
++            )
++            .await?;
++        }
+         vm.api("PUT", "/actions", json!({ "action_type": "InstanceStart" }))
+             .await?;
+         if !spec.env.is_empty() {

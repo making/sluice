@@ -19,7 +19,9 @@ Outside any guest's linear memory and unbounded:
 What an instance holds is measured now (291): its linear memories and their most, in the listings'
 `usage` (`usage.rs`), what `MemoryCap` lets grow; not its tables, GC heap or host-side state (299).
 
-To decide: `--max-memory-mib` as the Firecracker wicket's (shared arithmetic where it fits), what an
+To decide: `--max-memory-mib` as the Firecracker wicket's (shared arithmetic where it fits: its
+default from the host, `MemTotal` or the cgroup's limit less a reserve, and its `1.5x`, are
+`sluice-wicket-runtime-firecracker/src/host.rs`, 294), what an
 instance counts (its cap, or its use with 299 fixed and 291's numbers), a reserve for compiled code, the
 upload streamed to a file under its digest as the files tar is, compiles at once bounded.
 
