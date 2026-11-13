@@ -678,6 +678,7 @@ impl Builds {
         };
         let need = Need {
             memory: u64::from(spec.memory_mib),
+            cpu: spec.cpus(),
             route: crate::route::next_route(),
         };
         let slot = self

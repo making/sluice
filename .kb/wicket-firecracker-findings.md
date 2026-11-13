@@ -401,10 +401,12 @@ What the [liveness check](../sluice-wicket-runtime-firecracker/README.md#livenes
   into instead: 0.40ms of the keeper per VM, the jail's setup in the child 1-2ms instead
   of 2-4. Unmounting the keeper's directory in each jail (an expedited RCU grace period,
   0.3ms) costs nothing measurable.
-- **A group of the cpu controller per VM costs 10% of the clone rate** (its scheduling
-  entities on every CPU, their load tracked): 1,390-1,460 VMs/s at c=16 against
-  1,530-1,630 without the controller, 1,543 with one group for every clone. Hence a group
-  of its own only for a VM whose route caps its CPU (`capped/`).
+- **A group of the cpu controller per VM costs a VM per connection 8% of its rate, a VM
+  that lives on nothing** (its scheduling entities on every CPU, their load tracked):
+  1,390-1,460 VMs/s at c=16 against 1,530-1,630 without the controller, 1,543 with one group
+  for every clone. Measured again on the 6.8 kernel ([below](#the-cpu-budget-and-the-shares)):
+  hence a group of its own for every VM but a clone of a connection's own, which share one
+  (`shared/`) unless their route caps their CPU.
 - **The keeper's thread does not bound the jailed clone rate**: 63% busy at the unjailed
   rate, 0.4ms per VM (its fork 0.2ms), so about 2,500 VMs/s at most. Spawner processes
   forking in parallel (built and measured; the keeper's round trip p90 from 5.0ms to
@@ -511,6 +513,61 @@ made of, and why (the 64-core host, its 6.8 kernel):
   no one of the wicket sent. In the guest, `/init` reads its kernel's count as the process starts
   and as it is reaped. Lowering a jailed VM's `memory.max` below what it holds (`echo 1M >`) has the
   kernel's OOM killer take it within the write: the VM test's way
+
+## The CPU budget and the shares
+
+What [the CPU budget and a VM's share](../sluice-wicket-runtime-firecracker/README.md#limits) are
+made of, and why. Measured jailed on the 64-core host (6.8 kernel), `--listen`, `oha` for 5s,
+the sample guest, the runs of each row alternating (the scripts: `.todo/artefacts/292`):
+
+| | one group for the VMs without `cpu` | a group per VM |
+|---|---|---|
+| VM per connection, warm=16, new connections c=16 | 1,481-1,569 req/s | 1,359-1,394 |
+| the same, c=1 | 441-570 | 438-533 |
+| booted VM, 2 vCPUs, keep-alive c=16 | 15.4-19.9k | 14.8-21.9k |
+| booted VM, 1 vCPU, new connections c=16 | 2,711-3,001 | 2,647-3,066 |
+| pool of 4, keep-alive c=16 | 26.7-28.0k | 27.0-27.5k |
+| reused clones, new connections c=16 | 19.1-19.7k | 18.8-19.5k |
+
+- **The unit is a VM's vCPUs, its `cpu` where that is less**: what its guest may take of the
+  host, whatever it runs. Its VMM and API threads are beside it, as the memory budget counts
+  `memory-mib` alone (measured: a VMM thread up to 57% of a CPU beside vCPUs at 85-97%). A `cpu`
+  above the vCPUs gives the guest no more: it counts the vCPUs
+- **No budget unless stated**: past the host's CPUs the VMs slow, they do not fail as past its
+  memory, and any ratio would be a guess (an idle VM takes none, a clone a few milliseconds).
+  The ratio is the operator's (`--max-cpus 4x`), of the CPUs the wicket runs on
+  (`available_parallelism`: its affinity and its cgroup's quota), so one config file serves
+  hosts of other sizes
+- **The share is the budget's count**: `cpu.weight` 10 per CPU held, a tenth of the kernel's
+  default, so the shared group's weight follows its VMs up to 1000 CPUs (a weight is 10000 at
+  most); a `cpu` below a tenth of a CPU rounds up to 1, its `cpu.max` binding first. Guests
+  spinning every vCPU, the wicket and its VMs on 2 CPUs (`taskset`), over 6s:
+
+  | | CPUs taken |
+  |---|---|
+  | a VM of 4 vCPUs, one of 1 | 1.63, 0.38 |
+  | a VM of 2 vCPUs capped (`cpu=200`), six of 1 | 0.51, 0.25 each |
+  | the same, the classes before (`capped/`, `uncapped/`: one group each, of equal weight) | 0.68, 0.11-0.33 each |
+  | a VM of 2 vCPUs, four clones per connection (`shared/`, weight 40) | 0.67, 0.34 each |
+
+- **One group for the clones per connection, its weight what they hold**: a group per VM costs
+  them 8% of their rate at c=16 (the table; 10% when first measured), and nothing measurable of
+  a VM that lives on. In one group their threads share its CPUs as equals, which is by vCPU;
+  its weight is the sum of what its VMs alive hold of the budget, warm ones among them, so a
+  route's busy clones take up to what the route holds. Written at every spawn and reap it cost
+  3% of the clone rate (1,440-1,504 against 1,510-1,569: a write walks every CPU's run queue),
+  so it is written 100ms apart at least: 1,510-1,556 against 1,512-1,558 before the change
+- **The wicket's cgroup of the most weight, where the VMs' are beside it** (the default
+  `--jail-cgroup`: `keeper/` 10000): connections to an unknown host (accepted, answered 404,
+  closed: the wicket's own work) at c=64 on 2 CPUs, 37.1k req/s with 8 vCPUs spinning as with
+  none (36.4k); with `keeper/` weighted as each class of VMs before, 13.7k, its relay threads
+  on a CPU 27% of the time and waiting for one 68% (1.3ms a time). It takes the CPUs it
+  needs, the VMs the rest. With `--jail-cgroup <path>` the wicket is elsewhere, and the VMs'
+  parent one group among the host's (weight 100): nothing of the keeper's to weigh
+- **Not covered**: without the jail a VM has no cgroup, so no share (the budget alone keeps
+  the wicket its CPUs there); x86_64's `kvm-pit/<pid>` kernel thread stays in the root cgroup,
+  named after its VM's pid in the VM's own PID namespace (`kvm-pit/1` for every jailed VM), so
+  nothing tells which VM's it is
 
 ## Caveats
 

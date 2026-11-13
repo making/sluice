@@ -4,7 +4,10 @@ Difficulty: High
 
 Without `--jail-ids` a VM has no cgroup of its own: `cpu=` is a configuration error (`config.rs`),
 `memory.max` / `memory.oom.group` / `pids.max` (`jail.rs`, `keeper.rs`) are not written, and only `vcpus`
-and the rlimits (`vm.rs`: FSIZE, CORE, NOFILE) bound it. The README lists "CPU limits without the jail"
+and the rlimits (`vm.rs`: FSIZE, CORE, NOFILE) bound it. Nor has it a share of the CPUs (292: jailed,
+`cpu.weight` by the CPUs a VM holds of `--max-cpus`, a connection's own clones in one group, the
+wicket's own cgroup before the VMs'; `jail::Cgroups`): its threads and the wicket's contend as equals,
+and the CPU budget alone keeps the wicket its CPUs. The README lists "CPU limits without the jail"
 under Not yet, and that another member of the `kvm` group starts VMs outside the budget.
 
 291 reads what a VM uses of its process alike with or without the jail (`usage.rs`: its CPU clock,
@@ -18,5 +21,5 @@ To decide: a delegated cgroup subtree (systemd `Delegate=yes`, a container's wri
 unprivileged wicket writes itself, sharing the layout and the arithmetic with the keeper's; what it does
 where no subtree is delegated (refuse `cpu=` as today, say so at startup).
 
-Acceptance: `cpu`, the memory ceiling and `pids.max` hold on a jail-less wicket with a delegated subtree;
+Acceptance: `cpu`, the shares, the memory ceiling and `pids.max` hold on a jail-less wicket with a delegated subtree;
 the VM test covers both ways with the assertions it has for the jail; README's host setup updated.

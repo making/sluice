@@ -8,7 +8,9 @@ report, then file what is missing:
 - `memory`, `disk_quota`, instances and any CPU setting: parsed, stored, passed to a wicket, or ignored
   (`manifest.rs`, `staging.rs`, `config.rs`, `controller.rs`, `wicket.rs`); where `vcpus` come from
 - `placement.rs`: what room is (memory only? the wicket's reported budget or the cf-api's own count?),
-  CPU and disk in it, build VMs, what a push sees where no wicket has room
+  CPU and disk in it, build VMs, what a push sees where no wicket has room. A Firecracker wicket with
+  `--max-cpus` lists `budget.max_cpus` and `cpus`, what its routes keep for good, in CPUs (a VM's its
+  `vcpus`, or its `cpu` / 100 where less); `ListedBudget` does not read them yet
 - org / space quotas (`orgs.rs`): enforced or shown only
 - process stats (`views.rs`): `cpu`, `mem` and `disk` are the wickets' measurements now (291: an
   instance's `usage` in their listings, those of one index summed); `cpu_entitlement` and `log_rate`

@@ -2006,7 +2006,7 @@ impl VmPool {
                             down,
                             backoff,
                             retry: (!wait.is_zero()).then(|| Instant::now() + wait),
-                            held: Some(Arc::new(self.capacity.hold(self.need.memory))),
+                            held: Some(Arc::new(self.capacity.hold(self.need))),
                             starting: false,
                         },
                     );
@@ -2574,6 +2574,7 @@ impl Route {
         let bounds = Current(Arc::new(Mutex::new(spec.bounds.clone())));
         let need = Need {
             memory: u64::from(spec.vm.memory_mib),
+            cpu: spec.vm.cpus(),
             route: NEXT_ROUTE.fetch_add(1, Ordering::Relaxed),
         };
         capacity.cap(need.route, spec.bounds.instances);
@@ -2672,6 +2673,7 @@ impl Route {
         let bounds = Current(Arc::new(Mutex::new(spec.bounds.clone())));
         let need = Need {
             memory: u64::from(spec.vm.memory_mib),
+            cpu: spec.vm.cpus(),
             route: NEXT_ROUTE.fetch_add(1, Ordering::Relaxed),
         };
         capacity.cap(need.route, spec.bounds.instances);
@@ -2735,6 +2737,10 @@ impl Route {
             );
         }
         let snapshot = vm.snapshot(&place, &spec.vm).await?;
+        let snapshot = match spec.mode {
+            Mode::PerConnection => snapshot.of_connections(),
+            _ => snapshot,
+        };
         drop(vm);
         // the template gone, its snapshot the clones' alone to read (jail mode)
         place.seal().await?;
@@ -3492,9 +3498,11 @@ mod tests {
     async fn a_pool_failing_for_room_says_so() {
         let need = Need {
             memory: 1,
+            cpu: 100,
             route: 1,
         };
-        let Err(full) = Capacity::new(0, None).take(need, Duration::ZERO).await else {
+        let capacity = Capacity::new(0, None, None);
+        let Err(full) = capacity.take(need, Duration::ZERO).await else {
             panic!("no room at all");
         };
         for (failed, is_full, says) in [
@@ -3652,7 +3660,7 @@ mod tests {
             clones: Mutex::default(),
             failed: Mutex::default(),
             bounds: Current(Arc::new(Mutex::new(spec.bounds))),
-            capacity: Capacity::new(1, None),
+            capacity: Capacity::new(1, None, None),
             route: 1,
             changed: changed.clone(),
             ready_changed: Arc::new(|| {}),

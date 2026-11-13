@@ -15,7 +15,8 @@
 //!   copies). No `/dev/net/tun`, `/dev/urandom` or `/dev/userfaultfd`: a vsock-only
 //!   VM restored from a file needs none
 //! - a cgroup of its own ([`Cgroups`]), entered by `clone3` (`CLONE_INTO_CGROUP`), a
-//!   group of the cpu controller of its own only when its route caps its CPU; its
+//!   group of the cpu controller of its own (`cpu.weight` by the CPUs it holds, `cpu.max`
+//!   its route's `cpu`) but for a clone of a connection's own, which shares one; its
 //!   `memory.events` tells a VM the OOM killer took ([`Cgroup::oom_killed`])
 //! - a uid and gid of its own, no supplementary group, the capability bounding set
 //!   dropped, no new privileges; the wicket's seccomp filter (`seccomp`), then
@@ -821,18 +822,26 @@ impl Ids {
     }
 }
 
-/// The VMs' cgroups (v2), under a parent of theirs in two classes: `capped/` the VMs
-/// whose CPU their route's `cpu` caps (`cpu.max`), each a group of the cpu controller,
-/// `uncapped/` the others, without it (their class one group between them): a group per
-/// VM, scheduled on its own, cost 10% of the clone rate. In each, `route-<n>` for a
-/// route's template (its snapshot, which it writes, is charged there as long as the route
-/// lives) and `vm-<n>` for a VM serving, one per uid of [`Ids`] and reused (no cgroup made and
-/// removed per clone).
+/// The VMs' cgroups (v2), under a parent of theirs: `route-<n>` for a route's template (its
+/// snapshot, which it writes, is charged there as long as the route lives) and `vm-<n>` for a
+/// VM serving, one per uid of [`Ids`] and reused (no cgroup made and removed per clone). Each
+/// is a group of the cpu controller: its `cpu.weight` the VM's share of the CPUs among them
+/// ([`weight`]: by what it holds of the CPU budget), its `cpu.max` its route's `cpu`. So the
+/// VMs share the CPUs they contend for by what each was given, and the wicket's own cgroup,
+/// where it is their sibling (`keeper/`, [`KEEPER_WEIGHT`]), before them.
+///
+/// But a clone of a connection's own without `cpu` ([`Limits::weight`] none) is in `shared/`,
+/// one group of the cpu controller for all of them, their cgroups in it without: a group per
+/// VM, scheduled on its own, costs 8% of the clone rate, and nothing of a VM that lives on.
+/// Its threads share the group's CPUs as equals; the group's weight is what its VMs alive hold
+/// together, the keeper's to write ([`Cgroups::shared_weight`]).
 pub struct Cgroups {
     /// The parent, absolute.
     dir: PathBuf,
     /// Whether the keeper made it: removed at the end.
     made: bool,
+    /// Whether the VMs' cgroups are groups of the cpu controller: the hierarchy has it.
+    cpu: bool,
 }
 
 /// The cgroup v2 hierarchy.
@@ -841,17 +850,36 @@ const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 /// The controllers the VMs' cgroups use.
 const CONTROLLERS: &str = "+memory +pids";
 
-/// The controller of a route's `cpu`, enabled with [`CONTROLLERS`] down to the capped
-/// class where the hierarchy has it: a route asking for it fails its VMs' spawn where it
-/// is missing.
+/// The controller of the VMs' shares and of a route's `cpu`, enabled with [`CONTROLLERS`]
+/// down to the VMs' cgroups where the hierarchy has it: without it the VMs have no share of
+/// their own, and a route asking for `cpu` fails its VMs' spawn.
 const CPU_CONTROLLER: &str = "+cpu";
 
-/// The classes of the VMs' cgroups ([`Cgroups`]).
-const CAPPED: &str = "capped";
-const UNCAPPED: &str = "uncapped";
+/// The class of the VMs sharing one group of the cpu controller ([`Cgroups`]).
+const SHARED: &str = "shared";
+
+/// The classes of an earlier keeper's cgroups: removed with what it left.
+const EARLIER: [&str; 2] = ["capped", "uncapped"];
 
 /// The period of a VM's `cpu.max`, microseconds.
 pub const CPU_PERIOD_US: u64 = 100_000;
+
+/// `cpu.weight` per CPU a VM holds of the budget: a tenth of the kernel's default, so the
+/// shared group's weight follows its VMs up to 1000 CPUs ([`MAX_WEIGHT`]).
+const CPU_WEIGHT: u64 = 10;
+
+/// The most a `cpu.weight` is.
+const MAX_WEIGHT: u64 = 10_000;
+
+/// The `cpu.weight` of the keeper's leaf, the wicket's own cgroup, where the VMs' are its
+/// siblings: the most, its threads run before theirs. They relay every connection, and take
+/// the CPUs they need, not more.
+const KEEPER_WEIGHT: u64 = MAX_WEIGHT;
+
+/// The `cpu.weight` of a cgroup whose VMs hold `cpu` hundredths of a CPU of the budget.
+pub fn weight(cpu: u64) -> u64 {
+    (cpu.saturating_mul(CPU_WEIGHT).div_ceil(100)).clamp(1, MAX_WEIGHT)
+}
 
 /// What a VM's cgroup allows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -862,16 +890,19 @@ pub struct Limits {
     pub pids: u64,
     /// `cpu.max`'s quota per [`CPU_PERIOD_US`], microseconds; None = no limit.
     pub cpu: Option<u64>,
+    /// `cpu.weight`: its share of the CPUs; None = none of its own, its cgroup no group of
+    /// the cpu controller (a VM of the shared group; a hierarchy without the controller).
+    pub weight: Option<u64>,
 }
 
 impl Cgroups {
     /// The VMs' parent cgroup: `path` (under the hierarchy's root), made if missing, the
     /// controllers enabled down to it; or, None, the keeper's own cgroup (delegated to
     /// it: a systemd service's with `Delegate=yes`, a container's), which the keeper
-    /// leaves for a leaf (`keeper`): cgroup v2 enables no controller for the children of
-    /// a cgroup holding processes. Its classes made, the controllers enabled in them.
-    /// Removes the VMs' cgroups a previous keeper left, and fails when one still holds a
-    /// process.
+    /// leaves for a leaf (`keeper`, of [`KEEPER_WEIGHT`]): cgroup v2 enables no controller
+    /// for the children of a cgroup holding processes. The shared class made, without the
+    /// cpu controller for the cgroups in it. Removes the VMs' cgroups a previous keeper
+    /// left, and fails when one still holds a process.
     pub fn setup(path: Option<&str>) -> io::Result<Cgroups> {
         let root = Path::new(CGROUP_ROOT);
         if !is_cgroup2(root) {
@@ -903,7 +934,7 @@ impl Cgroups {
                     at.push(component);
                     enable(&at, busy, true)?;
                 }
-                Cgroups { dir, made }
+                Cgroups::at(dir, made)
             }
             None => {
                 let own = std::fs::read_to_string("/proc/self/cgroup")?;
@@ -929,23 +960,27 @@ impl Cgroups {
                      or set jail-cgroup",
                     true,
                 )?;
-                Cgroups { dir, made: false }
+                let cgroups = Cgroups::at(dir, false);
+                if cgroups.cpu {
+                    let weight = leaf.join("cpu.weight");
+                    std::fs::write(&weight, KEEPER_WEIGHT.to_string())
+                        .map_err(failed(&weight.display().to_string()))?;
+                }
+                cgroups
             }
         };
-        for capped in [true, false] {
-            let class = cgroups.class(capped);
-            match std::fs::create_dir(&class) {
-                Err(e) if e.kind() != io::ErrorKind::AlreadyExists => {
-                    return Err(failed(&class.display().to_string())(e));
-                }
-                _ => {}
+        let class = cgroups.dir.join(SHARED);
+        match std::fs::create_dir(&class) {
+            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => {
+                return Err(failed(&class.display().to_string())(e));
             }
-            enable(
-                &class,
-                "it holds processes, another wicket's: choose another jail-cgroup",
-                capped,
-            )?;
+            _ => {}
         }
+        enable(
+            &class,
+            "it holds processes, another wicket's: choose another jail-cgroup",
+            false,
+        )?;
         for stale in cgroups.children()? {
             let procs = std::fs::read_to_string(stale.join("cgroup.procs")).unwrap_or_default();
             if !procs.trim().is_empty() {
@@ -956,7 +991,19 @@ impl Cgroups {
             }
             std::fs::remove_dir(&stale).map_err(failed(&stale.display().to_string()))?;
         }
+        for earlier in EARLIER {
+            let _ = std::fs::remove_dir(cgroups.dir.join(earlier));
+        }
         Ok(cgroups)
+    }
+
+    /// The VMs' cgroups in `dir`, the controllers enabled for them: with the cpu controller
+    /// where it is among them.
+    fn at(dir: PathBuf, made: bool) -> Cgroups {
+        let control = dir.join("cgroup.subtree_control");
+        let enabled = std::fs::read_to_string(control).unwrap_or_default();
+        let cpu = enabled.split_whitespace().any(|name| name == "cpu");
+        Cgroups { dir, made, cpu }
     }
 
     /// The parent cgroup.
@@ -964,15 +1011,32 @@ impl Cgroups {
         &self.dir
     }
 
-    /// The class of the VMs whose CPU is `capped`, or not.
-    fn class(&self, capped: bool) -> PathBuf {
-        self.dir.join(if capped { CAPPED } else { UNCAPPED })
+    /// Whether the VMs' cgroups are groups of the cpu controller.
+    pub fn cpu(&self) -> bool {
+        self.cpu
     }
 
-    /// The cgroup `name` of the class of the VMs whose CPU is `capped`, or not, made if
-    /// missing.
-    pub fn child(&self, name: &str, capped: bool) -> io::Result<Cgroup> {
-        let dir = self.class(capped).join(name);
+    /// Where the cgroups of the VMs that share one group of the cpu controller are (`shared`),
+    /// or the others'.
+    fn class(&self, shared: bool) -> PathBuf {
+        match shared {
+            true => self.dir.join(SHARED),
+            false => self.dir.clone(),
+        }
+    }
+
+    /// The shared group's `cpu.weight`, open for the keeper to write what its VMs hold
+    /// ([`weight`]); none without the cpu controller.
+    pub fn shared_weight(&self) -> Option<std::fs::File> {
+        let weight = self.class(true).join("cpu.weight");
+        let open = || std::fs::OpenOptions::new().write(true).open(weight).ok();
+        self.cpu.then(open).flatten()
+    }
+
+    /// The cgroup `name`, of the VMs that share one group of the cpu controller (`shared`) or
+    /// a group of its own, made if missing.
+    pub fn child(&self, name: &str, shared: bool) -> io::Result<Cgroup> {
+        let dir = self.class(shared).join(name);
         match std::fs::create_dir(&dir) {
             Err(e) if e.kind() != io::ErrorKind::AlreadyExists => {
                 return Err(failed(&dir.display().to_string())(e));
@@ -997,19 +1061,23 @@ impl Cgroups {
         })
     }
 
-    /// Removes the cgroup `name`, of either class (its processes ended; the pages charged
+    /// Removes the cgroup `name`, shared or not (its processes ended; the pages charged
     /// to it stay charged to it, a dying cgroup, until they are freed).
     pub fn remove(&self, name: &str) {
-        for capped in [true, false] {
-            let _ = std::fs::remove_dir(self.class(capped).join(name));
+        for shared in [true, false] {
+            let _ = std::fs::remove_dir(self.class(shared).join(name));
         }
     }
 
-    /// The VMs' cgroups, `route-*` and `vm-*`: the classes', and the parent's (an
-    /// earlier keeper's, without classes).
+    /// The VMs' cgroups, `route-*` and `vm-*`: the parent's, the shared class's, and those
+    /// of an earlier keeper's classes.
     fn children(&self) -> io::Result<Vec<PathBuf>> {
         let mut children = Vec::new();
-        for dir in [self.dir.clone(), self.class(true), self.class(false)] {
+        let earlier = EARLIER.map(|class| self.dir.join(class));
+        for dir in [self.dir.clone(), self.class(true)]
+            .into_iter()
+            .chain(earlier)
+        {
             let entries = match std::fs::read_dir(&dir) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
                 entries => entries?,
@@ -1028,15 +1096,13 @@ impl Cgroups {
         Ok(children)
     }
 
-    /// Removes the VMs' cgroups (their processes ended), the classes, and the parent if
+    /// Removes the VMs' cgroups (their processes ended), the shared class, and the parent if
     /// the keeper made it.
     pub fn close(&self) {
         for child in self.children().unwrap_or_default() {
             let _ = std::fs::remove_dir(child);
         }
-        for capped in [true, false] {
-            let _ = std::fs::remove_dir(self.class(capped));
-        }
+        let _ = std::fs::remove_dir(self.class(true));
         if self.made {
             let _ = std::fs::remove_dir(&self.dir);
         }
@@ -1107,17 +1173,24 @@ impl Cgroup {
         ] {
             self.write(file, &value.to_string())?;
         }
-        // a capped VM's (its class's cgroups alone have the cpu controller: a hierarchy
-        // without it takes the routes without `cpu`)
-        if let Some(quota) = limits.cpu {
-            let value = format!("{quota} {CPU_PERIOD_US}");
-            self.write(c"cpu.max", &value).map_err(|e| match e.kind() {
-                io::ErrorKind::NotFound => io::Error::other(
+        match (limits.weight, limits.cpu) {
+            // a group of the cpu controller: its share, and its route's `cpu`, or none again
+            // where the VM before it of the id had one
+            (Some(weight), quota) => {
+                self.write(c"cpu.weight", &weight.to_string())?;
+                let capped = self.limits.is_some_and(|before| before.cpu.is_some());
+                if quota.is_some() || capped {
+                    let quota = quota.map_or("max".to_string(), |quota| quota.to_string());
+                    self.write(c"cpu.max", &format!("{quota} {CPU_PERIOD_US}"))?;
+                }
+            }
+            (None, Some(_)) => {
+                return Err(io::Error::other(
                     "cpu.max: the cpu controller is not enabled for the VMs' cgroups (cpu \
                      needs it)",
-                ),
-                _ => e,
-            })?;
+                ));
+            }
+            (None, None) => {}
         }
         self.limits = Some(limits);
         Ok(())

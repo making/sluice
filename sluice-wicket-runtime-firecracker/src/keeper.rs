@@ -87,6 +87,10 @@ const HOST_CPU_COPY: &str = "cpu0";
 /// How long a VM's spawn may wait for an id to be freed (the reap of a VM killed).
 const ID_WAIT_MS: i32 = 5000;
 
+/// How long the shared group's weight stays as written while its VMs come and go: written
+/// at every spawn and reap it cost 3% of the clone rate.
+const SHARED_WEIGHT_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// A VM's part in its route.
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Role {
@@ -107,6 +111,23 @@ pub struct Size {
     pub mem: u32,
     /// The host CPU time it may take, percent of one CPU; None = its vCPUs bound it.
     pub cpu: Option<u32>,
+    /// A clone of a connection's own: without `cpu`, its share of the CPUs is one with the
+    /// others' like it (`jail::Cgroups`), none of its own.
+    pub shared: bool,
+}
+
+impl Size {
+    /// What it holds of the CPU budget, in hundredths of a CPU: its vCPUs, or its `cpu`
+    /// where that is less.
+    pub fn cpus(&self) -> u64 {
+        let vcpus = u64::from(self.vcpus) * 100;
+        self.cpu.map_or(vcpus, |cpu| vcpus.min(u64::from(cpu)))
+    }
+
+    /// Whether a VM of it in `role` is one of the shared group.
+    fn shares(&self, role: Role) -> bool {
+        self.shared && self.cpu.is_none() && role == Role::Clone
+    }
 }
 
 /// A request of the wicket's.
@@ -375,11 +396,48 @@ struct Vm {
     route: u64,
     role: Role,
     id: u32,
-    /// Whether its CPU is capped: its cgroup's class.
-    capped: bool,
+    /// Whether it is one of the shared group: where its cgroup is, and what the group holds
+    /// with it.
+    shared: bool,
+    /// What it holds of the CPU budget, hundredths of a CPU.
+    cpu: u64,
     pid: libc::pid_t,
     /// `vm-<n>`, its id's: its sockets removed once it is reaped.
     dir: PathBuf,
+}
+
+/// The shared group's `cpu.weight` (`jail::Cgroups`): what its VMs alive hold of the CPU
+/// budget together, written as they come and go, [`SHARED_WEIGHT_INTERVAL`] apart at least.
+struct Shared {
+    /// The group's `cpu.weight`; none without the cpu controller.
+    weight: Option<std::fs::File>,
+    /// What its VMs alive hold, hundredths of a CPU.
+    cpu: u64,
+    /// The weight written last, and when.
+    written: Option<(u64, std::time::Instant)>,
+}
+
+impl Shared {
+    /// Writes the weight of what its VMs hold where that is due; else how long until it is.
+    /// A group without a VM keeps the weight it has: no thread runs by it.
+    fn settle(&mut self) -> Option<std::time::Duration> {
+        use std::io::Write as _;
+        let weight = jail::weight(self.cpu);
+        let file = self.weight.as_mut().filter(|_| self.cpu > 0)?;
+        if let Some((written, at)) = self.written {
+            let wait = SHARED_WEIGHT_INTERVAL.saturating_sub(at.elapsed());
+            if written == weight {
+                return None;
+            } else if !wait.is_zero() {
+                return Some(wait);
+            }
+        }
+        if let Err(e) = file.write_all(weight.to_string().as_bytes()) {
+            eprintln!("keeper: the shared group's cpu.weight {weight}: {e}");
+        }
+        self.written = Some((weight, std::time::Instant::now()));
+        None
+    }
 }
 
 /// A spawn waiting for an id.
@@ -408,9 +466,11 @@ struct Keeper {
     /// The ids whose directory (`vm-<n>`) is made, kept for the next VM of the id.
     made: HashSet<u32>,
     cgroups: Cgroups,
-    /// The clones' cgroups by id and whether their CPU is capped, made with the first
-    /// and reused.
+    /// The serving VMs' cgroups by id and whether they are of the shared group, made with
+    /// the first and reused.
     clones: HashMap<(u32, bool), Cgroup>,
+    /// The shared group's weight.
+    shared: Shared,
     /// The keeper's directory: `jail` (the template namespace's root), `route-<n>`,
     /// `vm-<n>`.
     dir: PathBuf,
@@ -514,6 +574,14 @@ impl Keeper {
         let null = std::fs::File::open("/dev/null")?.into();
         let pidfd = jail::own_pidfd()?;
         let cgroups = Cgroups::setup(jail.cgroup.as_deref())?;
+        if !cgroups.cpu() {
+            eprintln!(
+                "keeper: warning: {} has no cpu controller for the VMs' cgroups: the VMs have \
+                 no share of the CPUs of their own (cpu.weight), and a route's cpu fails its \
+                 VMs' spawn",
+                cgroups.dir().display()
+            );
+        }
 
         // the signals the keeper reads (blocked before the wicket starts: its exit is
         // never missed; the wicket unblocks them)
@@ -597,6 +665,11 @@ impl Keeper {
             free: (ids.first..=ids.last).collect(),
             ids,
             made: HashSet::new(),
+            shared: Shared {
+                weight: cgroups.shared_weight(),
+                cpu: 0,
+                written: None,
+            },
             cgroups,
             clones: HashMap::new(),
             dir,
@@ -631,8 +704,14 @@ impl Keeper {
                     revents: 0,
                 });
             }
-            // a spawn waiting for an id gives up in time
-            let timeout = if self.waiting.is_empty() { -1 } else { 100 };
+            // a spawn waiting for an id gives up in time, the shared group's weight is
+            // written once due
+            let due = self.shared.settle();
+            let timeout = match (self.waiting.is_empty(), due) {
+                (true, None) => -1,
+                (false, None) => 100,
+                (_, Some(due)) => due.as_millis() as libc::c_int + 1,
+            };
             // SAFETY: poll on an array of its length
             if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) } == -1 {
                 let e = io::Error::last_os_error();
@@ -714,9 +793,12 @@ impl Keeper {
             Role::Template => {
                 (self.routes.get_mut(&ended.route)).and_then(|route| route.cgroup.as_mut())
             }
-            Role::Boot | Role::Clone => self.clones.get_mut(&(ended.id, ended.capped)),
+            Role::Boot | Role::Clone => self.clones.get_mut(&(ended.id, ended.shared)),
         };
         let oom = cgroup.is_some_and(Cgroup::oom_killed);
+        if ended.shared {
+            self.shared.cpu -= ended.cpu;
+        }
         let log = crate::vm::log_tail(&ended.dir.join("firecracker.log"));
         // the id's next VM finds its run directory empty
         if let Ok(entries) = std::fs::read_dir(ended.dir.join("run")) {
@@ -996,13 +1078,18 @@ impl Keeper {
         let vm = self.next_vm;
         self.next_vm += 1;
         self.pids.insert(pid, vm);
+        let (shared, cpu) = (request.size.shares(request.role), request.size.cpus());
+        if shared {
+            self.shared.cpu += cpu;
+        }
         self.vms.insert(
             vm,
             Vm {
                 route: request.route,
                 role: request.role,
                 id,
-                capped: request.size.cpu.is_some(),
+                shared,
+                cpu,
                 pid,
                 dir: dir.clone(),
             },
@@ -1012,9 +1099,9 @@ impl Keeper {
 
     /// Starts the VM of `request` as the id `id`, its directory `dir`: the directory
     /// made for the id's first VM and kept (the reap empties its `run`), its log afresh,
-    /// its cgroup (the route's for a template, the id's for a VM serving, in the
-    /// class of its CPU, capped or not) made for the first and limited for each. Its pid and
-    /// a pidfd of it.
+    /// its cgroup (the route's for a template, the id's for a VM serving: of the shared
+    /// group, or a group of its own) made for the first and limited for each. Its pid and a
+    /// pidfd of it.
     fn jail(
         &mut self,
         id: u32,
@@ -1071,6 +1158,7 @@ impl Keeper {
         };
         let file_size =
             vm_file_size(request.role, mem).max(locked.as_ref().map_or(0, |(_, bytes)| *bytes));
+        let shared = request.size.shares(request.role);
         let limits = Limits {
             memory,
             pids: u64::from(request.size.vcpus) + THREADS,
@@ -1078,21 +1166,21 @@ impl Keeper {
                 .size
                 .cpu
                 .map(|percent| u64::from(percent) * jail::CPU_PERIOD_US / 100),
+            weight: (!shared && self.cgroups.cpu()).then(|| jail::weight(request.size.cpus())),
         };
-        let capped = limits.cpu.is_some();
         let route = self.routes.get_mut(&request.route).expect("checked");
         let cgroup = match request.role {
             Role::Template => {
                 if route.cgroup.is_none() {
                     let name = format!("route-{}", request.route);
-                    route.cgroup = Some(self.cgroups.child(&name, capped)?);
+                    route.cgroup = Some(self.cgroups.child(&name, false)?);
                 }
                 route.cgroup.as_mut().expect("made")
             }
-            Role::Boot | Role::Clone => match self.clones.entry((id, capped)) {
+            Role::Boot | Role::Clone => match self.clones.entry((id, shared)) {
                 std::collections::hash_map::Entry::Occupied(cgroup) => cgroup.into_mut(),
                 std::collections::hash_map::Entry::Vacant(vacant) => {
-                    vacant.insert(self.cgroups.child(&format!("vm-{n}"), capped)?)
+                    vacant.insert(self.cgroups.child(&format!("vm-{n}"), shared)?)
                 }
             },
         };
@@ -1546,5 +1634,32 @@ mod tests {
         for invalid in ["no-such-user-of-sluice", "1000:x"] {
             assert!(User::resolve(invalid).is_err(), "{invalid}");
         }
+    }
+
+    /// The shared group's weight is what its VMs hold, 10 a CPU and 1 at least: written at
+    /// once, then an interval apart at least, and not for a group left without a VM.
+    #[test]
+    fn the_shared_groups_weight_follows_its_vms() {
+        let path = std::env::temp_dir().join(format!("sfc-weight-{}", std::process::id()));
+        let mut shared = Shared {
+            weight: Some(std::fs::File::create(&path).unwrap()),
+            cpu: 150,
+            written: None,
+        };
+        let written = |shared: &Shared| shared.written.map(|(weight, _)| weight);
+        assert_eq!(shared.settle(), None);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "15");
+        shared.cpu = 5;
+        let due = shared.settle().expect("written a moment ago");
+        assert!(due <= SHARED_WEIGHT_INTERVAL, "{due:?}");
+        shared.cpu = 0;
+        assert_eq!(shared.settle(), None, "no VM: nothing to weigh");
+        assert_eq!(written(&shared), Some(15));
+        shared.cpu = 5;
+        std::thread::sleep(SHARED_WEIGHT_INTERVAL);
+        assert_eq!(shared.settle(), None);
+        assert_eq!(written(&shared), Some(1), "a twentieth of a CPU");
+        assert_eq!(jail::weight(2_000_000), 10_000, "the most a weight is");
+        std::fs::remove_file(&path).unwrap();
     }
 }

@@ -319,8 +319,10 @@ impl Console {
             budget: Budget {
                 max_instances: self.max_instances,
                 max_memory_mib: None,
+                max_cpus: None,
                 instances: table.pooled(),
                 memory_mib: None,
+                cpus: None,
             },
             capabilities: &Caps::NAMES,
             keyvalue_stores: self.store_views(),

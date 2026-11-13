@@ -59,7 +59,7 @@ fn made(file: &Path) -> Result<String, String> {
 
 /// The instances the wicket keeps at once at most, and what of them its routes keep for good
 /// (what refuses an edit for room): a wasm wicket's pools' units, a Firecracker wicket's booted
-/// and warm VMs, and their guest memory.
+/// and warm VMs, their guest memory and their CPUs.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 pub struct Budget {
     /// `--max-instances`.
@@ -67,11 +67,18 @@ pub struct Budget {
     /// `--max-memory-mib`; None: no memory budget.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_memory_mib: Option<u64>,
+    /// `--max-cpus`, in CPUs; None: no CPU budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_cpus: Option<f64>,
     /// The instances the routes keep.
     pub instances: usize,
     /// Their guest memory, where there is a memory budget.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub memory_mib: Option<u64>,
+    /// Their CPUs (a VM's its vCPUs, or its `cpu` where that is less), where there is a CPU
+    /// budget.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cpus: Option<f64>,
 }
 
 #[cfg(test)]

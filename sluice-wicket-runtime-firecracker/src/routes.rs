@@ -73,7 +73,7 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 
 use crate::BoxError;
-use crate::capacity::{Capacity, Full};
+use crate::capacity::{Capacity, Full, cpus};
 use crate::config::{File, Origin, RouteSource};
 use crate::deployed::{self, AppSpec, Deployed, Options};
 use crate::listener;
@@ -99,9 +99,10 @@ pub struct Table {
 }
 
 impl Table {
-    /// The VMs the advertised routes keep for good (their booted VMs, their pools' warm), and
-    /// their guest memory: what an edit's routes may not need more of than the budget.
-    pub fn resident(&self) -> (usize, u64) {
+    /// The VMs the advertised routes keep for good (their booted VMs, their pools' warm), their
+    /// guest memory (MiB) and their CPUs (hundredths): what an edit's routes may not need more
+    /// of than the budget.
+    pub fn resident(&self) -> Resident {
         let targets: HashSet<&String> = self.advertised.iter().map(|up| &up.target_url).collect();
         let specs: Vec<RouteSpec> = targets
             .into_iter()
@@ -1717,36 +1718,89 @@ fn fits(specs: &[(RouteSpec, Origin)], capacity: &Capacity) -> Result<(), BoxErr
             targets.push((target, spec));
         }
     }
-    let kept = |spec: &RouteSpec| spec.resident() as u64 * u64::from(spec.vm.memory_mib);
-    let (resident, in_memory) = resident(targets.iter().map(|(_, spec)| *spec));
-    let cloned = || targets.iter().filter(|(_, spec)| spec.mode.cloned());
-    let vms = cloned()
-        .map(|(_, spec)| resident - spec.resident() + 1)
-        .fold(resident, usize::max);
-    let memory = cloned()
-        .map(|(_, spec)| in_memory - kept(spec) + u64::from(spec.vm.memory_mib))
-        .fold(in_memory, u64::max);
-    if vms > capacity.max_instances() || capacity.max_memory_mib().is_some_and(|max| memory > max) {
+    let kept = resident(targets.iter().map(|(_, spec)| *spec));
+    // the most at once: beside a cloned route's template, its own VMs not there yet
+    let cloned = targets.iter().filter(|(_, spec)| spec.mode.cloned());
+    let needed = cloned
+        .map(|(_, spec)| {
+            let own = Resident::of(spec, spec.resident());
+            kept.without(own).with(Resident::of(spec, 1))
+        })
+        .fold(kept, Resident::most);
+    let within = |max: Option<u64>, needed: u64| max.is_none_or(|max| needed <= max);
+    if needed.vms > capacity.max_instances()
+        || !within(capacity.max_memory_mib(), needed.memory)
+        || !within(capacity.max_cpu(), needed.cpu)
+    {
+        let none = || "-".to_string();
         return Err(Full::over(format!(
-            "the routes need {vms} VM(s) and {memory} MiB of guest memory to start (their booted \
-             VMs, their pools' warm VMs, and a template at a time beside the other routes'): over \
-             --max-instances {} / --max-memory-mib {}",
+            "the routes need {} VM(s), {} MiB of guest memory and {} CPU(s) to start (their \
+             booted VMs, their pools' warm VMs, and a template at a time beside the other \
+             routes'): over --max-instances {} / --max-memory-mib {} / --max-cpus {}",
+            needed.vms,
+            needed.memory,
+            cpus(needed.cpu),
             capacity.max_instances(),
             capacity
                 .max_memory_mib()
-                .map_or("-".to_string(), |mib| mib.to_string())
+                .map_or_else(none, |mib| mib.to_string()),
+            capacity.max_cpu().map_or_else(none, cpus),
         ))
         .into());
     }
     Ok(())
 }
 
-/// The VMs the routes of `specs`, one of each target, keep for good, and their guest memory.
-fn resident<'a>(specs: impl Iterator<Item = &'a RouteSpec>) -> (usize, u64) {
-    specs.fold((0, 0), |(vms, memory), spec| {
-        let resident = spec.resident();
-        let mib = resident as u64 * u64::from(spec.vm.memory_mib);
-        (vms + resident, memory + mib)
+/// What routes keep of the budget for good.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Resident {
+    pub vms: usize,
+    /// Their guest memory, MiB.
+    pub memory: u64,
+    /// Their CPUs, hundredths.
+    pub cpu: u64,
+}
+
+impl Resident {
+    /// `vms` VMs of `spec`.
+    fn of(spec: &RouteSpec, vms: usize) -> Resident {
+        Resident {
+            vms,
+            memory: vms as u64 * u64::from(spec.vm.memory_mib),
+            cpu: vms as u64 * spec.vm.cpus(),
+        }
+    }
+
+    fn with(self, more: Resident) -> Resident {
+        Resident {
+            vms: self.vms + more.vms,
+            memory: self.memory + more.memory,
+            cpu: self.cpu + more.cpu,
+        }
+    }
+
+    fn without(self, less: Resident) -> Resident {
+        Resident {
+            vms: self.vms - less.vms,
+            memory: self.memory - less.memory,
+            cpu: self.cpu - less.cpu,
+        }
+    }
+
+    /// The larger of each.
+    fn most(self, other: Resident) -> Resident {
+        Resident {
+            vms: self.vms.max(other.vms),
+            memory: self.memory.max(other.memory),
+            cpu: self.cpu.max(other.cpu),
+        }
+    }
+}
+
+/// What the routes of `specs`, one of each target, keep for good.
+fn resident<'a>(specs: impl Iterator<Item = &'a RouteSpec>) -> Resident {
+    specs.fold(Resident::default(), |kept, spec| {
+        kept.with(Resident::of(spec, spec.resident()))
     })
 }
 
@@ -1783,26 +1837,36 @@ mod tests {
         ];
         let booted: &[(&str, &str)] = &[("memory-mib", "64")];
         let scaled: &[(&str, &str)] = &[("memory-mib", "64"), ("instances", "3")];
-        for (routes, max_instances, max_memory_mib, fit) in [
-            (&[("a", pool), ("b", pool)][..], 2, 128, true),
-            (&[("a", pool), ("b", pool)], 1, 128, false),
-            (&[("a", pool), ("b", pool)], 2, 127, false),
-            (&[("a", booted), ("b", pool)], 2, 128, true),
-            // N x memory-mib, all of them for good
-            (&[("a", scaled), ("b", pool)], 4, 256, true),
-            (&[("a", scaled), ("b", pool)], 3, 256, false),
-            (&[("a", scaled), ("b", pool)], 4, 255, false),
+        // half a CPU of its two vCPUs
+        let capped: &[(&str, &str)] = &[("memory-mib", "64"), ("vcpus", "2"), ("cpu", "50")];
+        // hundredths of a CPU, a vCPU 100
+        const CPUS: u64 = 6400;
+        for (routes, max_instances, max_memory_mib, max_cpu, fit) in [
+            (&[("a", pool), ("b", pool)][..], 2, 128, CPUS, true),
+            (&[("a", pool), ("b", pool)], 1, 128, CPUS, false),
+            (&[("a", pool), ("b", pool)], 2, 127, CPUS, false),
+            (&[("a", pool), ("b", pool)], 2, 128, 199, false),
+            (&[("a", booted), ("b", pool)], 2, 128, 200, true),
+            // N x memory-mib and N x its CPUs, all of them for good
+            (&[("a", scaled), ("b", pool)], 4, 256, 400, true),
+            (&[("a", scaled), ("b", pool)], 3, 256, 400, false),
+            (&[("a", scaled), ("b", pool)], 4, 255, 400, false),
+            (&[("a", scaled), ("b", pool)], 4, 256, 399, false),
             // no VM of its own to take a template's place
-            (&[("a", pool), ("b", large)], 1, 320, false),
-            (&[("a", pool), ("b", large)], 2, 319, false),
-            (&[("a", pool), ("b", large)], 2, 320, true),
+            (&[("a", pool), ("b", large)], 1, 320, 200, false),
+            (&[("a", pool), ("b", large)], 2, 319, 200, false),
+            (&[("a", pool), ("b", large)], 2, 320, 199, false),
+            (&[("a", pool), ("b", large)], 2, 320, 200, true),
+            // its `cpu` where that is less than its vCPUs
+            (&[("a", capped), ("b", booted)], 2, 128, 150, true),
+            (&[("a", capped), ("b", booted)], 2, 128, 149, false),
         ] {
-            let capacity = Capacity::new(max_instances, Some(max_memory_mib));
+            let capacity = Capacity::new(max_instances, Some(max_memory_mib), Some(max_cpu));
             let hosts: Vec<_> = routes.iter().map(|(host, _)| host).collect();
             assert_eq!(
                 fits(&specs(routes), &capacity).is_ok(),
                 fit,
-                "{hosts:?} {max_instances} {max_memory_mib}"
+                "{hosts:?} {max_instances} {max_memory_mib} {max_cpu}"
             );
         }
     }

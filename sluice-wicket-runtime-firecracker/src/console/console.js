@@ -451,6 +451,13 @@ function budgetStatus(listing) {
   memory.title = budget.max_memory_mib === null || budget.max_memory_mib === undefined
     ? "their guest memory; no memory budget (--max-memory-mib)"
     : "their guest memory / --max-memory-mib";
+  const cpus = field("budget-cpus");
+  cpus.textContent = budget.max_cpus === null || budget.max_cpus === undefined
+    ? `${budget.cpus}`
+    : `${budget.cpus} / ${budget.max_cpus}`;
+  cpus.title = budget.max_cpus === null || budget.max_cpus === undefined
+    ? "the CPUs they hold: each its vCPUs, or its cpu where that is less; no CPU budget (--max-cpus)"
+    : "the CPUs they hold: each its vCPUs, or its cpu where that is less / --max-cpus";
 }
 
 consolePage({

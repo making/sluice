@@ -52,9 +52,9 @@
 //! started as root (`sudo -n`, skipped without it), the wicket as the test's user,
 //! and checks the jails: each VM a `firecracker` of an id of its own, PID 1 of its
 //! namespace, without privileges, under seccomp filters of the keeper's, its own and
-//! Firecracker's, in a cgroup limiting its memory (and a route's
-//! clones' CPU, `cpu`, theirs alone with the cpu controller); the VMs and the
-//! wicket ending with the keeper (SIGKILL).
+//! Firecracker's, in a cgroup limiting its memory, a group of the cpu controller weighted
+//! by the CPUs it holds (a route's `cpu` capping it), a connection's own clones in one they
+//! share; the VMs and the wicket ending with the keeper (SIGKILL).
 #![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
@@ -213,7 +213,7 @@ async fn every_route_serves_http_through_the_tunnel() {
     }
     let booted_egress = booted_egress.join(", ");
     let config = dir.0.join("wicket.yaml");
-    // jailed, the clones' CPU limited by their cgroups
+    // jailed, the clones' CPU limited by their cgroups, each a group of its own
     let cpu = match jailed {
         true => format!(", cpu: {CLONE_CPU}"),
         false => String::new(),
@@ -627,9 +627,9 @@ async fn every_route_serves_http_through_the_tunnel() {
 
 /// What keeps a route below its `warm` reads so in its `vms.down` until the VMs are up: the starts
 /// of a pool and the restores of warm clones failing, their snapshot gone, and of a pool finding no
-/// room in the budget. A VM beyond `warm` finding none is its connections' affair alone. At `warm`
-/// 0, a connection's restore failing reads so too with no VM alive, since the first one: tried
-/// again, it is over as the restores are, with no other connection.
+/// room in the budget (its CPUs: `--max-cpus`). A VM beyond `warm` finding none is its connections'
+/// affair alone. At `warm` 0, a connection's restore failing reads so too with no VM alive, since
+/// the first one: tried again, it is over as the restores are, with no other connection.
 async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> Wicket) {
     const POOL: &str = "pool.local";
     const CLONES: &str = "clones.local";
@@ -650,8 +650,8 @@ async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> 
         &config.display().to_string(),
         "--state-dir",
         &state.display().to_string(),
-        // a pool's 2 VMs and a template beside them: a reload takes no less
-        "--max-instances",
+        // a pool's 2 VMs and a template beside them, a vCPU each: a reload takes no less
+        "--max-cpus",
         "3",
         "--listen",
         "127.0.0.1:0",
@@ -670,6 +670,14 @@ async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> 
         move |route: &serde_json::Value| pooled(n)(route) && route["instances"]["down"].is_null()
     };
     listed_as(wicket, POOL, up(1)).await;
+    // the budget as the apps' listing has it: what the routes keep for good, the pool's VM
+    let (_, apps) = console(wicket.console(), "GET", "/api/apps", true, Bytes::new()).await;
+    let budget = &apps["budget"];
+    assert_eq!(
+        (&budget["max_cpus"], &budget["cpus"]),
+        (&3.0.into(), &1.0.into()),
+        "{apps}"
+    );
     let serving = async |host: &str| {
         let mut client = tokio::net::TcpStream::connect(wicket.listening())
             .await
@@ -787,6 +795,7 @@ async fn below_warm(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> 
     let mark = wicket.log().len();
     let on_the_pool = serving(POOL).await;
     said_after(wicket, mark, "pool VM: no room").await;
+    said_after(wicket, mark, "CPUs 3/3, the route's 1/2").await;
     let beyond = listed(wicket, POOL).await;
     assert_eq!(
         beyond["instances"]["down"],
@@ -1395,6 +1404,9 @@ async fn deploy(
     let budget = &listing["budget"];
     assert!(budget["instances"].as_u64() >= Some(1), "{budget}");
     assert_eq!(budget["max_instances"], 64);
+    // no CPU budget: what the VMs alive hold, a vCPU each but clone.local's capped ones
+    assert!(budget["max_cpus"].is_null(), "{budget}");
+    assert!(budget["cpus"].as_f64() >= Some(1.0), "{budget}");
 
     // an app: refused until its image is uploaded under its digest, then two hosts on
     // one rootfs and VMs of its own, its env seen by the guest and listed by its names
@@ -2949,10 +2961,13 @@ async fn settled(wicket: &Wicket) {
 /// The jails of the VMs alive (the booted VM and the warm clones): each a
 /// `firecracker` of an id of its own, PID 1 of its namespace, without capability or
 /// new privileges, its seccomp filter on, in a cgroup of the keeper's limiting its
-/// memory, and the CPU of clone.local's alone (under `cgroup`, else beside the keeper's
-/// own: its default), on aarch64 the
-/// host CPU's files Firecracker reads in it; the wicket as `user`. The keeper killed (SIGKILL), they and the wicket end with it (their parent
-/// death signal); its files and cgroups are removed here (a container's go with it).
+/// memory (under `cgroup`, else beside the keeper's own: its default, the keeper's of the
+/// most weight there), a group of the cpu controller weighted by the CPUs it holds, 10 a
+/// vCPU, clone.local's capped by its `cpu` and weighted by it; a connection's own clone
+/// without `cpu` in the group they share, weighted by what they hold together; on aarch64
+/// the host CPU's files Firecracker reads in it; the wicket as `user`. The keeper killed
+/// (SIGKILL), they and the wicket end with it (their parent death signal); its files and
+/// cgroups are removed here (a container's go with it).
 fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
     let keeper = wicket.keeper();
     // the keeper's seccomp filter (the container's under it, if any), the wicket's and
@@ -2965,9 +2980,15 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
             .unwrap_or_default()
             .to_string()
     };
-    // the keeper leaves its own for a leaf of it (`keeper`), the VMs' cgroups beside
+    let weight_of = |cgroup: &str| {
+        let weight = std::fs::read_to_string(format!("/sys/fs/cgroup/{cgroup}/cpu.weight"));
+        weight.map(|weight| weight.trim().to_string())
+    };
+    // the keeper leaves its own for a leaf of it (`keeper`), the VMs' cgroups beside: the
+    // wicket's threads before the VMs'
     let cgroup = cgroup.map(String::from).unwrap_or_else(|| {
         let own = cgroup_of(keeper);
+        assert_eq!(weight_of(&own).ok().as_deref(), Some("10000"), "{own}");
         own.strip_suffix("/keeper").unwrap_or(&own).to_string()
     });
     let user = user.to_string();
@@ -2978,7 +2999,7 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
         wicket.log()
     );
     let mut ids = Vec::new();
-    let mut cpu_limited = 0;
+    let (mut cpu_limited, mut sharing) = (0, 0);
     for vm in &vms {
         let id = status(*vm, "Uid:");
         assert!(
@@ -3011,19 +3032,28 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
         );
         let max = std::fs::read_to_string(format!("/sys/fs/cgroup/{own}/memory.max")).unwrap();
         assert_ne!(max.trim(), "max", "{vm}: its memory limited");
-        // clone.local's CPU capped, its cgroup a group of the cpu controller; the
-        // others' without the controller
+        // a group of the cpu controller of its own, its weight the CPUs it holds, 10 a
+        // vCPU, clone.local's its `cpu`'s, which caps it; a connection's own clone without
+        // `cpu` in the shared group, its cgroup none
         let cpu = std::fs::read_to_string(format!("/sys/fs/cgroup/{own}/cpu.max"));
-        match own.rsplit('/').nth(1) {
-            Some("capped") => {
-                let limit = format!("{} 100000", CLONE_CPU * 1000);
-                assert_eq!(cpu.unwrap().trim(), limit, "{vm}");
+        let cpu = cpu.map(|cpu| cpu.trim().to_string());
+        let limit = format!("{} 100000", CLONE_CPU * 1000);
+        let named = own.strip_prefix(&format!("{cgroup}/")).unwrap();
+        let by_vcpus = 10 * vcpus(*vm);
+        match (named.split_once('/'), cpu.as_deref()) {
+            (Some(("shared", _)), Err(_)) => sharing += by_vcpus,
+            (None, Ok("max 100000")) => {
+                assert_eq!(weight_of(&own).unwrap(), by_vcpus.to_string(), "{vm}")
+            }
+            (None, Ok(capped)) if capped == limit => {
+                assert_eq!(
+                    weight_of(&own).unwrap(),
+                    (CLONE_CPU / 10).to_string(),
+                    "{vm}"
+                );
                 cpu_limited += 1;
             }
-            class => {
-                assert_eq!(class, Some("uncapped"), "{vm}: its cgroup {own}");
-                assert!(cpu.is_err(), "{vm}: its cgroup {own} has cpu.max");
-            }
+            other => panic!("{vm}: its cgroup {own}: {other:?}"),
         }
         // aarch64: the host CPU's files Firecracker reads, the host's in the jail
         if cfg!(target_arch = "aarch64") {
@@ -3049,6 +3079,19 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
         cpu_limited > 0,
         "clone.local's warm clones: their CPU limited"
     );
+    // console.local's warm clone (none in the image, which has no console): the shared
+    // group's weight what its VMs hold, written within the keeper's interval
+    assert!(sharing > 0 || wicket.container.is_some(), "{vms:?}");
+    let shared = format!("{cgroup}/shared");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while sharing > 0 && weight_of(&shared).unwrap() != sharing.to_string() {
+        assert!(
+            Instant::now() < deadline,
+            "{shared}: {:?}",
+            weight_of(&shared)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(others.len(), 1, "the wicket: {others:?}");
     assert_eq!(
         status(others[0], "Uid:").split_whitespace().next(),
@@ -3087,6 +3130,14 @@ fn jails(wicket: &Wicket, cgroup: Option<&str>, user: u32) {
             .unwrap();
         assert!(cleaned.success());
     }
+}
+
+/// The vCPUs of the VM whose `firecracker` is `pid`: its threads named so.
+fn vcpus(pid: i32) -> u64 {
+    let threads = std::fs::read_dir(format!("/proc/{pid}/task")).unwrap();
+    let names =
+        threads.filter_map(|thread| std::fs::read_to_string(thread.ok()?.path().join("comm")).ok());
+    names.filter(|name| name.starts_with("fc_vcpu")).count() as u64
 }
 
 /// The children of `pid`.

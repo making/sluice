@@ -91,6 +91,10 @@ usage: sluice-wicket-runtime-firecracker --kernel <vmlinux> --vm <host>=<rootfs.
                                   templates (default 64)
   --max-memory-mib <MiB>          their guest memory (memory-mib) at most (default none:
                                   --max-instances x the largest memory-mib bounds it)
+  --max-cpus <n>|<ratio>x         their CPUs at most, a VM's its vcpus (its cpu where less):
+                                  so many, or with x so many times the CPUs the wicket runs
+                                  on, 4x: four vCPUs to each (default none: --max-instances
+                                  x the largest vcpus bounds them)
   --workers <n>                   threads relaying the connections, a node's tunnel stream
                                   and its connections on one (default 4, at most the CPUs)
   --tunnel-stall-timeout <secs>   give a stream up once its frames wait that long untaken
@@ -187,6 +191,8 @@ pub struct Settings {
     pub max_instances: usize,
     /// MiB; None = no memory budget.
     pub max_memory_mib: Option<u64>,
+    /// Hundredths of a CPU; None = no CPU budget.
+    pub max_cpus: Option<u64>,
     /// The relay workers (`sluice_wicket_tunnel::workers`).
     pub workers: usize,
     /// How often the routes' files are polled; zero = SIGHUP only.
@@ -235,6 +241,7 @@ const VALUED: &[&str] = &[
     "max-connections",
     "max-instances",
     "max-memory-mib",
+    "max-cpus",
     "workers",
     "tunnel-stall-timeout",
     "drain-grace",
@@ -404,6 +411,10 @@ pub fn parse(
     let max_instances = positive("max-instances", file.and_then(|file| file.max_instances))?
         .map_or(DEFAULT_MAX_INSTANCES, |max| max as usize);
     let max_memory_mib = positive("max-memory-mib", file.and_then(|file| file.max_memory_mib))?;
+    let max_cpus = flag("max-cpus")
+        .or_else(|| file.and_then(|file| file.max_cpus.as_ref().map(Cpus::text)))
+        .map(|cpus| max_cpus(&cpus, host_cpus()))
+        .transpose()?;
     let workers = positive("workers", file.and_then(|file| file.workers))?.map_or_else(
         || {
             std::thread::available_parallelism()
@@ -548,6 +559,7 @@ pub fn parse(
         )?,
         max_instances,
         max_memory_mib,
+        max_cpus,
         workers,
         watch_interval: seconds(
             "watch-interval",
@@ -566,6 +578,29 @@ pub fn parse(
         routes,
         specs,
     })))
+}
+
+/// The CPUs the wicket runs on: those its affinity and its cgroup's quota leave it.
+pub fn host_cpus() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
+}
+
+/// `--max-cpus` in hundredths of a CPU: so many CPUs, or with `x` so many times `host`, the
+/// CPUs the wicket runs on.
+fn max_cpus(value: &str, host: usize) -> Result<u64, String> {
+    let (number, times) = match value.strip_suffix('x') {
+        Some(ratio) => (ratio, host as f64),
+        None => (value, 1.0),
+    };
+    let plain = !number.is_empty() && number.chars().all(|c| c.is_ascii_digit() || c == '.');
+    let cpus = number.parse::<f64>().ok().filter(|_| plain);
+    match cpus.map(|cpus| (cpus * times * 100.0).round()) {
+        Some(cpu) if (1.0..=1e12).contains(&cpu) => Ok(cpu as u64),
+        _ => Err(format!(
+            "--max-cpus {value}: expected a number of CPUs (64, 1.5) or of times those the \
+             wicket runs on (4x), a hundredth of a CPU at least"
+        )),
+    }
 }
 
 /// Where a route comes from.
@@ -829,6 +864,7 @@ pub struct File {
     max_connections: Option<u64>,
     max_instances: Option<u64>,
     max_memory_mib: Option<u64>,
+    max_cpus: Option<Cpus>,
     workers: Option<u64>,
     tunnel_stall_timeout: Option<Scalar>,
     drain_grace: Option<Scalar>,
@@ -1003,6 +1039,24 @@ impl FileRoute {
     }
 }
 
+/// A YAML scalar taken as `--max-cpus`: a number of CPUs, or a ratio (`4x`).
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Cpus {
+    Number(f64),
+    Text(String),
+}
+
+impl Cpus {
+    /// As the flag has it.
+    fn text(&self) -> String {
+        match self {
+            Cpus::Number(cpus) => cpus.to_string(),
+            Cpus::Text(text) => text.trim().to_string(),
+        }
+    }
+}
+
 /// A YAML scalar taken as a duration.
 #[derive(Deserialize)]
 #[serde(untagged)]
@@ -1059,7 +1113,7 @@ mod tests {
     /// A flag wins over the environment, the environment over the file, the
     /// file over the defaults; the file's paths are relative to it, its routes
     /// come before the flags', a host is routed once, a route's `cpu` needs jail
-    /// mode.
+    /// mode; the CPU budget is a number of CPUs or of times those it runs on.
     #[test]
     fn flags_win_over_the_environment_over_the_file_over_the_defaults() {
         let dir = std::env::temp_dir().join(format!("sfc-config-{}", std::process::id()));
@@ -1070,7 +1124,7 @@ mod tests {
         std::fs::write(
             &config,
             "server: grpc://file:8001\ntoken: from-file\nkernel: vmlinux\nmax-instances: 8\nworkers: 2\n\
-             health: 127.0.0.1:8081\n\
+             max-cpus: 2x\nhealth: 127.0.0.1:8081\n\
              drain-grace: 5s\nevacuation-grace: 1m\nready-grace: 2m\nflume: grpc://file:8002\nflume-token: from-file\n\
              flume-ca-cert: flume-ca.pem\njail-ids: 900000-900063\njail-user: from-file\n\
              console: 127.0.0.1:9090\nconsole-dir: kept\noidc-claim: [email=*]\n\
@@ -1131,6 +1185,11 @@ mod tests {
             "its directory relative to the file"
         );
         assert_eq!(settings.max_instances, 8);
+        assert_eq!(
+            settings.max_cpus,
+            Some(2 * 100 * host_cpus() as u64),
+            "twice the CPUs it runs on, in hundredths"
+        );
         assert_eq!(settings.workers, 2);
         assert_eq!(settings.drain_grace, Duration::from_secs(5));
         assert_eq!(settings.evacuation_grace, Duration::from_secs(60));
@@ -1167,6 +1226,7 @@ mod tests {
                 "--token",
                 "flag",
                 "--max-instances=4",
+                "--max-cpus=6.5",
                 "--workers=3",
                 "--health=0.0.0.0:10",
                 "--flume=grpcs://flag:8002",
@@ -1202,6 +1262,7 @@ mod tests {
         assert_eq!(settings.token, "flag");
         assert_eq!(settings.health.as_deref(), Some("0.0.0.0:10"));
         assert_eq!(settings.max_instances, 4);
+        assert_eq!(settings.max_cpus, Some(650));
         assert_eq!(settings.workers, 3);
         assert_eq!(
             settings.jail,
@@ -1229,10 +1290,9 @@ mod tests {
         )
         .unwrap();
         let by_file = dir.join("by-file.yaml").display().to_string();
-        assert_eq!(
-            run(&["--config", &by_file], &[]).unwrap().token,
-            "from-token-file"
-        );
+        let settings = run(&["--config", &by_file], &[]).unwrap();
+        assert_eq!(settings.token, "from-token-file");
+        assert_eq!(settings.max_cpus, None, "no CPU budget unless stated");
         let token_file = dir.join("token").display().to_string();
         let settings = run(
             &["--config", &config_flag, "--token-file", &token_file],
@@ -1315,6 +1375,10 @@ mod tests {
             (
                 vec!["--config", &config_flag, "--token-file", "missing"],
                 "--token-file missing:",
+            ),
+            (
+                vec!["--config", &config_flag, "--max-cpus", "0x"],
+                "--max-cpus 0x: expected a number of CPUs",
             ),
             (
                 vec![

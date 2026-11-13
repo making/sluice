@@ -267,6 +267,7 @@ kernel: /opt/firecracker/vmlinux
 firecracker: firecracker        # on the PATH
 max-instances: 64
 max-memory-mib: 16384           # of guest memory
+max-cpus: 4x                    # the VMs' CPUs: 4 times the wicket's; or so many, 256
 workers: 4                      # threads relaying the connections
 watch-interval: 1s              # 0 = SIGHUP only
 drain-grace: 20s
@@ -497,7 +498,7 @@ each route's VMs (up or pooled and their restarts, ready, warm, kept, starting, 
 use](#what-a-vm-uses)) and whether it is
 advertised ([Readiness](#readiness)), its connections, a cloned
 route's snapshot (its memory file, the template's boot and snapshot times) and the budget
-(`--max-instances`, `--max-memory-mib`) taken. It takes 64 connections at once; TCP keepalive ends one whose
+(`--max-instances`, `--max-memory-mib`, `--max-cpus`) taken. It takes 64 connections at once; TCP keepalive ends one whose
 client is gone, and a client that leaves one waiting for 60s, not sending a request or not reading
 its answer, loses it. All taken, one without a request the gate let through gives way to the next,
 the source holding the most first
@@ -592,7 +593,7 @@ digest, or made of an OCI image, first; the app names it:
 | `PUT /api/components/<sha256>` | keeps the body, an ext4 image of 4 GiB at most, under its digest (400 when the body has another): `{"sha256": .., "bytes": ..}` |
 | `PUT /api/images` | makes an ext4 image of the OCI image the body names (below), kept under its digest as an upload: `{"image": <the reference pinned to its digest>, "name": .., "sha256": .., "bytes": ..}` |
 | `PUT /api/layers/<sha256>`, `GET /api/layers/<sha256>?at=<n>`, `POST /api/builds`, `GET` / `DELETE /api/builds/<id>`, `DELETE /api/caches/<name>` | source staged by buildpacks into a droplet ([below](#source-staged-by-buildpacks)) |
-| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "wicket", "budget", "runtime": "firecracker", "capabilities": [], "keyvalue_stores": [], "apps": [..]}`; `wicket` which wicket this is: `id`, made at its first start and kept in the console directory (`wicket-id`), `node`, its flume node (`wicket:<client-id>`, null without `--flume`), `build`, `since` (its start, in seconds since the epoch); `budget` `max_instances`, `max_memory_mib` (with `--max-memory-mib`) and what the routes keep of them for good (their booted and warm VMs): `instances`, `memory_mib`. An app needing more is refused 422 with `"no_room": true` |
+| `GET /api/apps[?after=<revision>]` | the apps, as `/api/routes` (held with `after`): `{"revision", "generation", "wicket", "budget", "runtime": "firecracker", "capabilities": [], "keyvalue_stores": [], "apps": [..]}`; `wicket` which wicket this is: `id`, made at its first start and kept in the console directory (`wicket-id`), `node`, its flume node (`wicket:<client-id>`, null without `--flume`), `build`, `since` (its start, in seconds since the epoch); `budget` `max_instances`, `max_memory_mib` (with `--max-memory-mib`), `max_cpus` (with `--max-cpus`, in CPUs) and what the routes keep of them for good (their booted and warm VMs): `instances`, `memory_mib`, `cpus`. An app needing more is refused 422 with `"no_room": true` |
 | `PUT /api/apps/<name>` | serves the app of the body (JSON, below) |
 | `DELETE /api/apps/<name>?owner=<owner>` | removes the app of `owner` |
 | `PUT /api/evacuated/<owner>` | a wicket leaving (`"leaving"` in both listings, `--evacuation-grace`): `owner` moved what of its apps it could, those left staying until the drain; 409 unless leaving |
@@ -808,13 +809,24 @@ is where `/init` mounts it before the process starts, `disk-mib` its size (defau
 ### Limits
 
 `--max-instances N` (default 64) caps the VMs alive at once over every route -- booted ones,
-templates, clones warm, in use, kept and pooled -- and `--max-memory-mib N` (default none:
-`--max-instances` x the largest `memory-mib` bounds it) their guest memory (`memory-mib`). A route's
+templates, clones warm, in use, kept and pooled --, `--max-memory-mib N` (default none:
+`--max-instances` x the largest `memory-mib` bounds it) their guest memory (`memory-mib`) and
+`--max-cpus` (default none: `--max-instances` x the largest `vcpus`) their CPUs. A route's
 `instances=N` caps its own (at least `warm`). A VM takes its share before its `firecracker` starts
 and gives it back once killed, and one going down holds it for the VM in its place; a startup whose
-booted VMs (`instances` x `memory-mib`) and pools' `warm` VMs do not fit, with
+booted VMs (`instances` x `memory-mib`, x their CPUs) and pools' `warm` VMs do not fit, with
 a template at a time beside the other routes', fails, and so does a reload (a console's edit
 included).
+
+A VM's CPUs are its `vcpus`, or its route's `cpu` where that is less (`vcpus=2`: 2; `cpu=50`: 0.5),
+whatever it runs. `--max-cpus` is so many (`96`, `6.5`) or, with `x`, so many times the CPUs the
+wicket runs on (`4x`: four vCPUs to each; its affinity and its cgroup's quota count, a container's
+`--cpus`): the overcommit, which the wicket says at its start (`CPU limit 256 (on 64 CPU(s):
+4.00x)`). Past the host's CPUs the VMs contend for them. [Jailed](#jail-mode), each has a share
+by the CPUs it holds, and with the default `--jail-cgroup` the wicket's own threads run before
+theirs ([measured](../.kb/wicket-firecracker-findings.md#the-cpu-budget-and-the-shares));
+unjailed, their threads and the wicket's contend as equals: keep `--max-cpus` below what the host
+has there.
 
 A connection whose clone finds no room waits for one in turn (one held back by its own
 route's `instances` alone keeps no other route waiting), at most its route's `wait-ms` (default
@@ -845,8 +857,7 @@ bounds one client's share:
 - **`cpu=N`** (jail mode): a VM's host CPU time, in percent of one CPU (`cpu=50`, half a
   CPU; `cpu=200`, two), its cgroup's `cpu.max` (per 100ms), its VMM and API threads
   counted. Without the jail a VM takes at most its `vcpus` host CPUs (and its VMM thread's
-  share), which a guest spinning them takes from the others: the route's `cpu` needs jail
-  mode (`--jail-ids`)
+  share): the route's `cpu` needs jail mode (`--jail-ids`)
 
 ### What a VM uses
 
@@ -1037,10 +1048,15 @@ Each VM's `firecracker`:
   snapshot), `pids.max` its vCPUs plus 16. Past its limit the kernel's OOM
   killer ends the VM, nothing else. A cloned route's snapshot stays charged to the
   route's cgroup (`route-<n>`) as long as the route lives; a serving VM's cgroup (`vm-<n>`, one
-  per id) is reused. With its route's `cpu` (see [Limits](#limits)) it is in `capped/`, a
-  group of the cpu controller of its own, `cpu.max` the route's `cpu`; else in
-  `uncapped/`, without (the class one group of it): the vCPUs bound it. A group per VM slows
-  the clones (see [findings](../.kb/wicket-firecracker-findings.md#jail-mode))
+  per id) is reused. It is a group of the cpu controller: `cpu.weight` 10 per CPU the VM holds
+  of the budget (see [Limits](#limits)), so VMs short of CPUs share them by what each was
+  given, and `cpu.max` its route's `cpu`. A clone of a connection's own
+  (`mode=per-connection`) without `cpu` is in `shared/` instead, one group of the controller
+  for all of them, weighted by what they hold together (within 100ms): a group per VM costs
+  8% of their rate (see
+  [findings](../.kb/wicket-firecracker-findings.md#the-cpu-budget-and-the-shares)). With
+  the default `--jail-cgroup` the wicket's own cgroup (`keeper/`) is beside them, of the most
+  weight (10000): its threads run before the VMs'
 - ends with the keeper: its parent death signal is set after the uid change (which clears
   it: the jailer's `firecracker` outlives the jailer's parent). The keeper forwards SIGTERM,
   SIGINT and SIGHUP to the wicket and ends with it, its VMs killed, their files and cgroups
@@ -1058,11 +1074,12 @@ What it needs:
   own: the files need others' read permission (`o+r`); their directory may stay private (a
   jail binds the file, not its directory)
 - `--jail-cgroup <path>`: the VMs' parent cgroup under `/sys/fs/cgroup`, made, the memory and
-  pids controllers enabled down to it, and cpu down to `capped/` where the hierarchy has it
-  (a route's `cpu` fails its VMs' spawn without it). By default the wicket's own cgroup,
-  which the keeper leaves for `keeper/` (cgroup v2 enables no controller for the children of
-  a cgroup holding processes): a systemd service's with `Delegate=yes`, a container's; run
-  by hand, give a path
+  pids controllers enabled down to it, and cpu where the hierarchy has it (without it the
+  keeper warns: no VM has a share of its own, and a route's `cpu` fails its VMs' spawn). It
+  is one group beside the host's others, its own `cpu.weight` (100) the operator's to set.
+  By default the wicket's own cgroup, which the keeper leaves for `keeper/` (cgroup v2
+  enables no controller for the children of a cgroup holding processes): a systemd
+  service's with `Delegate=yes`, a container's; run by hand, give a path
 - the firecracker binary is the keeper's, the one named at startup: a reload may replace the
   file (a rename), not name another
 
@@ -1127,15 +1144,15 @@ What applies, in both modes unless said:
 - **the jailer's isolation**: [jail mode](#jail-mode). Unjailed, every VM runs as the
   wicket's user: a guest escaping its `firecracker` (past KVM and seccomp) holds every VM's
   sockets and snapshots and the wicket's token, and the VMs have no cgroup of their own
-  (the wicket's, a container's or a unit's `MemoryMax=`, holds them all). Tenants on one
-  wicket call for jail mode
+  (the wicket's, a container's or a unit's `MemoryMax=`, holds them all), nor a share of
+  the CPUs. Tenants on one wicket call for jail mode
 - **`/dev/kvm`**: unjailed, the wicket's user in the `kvm` group (see [Setup](#setup)), and
   nobody else: a member boots VMs past `--max-instances` and `--max-memory-mib`. Jailed, nobody: the
   keeper (root) makes each jail a node of its own, its VM's id's alone, so the host's may
   stay root's (`--jail-user` needs no group)
 - **x86_64's `kvm-pit/<pid>`**: a VM's PIT kernel thread stays in the root cgroup (the
-  wicket does not move it): a guest driving its PIT takes host CPU past its route's `cpu`,
-  at most what `kvm.min_timer_period_us` (200us by default) lets it
+  wicket does not move it): a guest driving its PIT takes host CPU past its route's `cpu`
+  and its share, at most what `kvm.min_timer_period_us` (200us by default) lets it
 
 Not needed at the wicket's rates: Linux 6.1's boot time mitigations (`favordynmods`,
 `kvm.nx_huge_pages=never`): `KVM_CREATE_VM` is a small part of a clone's restore
@@ -1290,6 +1307,7 @@ VM serving two hosts, a VM per connection, reused clones, a pool
 and a route of two VMs at most, one per client address, it checks http/1.1 with keep-alive,
 h2c, a 5MB POST under the tunnel's flow control and a client half-closing after its request,
 the clones' clock and random values, a client past its share, the connection finding no room,
+a pool's VM past the CPU budget not started,
 idle connections failed, clients left quiet on `--listen` closed and giving way, a reused clone serving the next connection until its `uses` or
 `keep-ms` ran out, a pool growing with the connections held, shrinking idle and replacing its
 VMs killed (unjailed) or their processes ended, a route's and an app's VMs kept as their numbers
@@ -1319,9 +1337,10 @@ sg kvm -c "SLUICE_WICKET_RUNTIME_FIRECRACKER_VMS='java.local=$T/upstream.ext4?me
 started as root (`sudo -n`; skipped without it) or, with `..._IMAGE`, as the image runs it
 jailed, and checks the jails of the VMs alive: an id of its own each, PID 1 of its
 namespace, no capability, no new privileges, the jail's seccomp filter and Firecracker's
-on the keeper's, a cgroup limiting its memory (and a route's clones' CPU, theirs alone with
-the cpu controller; a disk's VM taken by the OOM killer as its cgroup's memory is squeezed, told
-so), on aarch64 the host CPU's files, the wicket as `--jail-user` under its
+on the keeper's, a cgroup limiting its memory (a disk's VM taken by the OOM killer as its
+cgroup's memory is squeezed, told so) and weighted by its CPUs (a route's `cpu` capping it, a
+connection's own clones in the group they share, the keeper's of the most weight), on aarch64
+the host CPU's files, the wicket as `--jail-user` under its
 filter; the keeper killed (SIGKILL), the VMs and the wicket end. Unjailed, it checks the
 wicket's filter.
 
@@ -1339,7 +1358,7 @@ Benchmarks and design findings: [.kb/wicket-firecracker-findings.md](../.kb/wick
 
 A liveness check of a VM per connection past its template (a clone goes on a failed dial), a disk on
 a route of the config file, a flag or the page, a backup of a running disk, a pool
-spreading by load rather than by connections, CPU limits without the jail, an image of the
+spreading by load rather than by connections, CPU limits and shares without the jail, an image of the
 page rather than the API (`PUT /api/images`), a docker-archive upload, a build's cache between
 builds and its buildpacks chosen by the request, the requests on the
 flume (the VMs' output alone: `cf logs` shows no `RTR` line here), and egress over UDP or to

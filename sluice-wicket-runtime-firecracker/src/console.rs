@@ -43,8 +43,8 @@
 //! values; an app's `tag`, opaque to the console, tells its owner what it put),
 //! and its `disk` (`disk`). The apps' listing names the wicket too -- its id, kept in the
 //! console's directory, its flume node, its build -- and its budget: `--max-instances`,
-//! `--max-memory-mib` and what the routes keep of them for good; an edit needing more is
-//! refused `no_room`. Both listings say when the wicket is leaving: told to stop, it waits for
+//! `--max-memory-mib`, `--max-cpus` and what the routes keep of them for good; an edit needing
+//! more is refused `no_room`. Both listings say when the wicket is leaving: told to stop, it waits for
 //! the apps of the API but those with a disk to be moved elsewhere (`--evacuation-grace`). An app
 //! put with `held-ms` is held at each start of the wicket, listed so, until its owner confirms it,
 //! puts it again or removes it, or `held-ms` passed: its owner may have moved, changed or removed
@@ -310,7 +310,7 @@ impl Console {
                 }
             })
             .collect();
-        let (instances, memory) = self.capacity.usage();
+        let (instances, memory, cpu) = self.capacity.usage();
         Listing {
             revision: status.revision,
             generation: table.generation(),
@@ -324,8 +324,10 @@ impl Console {
             budget: BudgetView {
                 max_instances: self.capacity.max_instances(),
                 max_memory_mib: self.capacity.max_memory_mib(),
+                max_cpus: self.capacity.max_cpu().map(in_cpus),
                 instances,
                 memory_mib: memory,
+                cpus: in_cpus(cpu),
             },
             reload_failure: status.failure_view(),
             leaving: status.leaving_view(),
@@ -379,7 +381,7 @@ impl Console {
                 held: table.holds(name),
             });
         }
-        let (instances, memory_mib) = table.resident();
+        let kept = table.resident();
         AppsView {
             revision: status.revision,
             generation: table.generation(),
@@ -388,8 +390,10 @@ impl Console {
             budget: Budget {
                 max_instances: self.capacity.max_instances(),
                 max_memory_mib: self.capacity.max_memory_mib(),
-                instances,
-                memory_mib: self.capacity.max_memory_mib().map(|_| memory_mib),
+                max_cpus: self.capacity.max_cpu().map(in_cpus),
+                instances: kept.vms,
+                memory_mib: self.capacity.max_memory_mib().map(|_| kept.memory),
+                cpus: self.capacity.max_cpu().map(|_| in_cpus(kept.cpu)),
             },
             runtime: RUNTIME,
             capabilities: [],
@@ -959,9 +963,18 @@ struct BudgetView {
     max_instances: usize,
     /// None: no memory budget.
     max_memory_mib: Option<u64>,
+    /// In CPUs; None: no CPU budget.
+    max_cpus: Option<f64>,
     /// The VMs alive over every route.
     instances: usize,
     memory_mib: u64,
+    /// What they hold, in CPUs: each its vCPUs, or its `cpu` where that is less.
+    cpus: f64,
+}
+
+/// `cpu`, hundredths of a CPU as the budget counts them, in CPUs.
+fn in_cpus(cpu: u64) -> f64 {
+    cpu as f64 / 100.0
 }
 
 #[derive(Serialize)]

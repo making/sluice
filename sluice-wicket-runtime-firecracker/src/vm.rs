@@ -292,7 +292,14 @@ impl Spec {
             vcpus: self.vcpus,
             mem: self.memory_mib,
             cpu: self.cpu,
+            shared: false,
         }
+    }
+
+    /// What a VM of the spec holds of the CPU budget, in hundredths of a CPU: its vCPUs, or
+    /// its `cpu` where that is less.
+    pub fn cpus(&self) -> u64 {
+        self.size().cpus()
     }
 }
 
@@ -307,6 +314,15 @@ pub struct Snapshot {
     pub memory_on_host: PathBuf,
     /// Its template's, its clones'.
     size: Size,
+}
+
+impl Snapshot {
+    /// Its clones are each a connection's own: jailed, they share one group of the cpu
+    /// controller (`jail::Cgroups`).
+    pub fn of_connections(mut self) -> Snapshot {
+        self.size.shared = true;
+        self
+    }
 }
 
 /// How the wicket starts VMs, before its runtime does.

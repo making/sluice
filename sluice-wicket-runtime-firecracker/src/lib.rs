@@ -19,8 +19,8 @@
 //! `/init` relays it on to the process's TCP port (`routes`). A route's VMs
 //! are either VMs booted, or clones of a snapshot -- one per connection,
 //! reused by the next connections, or a pool serving many each -- (`route`, `vm`),
-//! within the VMs' budget (`capacity`). What each VM uses of the host is read from its
-//! process (`usage`) for the console's listings.
+//! within the VMs' budget (`capacity`: their number, memory and CPUs). What each VM
+//! uses of the host is read from its process (`usage`) for the console's listings.
 //!
 //! `--listen` serves the routes over plain TCP as well, each connection routed
 //! by its first request's host (`listener`).
@@ -150,6 +150,7 @@ async fn serving(
         ready_grace,
         max_instances,
         max_memory_mib,
+        max_cpus,
         workers: _,
         watch_interval,
         state_dir: _,
@@ -174,10 +175,17 @@ async fn serving(
     let serving = usize::from(server.is_some()) + usize::from(listen.is_some());
     let (open_files, vm_open_files) = vm::set_open_files(max_connections * serving)?;
     println!("open file limit {open_files}, each VM's {vm_open_files}");
-    let capacity = Capacity::new(max_instances, max_memory_mib);
+    let capacity = Capacity::new(max_instances, max_memory_mib, max_cpus);
+    // against the CPUs it runs on: what its operator overcommits them by
+    let host = config::host_cpus();
     println!(
-        "VM limit {max_instances}, guest memory limit {}",
-        max_memory_mib.map_or("none".to_string(), |mib| format!("{mib} MiB"))
+        "VM limit {max_instances}, guest memory limit {}, CPU limit {} (on {host} CPU(s){})",
+        max_memory_mib.map_or("none".to_string(), |mib| format!("{mib} MiB")),
+        max_cpus.map_or("none".to_string(), capacity::cpus),
+        max_cpus.map_or(String::new(), |cpu| format!(
+            ": {:.2}x",
+            cpu as f64 / (host * 100) as f64
+        )),
     );
     let tap = match flume {
         Some(_) => Tap::new(),
