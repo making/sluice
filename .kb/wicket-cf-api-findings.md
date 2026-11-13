@@ -340,8 +340,8 @@ Measured on one host (the images built from the tree; two instances):
 - memory: 5.2-5.8 MiB each idle (containers). In a VM without a disk, `memory-mib` 512: a
   `cf push` of a 135 MiB zip refused at the upload (`No space left on device`: `/tmp` is half
   the memory, the upload was there twice while it came); 1024: pushed in 15s. Since then the
-  zip is written once as it comes and unpacked from the bucket
-  ([An instance's scratch](#an-instances-scratch)); not pushed in a VM again
+  zip is written once as it comes and unpacked from the bucket: 304 pushes it
+  ([An instance's scratch](#an-instances-scratch))
 - the store: 9 connections of two instances idle; a database of 8 MB with one app
 - the test's run, both flows side by side: 384s on one instance each before, 511s on two (the
   wasi flow alone 310s, the Firecracker one 496s)
@@ -358,7 +358,26 @@ host, a wasi wicket beside it, the bucket a RustFS 1.0.5 container:
 | the `bits` part written as the body comes; with `--blobs` the package read from the bucket by ranges (8 MiB at a time) | 135 MiB | 135 MiB with `--blobs`, 270 MiB without |
 
 Without `--blobs` the staging's 270 MiB are what the directory keeps (the package and the
-droplet), not scratch. Decided against: the upload put to the bucket as a stream (no file at
+droplet), not scratch.
+
+The same push to an instance in a VM without a disk (`ha.md`: As apps of Firecracker wickets;
+one instance, with `--state` and `--blobs`, a wasi wicket beside it): `/tmp` is half the
+guest's `MemTotal`, some 30 MiB below `memory-mib` (the kernel's), and the bound is it, not
+the memory beside it:
+
+| `memory-mib` | `MemTotal` | `/tmp` | `cf push` | the VM's peak (firecracker's `VmHWM`; 72-74 MiB idle) |
+|---|---|---|---|---|
+| 256, 288 | | | refused at the upload | |
+| 296 | 267.5 MiB | 133.7 MiB | refused at the upload (`writing the part: No space left on device`) | |
+| 304 | 275.5 MiB | 137.7 MiB | pushed, 15.5s | 219 MiB |
+| 320 | 291.5 MiB | 145.7 MiB | pushed, 15.6s | 220 MiB |
+| 384 | | | pushed, 15.6s | 223 MiB |
+| 512 | 481.5 MiB | 240.7 MiB | pushed, 19.1s | 226 MiB |
+
+The upload and the staging (the site's tar) each hold the 135 MiB in `/tmp` and pass or fail
+together. At 304 the VM touched 219 MiB of it: the tmpfs's 135 MiB, the process's own (a
+piece read from the bucket, the inflate) and the kernel's left 85 MiB untouched. So
+`memory-mib` is twice the larger of the two plus 32 MiB, no more. Decided against: the upload put to the bucket as a stream (no file at
 all). A put is one request signed with its body's digest, so an object is there whole or not at
 all; a stream of a length not known before its end is a multipart upload, with parts to sweep
 when it is cut, and staging needs a file of what it makes anyway (a droplet is named by its

@@ -535,7 +535,9 @@ measured of both deployments, an update, a kill and the store away is in
   and a droplet go through files of `--data-dir`: with `--blobs` the zip while it is
   uploaded, then what staging makes of it (the component, a site's or the source's files as
   a tar), one at a time. On a tmpfs (a VM without a disk) those are memory, and `/tmp` is
-  half the VM's: `memory-mib` is above twice the larger of the two
+  half of what the guest's kernel leaves of the VM's (some 30 MiB less): `memory-mib` is
+  twice the larger of the two plus 32 MiB (304 for a zip of 135 MiB;
+  [measured](../.kb/wicket-cf-api-findings.md#an-instances-scratch))
 - **the store**: a row per entity, a few hundred bytes each, an app's 2 kB; 1000 apps with
   their routes, packages, builds and droplets are 5000 rows. An instance holds 4 or 5
   connections
