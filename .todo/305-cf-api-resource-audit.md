@@ -10,8 +10,9 @@ report, then file what is missing:
 - `placement.rs`: what room is (memory only? the wicket's reported budget or the cf-api's own count?),
   CPU and disk in it, build VMs, what a push sees where no wicket has room
 - org / space quotas (`orgs.rs`): enforced or shown only
-- process stats (`views.rs`): usage is zero today as the wickets' audits saw it; what 291 must report for
-  `cf app` to show real numbers
+- process stats (`views.rs`): `cpu`, `mem` and `disk` are the wickets' measurements now (291: an
+  instance's `usage` in their listings, those of one index summed); `cpu_entitlement` and `log_rate`
+  are still 0
 - packages' and droplets' size limits and the blob store's growth (`blobs.rs`, `s3.rs`, `Store::sweep`)
 
 Its README says disk, security groups and log rate are "accepted and shown, no effect" on a wasi wicket.

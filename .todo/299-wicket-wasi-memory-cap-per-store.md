@@ -16,4 +16,6 @@ With it:
 - `ResourceTable` has no entry limit
 
 Fix: compare `used + growth` with the cap, count tables (and the GC heap if it bypasses the limiter)
-against it, the same limits on the fallback. Extend the existing memory cap test.
+against it, the same limits on the fallback. Extend the existing memory cap test. A refusal is told to
+the store's meter (`usage::Meter::refused`, 291), which names the trap that follows out of memory and
+lists `used` as the instance's memory: keep both on every refusal and growth, the tables' included.

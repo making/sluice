@@ -156,9 +156,9 @@ impl Log {
         }
     }
 
-    /// Tells the wicket the image's process ended, after its last line.
-    pub fn exited(&self) {
-        lock(&self.state).add(LogFrame::Exited);
+    /// Tells the wicket the image's process ended, after its last line: how, where it is known.
+    pub fn exited(&self, exit: Option<wire::Exit>) {
+        lock(&self.state).add(LogFrame::Exited(exit));
         self.queued.notify_one();
     }
 

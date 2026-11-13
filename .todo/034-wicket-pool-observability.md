@@ -14,7 +14,12 @@ Options:
   recycled by reason), only while it changes
 - report the counters to the server over the tunnel and show them on the
   console's wasm route (proto change)
-- a local metrics endpoint (wicket has no HTTP listener today)
+- a local metrics endpoint: the console (`--console`) is the wicket's HTTP listener now
+
+291 put what each instance uses (CPU, memory, disk) in the console's listings, measured in the
+wicket: a route's `alive` in `GET /api/routes` (the page sums them per route) and an app's in
+`GET /api/apps` (`cf app` reads them through the cf-api). The counters here fit the same route
+view without a proto change; a metrics endpoint, if chosen, reads both.
 
 The instance limit (`--max-instances`, `Instances` in `wasm_host.rs`) is
 silent too: requests that waited for a slot (the process-wide one or their

@@ -2354,6 +2354,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "percent-encoding",
+ "pin-project-lite",
  "rcgen",
  "redis",
  "reqwest",

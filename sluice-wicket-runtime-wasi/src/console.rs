@@ -235,6 +235,7 @@ impl Console {
                         bytes: loaded.size(),
                     },
                     sandbox: SandboxView::of(&handler.sandbox()),
+                    alive: alive(handler.alive()),
                 })
             })
             .collect();
@@ -818,6 +819,8 @@ struct RouteView {
     target: String,
     component: ComponentView,
     sandbox: SandboxView,
+    /// Its instances alive, lowest index first, as an app's listing has them: what each uses.
+    alive: Vec<Alive>,
 }
 
 #[derive(Serialize)]

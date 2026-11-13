@@ -46,6 +46,27 @@ request. Without copy-on-write (macOS) the data section is copied per instance. 
 with what a guest writes and computes at its start, 1-1.6ms here against 20-30us for the hello
 guest: what `keep-ms` keeps beyond `warm`.
 
+## What an instance uses
+
+[An instance's `usage`](../sluice-wicket-runtime-wasi/README.md#what-an-instance-uses) is measured
+as its store runs, no thread reading it:
+
+- **CPU time is the time its store's polls take** (`usage::Metered`, around the futures driving
+  it): two `Instant` reads a poll. The thread's own CPU clock (`CLOCK_THREAD_CPUTIME_ID`) is a
+  system call, 550ns a read on the 64-core host's 6.8 kernel against 16.5ns for
+  `CLOCK_MONOTONIC` (the vDSO's): two a poll would cost more than the rest of the metering. A
+  poll's time is its CPU time unless the host took the thread away meanwhile
+- **Its rate needs no sampler**: each poll adds its time to the 5s window it ends in, and a read
+  takes the last two windows
+- **What the metering costs is within the runs' spread**: the hello guest through `--listen`,
+  keep-alive `oha -c 16` for 10s, 16 workers, release builds of the commit before it and with it,
+  alternating, two runs each (rate, the wicket's CPU a request):
+
+  | | without | with |
+  |---|---|---|
+  | pooled (`warm=16`) | 68.3-69.2k, 217-220us | 70.1-71.3k, 210-214us |
+  | per request | 45.6-46.3k, 321-327us | 45.6-46.3k, 321-326us |
+
 ## Concurrency
 
 A store is driven by one task. On an M4 Max (16 cores, default workers), keep-alive `GET /`

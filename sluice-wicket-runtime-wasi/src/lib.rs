@@ -46,7 +46,8 @@
 //!   epoch CPU budget, memory cap and `wasmtime serve`-style WASI
 //!   capabilities, and a process-wide instance limit (`--max-instances`)
 //!   with optional per-route caps (`instances=N`);
-//!   response bodies stream via a bounded relay
+//!   response bodies stream via a bounded relay; what each instance uses of the
+//!   host measured as it runs (`usage`), for the console's listings
 //!
 //! Usage:
 //!
@@ -66,6 +67,7 @@ mod files;
 mod keyvalue;
 mod listener;
 mod routes;
+mod usage;
 mod wasm_host;
 
 use sluice_wicket_console::env;

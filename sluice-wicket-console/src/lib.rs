@@ -15,7 +15,8 @@
 //!   its start, its budget
 //! - [`store`]: the console's directory (files kept under their sha256, never
 //!   rewritten, written by a rename), the names and hosts it takes
-//! - [`status`]: what the page shows of the reloads, and its long poll
+//! - [`status`]: what the page shows of the reloads, and its long poll; what a listing says of
+//!   an app's instances, what they use of the host among it
 //! - [`leaving`]: a wicket told to stop serving on while its apps' controllers move them
 //! - [`held`]: the apps a wicket holds at its start until their controllers confirm them
 //! - [`fence`]: an owner's writes refused below the highest epoch it sent: one of its

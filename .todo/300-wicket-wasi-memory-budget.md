@@ -16,6 +16,9 @@ Outside any guest's linear memory and unbounded:
 - a remote or file component fetched whole (`response.bytes()`), no size limit
 - `--max-connections` applies to the tunnel and to `--listen` each, so twice over with both
 
+What an instance holds is measured now (291): its linear memories and their most, in the listings'
+`usage` (`usage.rs`), what `MemoryCap` lets grow; not its tables, GC heap or host-side state (299).
+
 To decide: `--max-memory-mib` as the Firecracker wicket's (shared arithmetic where it fits), what an
 instance counts (its cap, or its use with 299 fixed and 291's numbers), a reserve for compiled code, the
 upload streamed to a file under its digest as the files tar is, compiles at once bounded.

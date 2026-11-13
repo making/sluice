@@ -15,6 +15,12 @@ memory. It counts `memory-mib` per VM and nothing else:
 Host pressure has no answer: no balloon, `memory.high`, `memory.swap.max`, hugepages, nor an
 `oom_score_adj` keeping the wicket alive over a VM ("the kernel kills firecracker or the wicket", README).
 
+What a VM holds is measured now (291): its process's resident memory and peak in the listings'
+`usage` (a clone's counting the snapshot pages it maps; the snapshot's file is the route's
+`snapshot.memory_bytes`), and an OOM kill is named as one, jailed or not. A jailed VM's cgroup is
+reused by the next VM of its id, so its `memory.peak` (and what is left charged to it) is not that
+VM's: see the findings' "What a VM uses".
+
 To decide: a default budget from the host (MemTotal or the wicket's own cgroup limit, less a reserve),
 overhead and snapshots inside it, the tmpfs checked against the snapshots it must hold at startup and
 reload (`fits`), `oom_score_adj` so a VM goes before the wicket; whether a balloon is worth it (measure

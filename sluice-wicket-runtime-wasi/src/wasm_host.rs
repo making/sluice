@@ -41,6 +41,8 @@ use wasmtime::AsContextMut as _;
 
 use crate::env::Env;
 use crate::keyvalue;
+use crate::usage::{Meter, Metered};
+use sluice_wicket_console::status;
 use sluice_wicket_tunnel::flume::{Index, Indices, Tap};
 use sluice_wicket_tunnel::tunnel::TunnelIo;
 
@@ -1024,7 +1026,7 @@ struct Ctx {
 impl Ctx {
     /// A store's state; `label` names the component in the guest's log
     /// lines, which also go to `tap` as lines of the request `serving`, of
-    /// the instance `index` (see `respond`).
+    /// the instance `index` (see `respond`); its memory told to `meter`.
     fn new(
         sandbox: &Sandbox,
         label: &str,
@@ -1032,6 +1034,7 @@ impl Ctx {
         tap: &Arc<Tap>,
         serving: &Serving,
         index: usize,
+        meter: Arc<Meter>,
     ) -> Self {
         static STORES: AtomicU64 = AtomicU64::new(1);
         let store = STORES.fetch_add(1, Ordering::Relaxed);
@@ -1060,6 +1063,7 @@ impl Ctx {
                 max: sandbox.limits.memory,
                 used: 0,
                 grew: false,
+                meter,
             },
             keyvalue,
         }
@@ -1085,7 +1089,8 @@ impl Ctx {
 
 /// The per-store linear-memory cap backing `Limits::memory`: growth past the
 /// cap is denied, which the guest sees as a failed allocation / `memory.grow`.
-/// Also tracks what the store holds, for `Ctx::spent`.
+/// Also tracks what the store holds, for `Ctx::spent` and its meter (a growth
+/// denied told to it: out of memory).
 struct MemoryCap {
     max: usize,
     /// Linear memory the store holds, over all its memories (wasm memory
@@ -1093,6 +1098,7 @@ struct MemoryCap {
     used: usize,
     /// Whether `used` grew since the last `rearm`.
     grew: bool,
+    meter: Arc<Meter>,
 }
 
 impl MemoryCap {
@@ -1112,11 +1118,13 @@ impl wasmtime::ResourceLimiterAsync for MemoryCap {
         _maximum: Option<usize>,
     ) -> wasmtime::Result<bool> {
         if desired > self.max {
+            self.meter.refused();
             return Ok(false);
         }
         // creation reports growth from 0, so this sums every memory
         self.used += desired.saturating_sub(current);
         self.grew = true;
+        self.meter.holds(self.used as u64);
         Ok(true)
     }
 
@@ -1473,13 +1481,19 @@ const BUDGET_EXHAUSTED: &str = "wasm budget exhausted";
 
 /// Maps a handler failure to its response: 504 when the epoch budget
 /// interrupted the guest, 500 for any other trap or error.
-fn failure(e: &wasmtime::Error) -> (u16, String) {
+fn failure(e: &wasmtime::Error, meter: &Meter) -> (u16, String) {
     if e.downcast_ref::<wasmtime::Trap>() == Some(&wasmtime::Trap::Interrupt) {
         (504, BUDGET_EXHAUSTED.into())
+    } else if meter.out_of_memory() {
+        (500, format!("wasm trap: {e}; {OUT_OF_MEMORY}"))
     } else {
         (500, format!("wasm trap: {e}"))
     }
 }
+
+/// What a trap of a store refused a growth of its linear memory is told as.
+pub const OUT_OF_MEMORY: &str =
+    "out of memory: its linear memory may not grow past its route's memory-mib";
 
 /// The epoch ticks for a request budget: granular to the tick, at least one.
 fn budget_ticks(budget: std::time::Duration) -> u64 {
@@ -1574,7 +1588,8 @@ async fn serve_on(
                 Outcome::Clean
             }
             Err(e) => {
-                let (status, message) = failure(&e);
+                let meter = accessor.with(|mut store| store.data_mut().limiter.meter.clone());
+                let (status, message) = failure(&e, &meter);
                 failed(head, status, message).await;
                 Outcome::Uncertain
             }
@@ -1858,19 +1873,24 @@ async fn watchdog(label: &str, watched: &watch::Sender<Watched>, drain: &Cancell
 /// no wasm the epoch deadline could interrupt, and wasmtime cannot reliably
 /// race a timer inside `run_concurrent`. A store error fails every request it
 /// still serves -- its head, or once streaming its body; dropping `driven`
-/// drops the store.
+/// drops the store. Its polls' time counts to `meter`.
 async fn supervise(
     label: &str,
     driven: impl Future<Output = wasmtime::Result<()>>,
     watched: &watch::Sender<Watched>,
     drain: &CancellationToken,
+    meter: &Meter,
 ) {
     let (status, message) = tokio::select! {
-        driven = driven => match driven {
+        driven = Metered::new(meter, driven) => match driven {
             Ok(()) => return,
             Err(e) => {
-                eprintln!("[wasm] {label} store ended with error: {e}");
-                failure(&e)
+                let out_of_memory = match meter.out_of_memory() {
+                    true => format!("; {OUT_OF_MEMORY}"),
+                    false => String::new(),
+                };
+                eprintln!("[wasm] {label} store ended with error: {e}{out_of_memory}");
+                failure(&e, meter)
             }
         },
         () = watchdog(label, watched, drain) => return,
@@ -2171,6 +2191,7 @@ async fn respond(
     // path.
     let live = LiveStore::mark(&handler.live);
     let serving = Serving::of(request_host(&request));
+    let meter = handler.pool.metered(cold.index);
     let ctx = Ctx::new(
         &handler.sandbox,
         &loaded.label,
@@ -2178,13 +2199,15 @@ async fn respond(
         &handler.instances.tap,
         &serving,
         cold.index,
+        meter.clone(),
     );
     let mut store = wasmtime::Store::new(engine(), ctx);
     store.limiter_async(|ctx| &mut ctx.limiter);
     // The deadline must exist before any wasm runs: with epoch interruption
     // enabled, a store without one traps on the first observed tick.
     store.set_epoch_deadline(budget_ticks(remaining(deadline)));
-    let service = match loaded.service_pre.instantiate_async(&mut store).await {
+    let instantiated = Metered::new(&meter, loaded.service_pre.instantiate_async(&mut store));
+    let service = match instantiated.await {
         Ok(service) => service,
         Err(e) => return plain_response(500, format!("wasm instantiate failed: {e}")),
     };
@@ -2219,7 +2242,7 @@ async fn respond(
             )
             .await;
         });
-        supervise(&label, driven, &watched, &CancellationToken::new()).await;
+        supervise(&label, driven, &watched, &CancellationToken::new(), &meter).await;
     });
 
     awaited.response().await
@@ -2445,12 +2468,25 @@ impl Handler {
         }
     }
 
-    /// The instance indices of the stores alive and their starts: the pool's units on their slot
-    /// (a replacement's its own) and the per-request ones, whose stores end with their requests.
-    pub fn alive(&self) -> BTreeMap<usize, SystemTime> {
+    /// The instance indices of the stores alive, their starts and what they use: the pool's
+    /// units on their slot (a replacement's its own) and the per-request ones, whose stores end
+    /// with their requests.
+    pub fn alive(&self) -> BTreeMap<usize, status::Instance> {
         let mut alive = self.pool.state.lock().unwrap().alive.clone();
         alive.extend(self.cold.held());
-        alive
+        let alive = alive.into_iter().map(|(index, since)| {
+            let usage = self.pool.usage(index);
+            let ready = None;
+            (
+                index,
+                status::Instance {
+                    since,
+                    ready,
+                    usage,
+                },
+            )
+        });
+        alive.collect()
     }
 
     /// Stores whose owning task is alive: the pool's units and the
@@ -2555,6 +2591,9 @@ struct Pool {
     /// The handler's indices from the pool's size up, which the spare units take too.
     cold: Arc<Indices>,
     state: Mutex<PoolState>,
+    /// What the store at each index uses, the index's last one: its units' and, from its size
+    /// up, the handler's per-request instances' (indices are taken lowest first).
+    meters: Mutex<HashMap<usize, std::sync::Weak<Meter>>>,
     /// Signalled whenever a unit has room for a request, for requests waiting on an
     /// instance (`Handler::admit`).
     offered: tokio::sync::Notify,
@@ -2672,6 +2711,7 @@ impl Pool {
             instances,
             route,
             cold,
+            meters: Mutex::default(),
             offered: tokio::sync::Notify::new(),
             reaped: tokio::sync::Notify::new(),
             closed: CancellationToken::new(),
@@ -2688,6 +2728,20 @@ impl Pool {
     /// The pool's size.
     fn target(&self) -> usize {
         self.state.lock().unwrap().target
+    }
+
+    /// The meter of a store made now at `index`, listed there from now on.
+    fn metered(&self, index: usize) -> Arc<Meter> {
+        let meter = Arc::new(Meter::new());
+        let mut meters = self.meters.lock().unwrap();
+        meters.insert(index, Arc::downgrade(&meter));
+        meter
+    }
+
+    /// What the store at `index` uses now, if one lives there.
+    fn usage(&self, index: usize) -> Option<status::Usage> {
+        let meter = self.meters.lock().unwrap().get(&index)?.upgrade()?;
+        Some(meter.usage(std::time::Instant::now()))
     }
 
     /// Keeps the units within `target`, starts those missing, each as [`Pool::new`] does, and
@@ -3080,6 +3134,7 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot, place: Place, first: Option<Job>)
     let _live = LiveStore::mark(&pool.live);
     // no request before the first job: the guest's output names no host
     let serving = Serving::default();
+    let meter = pool.metered(index);
     let ctx = Ctx::new(
         &pool.sandbox,
         &loaded.label,
@@ -3087,6 +3142,7 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot, place: Place, first: Option<Job>)
         &pool.instances.tap,
         &serving,
         index,
+        meter.clone(),
     );
     let mut store = wasmtime::Store::new(engine(), ctx);
     store.limiter_async(|ctx| &mut ctx.limiter);
@@ -3095,7 +3151,8 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot, place: Place, first: Option<Job>)
         Some(job) => remaining(job.deadline),
         None => budget,
     }));
-    let service = match loaded.service_pre.instantiate_async(&mut store).await {
+    let instantiated = Metered::new(&meter, loaded.service_pre.instantiate_async(&mut store));
+    let service = match instantiated.await {
         Ok(service) => service,
         Err(e) => {
             eprintln!("[wasm] pooled instance of {} failed: {e}", loaded.label);
@@ -3202,7 +3259,7 @@ async fn run_unit(pool: Arc<Pool>, slot: Slot, place: Place, first: Option<Job>)
         }
     });
 
-    supervise(&loaded.label, driven, &watched, &drain).await;
+    supervise(&loaded.label, driven, &watched, &drain, &meter).await;
     // handed to it but never taken (it was stopped running wasm, or failed): nothing of them ran
     pool.withdraw(&tx);
     rx.close();
@@ -3939,6 +3996,7 @@ pub(crate) mod tests {
                 &Tap::off(),
                 &Serving::default(),
                 0,
+                Arc::default(),
             )
         }
 
@@ -5162,21 +5220,25 @@ pub(crate) mod tests {
     async fn a_panicking_unit_is_replaced_and_requests_keep_serving() {
         let handler = pooled(&hello().await, Sandbox::default(), 1);
         restocked(&handler, 1).await;
-        let unit = handler.alive()[&0];
+        let unit = handler.alive()[&0].since;
         let body = exchange(&handler, &get("/panic")).await;
         assert!(body.starts_with("HTTP/1.1 5"), "head: {body}");
+        assert!(!body.contains(OUT_OF_MEMORY), "a trap of its own: {body}");
 
         restocked(&handler, 1).await;
         let body = exchange(&handler, &get("/")).await;
         assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
         assert_eq!(pool(&handler).served(), 2, "both requests pooled");
         assert_eq!(pool(&handler).spawned(), 2, "one replacement");
-        assert!(handler.alive()[&0] > unit, "of its index, its own start");
+        assert!(
+            handler.alive()[&0].since > unit,
+            "of its index, its own start"
+        );
     }
 
     /// `/spin` and `/balloon` degrade to clean responses on pooled units
-    /// under the route's own limits (a 100ms budget, an 8 MiB cap), and the
-    /// replacement keeps serving.
+    /// under the route's own limits (a 100ms budget, an 8 MiB cap: out of
+    /// memory, said so), and the replacement keeps serving.
     #[tokio::test]
     async fn pool_degrades_spin_and_balloon_cleanly() {
         let loaded = hello().await;
@@ -5208,6 +5270,7 @@ pub(crate) mod tests {
         let body = exchange(&spin, &get("/spin")).await;
         assert!(body.starts_with("HTTP/1.1 504"), "head: {body}");
         assert!(body.contains("budget"), "body: {body}");
+        assert!(!body.contains(OUT_OF_MEMORY), "body: {body}");
         assert!(
             started.elapsed() < Duration::from_secs(2),
             "the route's 100ms budget applied, not the default: {:?}",
@@ -5217,6 +5280,7 @@ pub(crate) mod tests {
         restocked(&balloon, 1).await;
         let body = exchange(&balloon, &get("/balloon")).await;
         assert!(body.starts_with("HTTP/1.1 5"), "head: {body}");
+        assert!(body.contains(OUT_OF_MEMORY), "named out of memory: {body}");
 
         for handler in [&spin, &balloon] {
             restocked(handler, 1).await;
@@ -5251,7 +5315,7 @@ pub(crate) mod tests {
         restocked(&handler, 1).await;
         let alive = || handler.alive().into_keys().collect::<Vec<_>>();
         assert_eq!(alive(), [0], "the unit, serving none");
-        let unit = handler.alive()[&0];
+        let unit = handler.alive()[&0].since;
 
         // occupy the only unit for the ~1s the stream takes
         let streamed = handler.clone();
@@ -5265,8 +5329,19 @@ pub(crate) mod tests {
         assert_eq!(held.index, 1, "the lowest from the pool's size up");
         let starts = handler.alive();
         assert_eq!(alive(), [0, 1]);
-        assert_eq!(starts[&0], unit, "the unit's own");
-        assert!(starts[&1] > unit, "the request's own");
+        assert_eq!(starts[&0].since, unit, "the unit's own");
+        assert!(starts[&1].since > unit, "the request's own");
+        // what the unit uses as it streams: its instantiation's and its polls' time, its memory;
+        // an index held with no store, nothing
+        let used = starts[&0].usage.expect("the unit's");
+        assert!(used.cpu_ns > 0 && used.cpu > 0.0, "{used:?}");
+        assert!(used.memory_bytes > 0, "{used:?}");
+        assert_eq!(
+            used.memory_peak_bytes, used.memory_bytes,
+            "never shrinks: {used:?}"
+        );
+        assert_eq!(used.disk_bytes, None);
+        assert_eq!(starts[&1].usage, None);
         let body = exchange(&handler, &get("/")).await;
         assert!(body.starts_with("HTTP/1.1 200"), "head: {body}");
         assert_eq!(

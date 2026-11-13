@@ -1,5 +1,6 @@
 //! What the page shows of a wicket's reloads besides its routes, whether it is leaving, the long
-//! poll following them, and what a listing says of an app's instances.
+//! poll following them, and what a listing says of an app's instances: their starts, readiness
+//! and what they use of the host ([`Usage`]).
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -23,27 +24,55 @@ pub struct Alive {
     /// Of a wicket checking its instances' readiness: whether it takes connections.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready: Option<bool>,
+    /// What it uses of the host; none before its wicket measured it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
 }
 
-/// `held`, the instances alive and their starts, lowest index first.
-pub fn alive(held: BTreeMap<usize, SystemTime>) -> Vec<Alive> {
-    held.into_iter()
-        .map(|(index, start)| Alive {
-            index,
-            since: epoch_secs(start),
-            ready: None,
-        })
-        .collect()
+/// What an instance uses of the host, as its wicket measured it a few seconds ago at most. Its
+/// changes move no listing's revision.
+#[derive(Serialize, Clone, Copy, Debug, Default, PartialEq)]
+pub struct Usage {
+    /// Its CPU time since its start, in nanoseconds.
+    pub cpu_ns: u64,
+    /// Its CPU over the last seconds, in CPUs: 1.0 is one CPU all along, as `cf app` shows 100%.
+    pub cpu: f64,
+    /// The memory it holds, in bytes.
+    pub memory_bytes: u64,
+    /// The most it held at once, in bytes.
+    pub memory_peak_bytes: u64,
+    /// What it uses of its disk, in bytes; none without one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
 }
 
-/// [`alive`] of instances whose readiness is checked: `held` has each one's start and whether
-/// it is ready.
-pub fn alive_ready(held: BTreeMap<usize, (SystemTime, bool)>) -> Vec<Alive> {
+impl Usage {
+    /// The CPU of `cpu_ns` taken over `over`, in CPUs, to the ten-thousandth.
+    pub fn rate(cpu_ns: u64, over: Duration) -> f64 {
+        match over.as_nanos() {
+            0 => 0.0,
+            nanos => (cpu_ns as f64 / nanos as f64 * 10_000.0).round() / 10_000.0,
+        }
+    }
+}
+
+/// An instance alive, as its wicket knows it.
+pub struct Instance {
+    /// Its start.
+    pub since: SystemTime,
+    /// Of a wicket checking its instances' readiness: whether it takes connections.
+    pub ready: Option<bool>,
+    pub usage: Option<Usage>,
+}
+
+/// `held`, the instances alive, lowest index first.
+pub fn alive(held: BTreeMap<usize, Instance>) -> Vec<Alive> {
     held.into_iter()
-        .map(|(index, (start, ready))| Alive {
+        .map(|(index, instance)| Alive {
             index,
-            since: epoch_secs(start),
-            ready: Some(ready),
+            since: epoch_secs(instance.since),
+            ready: instance.ready,
+            usage: instance.usage,
         })
         .collect()
 }

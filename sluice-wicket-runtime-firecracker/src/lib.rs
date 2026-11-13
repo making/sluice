@@ -19,7 +19,8 @@
 //! `/init` relays it on to the process's TCP port (`routes`). A route's VMs
 //! are either VMs booted, or clones of a snapshot -- one per connection,
 //! reused by the next connections, or a pool serving many each -- (`route`, `vm`),
-//! within the VMs' budget (`capacity`).
+//! within the VMs' budget (`capacity`). What each VM uses of the host is read from its
+//! process (`usage`) for the console's listings.
 //!
 //! `--listen` serves the routes over plain TCP as well, each connection routed
 //! by its first request's host (`listener`).
@@ -65,6 +66,7 @@ pub mod routes;
 pub mod seccomp;
 pub mod stage;
 pub mod state;
+pub mod usage;
 pub mod vm;
 pub mod wire;
 
@@ -186,6 +188,8 @@ async fn serving(
         tap: tap.clone(),
     });
     let places = Arc::new(launcher.start()?);
+    // what the VMs use, read from their processes before the first is spawned
+    tokio::spawn(usage::sample());
     let binaries = routes.binaries();
     // opened by the wicket, its user's (jail mode: not the keeper's)
     let mut intake = None;

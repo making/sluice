@@ -11,6 +11,9 @@ overcommit without bound: `--max-instances` x `vcpus`, never compared with the h
 - A build VM is `cpu: None` always (`stage.rs`).
 - Known and not covered by a cgroup: x86_64's `kvm-pit` thread (README).
 
+What a VM takes is measured now (291): its `firecracker`'s CPU time and its rate over 5s, every
+thread, in the listings' `usage` (`usage.rs`), the evidence to size the overcommit by.
+
 To decide: the unit (vCPUs, or `cpu` percent where set), `--max-cpus` with the overcommit ratio the
 operator states, what the wicket reports in its listing's budget (`identity`) for the cf-api's placement
 (305), and a default share (`cpu.weight` by vCPUs) so the wicket's own threads keep theirs. The .kb file

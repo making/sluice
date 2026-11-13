@@ -29,6 +29,13 @@ const GAP: u8 = 4;
 pub const SYNC: u8 = 5;
 const EXITED: u8 = 6;
 
+/// An `EXITED` frame's flag: the guest kernel's OOM killer took a process of the VM since the
+/// image's process started.
+const EXIT_OOM: u8 = 1;
+
+/// The longest status an `EXITED` frame carries.
+const MAX_EXIT_STATUS: usize = 128;
+
 /// A frame's head: its type and its payload's length.
 const HEAD: usize = 5;
 
@@ -50,7 +57,8 @@ pub const CONTROL_PORT: u32 = 1024;
 /// `STDERR`, without its newline, at most [`MAX_LINE`] bytes: a longer line goes in
 /// pieces), the lines dropped there (`GAP`: stdout's and stderr's, two u64 BE) and
 /// `SYNC` (no payload): the answer to the wicket's byte `SYNC` once every line the
-/// processes wrote before it was sent, and `EXITED` (no payload): the image's process ended.
+/// processes wrote before it was sent, and `EXITED`: the image's process ended, how
+/// ([`Exit`]: `[flags: u8][its wait status]`; no payload from a guest predating it).
 pub const LOG_PORT: u32 = 1025;
 
 /// The longest line of the log stream.
@@ -211,6 +219,51 @@ pub fn stop_line(grace: Duration) -> String {
 pub fn parse_stop(line: &str) -> Option<Duration> {
     let millis = line.strip_prefix("STOP ")?.parse().ok()?;
     Some(Duration::from_millis(millis))
+}
+
+/// The control stream's question of what the guest uses, answered [`usage_answer`]: `OK` and
+/// what it measures as `<name>=<bytes>` pairs (`OK disk_used=8192 disk_size=1073741824`, its
+/// disk's file system; none without a disk). A guest predating it answers as to a line it does
+/// not know.
+pub const USAGE_QUESTION: &str = "USAGE";
+
+/// What the guest answers of its use: its disk's file system, its bytes used and in all.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct GuestUsage {
+    pub disk: Option<(u64, u64)>,
+}
+
+/// The answer to [`USAGE_QUESTION`] (the guest's half), its newline included.
+#[allow(dead_code)] // the guest's half: each copy has both
+pub fn usage_answer(usage: &GuestUsage) -> String {
+    match usage.disk {
+        Some((used, size)) => format!("OK disk_used={used} disk_size={size}\n"),
+        None => "OK\n".into(),
+    }
+}
+
+/// The use an answer to [`USAGE_QUESTION`] tells (the wicket's half; its newline trimmed): a
+/// pair it does not know is left out, an answer but `OK` is None.
+#[allow(dead_code)] // the wicket's half: each copy has both
+pub fn parse_usage(answer: &str) -> Option<GuestUsage> {
+    let mut words = answer.split(' ');
+    if words.next() != Some("OK") {
+        return None;
+    }
+    let (mut used, mut size) = (None, None);
+    for pair in words {
+        let Some((name, value)) = pair.split_once('=') else {
+            continue;
+        };
+        match name {
+            "disk_used" => used = value.parse().ok(),
+            "disk_size" => size = value.parse().ok(),
+            _ => {}
+        }
+    }
+    Some(GuestUsage {
+        disk: used.zip(size),
+    })
 }
 
 /// The longest line of an egress stream's request or answer.
@@ -478,13 +531,23 @@ pub enum LogFrame {
     Gap { stdout: u64, stderr: u64 },
     /// Every line written before the wicket's sync came before this.
     Synced,
-    /// The image's process ended; the VM stays up.
-    Exited,
+    /// The image's process ended, how; the VM stays up. None from a guest predating it.
+    Exited(Option<Exit>),
+}
+
+/// How the image's process ended, as `/init` tells it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Exit {
+    /// Its wait status, as `/init` prints it (`exit status: 1`, `signal: 9 (SIGKILL)`).
+    pub status: String,
+    /// The guest kernel's OOM killer took a process of the VM since it started: out of memory.
+    pub oom: bool,
 }
 
 /// Appends `frame` to `out`.
 #[allow(dead_code)] // the guest's half: each copy has both
 pub fn put_log_frame(out: &mut Vec<u8>, frame: &LogFrame) {
+    let exit;
     let (kind, payload): (u8, &[u8]) = match frame {
         LogFrame::Line(Stream::Stdout, line) => (STDOUT, line),
         LogFrame::Line(Stream::Stderr, line) => (STDERR, line),
@@ -496,7 +559,19 @@ pub fn put_log_frame(out: &mut Vec<u8>, frame: &LogFrame) {
             return;
         }
         LogFrame::Synced => (SYNC, &[]),
-        LogFrame::Exited => (EXITED, &[]),
+        LogFrame::Exited(None) => (EXITED, &[]),
+        LogFrame::Exited(Some(Exit { status, oom })) => {
+            let status = status.as_bytes();
+            let mut flags = vec![if *oom { EXIT_OOM } else { 0 }];
+            // cut on a character's boundary, the rest dropped
+            let mut end = status.len().min(MAX_EXIT_STATUS);
+            while std::str::from_utf8(&status[..end]).is_err() {
+                end -= 1;
+            }
+            flags.extend_from_slice(&status[..end]);
+            exit = flags;
+            (EXITED, &exit)
+        }
     };
     out.push(kind);
     out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
@@ -519,7 +594,8 @@ pub async fn read_log_frame<R: AsyncRead + Unpin>(
     let fits = match head[0] {
         STDOUT | STDERR => len <= MAX_LINE,
         GAP => len == 16,
-        SYNC | EXITED => len == 0,
+        SYNC => len == 0,
+        EXITED => len <= 1 + MAX_EXIT_STATUS,
         other => {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -543,7 +619,10 @@ pub async fn read_log_frame<R: AsyncRead + Unpin>(
             stdout: count(0),
             stderr: count(8),
         },
-        EXITED => LogFrame::Exited,
+        EXITED => LogFrame::Exited(payload.split_first().map(|(flags, status)| Exit {
+            status: String::from_utf8_lossy(status).into_owned(),
+            oom: flags & EXIT_OOM != 0,
+        })),
         _ => LogFrame::Synced,
     }))
 }
@@ -787,6 +866,18 @@ mod tests {
         assert_eq!(parse_stop(stop_line(grace).trim_end()), Some(grace));
         assert_eq!(parse_stop("STOP soon"), None);
         assert_eq!(parse_stop(DISK_QUESTION), None);
+        // the use of a guest, with a disk or not; a pair unknown left out, an error none
+        for usage in [
+            GuestUsage::default(),
+            GuestUsage {
+                disk: Some((8192, 1 << 30)),
+            },
+        ] {
+            assert_eq!(parse_usage(usage_answer(&usage).trim_end()), Some(usage));
+        }
+        let later = "OK disk_used=1 disk_size=2 memory_used=3";
+        assert_eq!(parse_usage(later).unwrap().disk, Some((1, 2)));
+        assert_eq!(parse_usage("ERR not a restore notice"), None);
     }
 
     /// A rule prints as it parses (a name lowercased); a range holds the addresses of its

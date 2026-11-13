@@ -12,7 +12,7 @@ use crate::store::{
     App, Build, Deployment, Droplet, Job, Lifecycle, Named, Outcome, Package, Route, SecurityGroup,
     Space, State, epoch_secs, now,
 };
-use crate::wicket::{ListedApp, Runtime};
+use crate::wicket::{ListedApp, ListedUsage, Runtime};
 
 /// The Cloud Controller version announced.
 pub const CC_VERSION: &str = "3.200.0";
@@ -379,6 +379,7 @@ pub fn stats(state: &State, app: &App, owner: &str, listed: &BTreeMap<String, Li
                             details: details.cloned(),
                             since: running.since,
                             ready: false,
+                            usage: None,
                         })
                         .collect()
                 };
@@ -408,6 +409,7 @@ pub fn stats(state: &State, app: &App, owner: &str, listed: &BTreeMap<String, Li
                     details: None,
                     since: epoch_secs(),
                     ready: false,
+                    usage: None,
                 })
                 .collect()
         }
@@ -415,10 +417,12 @@ pub fn stats(state: &State, app: &App, owner: &str, listed: &BTreeMap<String, Li
     let resources: Vec<Value> = entries
         .into_iter()
         .map(|entry| {
+            let usage = entry.usage.unwrap_or_default();
             json!({
                 "type": "web", "index": entry.index, "state": entry.state,
                 "routable": entry.state == "RUNNING" && entry.ready,
-                "usage": {"time": now(), "cpu": 0.0, "cpu_entitlement": 0.0, "mem": 0, "disk": 0, "log_rate": 0},
+                "usage": {"time": now(), "cpu": usage.cpu, "cpu_entitlement": 0.0,
+                    "mem": usage.memory_bytes, "disk": usage.disk_bytes.unwrap_or(0), "log_rate": 0},
                 "host": entry.host, "instance_internal_ip": "127.0.0.1", "instance_ports": [],
                 "uptime": epoch_secs().saturating_sub(entry.since),
                 "mem_quota": app.process.memory_mb << 20,
@@ -433,7 +437,8 @@ pub fn stats(state: &State, app: &App, owner: &str, listed: &BTreeMap<String, Li
 }
 
 /// An entry of [`stats`], on the wicket `host`, up `since` a time in seconds since the epoch,
-/// `ready` when running and taking requests (a VM failing its readiness check takes none).
+/// `ready` when running and taking requests (a VM failing its readiness check takes none), using
+/// `usage` of the host (those of its wicket's instances it is, together).
 struct Entry {
     index: u64,
     host: String,
@@ -441,6 +446,7 @@ struct Entry {
     details: Option<String>,
     since: u64,
     ready: bool,
+    usage: Option<ListedUsage>,
 }
 
 /// The entries of what `wicket` lists alive of its share, the app's `indices` (the lowest first)
@@ -463,14 +469,16 @@ fn alive(listed: &ListedApp, wicket: &str, indices: &[u64], instances: u64) -> V
         details,
         since,
         ready: false,
+        usage: None,
     };
-    let mut up: BTreeMap<u64, (u64, bool)> = BTreeMap::new();
+    let mut up: BTreeMap<u64, (u64, bool, Option<ListedUsage>)> = BTreeMap::new();
     for instance in &listed.alive {
         let ready = instance.ready.unwrap_or(true);
-        let (_, any) = up
-            .entry(named(instance.index))
-            .or_insert((instance.since, ready));
+        let (_, any, usage) =
+            up.entry(named(instance.index))
+                .or_insert((instance.since, ready, None));
         *any |= ready;
+        *usage = together(*usage, instance.usage);
     }
     let mut crashed = BTreeMap::new();
     for down in &listed.crashed {
@@ -503,14 +511,30 @@ fn alive(listed: &ListedApp, wicket: &str, indices: &[u64], instances: u64) -> V
         down.extend(starting.map(|index| entry(index, "STARTING", None, epoch_secs())));
     }
     let mut entries: Vec<_> = (up.into_iter())
-        .map(|(index, (since, ready))| Entry {
+        .map(|(index, (since, ready, usage))| Entry {
             ready,
+            usage,
             ..entry(index, "RUNNING", None, since)
         })
         .chain(down)
         .collect();
     entries.sort_by_key(|entry| entry.index);
     entries
+}
+
+/// What instances named by one index use, together: none before any was measured.
+fn together(a: Option<ListedUsage>, b: Option<ListedUsage>) -> Option<ListedUsage> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some(ListedUsage {
+            cpu: a.cpu + b.cpu,
+            memory_bytes: a.memory_bytes + b.memory_bytes,
+            disk_bytes: match (a.disk_bytes, b.disk_bytes) {
+                (None, None) => None,
+                (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+            },
+        }),
+        (a, b) => a.or(b),
+    }
 }
 
 pub fn route(base: &str, state: &State, route: &Route) -> Value {
@@ -1029,7 +1053,7 @@ mod tests {
     }
 
     /// What the stats give of an app of 2 instances, as the CLI reads them; over two wickets,
-    /// each of its indices'.
+    /// each of its indices'; what each uses, as its wicket measured it.
     #[test]
     fn the_stats_list_what_is_alive() {
         let mut state = State::new("o", "s", &["localhost".into()]);
@@ -1039,13 +1063,16 @@ mod tests {
         let domain = state.domains[0].guid.clone();
         let app = state.app_mut(&guid).unwrap();
         app.process.instances = 2;
-        // the instances of `alive`'s indices, each up since the epoch's first second
+        // the instances of `alive`'s indices, each up since the epoch's first second, a quarter
+        // of a CPU and a MiB each
         let listed = |alive: Value, down: Value| -> ListedApp {
+            let usage = json!({"cpu_ns": 1, "cpu": 0.25, "memory_bytes": 1 << 20,
+                "memory_peak_bytes": 2 << 20});
             let alive: Vec<Value> = alive
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|index| json!({"index": index, "since": 1}))
+                .map(|index| json!({"index": index, "since": 1, "usage": usage}))
                 .collect();
             let listed: ListedApp<Value> = serde_json::from_value(json!({
                 "name": "a", "owner": "cf", "hosts": [], "deployed": "now",
@@ -1141,6 +1168,19 @@ mod tests {
                 "{alive}"
             );
         }
+        // what they use: those of one index together, of no disk none
+        let three = listed(json!([0, 2, 4]), Value::Null);
+        let shown = stats(&state, state.app(&guid).unwrap(), "cf", &on_w(Some(&three)));
+        let usage = &shown["resources"][0]["usage"];
+        assert_eq!(
+            (
+                usage["cpu"].as_f64(),
+                usage["mem"].as_u64(),
+                usage["disk"].as_u64()
+            ),
+            (Some(0.75), Some(3 << 20), Some(0)),
+            "{shown}"
+        );
 
         // a VM it keeps gone down, at an index no other holds: a failure of all at none alive
         let why = |index| (index, "CRASHED".to_string(), Some("exit 83".to_string()));

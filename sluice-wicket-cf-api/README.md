@@ -1352,6 +1352,12 @@ Java app, `cf scale` not waiting for it ([weighed](../.kb/wicket-firecracker-fin
   `instances` (`cf create-app-manifest`, `cf curl /v3/apps/<guid>/processes/web`). The VMs the wicket
   keeps up are another matter, coming whatever the requests: `-i 2` of a pool or `boot` shows `1/2`,
   the second `STARTING`, until it is up, unless one is down, which stays the `CRASHED` above
+- **`cf app`'s `cpu`, `memory` and `disk`** are what the wicket measured of each instance a few
+  seconds before, its listing's `usage` (`0B` before it did). A wasm instance's memory is its
+  linear memory, its disk none ([its README](../sluice-wicket-runtime-wasi/README.md#what-an-instance-uses));
+  a VM's are its process's CPU and resident memory and what its guest uses of its disk
+  ([its README](../sluice-wicket-runtime-firecracker/README.md#what-a-vm-uses)). Those of one
+  index (below) count together
 - **`cf logs`** names what `cf app` lists, `0` to `N - 1`: of a component the units alive may
   outnumber N, the work of N instances, and the cf-api names one `index % N`, knowing N as the
   wicket does not; those of one index are one entry. A VM's index is within N already, but for one

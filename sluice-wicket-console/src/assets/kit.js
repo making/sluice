@@ -385,6 +385,67 @@ export const envView = (names) => (names?.length
 
 export const deployedView = (route) => (route.deployed ? h("span", { class: "route__deployed" }, "deployed ", timeView(route.deployed)) : null);
 
+const percent = (cpu) => `${(cpu * 100).toFixed(1)}%`;
+
+/**
+ * What a route's instances alive (`alive`, as a listing has them) use of the host: their CPU over
+ * the last seconds and their memory, summed, the most one held, and their disks'; each one's in
+ * the title. Null before any was measured.
+ */
+export function usageView(alive) {
+  const measured = (alive ?? []).filter((instance) => instance.usage);
+  if (!measured.length) {
+    return null;
+  }
+  const disk = (usage) => usage.disk_bytes ?? null;
+  const total = (of) => measured.reduce((sum, { usage }) => sum + (of(usage) ?? 0), 0);
+  const peak = Math.max(...measured.map(({ usage }) => usage.memory_peak_bytes));
+  const each = measured.map(({ index, usage }) => [
+    `instance ${index}: ${percent(usage.cpu)} CPU`,
+    `${humanBytes(usage.memory_bytes)} of memory, at most ${humanBytes(usage.memory_peak_bytes)}`,
+    disk(usage) === null ? null : `${humanBytes(disk(usage))} of its disk`,
+  ].filter(Boolean).join(", "));
+  return h("span", { class: "route__meta", "data-testid": "usage", title: each.join("\n") }, joined([
+    h("span", { class: "num" }, `${percent(total((usage) => usage.cpu))} CPU`),
+    h("span", { class: "num" }, `${humanBytes(total((usage) => usage.memory_bytes))} of memory`),
+    measured.length > 1 ? `the most one held ${humanBytes(peak)}` : `at most ${humanBytes(peak)}`,
+    measured.some(({ usage }) => disk(usage) !== null) ? `${humanBytes(total(disk))} of disk` : null,
+  ]));
+}
+
+/**
+ * Follows the listing as `follow` does, and, as what `moving` returns of one moves without a new
+ * revision (the instances, what they use), fetches a plain listing every `ms` while the page is
+ * seen, rendered where it moved (a row rebuilt only when its route changed: an open editor stays
+ * as it is).
+ */
+export function followMoving(moving, ms) {
+  const moved = (listing) => JSON.stringify(listing && moving(listing));
+  follow((listing, changed) => {
+    showListing(listing, changed || moved(currentListing()) !== moved(listing));
+  });
+  setInterval(async () => {
+    if (document.visibilityState !== "visible" || currentListing() === null) {
+      return;
+    }
+    try {
+      const response = await fetch("/api/routes", { cache: "no-store", headers: { Accept: "application/json" } });
+      if (!response.ok) {
+        return;
+      }
+      const listing = parseJson(await response.text());
+      // a listing older than the one held is no news
+      if (!listing || listing.revision < currentListing().revision) {
+        return;
+      }
+      showListing(listing, moved(currentListing()) !== moved(listing));
+    }
+    catch {
+      // the long poll tells the link is lost
+    }
+  }, ms);
+}
+
 // ---------------------------------------------------------------------------- state
 
 /** What the wicket's script supplies: see `consolePage`. */

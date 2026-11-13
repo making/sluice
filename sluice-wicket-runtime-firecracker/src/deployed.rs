@@ -112,6 +112,12 @@ pub struct KeptDisk {
     /// Its app's name.
     pub name: String,
     pub mib: u64,
+    /// What it takes of the host's disk, in bytes: its file's blocks.
+    pub allocated_bytes: u64,
+    /// What its file system uses, in bytes, as the guest of a VM on it told last; none without
+    /// one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub used_bytes: Option<u64>,
     /// Whether that app is there.
     pub app: bool,
 }
@@ -506,8 +512,9 @@ fn disk_mib(options: &Options) -> Option<u32> {
 }
 
 /// The disks kept in the directory `dir`, by owner and name: `app` tells whether an app has
-/// each.
-pub fn disks(dir: &Path, app: impl Fn(&str, &str) -> bool) -> Vec<KeptDisk> {
+/// each, and what the guest of a VM on it said it uses.
+pub fn disks(dir: &Path, app: impl Fn(&str, &str) -> (bool, Option<u64>)) -> Vec<KeptDisk> {
+    use std::os::unix::fs::MetadataExt as _;
     let mut disks = Vec::new();
     for owner in std::fs::read_dir(dir.join(DISKS)).into_iter().flatten() {
         let Ok(owner) = owner else { continue };
@@ -524,11 +531,14 @@ pub fn disks(dir: &Path, app: impl Fn(&str, &str) -> bool) -> Vec<KeptDisk> {
             let Ok(metadata) = file.metadata() else {
                 continue;
             };
+            let (app, used_bytes) = app(&owner_name, name);
             disks.push(KeptDisk {
-                app: app(&owner_name, name),
+                app,
                 name: name.to_string(),
                 owner: owner_name.clone(),
                 mib: metadata.len() >> 20,
+                allocated_bytes: metadata.blocks() * 512,
+                used_bytes,
             });
         }
     }

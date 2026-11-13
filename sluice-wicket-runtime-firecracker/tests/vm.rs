@@ -13,7 +13,7 @@
 //! (http/1.1 and h2c, an unknown one answered 404), clients left quiet there and their slots given
 //! way, a `--vm` route alone
 //! whatever the host and handing through a guest speaking first, not with `--console` nor
-//! from the config file; a reload of the `--config`
+//! from the config file, its process taken by the guest kernel's OOM killer told so; a reload of the `--config`
 //! file, polled, removing a route and replacing a rootfs; its numbers and an app's changed, the
 //! VMs running kept; a pool's VM going down replaced; what keeps a route below its `warm` told; the
 //! console deploying
@@ -21,7 +21,8 @@
 //! served on the tunnel, listed with its VMs, and an app of two hosts on one
 //! rootfs uploaded by digest, its env seen by the guest, and an app with a disk:
 //! what it wrote kept across a restart of its VM, a failed start, a growth and
-//! its app's removal, one VM at a time on it, an edit taking over from a reload, or from a restart
+//! its app's removal, its VM killed or taken by the OOM killer (jailed) told so, what it
+//! uses (of its disk too), one VM at a time on it, an edit taking over from a reload, or from a restart
 //! there, or from a VM whose `/init` does not answer its stop; a VM
 //! never listening holding no other edit, by an app's edit, in the place of a disk's VM and
 //! through the config file; a readiness check deciding which VMs take connections and whether
@@ -64,7 +65,7 @@ use bytes::Bytes;
 use http_body_util::{BodyExt as _, Full};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use sha2::Digest as _;
-use sluice_wicket_runtime_firecracker::{disk, jail};
+use sluice_wicket_runtime_firecracker::{disk, jail, usage};
 use sluice_wicket_tunnel::flume::testing::{FeedStream, flume_server};
 use sluice_wicket_tunnel::proto::{AccessFilter, feed_message};
 use sluice_wicket_tunnel::session::testing::{ServerTunnel, dial_address, tunnel_server};
@@ -1030,7 +1031,7 @@ async fn app_alive(wicket: &Wicket, name: &str) -> (Vec<(u64, u64)>, serde_json:
 /// A route given by `--vm` alone takes any host, nothing read first: a guest speaking first
 /// speaks to a connection that sent nothing. With `--console`, or as the config file's one route,
 /// a connection is routed by its first request: nothing reaches the guest before it, and another
-/// host is answered 404.
+/// host is answered 404. Its process taken by the guest kernel's OOM killer is said to be.
 async fn sole_routes(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) -> Wicket) {
     const SPOKEN: &str = "220 speaking first";
     let speaking = speaking_rootfs(scratch, rootfs, SPOKEN);
@@ -1074,6 +1075,15 @@ async fn sole_routes(scratch: &Path, rootfs: &Path, start: impl Fn(&[String]) ->
         });
         assert!(checked.await.is_ok(), "{args:?}: hung; {}", routed.log());
     }
+
+    // its process taking memory until the guest kernel's OOM killer takes it: told so
+    let routed = wicket(&[&by_file]);
+    let oom = "GET /oom HTTP/1.1\r\nhost: sole.local\r\n\r\n";
+    let connected = tokio::net::TcpStream::connect(routed.listening()).await;
+    exchange(connected.unwrap(), oom).await;
+    let killed = "route sole.local: VM 0: its process ended (signal: 9 (SIGKILL)): out of memory, \
+                  the guest kernel's OOM killer took a process; killed";
+    said(&routed, killed).await;
 }
 
 /// `--listen`'s one slot taken, the next connection is served at once: a head not ended gives way,
@@ -2438,9 +2448,10 @@ async fn on_data(
 /// started again on it) and its growth, a smaller size refused; a VM never listening in its
 /// place holding no other edit, none coming back on the disk meanwhile, and taken over from: so
 /// a VM whose `/init` does not answer its stop, killed at that stop's end, and a VM started again
-/// after its process ended; for the app's VM alone, its id's in a jail; listed, and not removed
-/// under its app. One more file left unsynced, and a start under way: the wicket's end writes them
-/// out.
+/// after its process ended; for the app's VM alone, its id's in a jail; a VM killed (unjailed),
+/// or taken by the OOM killer (jailed: its cgroup's memory squeezed), told so; what it uses, of
+/// its disk too; listed, and not removed under its app. One more file left unsynced, and a start
+/// under way: the wicket's end writes them out.
 async fn disk_app(
     tunnel: &mut ServerTunnel,
     wicket: &Wicket,
@@ -2669,16 +2680,82 @@ async fn disk_app(
         assert_eq!(read, "fsynced");
 
         // its VM killed: another one, on what it made durable; the stops on purpose before
-        // counted none
+        // counted none; told how it ended, no OOM kill
         let held = wicket.vms_on(&file);
         let [vm] = held[..] else {
             panic!("one VM on the disk: {held:?}");
         };
         wicket.signal("KILL", vm);
         restarted(wicket, "data.local", 1).await;
+        said(
+            wicket,
+            "route data.local: VM 0: its VM ended (signal 9); killed",
+        )
+        .await;
+        let read = on_data(tunnel, &address, conn_id, "/disk?read=a", "").await;
+        assert_eq!(read, "fsynced");
+    } else {
+        // its cgroup's memory taken below what it holds: the kernel's OOM killer takes it, its
+        // cgroup's count says so, and another one comes on the disk
+        let held = wicket.vms_on(&file);
+        let [vm] = held[..] else {
+            panic!("one VM on the disk: {held:?}");
+        };
+        let own = std::fs::read_to_string(format!("/proc/{vm}/cgroup")).unwrap();
+        let own = own.trim().strip_prefix("0::/").unwrap().to_string();
+        let max = format!("/sys/fs/cgroup/{own}/memory.max");
+        let squeezed = Command::new("sudo")
+            .args(["-n", "sh", "-c"])
+            .arg(format!(
+                "was=$(cat {max}); echo 1M > {max}; echo $was > {max}"
+            ))
+            .status()
+            .unwrap();
+        assert!(squeezed.success());
+        said(
+            wicket,
+            "route data.local: VM 0: its VM ended (signal 9): out of memory, the host kernel's \
+             OOM killer took it; killed",
+        )
+        .await;
+        restarted(wicket, "data.local", 1).await;
         let read = on_data(tunnel, &address, conn_id, "/disk?read=a", "").await;
         assert_eq!(read, "fsynced");
     }
+
+    // what it uses, read of its process (another id's, jailed) and asked of its guest a few
+    // seconds ago at most: in all, and of its disk
+    let deadline = Instant::now() + 2 * usage::INTERVAL + SAID;
+    let usage = loop {
+        let (status, apps) = console(at, "GET", "/api/apps", true, Bytes::new()).await;
+        assert_eq!(status, 200, "{apps}");
+        let apps = apps["apps"].as_array().unwrap();
+        let app = apps.iter().find(|app| app["name"] == "data").unwrap();
+        let usage = app["alive"][0]["usage"].clone();
+        if usage["disk_bytes"].is_u64() {
+            break usage;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "not measured: {app}; {}",
+            wicket.log()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    let number = |name: &str| usage[name].as_u64().unwrap();
+    assert!(
+        number("cpu_ns") > 0 && usage["cpu"].as_f64() >= Some(0.0),
+        "{usage}"
+    );
+    let memory = number("memory_bytes");
+    assert!(memory > 1 << 20, "its guest's and its VMM's: {usage}");
+    assert!(number("memory_peak_bytes") >= memory, "{usage}");
+    assert!(
+        memory < (128 + 64) << 20,
+        "within its memory-mib and the VMM's: {usage}"
+    );
+    let used = number("disk_bytes");
+    assert!(used > 0 && used < 128 << 20, "{usage}");
 
     // listed; under its app, not removed
     let (status, apps) = console(at, "GET", "/api/apps", true, Bytes::new()).await;
@@ -2693,9 +2770,15 @@ async fn disk_app(
     assert_eq!(listed["sandbox"]["disk-mib"], 128);
     let (status, disks) = console(at, "GET", "/api/disks", true, Bytes::new()).await;
     assert_eq!(status, 200, "{disks}");
+    let mut disk = disks["disks"].clone();
+    let allocated = disk[0]["allocated_bytes"].take().as_u64().unwrap();
+    assert!(allocated > 0 && allocated <= 129 << 20, "{disks}");
+    let used = disk[0]["used_bytes"].take().as_u64().unwrap();
+    assert!(used > 0 && used < 128 << 20, "{disks}");
     assert_eq!(
-        disks["disks"],
-        serde_json::json!([{"owner": "cf", "name": "data", "mib": 128, "app": true}])
+        disk,
+        serde_json::json!([{"owner": "cf", "name": "data", "mib": 128, "app": true,
+            "allocated_bytes": null, "used_bytes": null}])
     );
     let gone = "/api/disks/data?owner=cf";
     let (status, refused) = console(at, "DELETE", gone, true, Bytes::new()).await;

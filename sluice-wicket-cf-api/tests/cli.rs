@@ -467,6 +467,15 @@ fn instances_shown(cf: &Cf, app: &str) -> String {
         .to_string()
 }
 
+/// Whether `cf app` shows memory of the instance of its `line` (`#0   running   <since>   0.3%
+/// 1.1M of 64M ...`): what its wicket measured, `0B` before it did.
+fn memory_shown(line: &str) -> bool {
+    let words: Vec<&str> = line.split_whitespace().collect();
+    let of = words.iter().position(|word| *word == "of");
+    let shown = words[of.unwrap_or_else(|| panic!("no memory: {line}")) - 1];
+    !matches!(shown, "0" | "0B")
+}
+
 /// Waits for `cf app` to show `count` of the instances: they come and go as it reads them.
 fn instances_come_to(cf: &Cf, app: &str, count: &str) {
     let deadline = Instant::now() + HANG;
@@ -1389,11 +1398,12 @@ fn the_cf_cli_deploys_to_the_wicket() {
         let stream = held(&listen, "hello.localhost", "/stall");
         let shown = cf.ok(&["app", "hello"]);
         drop(stream);
-        if shown
-            .lines()
-            .any(|line| line.starts_with("#0") && line.contains("running"))
-        {
+        let running =
+            (shown.lines()).find(|line| line.starts_with("#0") && line.contains("running"));
+        if let Some(running) = running {
             assert_eq!(shown.matches("\n#").count(), 1, "{shown}");
+            // its linear memory, as the wicket measured it
+            assert!(memory_shown(running), "{shown}");
             break;
         }
         assert!(Instant::now() < deadline, "{shown}");
@@ -3054,6 +3064,18 @@ fn the_cf_cli_deploys_to_a_firecracker_wicket() {
     cf.ok(&["start", "fc"]);
     let shown = cf.ok(&["app", "fc"]);
     assert!(shown.contains(&format!("{image}@{manifest}")), "{shown}");
+    // what the wicket read of its VM, a few seconds after its start
+    let deadline = Instant::now() + HANG;
+    loop {
+        let shown = cf.ok(&["app", "fc"]);
+        let running =
+            (shown.lines()).find(|line| line.starts_with("#0") && line.contains("running"));
+        if running.is_some_and(memory_shown) {
+            break;
+        }
+        assert!(Instant::now() < deadline, "not measured: {shown}");
+        std::thread::sleep(Duration::from_millis(500));
+    }
 
     // from inside the VM: the image's user, its files' owners and modes, the env, its
     // services

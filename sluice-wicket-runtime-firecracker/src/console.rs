@@ -8,9 +8,9 @@
 //! options with an env.
 //!
 //! ```text
-//! GET    /api/routes[?after=<revision>]         the routes, their VMs and the budget; held
-//!                                               until they change when `after` is the
-//!                                               current revision
+//! GET    /api/routes[?after=<revision>]         the routes, their VMs (what each uses) and
+//!                                               the budget; held until they change when
+//!                                               `after` is the current revision
 //! PUT    /api/routes/<host>?name=..&<options>   deploys the body, an ext4 image, to the host
 //! PATCH  /api/routes/<host>?<options>           gives the console's route other options
 //! PATCH  /api/routes/<host>?host=<to>           moves the console's route to another host
@@ -25,7 +25,8 @@
 //! GET    /api/apps[?after=<revision>]           the apps, as `/api/routes`
 //! PUT    /api/apps/<name>                       serves the app the body (JSON) has
 //! DELETE /api/apps/<name>?owner=<owner>         removes the app
-//! GET    /api/disks                             the apps' disks, which outlive them
+//! GET    /api/disks                             the apps' disks, which outlive them, and
+//!                                               what of them is used
 //! DELETE /api/disks/<name>?owner=<owner>        removes the disk of an app that was
 //! PUT    /api/evacuated/<owner>                 a wicket leaving: the owner moved what of its
 //!                                               apps it could (`sluice_wicket_console::leaving`)
@@ -71,7 +72,7 @@ use sluice_wicket_console::identity::{Budget, Identity};
 use sluice_wicket_console::leaving::{self, LeavingView};
 use sluice_wicket_console::serve::{self, Service};
 use sluice_wicket_console::status::{
-    Alive, Crashed, FailureView, Shortage, Status, alive_ready, crashed, settled,
+    Alive, Crashed, FailureView, Shortage, Status, alive, crashed, settled,
 };
 use sluice_wicket_console::store::{
     check_digest, check_host, check_hosts, check_name, check_tag, rfc3339,
@@ -298,6 +299,7 @@ impl Console {
                         restarts: vms.restarts,
                         down: route.down(),
                     },
+                    alive: alive(route.alive()),
                     ready: route.ready(),
                     snapshot: route.taken().map(|taken| SnapshotView {
                         memory_bytes: taken.memory,
@@ -370,7 +372,7 @@ impl Console {
                 tag: tag.clone(),
                 held_ms: *held_ms,
                 deployed: deployed.clone(),
-                alive: alive_ready(route.alive()),
+                alive: alive(route.alive()),
                 crashed: crashed(route.crashed()),
                 down: route.down(),
                 advertised: taken,
@@ -528,18 +530,31 @@ impl Console {
         edited(removal.await.inspect(|_| self.held.release(&name)))
     }
 
-    /// The disks kept in the console's directory, and whether an app has each.
+    /// The disks kept in the console's directory, whether an app has each, and what the guest
+    /// of the VM on it uses of it.
     fn disks(&self) -> DisksView {
         let table = self.routes.current();
-        let apps: Vec<(&str, &str)> = table
+        let apps: Vec<((&str, &str), Option<u64>)> = table
             .served()
-            .filter_map(|(_, origin, _)| match origin {
-                Origin::Api { name, owner, .. } => Some((owner.as_str(), name.as_str())),
+            .filter_map(|(_, origin, route)| match origin {
+                Origin::Api { name, owner, .. } => {
+                    let alive = route.disk().map(|_| route.alive().into_values());
+                    let used = alive
+                        .into_iter()
+                        .flatten()
+                        .find_map(|vm| vm.usage?.disk_bytes);
+                    Some(((owner.as_str(), name.as_str()), used))
+                }
                 _ => None,
             })
             .collect();
+        let app = |owner: &str, name: &str| match apps.iter().find(|(app, _)| *app == (owner, name))
+        {
+            Some((_, used)) => (true, *used),
+            None => (false, None),
+        };
         DisksView {
-            disks: deployed::disks(&self.dir, |owner, name| apps.contains(&(owner, name))),
+            disks: deployed::disks(&self.dir, app),
         }
     }
 
@@ -970,6 +985,8 @@ struct RouteView {
     vcpus: u32,
     /// Its VMs, as the budget counts them.
     instances: InstancesView,
+    /// Its VMs alive, lowest index first, as an app's listing has them: what each uses.
+    alive: Vec<Alive>,
     /// Whether its next connection finds a VM: advertised only then.
     ready: bool,
     /// Cloned modes: the template's snapshot.

@@ -13,8 +13,9 @@
 //! (or snapshots it) when it does.
 //!
 //! The process's stdout and stderr (and hello mode's own lines) go to the wicket as lines
-//! on the log stream (`log`, vsock port `wire::LOG_PORT`), open before the process starts;
-//! /init's own output goes to the console.
+//! on the log stream (`log`, vsock port `wire::LOG_PORT`), open before the process starts,
+//! and its end after them: its wait status, and whether the kernel's OOM killer took a
+//! process meanwhile (`wire::Exit`); /init's own output goes to the console.
 //!
 //! A VM cloned from a snapshot gets the wicket's restore notice on the control port
 //! (`wire::CONTROL_PORT`): /init sets the clock to its time (where it carries one: the
@@ -34,7 +35,8 @@
 //! drive's size and its root given to the image's user: a failure is told on the control
 //! port (`wire::DISK_QUESTION`) and starts no process. A stop notice on that port
 //! (`wire::parse_stop`) ends the process and writes all out before the wicket kills the VM.
-//! Hello mode's `/disk` reads and writes it.
+//! What its file system uses is answered there too (`wire::USAGE_QUESTION`). Hello mode's
+//! `/disk` reads and writes it.
 //!
 //! A build's VM (`wire::STAGE_PARAMETER`) starts neither: its rootfs is a Cloud Native
 //! Buildpacks builder's, and /init runs one build of the source the wicket sends (`stage`).
@@ -243,7 +245,7 @@ fn main() {
                 Stream::Stderr,
                 b"guest: the process is not started: a rule of the egress holds its port",
             );
-            log.exited();
+            log.exited(None);
             std::future::pending::<()>().await;
         }
         let port = match launch {
@@ -257,7 +259,7 @@ fn main() {
                     && std::fs::remove_file(std::path::Path::new(mount).join(EXIT_ONCE)).is_ok()
                 {
                     log.line(Stream::Stderr, b"guest: exiting before it listens, as told");
-                    log.exited();
+                    log.exited(None);
                     std::future::pending::<()>().await;
                 }
                 write_at_start(&log);
@@ -600,23 +602,59 @@ fn start(launch: Launch, log: &Arc<Log>) -> std::io::Result<()> {
             Ok(())
         });
     }
+    let oom_kills_before = oom_kills();
     let mut child = command.spawn()?;
     capture(&mut child, log);
     println!("guest: started {program} (pid {})", child.id());
     // PID 1 reaps every orphan; the process's exit reaches the wicket as its last line (no
-    // serial console tells it), the VM stays up
+    // serial console tells it) and how it ended, the VM staying up
     let pid = child.id() as libc::pid_t;
     let log = log.clone();
     std::thread::spawn(move || {
         REAPER.run(|reaped, status| {
             if reaped == pid {
-                let line = format!("guest: {program} exited ({status})");
+                // the process, or what it waited for: a process of the guest alone runs it
+                let oom = oom_kills() > oom_kills_before;
+                let status = status.to_string();
+                let mut line = format!("guest: {program} exited ({status})");
+                if oom {
+                    line.push_str(": out of memory, the kernel's OOM killer took a process");
+                }
                 log.line(Stream::Stderr, line.as_bytes());
-                log.exited();
+                log.exited(Some(wire::Exit { status, oom }));
             }
         })
     });
     Ok(())
+}
+
+/// The processes the guest kernel's OOM killer took since its boot (`/proc/vmstat`, out of
+/// memory in the guest or in its cgroup); a clone's count goes on from its snapshot's.
+fn oom_kills() -> u64 {
+    let vmstat = std::fs::read_to_string("/proc/vmstat").unwrap_or_default();
+    let count = vmstat
+        .lines()
+        .find_map(|line| line.strip_prefix("oom_kill "));
+    count.and_then(|count| count.parse().ok()).unwrap_or(0)
+}
+
+/// What the guest uses, as the wicket asks it: its disk's file system, its bytes used (as `df`
+/// counts them) and in all.
+fn usage() -> wire::GuestUsage {
+    let disk = DISK.get().and_then(|mounted| mounted.as_ref().ok());
+    let disk = disk.and_then(|path| {
+        let path = CString::new(path.as_str()).ok()?;
+        let mut fs = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: statvfs of a NUL-terminated path into a buffer of its type
+        if unsafe { libc::statvfs(path.as_ptr(), fs.as_mut_ptr()) } != 0 {
+            return None;
+        }
+        // SAFETY: filled by the successful call
+        let fs = unsafe { fs.assume_init() };
+        let used = fs.f_blocks.saturating_sub(fs.f_bfree) * fs.f_frsize;
+        Some((used, fs.f_blocks * fs.f_frsize))
+    });
+    wire::GuestUsage { disk }
 }
 
 /// Has `log` read the output of `child` (spawned with it piped).
@@ -661,6 +699,11 @@ async fn control_loop(listener: VsockListener, hook: Option<Hook>, log: Arc<Log>
                 return;
             }
             let line = line.trim_end();
+            if line == wire::USAGE_QUESTION {
+                let answer = wire::usage_answer(&usage());
+                let _ = writer.write_all(answer.as_bytes()).await;
+                return;
+            }
             let done = if line == wire::DISK_QUESTION {
                 match DISK.get() {
                     Some(Ok(_)) => Ok(()),
@@ -862,7 +905,7 @@ async fn hello(listener: tokio::net::TcpListener, booted: Instant, log: Arc<Log>
     }
     drop(listener);
     log.line(Stream::Stderr, b"guest: exited, as told");
-    log.exited();
+    log.exited(None);
 }
 
 /// Hello mode's `POST /exit`: its server ends just after the answer, as a process does, or with
@@ -870,7 +913,7 @@ async fn hello(listener: tokio::net::TcpListener, booted: Instant, log: Arc<Log>
 /// next boot's exit once more, before it listens.
 fn exit_answer(query: &str, log: &Log) -> String {
     if query == "listening=1" {
-        log.exited();
+        log.exited(None);
         return "exited, listening\n".into();
     }
     if query == "again=1"

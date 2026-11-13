@@ -577,8 +577,9 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
   `name`, `deployed`, `alive`, `advertised` and `held`, and the env's values); a PUT is 1MiB at
   most
 - `alive` in a listing: its instances alive, lowest first, a warm one's, a spare one's and a
-  request's own while it runs, `{"index": 0, "since": 1793000000}`: the [index](#live-access-log) and its start in seconds
-  since the epoch, a replacement's its own
+  request's own while it runs, `{"index": 0, "since": 1793000000, "usage": {..}}`: the
+  [index](#live-access-log), its start in seconds since the epoch (a replacement's its own) and
+  what it uses ([What an instance uses](#what-an-instance-uses))
 - `advertised` in a listing: whether the server of every tunnel stream took the app's routes as
   they are, sending them connections (true in local mode): a controller moving an app here
   removes it from the wicket it leaves once they are
@@ -603,6 +604,27 @@ curl -T app.json -H 'Authorization: Bearer SECRET' http://127.0.0.1:9090/api/app
 - the data of a namespace no app maps any more stays until deleted (`DELETE
   /api/keyvalue/...`): a controller deletes it with what owned it (`sluice-wicket-cf-api`: a
   service instance)
+
+### What an instance uses
+
+Both listings give each instance alive what it uses, measured as it runs: an app's `alive` entries
+and a route's `alive` in `GET /api/routes` (the page sums them per route, each one's in its title),
+as `"usage"`:
+
+```json
+{"cpu_ns": 412000000, "cpu": 0.0821, "memory_bytes": 1179648, "memory_peak_bytes": 1179648}
+```
+
+- **`cpu_ns`**: the time the wicket's threads spent running its store (instantiating it, its
+  requests, its guest's tasks), which is its CPU time unless the host took a thread away meanwhile;
+  `cpu` that of the last 5 to 10s in CPUs (1.0: one all along)
+- **`memory_bytes`, `memory_peak_bytes`**: its linear memories, what `memory-mib` caps, and their
+  most: a linear memory never shrinks, so the two are one
+- no `disk_bytes`: a route's files are read-only and its instances' alike
+
+A request's own instance is listed while it runs. A guest growing its memory past `memory-mib` is
+refused the growth; the trap that follows is told as `out of memory` (the request's 500, the log's
+`store ended with error`). The values move no listing's `revision`.
 
 ### Capabilities
 

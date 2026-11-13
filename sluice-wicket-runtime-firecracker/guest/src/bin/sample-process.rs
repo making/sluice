@@ -4,6 +4,7 @@
 //! `/dev/stderr` by path, the owner and mode of each path of its arguments, its environment --
 //! and printing a line per request, as a process's output. `/egress?to=<host>:<port>` connects
 //! as a process does, half-closes and answers with what came, `/exit` answers and exits,
+//! `/oom` answers and takes memory until the kernel's OOM killer takes it,
 //! `/ready?after=N` answers 503 to the first N of them, as a readiness check sees a process
 //! starting, 200 after, counting none served.
 //! Told to stop (SIGTERM, a stop notice's) it says so on its stdout and ends.
@@ -90,6 +91,20 @@ fn main() {
             drop(stream);
             std::process::exit(83);
         }
+        if path == "/oom" {
+            drop(stream);
+            take_all_memory();
+        }
+    }
+}
+
+/// Writes to ever more memory of its own until the kernel's OOM killer takes it.
+fn take_all_memory() -> ! {
+    let mut taken: Vec<Vec<u8>> = Vec::new();
+    loop {
+        // every page written: the guest's memory, not only its address space
+        taken.push(vec![1u8; 1 << 20]);
+        std::hint::black_box(&taken);
     }
 }
 

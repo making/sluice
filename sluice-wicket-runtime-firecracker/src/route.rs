@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime};
 
 use sluice_wicket_console::env::Env;
-use sluice_wicket_console::status::{Shortage, Status};
+use sluice_wicket_console::status::{self, Shortage, Status};
 use sluice_wicket_tunnel::flume::{Index, Indices};
 use sluice_wicket_tunnel::workers::Workers;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt as _};
@@ -40,6 +40,7 @@ use crate::egress::Egress;
 use crate::health::{self, Check, Liveness, Readiness};
 use crate::keeper::Role;
 use crate::output::{self, Ended, Hosts, Output, Sink};
+use crate::usage::Meter;
 use crate::vm::{self, Place, Places, Snapshot, Spec, Vm};
 use crate::wire::{self, Rule};
 
@@ -2180,6 +2181,9 @@ struct Cloner {
     next: AtomicU64,
     /// The instance indices its clones alive hold.
     indices: Arc<Indices>,
+    /// What the clone at each index uses, the index's last one: indices are taken lowest
+    /// first, so these are the most clones alive at once.
+    meters: Mutex<HashMap<usize, Weak<Meter>>>,
     sink: Arc<Sink>,
     hosts: Arc<Hosts>,
     /// Whether the guest sends its output: its template's did.
@@ -2227,6 +2231,8 @@ impl Cloner {
         notify(&mut stream, &notice).await?;
         let accepting = vm.dial_ready(port, RESTORE_TIMEOUT).await;
         let index = index.unwrap_or_else(|| Arc::new(self.indices.take(0)));
+        let meter = Arc::downgrade(vm.meter());
+        self.meters.lock().unwrap().insert(index.index, meter);
         // the guest's listener outlives the restore; its lines wait for the stream
         let mut output = match self.output {
             true => match vm.dial(wire::LOG_PORT).await {
@@ -2268,6 +2274,36 @@ impl Cloner {
     }
 }
 
+/// Why a pool's VM serves no more, as its watch ([`watch`]) finds it.
+#[derive(Debug, PartialEq, Eq)]
+enum Down {
+    /// Its log stream ended: the VM is gone.
+    Vm,
+    /// The guest said its process ended, how where it tells, and its port refuses.
+    Process(Option<wire::Exit>),
+    /// A connection failed, and its port refuses.
+    Unanswered,
+}
+
+impl Down {
+    /// What the log and a listing say of it; of a VM gone, the VM's end where it is known
+    /// ([`Vm::end`]). An OOM kill of the guest's is named so.
+    fn why(self, vm_end: Option<String>) -> String {
+        match self {
+            Down::Vm => vm_end.unwrap_or_else(|| "its VM ended".into()),
+            Down::Process(None) => "its process ended".into(),
+            Down::Process(Some(wire::Exit { status, oom: false })) => {
+                format!("its process ended ({status})")
+            }
+            Down::Process(Some(wire::Exit { status, oom: true })) => format!(
+                "its process ended ({status}): out of memory, the guest kernel's OOM killer took \
+                 a process"
+            ),
+            Down::Unanswered => "its guest accepts no connection".into(),
+        }
+    }
+}
+
 /// Follows a pool's VM until it serves no more: why, or None when it is gone from its route.
 ///
 /// - the log stream ended: the VM is gone
@@ -2283,7 +2319,7 @@ async fn watch<F>(
     mut suspected: mpsc::Receiver<()>,
     accepting: impl Fn(Duration) -> F,
     boot: impl Fn() -> Duration,
-) -> Option<&'static str>
+) -> Option<Down>
 where
     F: Future<Output = bool>,
 {
@@ -2304,16 +2340,16 @@ where
             }
         };
         match ended {
-            Some(Ended::Vm) => return Some("its VM ended"),
-            Some(Ended::Process) => {
+            Some(Ended::Vm) => return Some(Down::Vm),
+            Some(Ended::Process(exit)) => {
                 told = true;
                 if !accepting(Duration::ZERO).await {
-                    return Some("its process ended");
+                    return Some(Down::Process(exit));
                 }
             }
             None => {
                 if !accepting(boot()).await {
-                    return Some("its guest accepts no connection");
+                    return Some(Down::Unanswered);
                 }
             }
         }
@@ -2358,10 +2394,18 @@ async fn watched(
     };
     let accepting = |within| accepting_within(look, within);
     let boot = || bounds.get().boot;
-    if let Some(why) = watch(output, suspected, accepting, boot).await
-        && let Some(pool) = pool.upgrade()
-    {
-        pool.went_down(id, why);
+    let Some(down) = watch(output, suspected, accepting, boot).await else {
+        return;
+    };
+    // a VM gone: how its `firecracker` ended, an OOM kill named so. Held no longer than that
+    // (a stop takes the VM once alone): it is dead already
+    let held = matches!(down, Down::Vm).then(|| vm.upgrade()).flatten();
+    let vm_end = match held {
+        Some(held) => Some(held.vm.end().await),
+        None => None,
+    };
+    if let Some(pool) = pool.upgrade() {
+        pool.went_down(id, &down.why(vm_end));
     }
 }
 
@@ -2702,6 +2746,7 @@ impl Route {
             place: place.clone(),
             next: AtomicU64::new(0),
             indices: indices.clone(),
+            meters: Mutex::default(),
             sink,
             hosts: hosts.clone(),
             output: output.is_some(),
@@ -2894,21 +2939,43 @@ impl Route {
         vms
     }
 
-    /// The instance indices of its VMs alive, their starts, each from its guest accepting on, and
-    /// whether each takes connections: a pool's VM ready, within `instances`; a clone as it comes.
-    pub fn alive(&self) -> BTreeMap<usize, (SystemTime, bool)> {
+    /// The instance indices of its VMs alive, their starts, each from its guest accepting on,
+    /// whether each takes connections -- a pool's VM ready, within `instances`; a clone as it
+    /// comes -- and what each uses, as last read.
+    pub fn alive(&self) -> BTreeMap<usize, status::Instance> {
         match &self.backend {
             Backend::Cloned { cloner, .. } => {
+                let meters = cloner.meters.lock().unwrap();
                 let held = cloner.indices.held().into_iter();
-                held.map(|(index, since)| (index, (since, true))).collect()
+                held.map(|(index, since)| {
+                    let meter = meters.get(&index).and_then(Weak::upgrade);
+                    let usage = meter.and_then(|meter| meter.usage());
+                    let ready = Some(true);
+                    (
+                        index,
+                        status::Instance {
+                            since,
+                            ready,
+                            usage,
+                        },
+                    )
+                })
+                .collect()
             }
             Backend::Pool(pool) => {
                 let max = self.bounds.get().pool_size();
                 let members = pool.members.lock().unwrap();
                 let past = members.past(max);
                 let vms = members.vms.iter();
-                vms.map(|vm| (vm.index, (vm.instance.since, vm.ready && vm.index < past)))
-                    .collect()
+                vms.map(|vm| {
+                    let instance = status::Instance {
+                        since: vm.instance.since,
+                        ready: Some(vm.ready && vm.index < past),
+                        usage: vm.instance.vm.usage(),
+                    };
+                    (vm.index, instance)
+                })
+                .collect()
             }
         }
     }
@@ -3608,7 +3675,8 @@ mod tests {
     }
 
     /// What a VM's watch makes of what it is told: only an end it finds true, a stream
-    /// given up telling nothing; the route's end ends it.
+    /// given up telling nothing; the route's end ends it. A process's end says how, an OOM
+    /// kill named so.
     #[tokio::test]
     async fn a_vm_is_down_when_its_port_refuses_too() {
         use std::collections::VecDeque;
@@ -3629,9 +3697,13 @@ mod tests {
                 output::follow(wicket, sink.clone(), hosts.clone(), "vm-0".to_string(), 0);
             (followed, guest)
         };
+        let exit = wire::Exit {
+            status: "signal: 9 (SIGKILL)".into(),
+            oom: true,
+        };
         let exited = {
             let mut frame = Vec::new();
-            wire::put_log_frame(&mut frame, &LogFrame::Exited);
+            wire::put_log_frame(&mut frame, &LogFrame::Exited(Some(exit.clone())));
             frame
         };
         // the answers of the looks, in turn, which are asked with how long they may take
@@ -3654,7 +3726,13 @@ mod tests {
         let (_suspects, suspected) = mpsc::channel(1);
         let accepting = answers(&[(Duration::ZERO, false)]);
         let why = watch(Some(followed), suspected, accepting, || BOOT).await;
-        assert_eq!(why, Some("its process ended"));
+        assert_eq!(why, Some(Down::Process(Some(exit))));
+        assert_eq!(
+            why.unwrap().why(None),
+            "its process ended (signal: 9 (SIGKILL)): out of memory, the guest kernel's OOM \
+             killer took a process"
+        );
+        assert_eq!(Down::Process(None).why(None), "its process ended");
 
         // a launcher's end, a daemon accepting: then nothing told of the process again; a
         // connection failing while it accepts, then not: down
@@ -3673,14 +3751,15 @@ mod tests {
             suspects.send(()).await.unwrap();
         }
         let why = watching.await.unwrap();
-        assert_eq!(why, Some("its guest accepts no connection"));
+        assert_eq!(why, Some(Down::Unanswered));
 
         // its VM gone: no look to take. A guest without a log stream, the route gone: no end
         let (followed, guest) = log();
         drop(guest);
         let (_suspects, suspected) = mpsc::channel(1);
         let why = watch(Some(followed), suspected, answers(&[]), || BOOT).await;
-        assert_eq!(why, Some("its VM ended"));
+        assert_eq!(why, Some(Down::Vm));
+        assert_eq!(Down::Vm.why(None), "its VM ended");
         let (suspects, suspected) = mpsc::channel(1);
         drop(suspects);
         assert_eq!(watch(None, suspected, answers(&[]), || BOOT).await, None);

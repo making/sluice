@@ -472,6 +472,46 @@ through the image, and a sluice server on the Mac serving a booted VM and clones
 On a Mac the wicket listens once every VM it restores has booted: 9.6s here with a Node.js image,
 3.7s with a Go one.
 
+## What a VM uses
+
+What [the listings' `usage`](../sluice-wicket-runtime-firecracker/README.md#what-a-vm-uses) is
+made of, and why (the 64-core host, its 6.8 kernel):
+
+- **Read of the process, with the jail or without it**: a process's CPU clock
+  (`clock_getcpuclockid`) is any process's to read, 0.49us a read; `/proc/<pid>/status` is
+  readable by any user, 9us a read (`VmRSS`, `VmHWM` are counters: no walk of the page tables).
+  The unprivileged wicket reads a jailed VM's (another id's) so; `smaps_rollup` (PSS, a VM's
+  private pages) needs ptrace access, and walks the page tables. Every VM every 5s: about 10ms of a
+  blocking thread every 5s for 1,000 VMs
+- **The pid is checked against its pidfd**: a read is dropped once the pidfd says the process
+  ended (a pid reaped may be another's). Jailed, the keeper's `clone3` makes the pidfd
+  (`CLONE_PIDFD`) and passes it with its answer; a VM's exit status without the jail is
+  `waitid(P_PIDFD, WNOWAIT)`'s, the reap left to tokio's `Child`
+- **A jailed VM's cgroup is no measure of that VM**: the keeper reuses a cgroup per id
+  (made and removed per VM cost 8% of the clone rate, [Jail mode](#jail-mode)), so its
+  `memory.peak` is the most of every VM it held, and pages charged to it by a VM before (the
+  rootfs's page cache, a snapshot's holes it filled) stay counted for the next. Jailed, the sample
+  guest at 128 MiB, a booted VM and a pool of 2 (debug build), its process against its cgroup:
+
+  | | `VmRSS` / `VmHWM` | `memory.current` / `memory.peak` |
+  |---|---|---|
+  | booted VM, started | 54 / 54 MiB | 53 / 54 MiB (anon 52) |
+  | booted VM, after `oha -c 8` 5s | 55 / 55 MiB | 53 / 54 MiB |
+  | a pool's clone, started | 20 / 20 MiB | 2 / 2 MiB (anon 1) |
+  | a pool's clone, after `oha -c 8` 5s | 22 / 22 MiB | 4 / 6 MiB |
+  | the clone in its place (SIGKILL), its cgroup the one before's | 20 / 20 MiB | 3 / 6 MiB: the one before's peak |
+
+  A clone's cgroup is charged its private pages alone, the snapshot's being its route's; its
+  process maps 18 MiB of them besides. The listings give the process's, alike with the jail or
+  without it, and its peak of its own
+- **An OOM kill**: jailed, the cgroup's `memory.events` `oom_kill` read by the keeper as it
+  reaps the VM (its file open, one `pread`), against what it read at the last reap of that
+  cgroup: one VM at a time. Without a cgroup, the host's count (`/proc/vmstat`) rising since the
+  sampler read it, a second before the VM's end at least, and the VM ending by a SIGKILL
+  no one of the wicket sent. In the guest, `/init` reads its kernel's count as the process starts
+  and as it is reaped. Lowering a jailed VM's `memory.max` below what it holds (`echo 1M >`) has the
+  kernel's OOM killer take it within the write: the VM test's way
+
 ## Caveats
 
 - `/dev/kvm` ACLs set by hand do not last: udev rewrote one within minutes. Use the

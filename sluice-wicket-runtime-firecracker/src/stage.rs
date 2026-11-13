@@ -1521,7 +1521,7 @@ impl Output {
                             build.note(format!("({} lines of the output dropped)", stdout + stderr))
                         }
                         Ok(Some(LogFrame::Synced)) => count.send_modify(|count| *count += 1),
-                        Ok(Some(LogFrame::Exited)) => {}
+                        Ok(Some(LogFrame::Exited(_))) => {}
                         Ok(None) | Err(_) => return,
                     }
                 }

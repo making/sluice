@@ -13,6 +13,10 @@ Nothing checks free space (`statvfs`) or bounds a console directory's total.
   within the 10 minutes an unnamed upload lives (`sluice-wicket-console/src/store.rs`). keyvalue's sqlite
   bounds a namespace (64 Mi), not their number nor the file.
 
+`GET /api/disks` lists each disk's `allocated_bytes` (its file's blocks: the whole size, a disk being
+`fallocate`d) and `used_bytes`, what its guest's file system uses while a VM runs on it; an app's VM
+lists the latter as `usage.disk_bytes` (291).
+
 To decide: one budget in `sluice-wicket-console`'s `store` both wickets use (bytes reserved before an
 upload / image / disk / scratch is written, released on sweep), a floor of free space refused below, a
 share per owner, eviction of caches by size when the budget is short, and the budget in the listing's

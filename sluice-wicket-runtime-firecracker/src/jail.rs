@@ -15,7 +15,8 @@
 //!   copies). No `/dev/net/tun`, `/dev/urandom` or `/dev/userfaultfd`: a vsock-only
 //!   VM restored from a file needs none
 //! - a cgroup of its own ([`Cgroups`]), entered by `clone3` (`CLONE_INTO_CGROUP`), a
-//!   group of the cpu controller of its own only when its route caps its CPU
+//!   group of the cpu controller of its own only when its route caps its CPU; its
+//!   `memory.events` tells a VM the OOM killer took ([`Cgroup::oom_killed`])
 //! - a uid and gid of its own, no supplementary group, the capability bounding set
 //!   dropped, no new privileges; the wicket's seccomp filter (`seccomp`), then
 //!   Firecracker's as it installs them
@@ -54,6 +55,9 @@ use crate::seccomp::Filter;
 
 /// `CLONE_INTO_CGROUP` (Linux 5.7), which libc does not name for every target.
 const CLONE_INTO_CGROUP: u64 = 0x2_0000_0000;
+
+/// `CLONE_PIDFD` (Linux 5.2).
+const CLONE_PIDFD: u64 = 0x1000;
 
 /// `open_tree`'s `OPEN_TREE_CLONE` (Linux 5.2), which libc does not name for every
 /// target.
@@ -463,10 +467,10 @@ struct CloneArgs {
 
 /// Clones a child into a new PID namespace and the jail's cgroup, which jails itself
 /// (its other namespaces made in it: in parallel, not in the caller's thread) and
-/// executes `firecracker`; its pid. The caller is single-threaded (the child, a copy of
-/// it, takes no lock another thread may hold) and reaps the child (SIGCHLD); the
-/// child's failures go to the jail's log, and it exits 127.
-pub fn spawn(jail: &Jail<'_>) -> io::Result<libc::pid_t> {
+/// executes `firecracker`; its pid and a pidfd of it. The caller is single-threaded (the
+/// child, a copy of it, takes no lock another thread may hold) and reaps the child
+/// (SIGCHLD); the child's failures go to the jail's log, and it exits 127.
+pub fn spawn(jail: &Jail<'_>) -> io::Result<(libc::pid_t, OwnedFd)> {
     let mut binds = vec![(
         kept(&jail.route.join(ROUTE_ROOTFS))?,
         inside(ROOTFS)?,
@@ -517,9 +521,10 @@ pub fn spawn(jail: &Jail<'_>) -> io::Result<libc::pid_t> {
             cstring(API_SOCKET.as_bytes())?,
         ],
     };
+    let mut pidfd: libc::c_int = -1;
     let args = CloneArgs {
-        flags: libc::CLONE_NEWPID as u64 | CLONE_INTO_CGROUP,
-        pidfd: 0,
+        flags: libc::CLONE_NEWPID as u64 | CLONE_INTO_CGROUP | CLONE_PIDFD,
+        pidfd: &mut pidfd as *mut libc::c_int as u64,
         child_tid: 0,
         parent_tid: 0,
         exit_signal: libc::SIGCHLD as u64,
@@ -552,7 +557,8 @@ pub fn spawn(jail: &Jail<'_>) -> io::Result<libc::pid_t> {
                 libc::_exit(127)
             }
         }
-        pid => Ok(pid as libc::pid_t),
+        // SAFETY: the pidfd clone3 made for us (close-on-exec, as every pidfd)
+        pid => Ok((pid as libc::pid_t, unsafe { OwnedFd::from_raw_fd(pidfd) })),
     }
 }
 
@@ -986,6 +992,8 @@ impl Cgroups {
             // SAFETY: a new fd of ours
             dir: unsafe { OwnedFd::from_raw_fd(fd) },
             limits: None,
+            events: None,
+            oom_kills: 0,
         })
     }
 
@@ -1035,15 +1043,55 @@ impl Cgroups {
     }
 }
 
-/// A VM's cgroup: its directory, open for `clone3`, and its limits as last written.
+/// A VM's cgroup: its directory, open for `clone3`, its limits as last written, and the OOM
+/// killer's kills in it as last read.
 pub struct Cgroup {
     dir: OwnedFd,
     limits: Option<Limits>,
+    /// Its `memory.events`, open from its first read on.
+    events: Option<std::fs::File>,
+    oom_kills: u64,
 }
 
 impl Cgroup {
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.dir.as_fd()
+    }
+
+    /// Whether the kernel's OOM killer took a process of it since the last call: its
+    /// `memory.events`' `oom_kill` rose. Asked as each VM it held is reaped, one at a time,
+    /// it tells whether the OOM killer took that VM (whose limit is the cgroup's, or the
+    /// host's memory ran out). An error reads as none.
+    pub fn oom_killed(&mut self) -> bool {
+        use std::os::unix::fs::FileExt as _;
+        if self.events.is_none() {
+            // SAFETY: openat of a NUL-terminated name in our directory
+            let fd = unsafe {
+                libc::openat(
+                    self.dir.as_raw_fd(),
+                    c"memory.events".as_ptr(),
+                    libc::O_RDONLY | libc::O_CLOEXEC,
+                )
+            };
+            // SAFETY: a new fd of ours
+            self.events =
+                (fd >= 0).then(|| std::fs::File::from(unsafe { OwnedFd::from_raw_fd(fd) }));
+        }
+        let Some(events) = &self.events else {
+            return false;
+        };
+        // read from its start each time: the kernel writes it anew
+        let mut text = [0u8; 512];
+        let Ok(read) = events.read_at(&mut text, 0) else {
+            return false;
+        };
+        let text = String::from_utf8_lossy(&text[..read]);
+        let Some(count) = crate::usage::oom_kills(&text) else {
+            return false;
+        };
+        let rose = count > self.oom_kills;
+        self.oom_kills = count;
+        rose
     }
 
     /// Sets `limits`, unless they are the ones set last (a reused cgroup's).

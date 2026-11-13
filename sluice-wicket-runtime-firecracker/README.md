@@ -366,6 +366,16 @@ its place, from the same spec, under its instance index:
 
 Without a liveness check, a process that lives, keeps its port and answers nothing is not seen.
 
+Why is told with how it ended: `its process ended (exit status: 1)`, its wait status as `/init`
+saw it; `its VM ended (signal 9)`, its `firecracker`'s. An OOM kill is named so: `its process
+ended (signal: 9 (SIGKILL)): out of memory, the guest kernel's OOM killer took a process`, when
+the guest's count of them (`/proc/vmstat`) rose while the process ran (a process it started taken,
+it ending for that, says so too); `its VM ended (signal 9): out of memory, the host kernel's OOM
+killer took it`, jailed when its cgroup's `memory.events` counted it, without the jail when the
+host's count rose since the sampler read it a moment before (another process's `kill -9` of the
+VM as the OOM killer took one elsewhere reads as one). An `/init` predating it says `its process
+ended`.
+
 The others serve on, its connections alone cut. The old VM is killed (on a [disk](#disks), stopped
 first: SIGTERM to what is left, all written out, the disk free), the new one on the room in the
 budget the old one held (no other route takes it meanwhile), its env and disk as they were. Per
@@ -483,7 +493,8 @@ host and the route's options, and it is served -- on the tunnel and on `--listen
 Dropped on a route of the console, an image replaces its own; renamed, a route moves to
 another host with its image and options. The routes of the config file and the `--vm` flags
 are listed too, read-only. The page shows what the wasm wicket's has no counterpart for:
-each route's VMs (up or pooled and their restarts, ready, warm, kept, starting, all alive) and whether it is
+each route's VMs (up or pooled and their restarts, ready, warm, kept, starting, all alive, [what they
+use](#what-a-vm-uses)) and whether it is
 advertised ([Readiness](#readiness)), its connections, a cloned
 route's snapshot (its memory file, the template's boot and snapshot times) and the budget
 (`--max-instances`, `--max-memory-mib`) taken. It takes 64 connections at once; TCP keepalive ends one whose
@@ -546,7 +557,7 @@ its default):
 
 | request | |
 |---|---|
-| `GET /api/routes[?after=<revision>]` | every route with its VMs, the budget and the last failed reload of the files, as JSON; with `after` the current `revision`, held until the routes change (25s at most; the VMs' counts move without a revision) |
+| `GET /api/routes[?after=<revision>]` | every route with its VMs (what each uses among it), the budget and the last failed reload of the files, as JSON; with `after` the current `revision`, held until the routes change (25s at most; the VMs' counts and use move without a revision) |
 | `PUT /api/routes/<host>?name=<file>&<options>` | deploys the body, an ext4 image, to the host (replacing the console's route of the host) |
 | `PATCH /api/routes/<host>?<options>` | gives the console's route of the host other options |
 | `PATCH /api/routes/<host>?host=<to>` | moves the console's route of the host to `<to>` as it is |
@@ -610,9 +621,10 @@ digest, or made of an OCI image, first; the app names it:
   until its owner confirms it (`PUT /api/confirmed/<owner>`), puts it again or removes it, or
   `held-ms` passed. It alone starts no VM
 - `alive` in a listing: its VMs alive, lowest first, `{"index": 0, "since": 1793000000, "ready":
-  true}`: the `instance` index, its start in seconds since the epoch, its guest accepting, and whether
-  it takes connections ([Readiness](#readiness)); `crashed`, those it
-  keeps that are down, `{"index": 1, "why": "its process ended", "since": 1793000000}`, each until
+  true, "usage": {..}}`: the `instance` index, its start in seconds since the epoch, its guest
+  accepting, whether it takes connections ([Readiness](#readiness)) and what it uses ([What a VM
+  uses](#what-a-vm-uses)); `crashed`, those it
+  keeps that are down, `{"index": 1, "why": "its process ended (exit status: 1)", "since": 1793000000}`, each until
   another one is up there; `down`, when told: why it is short of VMs, and since when (`instances.down`),
   until they are up; `advertised`, whether the server of every tunnel stream took its routes as
   they are, a VM of them ready (true in local mode): a controller moving an app here removes it
@@ -778,8 +790,10 @@ is where `/init` mounts it before the process starts, `disk-mib` its size (defau
   `mkfs.ext4` makes such a file system without a journal). A start that failed may leave it
   grown, which the old VM then has: the next PUT asks for that much at least
 - **stays** as its app goes (`DELETE /api/apps/<name>`), for the next app of that name and
-  owner. `GET /api/disks` lists them, `{"disks": [{"owner", "name", "mib", "app": <whether it has
-  its app>}]}`; `DELETE /api/disks/<name>?owner=<owner>` removes one, refused (409) while its app
+  owner. `GET /api/disks` lists them, `{"disks": [{"owner", "name", "mib", "allocated_bytes",
+  "used_bytes", "app": <whether it has its app>}]}`: what its file takes of the host's disk, and
+  what its file system uses as the guest of its VM told last (left out without one);
+  `DELETE /api/disks/<name>?owner=<owner>` removes one, refused (409) while its app
   is there or a VM of it still holds it
 - **a backup** is the file, while no VM holds it: `flock -n <file> cp --sparse=always <file> <copy>`
   fails while one does (stop it by removing its app: the disk stays). Copying under a running VM
@@ -833,6 +847,32 @@ bounds one client's share:
   counted. Without the jail a VM takes at most its `vcpus` host CPUs (and its VMM thread's
   share), which a guest spinning them takes from the others: the route's `cpu` needs jail
   mode (`--jail-ids`)
+
+### What a VM uses
+
+Both listings give each VM alive what it uses of the host, read every 5s: an app's `alive` entries
+and a route's `alive` in `GET /api/routes` (the page sums them per route, each VM's in its title),
+as `"usage"`:
+
+```json
+{"cpu_ns": 1840000000, "cpu": 0.0312, "memory_bytes": 73400320, "memory_peak_bytes": 79691776,
+ "disk_bytes": 21708800}
+```
+
+- **`cpu_ns`**: the CPU time of its `firecracker` since its start, every thread (its vCPUs, its VMM
+  and API threads); `cpu` the CPU of the last 5s in CPUs (1.0: one all along, what `cf app` shows
+  as 100%)
+- **`memory_bytes`, `memory_peak_bytes`**: its process's resident memory and the most of it so far
+  (`VmRSS`, `VmHWM`): the guest memory it touched and the VMM's own. A clone's counts the pages of
+  its snapshot it maps, shared with the route's other clones (the snapshot is the route's,
+  `snapshot.memory_bytes`)
+- **`disk_bytes`**: what its disk's file system uses, as its `/init` answers (none without a disk;
+  an `/init` predating it answers none)
+
+They are read of the process alike with the jail or without it, as the wicket's user; an entry
+has none until the first read. The values move no listing's `revision` (a long poll does not wake
+for them). How a VM ended, an OOM kill named so, is [A VM going down](#a-vm-going-down)'s
+([findings](../.kb/wicket-firecracker-findings.md#what-a-vm-uses)).
 
 ### Output and the live access log
 
@@ -1243,8 +1283,8 @@ a builder comes from; here its parts are (`stage.rs`, `image.rs`, `rootfs.rs`, t
 `stage.rs`).
 
 `tests/vm.rs` boots VMs where `/dev/kvm` is usable (it is skipped elsewhere): through a tunnel
-server double, an app's disk through a restart of its VM, its process's end, its VM killed, a failed
-start, a growth, the wicket's end and its restart, a VM started again as its process keeps
+server double, an app's disk through a restart of its VM, its process's end, its VM killed (told
+so), a failed start, a growth, what its VM uses (of its disk too), the wicket's end and its restart, a VM started again as its process keeps
 ending, several VMs booted (spread over, one going down alone, scaled up and down), and for a booted
 VM serving two hosts, a VM per connection, reused clones, a pool
 and a route of two VMs at most, one per client address, it checks http/1.1 with keep-alive,
@@ -1257,7 +1297,8 @@ change, the VMs' output (a booted VM's, a template's, a clone's) on the wicket's
 stdout / stderr and on a flume (`sluice-wicket-tunnel`'s double), the guests' egress (a booted
 VM's and a clone's, to a destination on the host by name, address, range and IPv6, and its
 records), reloads of the config file, an edit taking over from a reload on a disk, a route
-given by `--vm` alone handing through a guest speaking first, a booted route checking its VMs'
+given by `--vm` alone handing through a guest speaking first, its process taken by the guest
+kernel's OOM killer told so, a booted route checking its VMs'
 readiness: one failing its check taking no connection, none ready leaving the advertisement until
 one answers again, a process ending likewise, and their liveness: one whose endpoint fails
 restarted, the other serving meanwhile, a start whose endpoint never answers 200 failing at
@@ -1279,7 +1320,8 @@ started as root (`sudo -n`; skipped without it) or, with `..._IMAGE`, as the ima
 jailed, and checks the jails of the VMs alive: an id of its own each, PID 1 of its
 namespace, no capability, no new privileges, the jail's seccomp filter and Firecracker's
 on the keeper's, a cgroup limiting its memory (and a route's clones' CPU, theirs alone with
-the cpu controller), on aarch64 the host CPU's files, the wicket as `--jail-user` under its
+the cpu controller; a disk's VM taken by the OOM killer as its cgroup's memory is squeezed, told
+so), on aarch64 the host CPU's files, the wicket as `--jail-user` under its
 filter; the keeper killed (SIGKILL), the VMs and the wicket end. Unjailed, it checks the
 wicket's filter.
 

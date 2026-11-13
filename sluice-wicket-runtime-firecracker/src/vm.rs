@@ -63,7 +63,8 @@ use crate::capacity::Slot;
 use crate::disk::{self, Disk};
 use crate::egress::{self, Egress, Listening};
 use crate::jail;
-use crate::keeper::{Client, Role, Size, vm_file_size};
+use crate::keeper::{Client, Role, Size, VmEnd, vm_file_size};
+use crate::usage::{self, Meter};
 use crate::wire::{self, Rule};
 
 /// Guest CID of every VM: each VM has its own vsock device, so they need not differ.
@@ -445,7 +446,7 @@ enum Process {
     Jailed {
         keeper: Arc<Client>,
         vm: u64,
-        exited: watch::Receiver<Option<String>>,
+        exited: watch::Receiver<Option<VmEnd>>,
     },
     /// Handed over to the task of its stop, [`Vm::handed_over`].
     HandedOver,
@@ -464,6 +465,8 @@ struct StopOnDrop {
 /// A running VM, killed (and its files removed) on drop; on a disk, stopped first.
 pub struct Vm {
     process: Process,
+    /// What it uses, as the sampler reads it of its process.
+    meter: Arc<Meter>,
     /// The VM's share of the budget, given back once it is killed.
     _slot: Option<Slot>,
     /// Its API socket, vsock socket and log, on the host.
@@ -534,8 +537,11 @@ impl Vm {
         })
         .await??;
         let vsock = dir.join("v.sock");
+        // the launcher's pid is its `firecracker`'s, which it execs
+        let pid = child.id().map_or(0, |pid| pid as libc::pid_t);
         let mut vm = Vm {
             process: Process::Child { child, dir },
+            meter: Meter::start(pid, usage::pidfd(pid)),
             _slot: Some(slot),
             api,
             vsock_inside: vsock.clone(),
@@ -566,6 +572,7 @@ impl Vm {
                 vm: spawned.vm,
                 exited: spawned.exited,
             },
+            meter: Meter::start(spawned.pid, spawned.pidfd),
             _slot: Some(slot),
             api: run.join("api.sock"),
             vsock: run.join("v.sock"),
@@ -588,7 +595,9 @@ impl Vm {
                     .try_wait()?
                     .map(|status| format!("{status}; {}", log_tail(&self.log))),
                 // its directory is gone: the keeper sent its log's tail
-                Process::Jailed { exited, .. } => exited.borrow().clone(),
+                Process::Jailed { exited, .. } => {
+                    (exited.borrow().as_ref()).map(|end| format!("{}; {}", end.status, end.log))
+                }
                 Process::HandedOver => None,
             };
             if let Some(ended) = ended {
@@ -711,8 +720,57 @@ impl Vm {
                 _place: place.clone(),
                 stops: stops.clone(),
             });
+            vm.meter.ask_disk(&vm.vsock);
         }
         Ok(vm)
+    }
+
+    /// What it uses, as the sampler read it last ([`usage`]); none before it did.
+    pub fn usage(&self) -> Option<sluice_wicket_console::status::Usage> {
+        self.meter.usage()
+    }
+
+    /// What reads what it uses.
+    pub fn meter(&self) -> &Arc<Meter> {
+        &self.meter
+    }
+
+    /// Why it serves no more, its log stream ended: its `firecracker` ended, how, once that is
+    /// known ([`usage::END_TIMEOUT`] at most); the host kernel's OOM killer's kill named so, as
+    /// its cgroup tells it (jailed), else as the host's count of them rose while it lived.
+    pub async fn end(&self) -> String {
+        let (status, oom) = match &self.process {
+            Process::Child { .. } => match self.meter.exit(usage::END_TIMEOUT).await {
+                Some(exit) => {
+                    let killed = exit == usage::Exit::Signal(libc::SIGKILL);
+                    (
+                        Some(exit.to_string()),
+                        killed && self.meter.host_oom_killed(),
+                    )
+                }
+                None => (None, false),
+            },
+            Process::Jailed { exited, .. } => {
+                let mut exited = exited.clone();
+                let ended =
+                    tokio::time::timeout(usage::END_TIMEOUT, exited.wait_for(Option::is_some));
+                match ended.await {
+                    Ok(Ok(end)) => {
+                        let end = end.as_ref().expect("waited for");
+                        (Some(end.status.clone()), end.oom)
+                    }
+                    _ => (None, false),
+                }
+            }
+            Process::HandedOver => (None, false),
+        };
+        match (status, oom) {
+            (Some(status), true) => format!(
+                "its VM ended ({status}): out of memory, the host kernel's OOM killer took it"
+            ),
+            (Some(status), false) => format!("its VM ended ({status})"),
+            (None, _) => "its VM ended".into(),
+        }
     }
 
     /// `line` to `/init` on the control stream `stream`, and its answer within `timeout`:
@@ -781,6 +839,7 @@ impl Vm {
     fn handed_over(&mut self) -> Vm {
         Vm {
             process: std::mem::replace(&mut self.process, Process::HandedOver),
+            meter: self.meter.clone(),
             _slot: self._slot.take(),
             api: std::mem::take(&mut self.api),
             vsock: std::mem::take(&mut self.vsock),
@@ -887,25 +946,7 @@ impl Vm {
 
     /// Opens a stream to the guest's vsock `port`, within [`DIAL_TIMEOUT`].
     pub async fn dial(&self, port: u32) -> Result<UnixStream, BoxError> {
-        let dialed = async {
-            let mut stream = UnixStream::connect(&self.vsock).await?;
-            stream
-                .write_all(format!("CONNECT {port}\n").as_bytes())
-                .await?;
-            // what follows the line is the guest's
-            let line = wire::read_short_line(&mut stream, 64)
-                .await
-                .map_err(|e| format!("vsock handshake: {e}"))?;
-            if !line.starts_with(b"OK ") {
-                return Err(
-                    format!("vsock handshake: {}", String::from_utf8_lossy(&line).trim()).into(),
-                );
-            }
-            Ok::<_, BoxError>(stream)
-        };
-        tokio::time::timeout(DIAL_TIMEOUT, dialed)
-            .await
-            .map_err(|_| format!("vsock handshake: no answer within {DIAL_TIMEOUT:?}"))?
+        dial_at(&self.vsock, port).await
     }
 
     /// Whether the guest's process accepts on `port`: a dial alone says nothing, `/init`'s vsock
@@ -1018,6 +1059,30 @@ impl Drop for Vm {
             Process::HandedOver => {}
         }
     }
+}
+
+/// Opens a stream to the vsock `port` of the guest whose vsock socket is `vsock`, within
+/// [`DIAL_TIMEOUT`].
+pub async fn dial_at(vsock: &Path, port: u32) -> Result<UnixStream, BoxError> {
+    let dialed = async {
+        let mut stream = UnixStream::connect(vsock).await?;
+        stream
+            .write_all(format!("CONNECT {port}\n").as_bytes())
+            .await?;
+        // what follows the line is the guest's
+        let line = wire::read_short_line(&mut stream, 64)
+            .await
+            .map_err(|e| format!("vsock handshake: {e}"))?;
+        if !line.starts_with(b"OK ") {
+            return Err(
+                format!("vsock handshake: {}", String::from_utf8_lossy(&line).trim()).into(),
+            );
+        }
+        Ok::<_, BoxError>(stream)
+    };
+    tokio::time::timeout(DIAL_TIMEOUT, dialed)
+        .await
+        .map_err(|_| format!("vsock handshake: no answer within {DIAL_TIMEOUT:?}"))?
 }
 
 /// The last lines of a VM's log at `path` (Firecracker's and the guest console's), read

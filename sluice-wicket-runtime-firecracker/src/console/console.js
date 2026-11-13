@@ -6,8 +6,8 @@
 // as markup.
 
 import {
-  choiceView, consolePage, currentListing, deployedView, envView, field, follow, formatMs, h, humanBytes, joined,
-  limitView, nextId, parseJson, plural, refuse, showListing,
+  choiceView, consolePage, currentListing, deployedView, envView, field, followMoving, formatMs, h, humanBytes,
+  joined, limitView, nextId, plural, refuse, usageView,
 } from "/kit.js";
 
 const CLONED = ["per-connection", "reuse", "pool"];
@@ -393,7 +393,7 @@ function modeCell(route) {
   return [h("div", { class: "route__sandbox" }, parts), vmsView(route)];
 }
 
-/** What a route's VMs are: alive, then by mode, its connections, the template's snapshot. */
+/** What a route's VMs are: alive, then by mode, its connections, what they use, the template's snapshot. */
 function vmsView(route) {
   const { instances: vms, snapshot } = route;
   const counts = [h("span", { class: "num", title: "its VMs alive, as the budget counts them" }, plural(vms.alive, "VM"))];
@@ -417,6 +417,10 @@ function vmsView(route) {
   }
   counts.push(plural(vms.connections, "connection"));
   const lines = [h("span", { class: "route__meta", "data-testid": "instances" }, joined(counts))];
+  const used = usageView(route.alive);
+  if (used) {
+    lines.push(used);
+  }
   if (vms.down) {
     lines.push(h("span", { class: "route__meta", title: "its VM starts again by itself" }, vms.down.why));
   }
@@ -483,36 +487,5 @@ consolePage({
 
 // ----------------------------------------------------------------------- the link
 
-const counts = (listing) => JSON.stringify(listing && [listing.budget, listing.routes.map((route) => [route.instances, route.ready, route.snapshot])]);
-
-follow((listing, moved) => {
-  showListing(listing, moved || counts(currentListing()) !== counts(listing));
-});
-
-/**
- * The VMs' counts and the budget move without a new revision: a plain listing every
- * REFRESH_MS while the page is seen, rendered where they moved (a row rebuilt only when its
- * route changed: an open editor stays as it is).
- */
-async function refresh() {
-  if (document.visibilityState !== "visible" || currentListing() === null) {
-    return;
-  }
-  try {
-    const response = await fetch("/api/routes", { cache: "no-store", headers: { Accept: "application/json" } });
-    if (!response.ok) {
-      return;
-    }
-    const listing = parseJson(await response.text());
-    // a listing older than the one held is no news
-    if (!listing || listing.revision < currentListing().revision) {
-      return;
-    }
-    showListing(listing);
-  }
-  catch {
-    // the long poll tells the link is lost
-  }
-}
-
-setInterval(refresh, REFRESH_MS);
+// what moves without a new revision: the VMs' counts, what they use, and the budget
+followMoving((listing) => [listing.budget, listing.routes.map((route) => [route.instances, route.ready, route.snapshot, route.alive])], REFRESH_MS);

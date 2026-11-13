@@ -22,7 +22,7 @@ use tokio::io::{AsyncWriteExt as _, BufReader};
 use tokio::net::UnixStream;
 use tokio::sync::{mpsc, watch};
 
-use crate::wire::{self, LogFrame, Stream};
+use crate::wire::{self, Exit, LogFrame, Stream};
 
 /// Lines waiting for the printer at most: past them the streams wait.
 const PRINTER_LINES: usize = 1024;
@@ -164,8 +164,8 @@ impl Sink {
 /// What ended, as a VM's log stream tells.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Ended {
-    /// The guest said its process did.
-    Process,
+    /// The guest said its process did, how where it tells.
+    Process(Option<Exit>),
     /// The stream did, the VM with it.
     Vm,
 }
@@ -177,18 +177,30 @@ async fn turned_on(flag: &mut watch::Receiver<bool>) {
     }
 }
 
+/// What the guest said of its process's end, once it did: how, where it tells.
+type Exited = Option<Option<Exit>>;
+
+/// Resolves once the guest said its process ended, how; never if it never will.
+async fn told_exit(exited: &mut watch::Receiver<Exited>) -> Option<Exit> {
+    let told = exited.wait_for(Option::is_some).await;
+    match told.map(|told| told.clone().flatten()) {
+        Ok(exit) => exit,
+        Err(_) => std::future::pending().await,
+    }
+}
+
 /// A VM's output being followed ([`follow`]).
 pub struct Output {
     syncs: mpsc::Sender<()>,
     synced: watch::Receiver<u64>,
-    exited: watch::Receiver<bool>,
+    exited: watch::Receiver<Exited>,
     gone: watch::Receiver<bool>,
 }
 
 impl Output {
     /// Resolves once the guest said its process ended; never if the stream ends first.
     pub async fn exited(&mut self) {
-        turned_on(&mut self.exited).await;
+        told_exit(&mut self.exited).await;
     }
 
     /// Resolves once the VM is gone, or its process ended unless that was `told` before; never
@@ -197,7 +209,7 @@ impl Output {
         tokio::select! {
             biased;
             () = turned_on(&mut self.gone) => Ended::Vm,
-            () = turned_on(&mut self.exited), if !told => Ended::Process,
+            exit = told_exit(&mut self.exited), if !told => Ended::Process(exit),
         }
     }
 
@@ -225,7 +237,7 @@ pub fn follow(
 ) -> Output {
     let (syncs, mut asked) = mpsc::channel(1);
     let (count, synced) = watch::channel(0u64);
-    let (ended, exited) = watch::channel(false);
+    let (ended, exited) = watch::channel::<Exited>(None);
     let (vm_gone, gone) = watch::channel(false);
     tokio::spawn(async move {
         // borrowed halves: an owned write half shuts the socket down when dropped,
@@ -242,7 +254,7 @@ pub fn follow(
                         sink.gap(&hosts, &vm, stdout, stderr).await;
                     }
                     Ok(Some(LogFrame::Synced)) => count.send_modify(|count| *count += 1),
-                    Ok(Some(LogFrame::Exited)) => drop(ended.send(true)),
+                    Ok(Some(LogFrame::Exited(exit))) => drop(ended.send(Some(exit))),
                     Ok(None) => {
                         let _ = vm_gone.send(true);
                         return;
@@ -329,8 +341,8 @@ mod tests {
 
     /// Each line goes to the printer with the route's hosts of the moment and the VM,
     /// and to the tap as a line of the first host; the guest's drops are noted; a sync
-    /// answers once the lines before it were handed on; a frame the wicket does not
-    /// take ends the stream.
+    /// answers once the lines before it were handed on; the process's end is told, how; a
+    /// frame the wicket does not take ends the stream.
     #[tokio::test]
     async fn a_vms_lines_reach_the_printer_and_the_tap() {
         let (stdout, stderr) = (Written::default(), Written::default());
@@ -377,6 +389,14 @@ mod tests {
                 tapped_line("stdout", "b.local", "on"),
             ]
         );
+        let exit = Exit {
+            status: "signal: 9 (SIGKILL)".into(),
+            oom: true,
+        };
+        let mut out = Vec::new();
+        wire::put_log_frame(&mut out, &LogFrame::Exited(Some(exit.clone())));
+        guest.write_all(&out).await.unwrap();
+        assert_eq!(output.ended(false).await, Ended::Process(Some(exit)));
 
         // over the bound: the stream is given up
         let mut overlong = vec![2u8];

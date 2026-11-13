@@ -9,7 +9,9 @@
 //! ```
 //!
 //! The wicket drives its VMs itself (their API and vsock sockets are in directories of
-//! its group). The keeper trusts none of its requests: a VM gets the files the wicket
+//! its group), and reads what each uses of its process (a pidfd of it comes with the spawn's
+//! answer); the keeper tells how each ended, a kill of the OOM killer's as its cgroup counted
+//! it. The keeper trusts none of its requests: a VM gets the files the wicket
 //! opened (passed as fds: no path of the wicket's is opened as root), an id, directory
 //! and cgroup of the keeper's choosing, and its route's `firecracker`, which the keeper
 //! read from its own setting.
@@ -142,10 +144,13 @@ enum Answer {
         /// The route's snapshot directory.
         snapshot: PathBuf,
     },
+    /// Sent with a pidfd of the VM's `firecracker`.
     Spawned {
         vm: u64,
         /// The VM's directory: `firecracker.log`, and `run/` holding its sockets.
         dir: PathBuf,
+        /// Its `firecracker`'s pid, the wicket's PID namespace being the keeper's.
+        pid: libc::pid_t,
     },
     Sealed,
 }
@@ -157,13 +162,25 @@ enum Message {
         id: u64,
         result: Result<Answer, String>,
     },
-    /// A VM ended: `exit N`, `signal N`, and the tail of its log (which the id's next
-    /// VM truncates).
+    /// A VM ended: `exit N`, `signal N`, the tail of its log (which the id's next VM
+    /// truncates), and whether the kernel's OOM killer took it (its cgroup said so).
     Exited {
         vm: u64,
         status: String,
         log: String,
+        oom: bool,
     },
+}
+
+/// How a VM the keeper spawned ended.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VmEnd {
+    /// `exit N`, `signal N`.
+    pub status: String,
+    /// The tail of its log.
+    pub log: String,
+    /// The kernel's OOM killer took it.
+    pub oom: bool,
 }
 
 /// Sends one message with `fds` on the socket `fd`.
@@ -358,6 +375,8 @@ struct Vm {
     route: u64,
     role: Role,
     id: u32,
+    /// Whether its CPU is capped: its cgroup's class.
+    capped: bool,
     pid: libc::pid_t,
     /// `vm-<n>`, its id's: its sockets removed once it is reaped.
     dir: PathBuf,
@@ -684,12 +703,20 @@ impl Keeper {
         }
     }
 
-    /// A VM was reaped: its exit reported with its log's tail, its `run` emptied, its id
-    /// freed; the seals and spawns waiting on it go on.
+    /// A VM was reaped: its exit reported with its log's tail and whether the OOM killer took
+    /// it (its cgroup's count, read before the cgroup holds another VM), its `run` emptied,
+    /// its id freed; the seals and spawns waiting on it go on.
     fn ended_vm(&mut self, vm: u64, status: libc::c_int) {
         let Some(ended) = self.vms.remove(&vm) else {
             return;
         };
+        let cgroup = match ended.role {
+            Role::Template => {
+                (self.routes.get_mut(&ended.route)).and_then(|route| route.cgroup.as_mut())
+            }
+            Role::Boot | Role::Clone => self.clones.get_mut(&(ended.id, ended.capped)),
+        };
+        let oom = cgroup.is_some_and(Cgroup::oom_killed);
         let log = crate::vm::log_tail(&ended.dir.join("firecracker.log"));
         // the id's next VM finds its run directory empty
         if let Ok(entries) = std::fs::read_dir(ended.dir.join("run")) {
@@ -699,11 +726,15 @@ impl Keeper {
             }
         }
         self.free.insert(ended.id);
-        self.tell(&Message::Exited {
-            vm,
-            status: describe(status),
-            log,
-        });
+        self.tell(
+            &Message::Exited {
+                vm,
+                status: describe(status),
+                log,
+                oom,
+            },
+            None,
+        );
         if ended.role == Role::Template {
             let (now, later): (Vec<_>, Vec<_>) = std::mem::take(&mut self.seals)
                 .into_iter()
@@ -717,8 +748,8 @@ impl Keeper {
         self.closed(ended.route);
         while !self.waiting.is_empty() && !self.free.is_empty() {
             let waiting = self.waiting.pop_front().expect("not empty");
-            let result = self.spawn(&waiting);
-            self.reply(waiting.call, result);
+            let spawned = self.spawn(&waiting);
+            self.reply_spawned(waiting.call, spawned);
         }
     }
 
@@ -782,7 +813,9 @@ impl Keeper {
                     self.waiting.push_back(waiting);
                     return;
                 }
-                self.spawn(&waiting)
+                let spawned = self.spawn(&waiting);
+                self.reply_spawned(call.id, spawned);
+                return;
             }
             Request::Kill { vm } => {
                 if let Some(vm) = self.vms.get(&vm) {
@@ -817,15 +850,30 @@ impl Keeper {
     }
 
     fn reply(&self, id: u64, result: Result<Answer, String>) {
-        self.tell(&Message::Reply { id, result });
+        self.tell(&Message::Reply { id, result }, None);
     }
 
-    fn tell(&self, message: &Message) {
+    /// Answers the spawn `call`: the VM, sent with its pidfd.
+    fn reply_spawned(&self, call: u64, spawned: Result<(Answer, OwnedFd), String>) {
+        match spawned {
+            Ok((answer, pidfd)) => {
+                let reply = Message::Reply {
+                    id: call,
+                    result: Ok(answer),
+                };
+                self.tell(&reply, Some(&pidfd));
+            }
+            Err(e) => self.reply(call, Err(e)),
+        }
+    }
+
+    fn tell(&self, message: &Message, fd: Option<&OwnedFd>) {
         let Some(socket) = &self.socket else {
             return;
         };
         let bytes = serde_json::to_vec(message).expect("a message serializes");
-        if let Err(e) = send(socket.as_raw_fd(), &bytes, &[]) {
+        let fds: Vec<RawFd> = fd.iter().map(|fd| fd.as_raw_fd()).collect();
+        if let Err(e) = send(socket.as_raw_fd(), &bytes, &fds) {
             eprintln!("keeper: a message to the wicket lost: {e}");
         }
     }
@@ -914,8 +962,9 @@ impl Keeper {
         let _ = std::fs::remove_dir_all(self.dir.join(name));
     }
 
-    /// Spawns a VM in a jail: a free id (there is one), its directory and cgroup.
-    fn spawn(&mut self, request: &Waiting) -> Result<Answer, String> {
+    /// Spawns a VM in a jail: a free id (there is one), its directory and cgroup; and a pidfd
+    /// of it.
+    fn spawn(&mut self, request: &Waiting) -> Result<(Answer, OwnedFd), String> {
         let route = self
             .routes
             .get(&request.route)
@@ -937,8 +986,8 @@ impl Keeper {
         }
         let id = self.free.pop_first().expect("an id is free");
         let dir = self.dir.join(format!("vm-{}", id - self.ids.first));
-        let pid = match self.jail(id, &dir, request) {
-            Ok(pid) => pid,
+        let (pid, pidfd) = match self.jail(id, &dir, request) {
+            Ok(spawned) => spawned,
             Err(e) => {
                 self.free.insert(id);
                 return Err(format!("a jail for the VM: {e}"));
@@ -953,18 +1002,25 @@ impl Keeper {
                 route: request.route,
                 role: request.role,
                 id,
+                capped: request.size.cpu.is_some(),
                 pid,
                 dir: dir.clone(),
             },
         );
-        Ok(Answer::Spawned { vm, dir })
+        Ok((Answer::Spawned { vm, dir, pid }, pidfd))
     }
 
     /// Starts the VM of `request` as the id `id`, its directory `dir`: the directory
     /// made for the id's first VM and kept (the reap empties its `run`), its log afresh,
     /// its cgroup (the route's for a template, the id's for a VM serving, in the
-    /// class of its CPU, capped or not) made for the first and limited for each.
-    fn jail(&mut self, id: u32, dir: &Path, request: &Waiting) -> io::Result<libc::pid_t> {
+    /// class of its CPU, capped or not) made for the first and limited for each. Its pid and
+    /// a pidfd of it.
+    fn jail(
+        &mut self,
+        id: u32,
+        dir: &Path,
+        request: &Waiting,
+    ) -> io::Result<(libc::pid_t, OwnedFd)> {
         let n = id - self.ids.first;
         if !self.made.contains(&id) {
             std::fs::DirBuilder::new().mode(0o750).create(dir)?;
@@ -1238,16 +1294,22 @@ pub struct Client {
     next: AtomicU64,
 }
 
-/// An answer, with the exit watch of a VM spawned.
-type Received = Result<(Answer, Option<watch::Receiver<Option<String>>>), String>;
+/// An answer, with the exit watch and the pidfd of a VM spawned.
+type Received = Result<(Answer, Option<Watched>), String>;
+
+/// A VM spawned's exit watch, and its pidfd.
+type Watched = (watch::Receiver<Option<VmEnd>>, Option<OwnedFd>);
 
 /// A VM the keeper spawned.
 pub struct Spawned {
     pub vm: u64,
     /// `firecracker.log`, and `run/` holding its sockets.
     pub dir: PathBuf,
-    /// Its exit (`exit N`, `signal N`) and the tail of its log, once it ended.
-    pub exited: watch::Receiver<Option<String>>,
+    /// Its `firecracker`'s pid, and a pidfd of it.
+    pub pid: libc::pid_t,
+    pub pidfd: Option<OwnedFd>,
+    /// How it ended, once it did.
+    pub exited: watch::Receiver<Option<VmEnd>>,
 }
 
 impl Client {
@@ -1282,7 +1344,7 @@ impl Client {
         let socket = unsafe { AsyncFd::register(fd) }.map_err(|e| e.into_parts().1)?;
         let socket = Arc::new(socket);
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Received>>>> = Arc::default();
-        let exits: Arc<Mutex<HashMap<u64, watch::Sender<Option<String>>>>> = Arc::default();
+        let exits: Arc<Mutex<HashMap<u64, watch::Sender<Option<VmEnd>>>>> = Arc::default();
         let (calls, mut outgoing) = mpsc::unbounded_channel::<(Vec<u8>, Vec<OwnedFd>)>();
         let writer = socket.clone();
         tokio::spawn(async move {
@@ -1312,24 +1374,25 @@ impl Client {
                 let Ok(mut ready) = reader.readable().await else {
                     break;
                 };
-                let n = match ready.try_io(|socket| receive(socket.as_raw_fd(), &mut buffer)) {
+                let (n, fds) = match ready.try_io(|socket| receive(socket.as_raw_fd(), &mut buffer))
+                {
                     Ok(Ok((0, _))) | Ok(Err(_)) => break,
-                    Ok(Ok((n, _))) => n,
+                    Ok(Ok(received)) => received,
                     Err(_would_block) => continue,
                 };
                 match serde_json::from_slice::<Message>(&buffer[..n]) {
                     Ok(Message::Reply { id, result }) => {
-                        // a VM's exit watch, before its exit can be read
+                        // a VM's exit watch, before its exit can be read, and its pidfd
                         let result = result.map(|answer| {
-                            let exited = match &answer {
+                            let watched = match &answer {
                                 Answer::Spawned { vm, .. } => {
                                     let (tell, exited) = watch::channel(None);
                                     exits.lock().unwrap().insert(*vm, tell);
-                                    Some(exited)
+                                    Some((exited, fds.into_iter().next()))
                                 }
                                 _ => None,
                             };
-                            (answer, exited)
+                            (answer, watched)
                         });
                         let waiter = answered.lock().unwrap().remove(&id);
                         let unreceived = match waiter {
@@ -1353,9 +1416,14 @@ impl Client {
                             let _ = undo.send((bytes, Vec::new()));
                         }
                     }
-                    Ok(Message::Exited { vm, status, log }) => {
+                    Ok(Message::Exited {
+                        vm,
+                        status,
+                        log,
+                        oom,
+                    }) => {
                         if let Some(tell) = exits.lock().unwrap().remove(&vm) {
-                            let _ = tell.send(Some(format!("{status}; {log}")));
+                            let _ = tell.send(Some(VmEnd { status, log, oom }));
                         }
                     }
                     Err(e) => eprintln!("keeper: a message it cannot read: {e}"),
@@ -1364,7 +1432,11 @@ impl Client {
             // the keeper ended: nothing will be answered (and the wicket dies with it)
             answered.lock().unwrap().clear();
             for (_, tell) in exits.lock().unwrap().drain() {
-                let _ = tell.send(Some("the keeper ended".into()));
+                let _ = tell.send(Some(VmEnd {
+                    status: "the keeper ended".into(),
+                    log: String::new(),
+                    oom: false,
+                }));
             }
         });
         Ok(Arc::new(Client {
@@ -1423,7 +1495,13 @@ impl Client {
             open_files,
         };
         match self.call(request, Vec::new()).await? {
-            (Answer::Spawned { vm, dir }, Some(exited)) => Ok(Spawned { vm, dir, exited }),
+            (Answer::Spawned { vm, dir, pid }, Some((exited, pidfd))) => Ok(Spawned {
+                vm,
+                dir,
+                pid,
+                pidfd,
+                exited,
+            }),
             (answer, _) => Err(format!("keeper: unexpected {answer:?}").into()),
         }
     }

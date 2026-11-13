@@ -576,6 +576,22 @@ pub struct ListedInstance {
     /// Of a wicket checking its readiness: whether it takes requests. None: it does.
     #[serde(default)]
     pub ready: Option<bool>,
+    /// What it uses of its host, as its wicket measured it last: none before it did, as from a
+    /// wicket predating it.
+    #[serde(default)]
+    pub usage: Option<ListedUsage>,
+}
+
+/// What an instance uses of its wicket's host.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq)]
+pub struct ListedUsage {
+    /// Its CPU over the last seconds, in CPUs.
+    pub cpu: f64,
+    /// The memory it holds, in bytes.
+    pub memory_bytes: u64,
+    /// What it uses of its disk, in bytes: none without one.
+    #[serde(default)]
+    pub disk_bytes: Option<u64>,
 }
 
 #[derive(Deserialize, Debug)]

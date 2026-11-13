@@ -1,12 +1,13 @@
-// The sluice wicket console: lists the routes (long-polled), deploys a component dropped
+// The sluice wicket console: lists the routes (long-polled, and refreshed for what their
+// instances use), deploys a component dropped
 // on the page or chosen from a file, and replaces, reconfigures or removes the routes
 // deployed here. The flow is kit.js's; here is what is the wasm wicket's: the sandbox fields,
 // the component's check, the cells. Every string from the wicket is put in the DOM as text,
 // never as markup.
 
 import {
-  choiceView, consolePage, currentListing, deployedView, envView, follow, formatMs, h, humanBytes, limitView,
-  nextId, refuse, sep, showListing,
+  choiceView, consolePage, currentListing, deployedView, envView, followMoving, formatMs, h, humanBytes, limitView,
+  nextId, refuse, sep, usageView,
 } from "/kit.js";
 
 const NETWORK = ["inherit-network", "allow-ip-name-lookup", "tcp", "udp"];
@@ -28,6 +29,10 @@ const FALLBACK = {
 };
 
 const defaults = () => currentListing()?.defaults ?? FALLBACK.defaults;
+
+// the instances and what they use move without a new listing: a plain one this often while the
+// page is seen
+const REFRESH_MS = 5000;
 
 /** Its first 8 bytes: the wasm magic, then the version's layer (0: a core module). */
 function sniff(file, head) {
@@ -202,7 +207,7 @@ function componentCell(route) {
   ];
 }
 
-function sandboxCell({ sandbox }) {
+function sandboxCell({ sandbox, alive }) {
   const parts = sandbox.wasi.map((cap) => h("span", { class: "tag", title: CAP_HINTS[cap] ?? null }, cap));
   const limit = (text) => h("span", { class: "route__limit" }, text);
   if (sandbox["budget-ms"] !== defaults()["budget-ms"]) {
@@ -235,7 +240,7 @@ function sandboxCell({ sandbox }) {
   if (!parts.length) {
     parts.push(h("span", { class: "route__defaults" }, "defaults"));
   }
-  return h("div", { class: "route__sandbox" }, parts);
+  return [h("div", { class: "route__sandbox" }, parts), usageView(alive)];
 }
 
 consolePage({
@@ -270,4 +275,4 @@ consolePage({
   },
 });
 
-follow(showListing);
+followMoving((listing) => listing.routes.map((route) => route.alive), REFRESH_MS);
